@@ -15,6 +15,7 @@ APK
  ├─ assets/boosandbox.bin          LD_PRELOAD 写拦截器（沙箱的强制层）
  ├─ assets/boo-sandbox-run.bin     沙箱 runner：把 bwrap 方言翻译成拦截器配置
  ├─ assets/ripgrep-android-arm64.zip   官方 linux-arm64 静态 rg，补 @vscode/ripgrep 缺的 android 包
+ ├─ assets/sharp-wasm32.zip        sharp 的 wasm32 变体（官方无 android 预编译二进制）
  ├─ assets/pnpm-android-arm64.zip  pnpm 11.28.3 纯 JS 版，解到 $PREFIX/lib/pnpm
  ├─ assets/mobile-ui.zip           移动端 UI 适配插件（dsh-android-mobile）
  └─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片
@@ -94,6 +95,8 @@ adb logcat -d -s DSH:I
 | `已安装 system 插件 @deepseek-ai/node-addon-system-android-arm64` | flock 绑定已就位 |
 | `已放行 flock 的 android 平台: flock.js` | 平台白名单已补 android |
 | `已安装 ripgrep @vscode/ripgrep-android-arm64 (<N> 字节)` | grep/glob 的搜索二进制已就位 |
+| `已安装 sharp wasm 变体 (@img/sharp-wasm32, <N> 字节)` | 图片附件的图像处理已就位 |
+| `已放行附件模块的祖先目录 fsync: dsh-attachment-local` | 附件发布的目录 fsync 已容错 |
 | `已安装 pnpm 11.28.3 (<N> 个文件, <M> 字节启动脚本)` | 插件管理器可用了 |
 | `已解出沙箱 runner boo-sandbox-run (<N> 字节) + libboosandbox.so (<N> 字节)` | 沙箱组件已落盘 |
 | `已写入沙箱 overlay: sandbox.patch.yml` | 沙箱 runner 已挂上 |
@@ -436,6 +439,86 @@ WebView 的默认实现**立刻回调 `onReceiveValue(null)`**（即"用户没�
 ⚠️ **取消时必须回调 `null`，不能回调空数组** —— 空数组会被页面解读成"选了 0 个文件"
 而触发一次空提交。`ActivityNotFoundException`（无任何应用能处理）同样要 `null` 并返回 `false`。
 ⚠️ 回调是**一次性**的：`filePathCallbackRef` 要在调用前取出并置空，否则第二次点击不会响应。
+
+### ⑧ `sharp` 没有 android 预编译二进制 —— 装 wasm32 变体
+
+**症状**：图片附件**上传成功**（缩略图正常显示），点发送报
+`prompt rejected (session/agent-busy)`。
+
+⚠️ `agent-busy` 是**兜底错误码**，真因藏在 `details.reason` 里，别照着字面查
+"会话忙"。`dsh-api-session-controller/lib/index.js` 是
+`throw new RemoteError("session/agent-busy", "prompt rejected", { reason: String(error) })`。
+**排查手法**：在页面里 hook `window.fetch`，把 `details.reason` 打出来。
+
+`dsh-attachment-local` 用 `sharp`（^0.35.3）做图片元数据 + 缩放重编码。sharp 的
+预编译二进制只覆盖 darwin/linux/linuxmusl/win32/freebsd，**没有 android**。
+
+`sharp/dist/sharp.cjs` 算出 `runtimePlatform = android-arm64`，switch 里没有这个分支，
+于是**无条件落到 wasm 兜底**：
+
+```js
+sharp = require("@img/sharp-wasm32/sharp.node");
+```
+
+所以**只需要装 `@img/sharp-wasm32`，sharp 本身一行都不用改**。
+
+**做法**：`assets/sharp-wasm32.zip`（含 `@img/sharp-wasm32` + `@emnapi/runtime`，
+条目为相对路径、无顶层目录），`EngineManager.ensureSharp()` 解到
+`engine/node_modules/`。幂等判据是
+`@img/sharp-wasm32/lib/sharp-wasm32-0.35.5.node.wasm` 存在且非空。无需版本戳。
+
+⚠️ `@emnapi/runtime` 的 `index.js` 按 `NODE_ENV` 二选一 require
+（`emnapi.cjs.min.js` / `emnapi.cjs.js`），**两个都要打进去**。
+⚠️ wasm 靠 `locateFile()` 相对 `scriptDirectory` 找同目录的
+`sharp-wasm32-0.35.5.node.wasm`，所以 `.node.js` 与 `.node.wasm` 必须同目录。
+⚠️ 设备实测通过（`sharp 0.35.5` / `vips 8.18.7`，1200×800 全链路
+metadata → resize → png/jpeg/webp → thumbnail 全 OK）。
+**别用手搓的 base64 PNG 测**，那会报 `vipspng: libpng read error`，误判成 wasm 的锅；
+用 `sharp({ create: {...} })` 造图。
+
+### ⑨ 附件模块会 fsync 到 `/` —— Android 的 SELinux 不给 open
+
+**症状**：与 ⑧ 完全一样（`agent-busy`），但在 ⑧ 修好**之后**才浮出来。
+
+`details.reason` 的真因：
+
+```
+Error: EACCES: permission denied, open '/data/user/0'
+```
+
+**根因**：`dsh-attachment-local` 发布附件时要证明"目录项已落盘"，
+`ensureDurableDirectory()` 从 `$DSH_HOME` **逐级向上** fsync 每一层父目录
+（`syncDirectory()` = `open(dir, O_RDONLY)` + `handle.sync()`），而
+`ensureDurableHome()` 把 boundary 定成 `parse(home).root` —— 也就是 **`/`**，
+于是这趟遍历**必然**走出应用目录。
+
+而 Android 的 SELinux 不让应用 open 这些祖先目录。真机实测（root 的 `/` 也是 EACCES，
+**不是权限位问题**，别去 `chmod`）：
+
+| 目录 | 模式 | `open(O_RDONLY)` |
+|---|---|---|
+| `/` | 755 | **EACCES** |
+| `/data` | 771 | **EACCES** |
+| `/data/user` | 711 | **EACCES** |
+| `/data/user/0` | 771 | **EACCES** |
+| `/data/data` | 771 | **EACCES** |
+| `/data/user/0/com.dsh.android` | 700 | OK |
+| `/storage/emulated/0` | 771 | OK |
+
+**做法**：`EngineManager.patchAttachmentDurability()` 把 `syncDirectory()` 里那次
+`open` 包进 try/catch，**只把 EACCES/EPERM 改成跳过该层**，其余 errno 照旧抛出。
+锚点见 `ATTACH_SYNC_GUARD` / `ATTACH_SYNC_ANCHOR`。
+
+⚠️ 丢掉的只是"祖先目录项的崩溃持久性"这一项加固，**不是正确性**：附件字节本身的
+fsync 照旧，应用自己目录（700、可 open）的 fsync 也照旧。应用目录之外的目录项在
+Android 上**本来就不可达**，这不是取舍是平台事实。
+⚠️ 桌面端不受影响（`/`、`/home` 在 Linux 上都是可 open 的 755），catch 分支不触发。
+⚠️ 引擎升级后锚点若不匹配，补丁会跳过并打日志，不会让启动失败。
+
+**同类站点已逐处核对**（`dsh-session-persistence-jsonl` 的 `syncDirectory`、
+其 `lib/worker.cjs` 孪生、`dsh-storage-json` 的 `fsyncDirectory`）——
+它们只 fsync **直接父目录**，都在 `$DSH_HOME` 以内，**安全**。
+**只有 `dsh-attachment-local` 会一路走到 `/`。**
 
 ## 移动端 UI 插件
 

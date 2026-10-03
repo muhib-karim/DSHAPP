@@ -345,6 +345,131 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 安装 sharp 的 WebAssembly 变体（幂等）。
+     *
+     * **症状**：图片附件上传成功后点发送，提示 `prompt rejected (session/agent-busy)`。
+     * 那个 `agent-busy` 是**兜底错误码**（`dsh-api-session-controller` 的
+     * `admit()` 把非 RemoteError 一律包成它），真因藏在 `details.reason` 里：
+     * `Could not load the "sharp" module using the android-arm64 runtime`。
+     *
+     * **根因**：`dsh-attachment-local` 用 sharp 做图片的元数据读取与缩放/重编码，
+     * 而 sharp 的预编译二进制只覆盖 darwin/linux/linuxmusl/win32/freebsd，
+     * **没有 android**。`sharp/dist/sharp.cjs` 按 `runtimePlatformArch()` 拼包名
+     * （`${process.platform}${libc}-${process.arch}` = `android-arm64`）走 switch，
+     * 落不进任何 case。
+     *
+     * **做法**：装 sharp 官方的 **wasm32 变体**。它正是 sharp 在
+     * 「无预编译二进制」平台上的官方兜底 —— `sharp.cjs` 的 switch 走完之后，
+     * 还有一条无条件的 `require("@img/sharp-wasm32/sharp.node")`（第 102-108 行），
+     * 只要该包存在就能加载，**不需要改 sharp 自身一行代码**。
+     * 它依赖 `@emnapi/runtime`（N-API 的 wasm 实现），故一并安装。
+     *
+     * 真机实测（`create` 1200×800 RGBA → metadata / resize / png+jpeg+webp 编码 /
+     * 缩略图裁剪）全部通过，`sharp.versions` = 0.35.5 / libvips 8.18.7。
+     *
+     * 无需改版本戳 —— 与 ripgrep 同理，判定条件是「wasm 文件存在且非空」。
+     */
+    private fun ensureSharp() {
+        val nodeModules = File(engineDir, "node_modules")
+        if (!nodeModules.isDirectory) {
+            Log.w(TAG, "引擎尚未解包，跳过 sharp 安装")
+            return
+        }
+
+        val wasm = File(nodeModules, SHARP_WASM_PACKAGE).let { dir ->
+            File(dir, "lib/sharp-wasm32-${SHARP_VERSION}.node.wasm")
+        }
+        if (wasm.isFile && wasm.length() > 0) {
+            return
+        }
+
+        try {
+            java.util.zip.ZipInputStream(context.assets.open(SHARP_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(nodeModules, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            Log.i(TAG, "已安装 sharp wasm 变体 ($SHARP_WASM_PACKAGE, ${wasm.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上不阻断启动：仅图片附件会发送失败，其余功能照常
+            Log.w(TAG, "安装 sharp wasm 变体失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 让 `dsh-attachment-local` 的目录 fsync 容忍「祖先目录打不开」（幂等）。
+     *
+     * **症状**：图片/文件附件**上传成功**（缩略图都在），但点发送报
+     * `prompt rejected (session/agent-busy)`。`agent-busy` 又是兜底错误码，
+     * `details.reason` 里的真因是：
+     *
+     * ```
+     * Error: EACCES: permission denied, open '/data/user/0'
+     * ```
+     *
+     * **根因**：该包发布附件时要证明「目录项已落盘」，于是从 `$DSH_HOME` **逐级向上**
+     * fsync 每一层父目录（`syncDirectory()` = `open(dir, O_RDONLY)` + `handle.sync()`），
+     * 而 `ensureDurableHome()` 把 boundary 定为 `parse(home).root` —— 也就是 `/`，
+     * 于是这趟遍历一定会走到应用目录之外。
+     *
+     * 但 **Android 的 SELinux 不允许应用 open 这些祖先目录**（真机实测，连
+     * root 的 `/` 也是 EACCES，不是权限位的问题）：
+     *
+     * | 目录 | 模式 | `open(O_RDONLY)` |
+     * |---|---|---|
+     * | `/` | 755 | **EACCES** |
+     * | `/data` | 771 | **EACCES** |
+     * | `/data/user/0` | 771 | **EACCES** |
+     * | `/data/data` | 771 | **EACCES** |
+     * | `/data/data/com.dsh.android` | 700 | OK |
+     *
+     * 于是走到 `/data/user/0` 就抛 EACCES，整个附件发布失败。
+     *
+     * **做法**：只把「open 目录被拒（EACCES/EPERM）」这一种失败改成**跳过该层**
+     * （`return`），其余 errno 照旧抛出。遍历本身会继续向上，最终自然收敛。
+     *
+     * ⚠️ **丢掉的只是「祖先目录项崩溃持久性」这一项加固，不是正确性** ——
+     * 附件字节本身的 fsync（临时文件 `handle.sync()`）照旧执行，应用自己目录
+     * （`$DSH_HOME` 及其以下，700、可 open）的 fsync 也照旧执行。
+     * 而应用目录之外的目录项在 Android 上**本来就不可能**被 fsync，
+     * 这不是取舍，是平台事实。
+     *
+     * ⚠️ 桌面端不受影响：`/`、`/home` 在 Linux 上都是可 open 的 755，
+     * 这条 catch 分支根本不会触发。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败，届时日志里有提示）。
+     */
+    private fun patchAttachmentDurability() {
+        val entry = File(engineDir, "node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到附件模块入口，跳过目录 fsync 容错: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(ATTACH_SYNC_ANCHOR)) {
+                return
+            }
+            if (!source.contains(ATTACH_SYNC_GUARD)) {
+                Log.w(TAG, "附件模块的目录 fsync 结构与预期不符，跳过容错补丁")
+                return
+            }
+            entry.writeText(source.replace(ATTACH_SYNC_GUARD, ATTACH_SYNC_ANCHOR))
+            Log.i(TAG, "已放行附件模块的祖先目录 fsync: dsh-attachment-local")
+        } catch (t: Throwable) {
+            Log.w(TAG, "放行附件模块的祖先目录 fsync 失败: ${t.message}")
+        }
+    }
+
+    /**
      * 安装 pnpm 到 `$PREFIX/bin`（幂等）。
      *
      * `plugin_manager` 的 `install_bundle` 通过 spawn `pnpm add` 装插件，而
@@ -760,6 +885,10 @@ class EngineManager private constructor(private val context: Context) {
         ensureSystemAddon()
         // ripgrep：官方无 android 平台包，缺了 grep/glob 两个工具全废
         ensureRipgrep()
+        // sharp：官方无 android 预编译二进制，缺了图片附件发送会以 agent-busy 失败
+        ensureSharp()
+        // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
+        patchAttachmentDurability()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
         ensureMobileUi()
         val mobileUiPatch = writeMobileUiPatch()
@@ -947,6 +1076,26 @@ class EngineManager private constructor(private val context: Context) {
         private const val FLOCK_ANDROID_ANCHOR =
             "if (platform !== 'linux' && platform !== 'darwin' && platform !== 'android') {"
 
+        /**
+         * `dsh-attachment-local/lib/index.js` 里 `syncDirectory()` 的原样文本，
+         * 以及容忍祖先目录打不开之后的文本。见 [patchAttachmentDurability]。
+         *
+         * ⚠️ 缩进是**一个制表符**，与官方发布件逐字一致；引擎升级后若不再匹配，
+         * 补丁会跳过并在日志里提示，不会让启动失败。
+         */
+        private const val ATTACH_SYNC_GUARD =
+            "\tconst handle = await open(path, constants.O_RDONLY);"
+        private const val ATTACH_SYNC_ANCHOR =
+            "\tlet handle;\n" +
+                "\ttry {\n" +
+                "\t\thandle = await open(path, constants.O_RDONLY);\n" +
+                "\t} catch (err) {\n" +
+                "\t\t/* Android: 祖先目录（/data、/data/user/0 等）被 SELinux 拒绝 open，\n" +
+                "\t\t   而这些目录项的崩溃持久性在应用沙箱内本来就不可达，跳过即可。 */\n" +
+                "\t\tif (err && (err.code === \"EACCES\" || err.code === \"EPERM\")) return;\n" +
+                "\t\tthrow err;\n" +
+                "\t}"
+
         /** 移动端 UI 适配插件：包名、资产名，以及挂载它的 overlay 文件名。 */
         private const val MOBILE_UI_ASSET = "mobile-ui.zip"
         private const val MOBILE_UI_PACKAGE = "dsh-android-mobile"
@@ -972,6 +1121,11 @@ class EngineManager private constructor(private val context: Context) {
         /** ripgrep：官方 `@vscode/ripgrep` 没有 android 平台包，这里补一个。 */
         private const val RIPGREP_ASSET = "ripgrep-android-arm64.zip"
         private const val RIPGREP_PACKAGE = "@vscode/ripgrep-android-arm64"
+
+        /** sharp 的 wasm32 变体（官方兜底，见 `ensureSharp()`）。 */
+        private const val SHARP_ASSET = "sharp-wasm32.zip"
+        private const val SHARP_WASM_PACKAGE = "@img/sharp-wasm32"
+        private const val SHARP_VERSION = "0.35.5"
 
         /** 沙箱：runner（bwrap 方言翻译）+ LD_PRELOAD 写拦截器。 */
         private const val SANDBOX_RUNNER_ASSET = "boo-sandbox-run.bin"
