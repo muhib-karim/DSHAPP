@@ -1,0 +1,1202 @@
+package com.dsh.android.termux
+
+import android.content.Context
+import android.os.Build
+import android.system.Os
+import android.util.Log
+import com.dsh.android.termux.util.AppLogger
+import com.dsh.android.termux.util.AtomicTextFile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.util.zip.ZipInputStream
+
+/**
+ * Manages the Termux bootstrap — extracts from bundled assets into prefix dir.
+ *
+ * The bootstrap zip is bundled at app/src/main/assets/bootstrap-{arch}.zip
+ * during build. On first launch we extract it to {dataDir}/termux/usr/,
+ * set up symlinks and apt sources, so the LLM's shell has full pkg/apt.
+ *
+ * It also owns **mirror selection** (see [MirrorProbe]): every launch it re-asserts
+ * the domestic fast mirrors into pip/npm/go/cargo/apt configs so the model never
+ * has to remember `-i` / `--registry` flags, and it can re-measure candidates on
+ * demand via [probeMirrors].
+ */
+class TermuxBootstrap(private val context: Context) {
+
+    private val dataDir = context.filesDir.absolutePath
+    private val rootDir get() = File(dataDir, "termux")
+    val prefixDir get() = File(rootDir, "usr")
+    val homeDir get() = File(rootDir, "home")
+    private val marker get() = File(prefixDir, ".bootstrap_done")
+
+    val isReady: Boolean get() = marker.exists()
+
+    /**
+     * Marker for [rewriteTermuxPaths] and the prefix repair that goes with it.
+     *
+     * ⚠️ The version suffix is load-bearing — **bump it whenever the repair must
+     * reach machines that already installed**. `install()` returns early when
+     * `.bootstrap_done` exists, so an upgraded app only ever runs
+     * [ensurePathsRewritten], and that is gated on this marker being absent.
+     *
+     * - `_v1` → `_v2`: v1 only rewrote **text** files and skipped ELF binaries,
+     *   so installations repaired by v1 would never pick up the ELF fix.
+     * - `_v2` → `_v3`: v2 wrote a `dpkg.cfg` with `instdir` alone and no apt
+     *   hook, so those installations keep failing on every package that ships a
+     *   maintainer script.
+     * - `_v3` → `_v4`: the v3 hook rewrote the prefix inside maintainer scripts
+     *   but left dpkg's own `DPKG_ROOT` export in place. Tools that honour it
+     *   (`update-alternatives`) then prepend `<aptroot>` to the already-real
+     *   path and look for `aptroot/data/user/0/…/bin/nano`, which does not
+     *   exist — every package using alternatives (nano, vim, …) aborted in
+     *   `--configure` and stuck at `iF`.
+     * - `_v4` → `_v5`: v4 only repaired the `.deb` **control** member, which
+     *   fixes the scripts dpkg runs but not the files dpkg *installs*. A fresh
+     *   payload keeps the official prefix in its own shebangs and in plain-text
+     *   data files, so `python-pip` landed at `ii` yet `pip` died with
+     *   `bad interpreter` and tried to write `/data/data/com.termux/files/usr/
+     *   etc/pip.conf` — installed, but broken. v5 adds the post-unpack sweep.
+     * - `_v5` → `_v6`: v5's `.deb` repair shelled out to `ar`, which the baseline
+     *   does not have — `$PREFIX/bin/ar` only exists once the `llvm` package
+     *   lands, and `llvm` is itself a dependency of `python`, i.e. installed by
+     *   the same transaction that needs the hook. On a cold prefix the extract
+     *   failed, the loop skipped the package silently, and every package with a
+     *   maintainer script died at `dpkg returned an error code (1)`. v6 uses
+     *   `dpkg-deb`, which ships inside `dpkg` and is therefore always present.
+     */
+    private val rewriteMarker get() = File(prefixDir, ".paths_rewritten_v6")
+
+    /**
+     * 内置 Node 运行时的安装标记。
+     *
+     * ⚠️ 与 [rewriteMarker] **分开**是必需的：那个标记只覆盖 bootstrap 自己解出来的文件，
+     * 而 Node 运行时是随后单独铺进去的一批文件。若共用标记，升级安装时新增或更新的
+     * 运行时对**老装机永远不会生效** —— 正是 [rewriteMarker] 的 KDoc 记录过的那类坑。
+     */
+    private val nodeMarker get() = File(prefixDir, ".node_runtime_$NODE_VERSION")
+
+    /**
+     * How long a mirror probe result stays fresh.
+     *
+     * ⚠️ **不要每次启动都重测**：一次探测要打 19 个候选（并行，约 8 秒），而且镜像速度
+     * 不会分钟级变化。7 天是个折中 —— 既不会长期停留在某个已劣化的源上，也不会把
+     * 启动路径变成测速工具。用户/模型随时可以 `boo-mirror` 手动重测。
+     */
+    private val probeTtlMs = 7L * 24 * 60 * 60 * 1000
+
+    /** Install bootstrap from assets → prefix dir. Safe to call multiple times. */
+    suspend fun install() {
+        if (isReady) return
+        AppLogger.i("TERMUX", "install start arch=$termuxArch")
+        withContext(Dispatchers.IO) {
+            Log.i(TAG, "Extracting Termux bootstrap from assets")
+            rootDir.mkdirs()
+            homeDir.mkdirs()
+            prefixDir.deleteRecursively()
+            prefixDir.mkdirs()
+
+            val zipName = "bootstrap-${termuxArch}.zip"
+            context.assets.open(zipName).use { input ->
+                ZipInputStream(input.buffered()).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        val name = entry.name
+                        if (name == "SYMLINKS.txt") {
+                            File(prefixDir, name).outputStream().use { zis.copyTo(it) }
+                        } else {
+                            val outFile = File(prefixDir, name)
+                            if (entry.isDirectory) {
+                                outFile.mkdirs()
+                            } else {
+                                outFile.parentFile?.mkdirs()
+                                FileOutputStream(outFile).use { zis.copyTo(it) }
+                                if (name.startsWith("bin/") || name.startsWith("libexec/") ||
+                                    name.startsWith("lib/apt/methods/")) {
+                                    outFile.setExecutable(true, false)
+                                }
+                            }
+                        }
+                        zis.closeEntry()
+                        entry = zis.nextEntry
+                    }
+                }
+            }
+
+            val symlinksFile = File(prefixDir, "SYMLINKS.txt")
+            if (symlinksFile.exists()) {
+                processSymlinks(symlinksFile, prefixDir)
+                symlinksFile.delete()
+            }
+
+            // Point every baked-in /data/data/com.termux path at this install.
+            // Order matters: the alias symlinks come first because the paths
+            // rewritten inside ELF binaries resolve *through* them.
+            // See rewriteTermuxPaths for why binaries need a different rule.
+            createPrefixAliases()
+            ensureDpkgDirs()
+            ensureAptInstdirRoot()
+            rewriteTermuxPaths(prefixDir)
+
+            // Install GPG keyrings so apt can verify repository signatures.
+            // The bootstrap zip ships keys in share/termux-keyring/*.gpg
+            // but etc/apt/trusted.gpg.d/ is empty. Normally the second-stage
+            // bootstrap (dpkg --configure termux-keyring) does this, but
+            // we skip second-stage since its scripts also have broken paths.
+            installGpgKeys(prefixDir)
+
+            // Ensure TMPDIR exists — the shell environment references it.
+            File(prefixDir, "tmp").mkdirs()
+
+            // Pre-create apt directories. The bootstrap zip doesn't ship
+            // var/cache/apt/ or var/lib/apt/ — apt creates them lazily, but
+            // pre-creating avoids any edge case with directory creation on
+            // read-only / restrictive Android filesystem paths.
+            File(prefixDir, "var/cache/apt/archives/partial").mkdirs()
+            File(prefixDir, "var/lib/apt/lists/partial").mkdirs()
+
+            writeSourcesList()
+            writeAptConfig()
+            // 首次安装就把国内快源写进 pip/npm/go/cargo 配置。用候选表默认值（实测各生态
+            // 最快的一个），**不做同步测速** —— 启动路径绝不为了挑源多等 8 秒。
+            applyMirrorConfigs(loadMirrors())
+            marker.writeText("ok")
+            rewriteMarker.writeText("ok")
+            Log.i(TAG, "Termux bootstrap installed ($prefixDir)")
+        }
+    }
+
+    /**
+     * 每次启动都跑：确保各包管理器指向已选定的国内快源（幂等，内容相同则不写盘）。
+     *
+     * ⚠️ **不能挂在 [ensurePathsRewritten] 里**：那条路径被 `.paths_rewritten_v6` 门住，
+     * 已装好的机器永远不会再进 —— 也就是说新增的镜像配置对**老装机完全不会生效**。
+     * 用户升级安装后第一次启动就应该看到快源，所以这条必须是独立的、每启动必跑的路径。
+     *
+     * 成本：读一个状态文件 + 最多 7 个小文本文件的内容比对，量级是微秒。
+     */
+    fun ensureMirrorsConfigured() {
+        if (!prefixDir.exists()) return
+        try {
+            applyMirrorConfigs(loadMirrors())
+        } catch (e: Exception) {
+            AppLogger.w("TERMUX", "ensure mirrors: ${e.message}")
+        }
+    }
+
+    /**
+     * 安装内置的 Node 运行时（node 可执行文件 + 它 NEEDED 的库）。
+     *
+     * ## 为什么不用 `pkg install nodejs`
+     *
+     * 那需要联网，而首次启动必须能在离线状态下把 DSH 跑起来。所以运行时随 APK 一起
+     * 分发（[NODE_RUNTIME_ASSET]，33 MB 压缩后），解到 `$PREFIX/{bin,lib}`。
+     *
+     * ## 为什么是「叠加」而不是「覆盖整个 lib」
+     *
+     * 只铺入 bootstrap **没有**的那几个库（ICU / c-ares / libffi / libsqlite3）。
+     * `libc++_shared.so`、`libcrypto.so.3`、`libssl.so.3`、`libz.so.1.3.2` 在 bootstrap
+     * 里已经有一份，而 bootstrap 的 apt/dpkg/curl 都链接着它们 —— 用另一批 deb 的
+     * 同名库盖掉，等于把整个包管理器的 ABI 换掉，风险远大于收益。node 与它们同源
+     * （都是 Termux 官方仓库同一时刻的构建），链接兼容。
+     *
+     * ## 软链必须运行期重建
+     *
+     * zip 格式不保存符号链接，而 Termux 的库全靠 `libicuuc.so.78 -> libicuuc.so.78.3`
+     * 这类链被 `dlopen` 找到。asset 里带一份 `LINKS.txt`，这里逐行 [Os.symlink] 出来。
+     *
+     * @return true 表示运行时已就位（含本就已安装的情况）。
+     */
+    suspend fun installNodeRuntime(): Boolean = withContext(Dispatchers.IO) {
+        if (!prefixDir.exists()) {
+            AppLogger.w("TERMUX", "installNodeRuntime: prefix 不存在，跳过")
+            return@withContext false
+        }
+        if (nodeMarker.exists() && nodeBinary.isFile) {
+            return@withContext true
+        }
+
+        try {
+            AppLogger.i("TERMUX", "安装内置 Node 运行时 $NODE_VERSION")
+            val links = mutableListOf<Pair<String, String>>()
+
+            context.assets.open(NODE_RUNTIME_ASSET).use { raw ->
+                ZipInputStream(raw.buffered()).use { zis ->
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        val name = entry.name
+                        when {
+                            entry.isDirectory -> File(prefixDir, name).mkdirs()
+
+                            name == "LINKS.txt" -> {
+                                val text = zis.readBytes().toString(Charsets.UTF_8)
+                                for (line in text.lineSequence()) {
+                                    val t = line.trim()
+                                    if (t.isEmpty() || t.startsWith("#")) continue
+                                    val parts = t.split(Regex("\\s+"))
+                                    if (parts.size == 2) links.add(parts[0] to parts[1])
+                                }
+                            }
+
+                            else -> {
+                                val out = File(prefixDir, name)
+                                out.parentFile?.mkdirs()
+                                // 先写临时文件再改名：中途被杀不会留下半截的可执行文件，
+                                // 而半截的 node 会在 exec 时报 "Exec format error"，
+                                // 症状离根因很远。
+                                val tmp = File(out.parentFile, "${out.name}.part")
+                                FileOutputStream(tmp).use { zis.copyTo(it) }
+                                if (tmp.renameTo(out)) {
+                                    if (name.startsWith("bin/")) out.setExecutable(true, false)
+                                } else {
+                                    AppLogger.w("TERMUX", "改名失败: ${tmp.name}")
+                                }
+                            }
+                        }
+                        zis.closeEntry()
+                        entry = zis.nextEntry
+                    }
+                }
+            }
+
+            // 软链在文件全部落盘之后建，否则指向的目标还不存在。
+            //
+            // ⚠️ 第一列是**相对链接路径**（必须带 lib/ 前缀），第二列是相对目标。
+            // 漏掉 lib/ 前缀会把软链建到 $PREFIX 根目录，而 node 的 NEEDED 写的是裸
+            // 文件名、由 LD_LIBRARY_PATH=$PREFIX/lib 去那里找 —— 真机症状是
+            // `CANNOT LINK EXECUTABLE ... library "libsqlite3.so" not found`。
+            // 目标不存在就跳过：bootstrap 与内置运行时可能带不同小版本的同一个库
+            // （如 zlib），断链会让 dlopen 报错，跳过则回落到 bootstrap 那份。
+            var linked = 0
+            for ((link, target) in links) {
+                val linkPath = File(prefixDir, link)
+                val targetPath = File(linkPath.parentFile, target)
+                if (!targetPath.exists()) {
+                    AppLogger.w("TERMUX", "跳过断链 $link -> $target（目标不存在）")
+                    continue
+                }
+                try {
+                    if (Files.isSymbolicLink(linkPath.toPath())) linkPath.delete()
+                    else if (linkPath.exists()) continue
+                    Os.symlink(target, linkPath.absolutePath)
+                    linked++
+                } catch (e: Exception) {
+                    AppLogger.w("TERMUX", "symlink $link -> $target: ${e.message}")
+                }
+            }
+            AppLogger.i("TERMUX", "建立 $linked/${links.size} 个库软链")
+
+            // 🔴 必须重写 node 与这批库里的烤死路径。它们全是 Termux 官方构建，
+            //    二进制里带着 /data/data/com.termux/files/usr/lib 作为 RUNPATH，
+            //    不重写就永远去读 com.termux 的私有目录（读不到 ⇒ 链接失败）。
+            rewriteTermuxPaths(prefixDir)
+
+            if (nodeBinary.isFile) {
+                nodeMarker.writeText("ok")
+                AppLogger.i("TERMUX", "Node 运行时就绪: ${nodeBinary.absolutePath}")
+                true
+            } else {
+                AppLogger.w("TERMUX", "Node 运行时安装后仍找不到 ${nodeBinary.absolutePath}")
+                false
+            }
+        } catch (t: Throwable) {
+            AppLogger.w("TERMUX", "安装 Node 运行时失败: ${t.message}")
+            false
+        }
+    }
+
+    /** 内置 Node 可执行文件的绝对路径。 */
+    val nodeBinary: File get() = File(prefixDir, "bin/node")
+
+    /**
+     * 每次启动都跑：把 ELF 路径重写补到新铺进来的文件上（幂等，已正确则零成本）。
+     *
+     * ⚠️ 与 [ensurePathsRewritten] 分开，原因同 [ensureMirrorsConfigured]：那条被
+     * `.paths_rewritten_v6` 门住，老装机不会重进，而 Node 运行时是**后来才加的**。
+     */
+    fun ensureNodeRuntimePatched() {
+        if (!nodeBinary.isFile) return
+        try {
+            rewriteTermuxPaths(prefixDir)
+        } catch (e: Exception) {
+            AppLogger.w("TERMUX", "ensure node patched: ${e.message}")
+        }
+    }
+
+    /**
+     * Ensure shebangs and paths are rewritten for the current installation.
+     * Safe to call every launch: fast on already-correct files (read + skip),
+     * and fixes existing installations that upgraded from a broken APK
+     * without re-extracting the 30 MB bootstrap zip.
+     */
+    fun ensurePathsRewritten() {
+        if (prefixDir.exists() && !rewriteMarker.exists()) {
+            AppLogger.i("TERMUX", "rewriting Termux paths")
+            // Same first-install sequence, minus the zip extraction: existing
+            // installs need the aliases and the dpkg skeleton too, not just the
+            // path rewrite.
+            createPrefixAliases()
+            ensureDpkgDirs()
+            ensureAptInstdirRoot()
+            rewriteTermuxPaths(prefixDir)
+            // Re-assert our apt/dpkg config on the repair path too — an install
+            // that predates the instdir redirect would otherwise keep failing.
+            // Only Boo-authored files are (re)written; sources.list is left
+            // alone because the user or `pkg` may have repointed the mirror.
+            writeAptConfig()
+            rewriteMarker.writeText("ok")
+        }
+    }
+
+    /** Environment variables for shell commands run under PREFIX. */
+    fun getShellEnv(originalPath: String = "/system/bin"): Map<String, String> {
+        val p = prefixDir.absolutePath
+        val env = linkedMapOf(
+            "PREFIX" to p,
+            "HOME" to homeDir.absolutePath,
+            "TMPDIR" to "$p/tmp",
+            "LD_LIBRARY_PATH" to "$p/lib",
+            // Termux's CA bundle lives in the app-private prefix; curl/openssl
+            // won't trust HTTPS mirrors without these (mirror of bridge.go termuxEnv).
+            "SSL_CERT_FILE" to "$p/etc/tls/cert.pem",
+            "CURL_CA_BUNDLE" to "$p/etc/tls/cert.pem",
+            // git compiled with the standard Termux prefix baked in; migrated
+            // installs need these to find helpers/templates/skip system gitconfig.
+            "GIT_EXEC_PATH" to "$p/libexec/git-core",
+            "GIT_TEMPLATE_DIR" to "$p/share/git-core/templates",
+            "GIT_CONFIG_NOSYSTEM" to "1",
+            "GIT_SSL_CAINFO" to "$p/etc/tls/cert.pem",
+            "PATH" to "$p/bin:$p/bin/applets:$originalPath",
+        )
+        // 镜像环境变量：配置文件已经能覆盖绝大多数工具，但 env 里直接可见 `PIP_INDEX_URL`
+        // 让模型**自己就能发现**当前走哪个源，不必去读/猜配置文件内容。
+        try {
+            env.putAll(MirrorProbe.shellEnv(loadMirrors()))
+        } catch (_: Exception) {
+            // 读状态失败不影响 shell 可用性 —— 配置文件那一层仍然生效。
+        }
+        return env
+    }
+
+    // ── private ──
+
+    private val termuxArch: String get() = when (Build.SUPPORTED_ABIS.firstOrNull()) {
+        "arm64-v8a" -> "aarch64"
+        "armeabi-v7a" -> "arm"
+        "x86_64" -> "x86_64"
+        "x86" -> "i686"
+        else -> "aarch64"
+    }
+
+    private fun processSymlinks(symlinksFile: File, prefixDir: File) {
+        val oldPrefix = "/data/data/com.termux/files/usr"
+        val newPrefix = prefixDir.absolutePath
+        symlinksFile.readLines().forEach { line ->
+            val parts = line.split("←")
+            if (parts.size == 2) {
+                val target = parts[0].replace(oldPrefix, newPrefix)
+                try {
+                    Os.symlink(target, File(prefixDir, parts[1]).absolutePath)
+                } catch (e: Exception) {
+                    Log.w(TAG, "symlink ${parts[1]} -> $target: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun writeSourcesList() {
+        val etcApt = File(prefixDir, "etc/apt")
+        etcApt.mkdirs()
+        val f = File(etcApt, "sources.list")
+        val mirrors = loadMirrors()
+        val chosen = mirrors[MirrorProbe.ECO_APT]
+            ?: MirrorProbe.defaults()[MirrorProbe.ECO_APT] ?: return
+
+        // 🔴 不覆盖用户/`pkg` 自己换过的源。判定见 MirrorProbe.isUserCustomizedApt：
+        // 只有「文件不存在 / 空 / 与我们上次写的完全一致 / 上游 pkg 自己写的（官方源或
+        // 它镜像池里的任意站）」才允许改写。
+        val current = try {
+            if (f.isFile) f.readText() else null
+        } catch (_: Exception) {
+            null
+        }
+        //
+        // ⚠️ 第三个参数**必须传**：`pkg` 的 `select_mirror()` 会从镜像池 60+ 个站点里
+        // 加权随机抽一个覆写 sources.list，池子里绝大多数是我们候选表里没有的海外站
+        // （实测抽中越南 mirrors.nguyenhoang.cloud，84 KB/s vs bfsu 1.07 MB/s）。
+        // 不把池子纳入判定，这份覆写就会被当成「用户自己的选择」而**永久拒绝修复**。
+        val upstreamHosts = try {
+            MirrorProbe.upstreamMirrorHosts(File(prefixDir, "etc/termux/mirrors"))
+        } catch (_: Exception) {
+            emptySet<String>()
+        }
+        if (MirrorProbe.isUserCustomizedApt(current, mirrors[MirrorProbe.KEY_APT_WRITTEN], upstreamHosts)) {
+            AppLogger.i("TERMUX", "apt sources.list 被用户改过，保留不动")
+            return
+        }
+        val body = MirrorProbe.aptSourcesList(mapOf(MirrorProbe.ECO_APT to chosen)) ?: return
+        try {
+            f.writeText(body)
+        } catch (e: Exception) {
+            AppLogger.w("TERMUX", "write sources.list: ${e.message}")
+        }
+    }
+
+    /**
+     * 把当前镜像选择落盘到各包管理器的配置文件。
+     *
+     * 幂等且**不覆盖用户手改**：只在内容与目标不一致时写入，且 apt 走
+     * [writeSourcesList] 的「用户改过就不动」判定。
+     */
+    private fun applyMirrorConfigs(mirrors: Map<String, String>) {
+        val files = MirrorProbe.configFiles(prefixDir, homeDir, File(dataDir), mirrors)
+        for ((file, body) in files) {
+            try {
+                if (file.isFile && file.readText() == body) continue
+                file.parentFile?.mkdirs()
+                if (!AtomicTextFile.write(file, body)) {
+                    // 回退到非原子写：某些文件系统不支持 ATOMIC_MOVE，但配置文件
+                    // 写入不敏感（内容小、可重写），不值得因此整条链路失败。
+                    file.writeText(body)
+                }
+            } catch (e: Exception) {
+                AppLogger.w("TERMUX", "write ${file.name}: ${e.message}")
+            }
+        }
+        // apt 单独走一遍：它受「用户是否改过」约束，且失败要留日志。
+        writeSourcesList()
+    }
+
+    /** 读取 [MirrorProbe.STATE_FILE]；不存在或损坏时回退候选表默认值。 */
+    fun loadMirrors(): Map<String, String> =
+        MirrorProbe.loadOrDefaults(File(dataDir, MirrorProbe.STATE_FILE))
+
+    /** 当前生效的镜像表，供 UI / 调试查看。 */
+    val mirrors: Map<String, String> get() = loadMirrors()
+
+    /**
+     * 后台跑一次镜像测速，挑每个生态最快的源并落盘。**不阻塞启动**。
+     *
+     * 为什么值得自动跑：真机实测 `pypi.org` 与 `proxy.golang.org` 完全不可达、
+     * aliyun 是 PyPI 冠军但 APT 是 404 —— 写死任何一个源都会在某个生态上静默失败。
+     * 让机器实测一遍比让模型记住一张表可靠得多（这正是用户要的「先检索节点挑最快」）。
+     *
+     * ⚠️ 失败**不是**错误：探测不到任何东西时保留 [MirrorProbe.defaults]（那是实测里
+     * 各生态最快的一个），所以「探测挂了」不会让任何工具失去可用源。
+     *
+     * @param force 为 true 时忽略缓存，强制重测。
+     * @return 本次选中的表；探测无结果时返回当前（默认或缓存）表。
+     */
+    suspend fun probeMirrors(force: Boolean = false): Map<String, String> {
+        val cached = loadMirrors()
+        if (!force) {
+            val marker = File(dataDir, MirrorProbe.STATE_FILE)
+            // 缓存有效期内不重测：每次启动都打 19 个候选是纯粹的浪费。
+            if (marker.isFile && System.currentTimeMillis() - marker.lastModified() < probeTtlMs) {
+                return cached
+            }
+        }
+        val script = File(prefixDir, "bin/${MirrorProbe.PROBE_CMD}")
+        val raw = try {
+            script.parentFile?.mkdirs()
+            script.writeText(MirrorProbe.probeScript())
+            script.setExecutable(true, false)
+            runProbeScript(script)
+        } catch (e: Exception) {
+            AppLogger.w("TERMUX", "mirror probe: ${e.message}")
+            return cached
+        }
+        val picked = MirrorProbe.parseProbeOutput(raw)
+        if (picked.isEmpty()) {
+            AppLogger.w("TERMUX", "mirror probe 没有任何 200 结果，保留当前源")
+            return cached
+        }
+        val merged = MirrorProbe.merge(cached + picked)
+        applyMirrorConfigs(merged)
+        saveState(merged)
+        AppLogger.i("TERMUX", "mirror probe 选中: ${picked.entries.joinToString { "${it.key}=${it.value}" }}")
+        return merged
+    }
+
+    /** 执行探测脚本。用 `/system/bin/sh` 而非 prefix 里的 shell —— 探测的意义正是在
+     *  prefix 不可用时也能跑，用需要依赖 prefix 的 shell 去探测 prefix 是循环依赖。 */
+    private suspend fun runProbeScript(script: File): String = withContext(Dispatchers.IO) {
+        val pb = ProcessBuilder("/system/bin/sh", script.absolutePath)
+        pb.redirectErrorStream(true)
+        pb.environment().putAll(getShellEnv())
+        val proc = pb.start()
+        val out = proc.inputStream.readBytes().toString(Charsets.UTF_8)
+        proc.waitFor()
+        out
+    }
+
+    /** 落盘镜像选择 + 记录我们写进 sources.list 的 apt 源，供下次判断是否被用户改过。 */
+    private fun saveState(mirrors: Map<String, String>) {
+        val withApt = LinkedHashMap(mirrors)
+        mirrors[MirrorProbe.ECO_APT]?.let { withApt[MirrorProbe.KEY_APT_WRITTEN] = it }
+        val f = File(dataDir, MirrorProbe.STATE_FILE)
+        try {
+            AtomicTextFile.write(f, MirrorProbe.encodeState(withApt))
+        } catch (e: Exception) {
+            AppLogger.w("TERMUX", "save mirror state: ${e.message}")
+        }
+    }
+
+    /** Write APT config for a faster, non-interactive Termux experience. */
+    private fun writeAptConfig() {
+        val confDir = File(prefixDir, "etc/apt/apt.conf.d")
+        confDir.mkdirs()
+        // Disable recommends/suggests — they pull in X11 etc. Termux doesn't need.
+        File(confDir, "01-norecommends").writeText("""
+APT::Get::Install-Recommends "false";
+APT::Get::Install-Suggests "false";
+""".trimIndent())
+        // Non-interactive, assume yes.
+        File(confDir, "02-options").writeText("""
+APT::Get::Assume-Yes "true";
+APT::Get::AllowUnauthenticated "true";
+Dpkg::Options {"--force-confdef";"--force-confold"};
+""".trimIndent())
+        // Redirect apt's archive cache. libapt-pkg.so has
+        // `/data/data/com.termux/cache/apt` compiled in, and that path does NOT
+        // match the `/data/data/com.termux/files` rule the ELF patcher rewrites
+        // (its root is `…/com.termux/cache`, a sibling of `…/com.termux/files`).
+        // Left alone, every download dies with
+        //   E: Archives directory /data/data/com.termux/cache/apt/archives/partial
+        //      is missing. - Acquire (13: Permission denied)
+        // `Dir::Cache` is a plain apt.conf default, so overriding it here is
+        // enough — no need to touch the shared library.
+        File(confDir, "03-cache").writeText("""
+Dir::Cache "$prefixDir/var/cache/apt";
+Dir::Cache::archives "$prefixDir/var/cache/apt/archives";
+""".trimIndent())
+        // Make dpkg unpack into our prefix instead of the filesystem root.
+        // See ensureAptInstdirRoot for why bare `/` cannot work. The braced
+        // list form is required: apt.conf.d splits `DPkg::Options::=` on
+        // whitespace, so the un-braced spelling silently truncates the path.
+        val instdir = File(rootDir, "aptroot").absolutePath
+        File(confDir, "04-instdir").writeText("""
+DPkg::options { "--instdir=$instdir"; };
+""".trimIndent())
+        // Same setting for direct `dpkg` invocations, which never read
+        // apt.conf.d. dpkg.cfg uses the bare `option value` form — this file is
+        // NOT apt.conf syntax, and quoting the value or adding a semicolon makes
+        // dpkg abort with "unbalanced quotes in 'instdir'".
+        //
+        // All three lines are required; each one was surfaced only after fixing
+        // the previous, measured on device with `dpkg --configure -a`:
+        //
+        //  1. `instdir` alone            → "admindir must be inside instdir for
+        //                                   dpkg to work properly"
+        //  2. + `admindir`               → "failed to chroot to '<aptroot>':
+        //                                   Operation not permitted" — an app uid
+        //                                   has no CAP_SYS_CHROOT, so dpkg can
+        //                                   never chroot no matter what
+        //  3. + `force-script-chrootless` → maintainer scripts finally run
+        //
+        // Only packages that *have* a maintainer script trip 1 and 2, which is
+        // why `wget` installed cleanly while `glib`/`openssh` always failed.
+        //
+        // Line 4 is a `post-invoke` sweep (see [installShebangFixHook]). It has
+        // to live in **dpkg.cfg**, not apt.conf.d: dpkg runs maintainer scripts
+        // in a separate `--configure` pass *after* `--unpack`, and apt's
+        // `DPkg::Post-Invoke` only fires once the whole transaction is done —
+        // far too late. Measured with `python-pip`, whose postinst shells out to
+        // `pip` itself: the apt-level hook did rewrite the shebang, but only
+        // after the postinst had already died on it.
+        File(prefixDir, "etc/dpkg/dpkg.cfg").writeText(
+            "instdir $instdir\n" +
+                "admindir $instdir/var/lib/dpkg\n" +
+                "force-script-chrootless\n" +
+                "post-invoke $shebangHookPath\n"
+        )
+        installDebFixHook()
+    }
+
+    /**
+     * Install the apt hook that repairs `.deb` control scripts before dpkg runs
+     * them.
+     *
+     * [rewriteTermuxPaths] fixes the paths of everything **already on disk**.
+     * That is not enough: every `pkg install` unpacks a *fresh* `.deb` whose
+     * maintainer scripts still carry the official Termux prefix, so dpkg writes
+     * those official paths back over our repaired copies. Measured on device —
+     * re-installing `glib` after a manual fix restored the broken shebang and
+     * the package dropped straight back to `iF`.
+     *
+     * Maintainer scripts are not cosmetic. `openssh.postinst` is what generates
+     * the sshd host keys and `glib.postinst` is what compiles the GSettings
+     * schema cache; when the script dies on its shebang the package still ends
+     * up "installed" but silently half-working, which is exactly the
+     * "能用但不好用" failure mode.
+     *
+     * `DPkg::Pre-Install-Pkgs` is invoked once per dpkg transaction with every
+     * `.deb` path on stdin (measured: one PRE / one POST for a 10-package
+     * install), so the hook is the single interception point where a package can
+     * still be repaired before it lands. It rewrites the prefix inside the
+     * `control.tar.*` member and repacks with `ar` — the payload member is
+     * copied through untouched, so package contents are never rewritten.
+     *
+     * The hook runs under `/system/bin/sh` (mksh, ships with Android) rather
+     * than our prefix's shell: a hook that can only run once the prefix works
+     * would be useless on exactly the installs that need it.
+     */
+    private fun installDebFixHook() {
+        try {
+            val hookDir = File(prefixDir, "etc/apt/hooks")
+            val confDir = File(prefixDir, "etc/apt/apt.conf.d")
+            hookDir.mkdirs()
+            confDir.mkdirs()
+
+            val hook = File(hookDir, "boo-fix-deb.sh")
+            hook.writeText(debFixHookScript())
+            hook.setExecutable(true, false)
+
+            // Repairs the payload *after* unpack; referenced by dpkg.cfg, not
+            // apt.conf.d — see writeAptConfig for why the timing matters.
+            val sweep = File(hookDir, "boo-fix-paths.sh")
+            sweep.writeText(shebangFixHookScript())
+            sweep.setExecutable(true, false)
+
+            File(confDir, "97-boo-fixdeb").writeText(
+                "DPkg::Pre-Install-Pkgs { \"${hook.absolutePath}\"; };\n"
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "install deb fix hook: ${e.message}")
+        }
+    }
+
+    /** Path of the post-unpack sweep hook, referenced from `dpkg.cfg`. */
+    private val shebangHookPath: String
+        get() = File(prefixDir, "etc/apt/hooks/boo-fix-paths.sh").absolutePath
+
+    /**
+     * Body of `etc/apt/hooks/boo-fix-paths.sh`, wired in as dpkg's `post-invoke`.
+     *
+     * [debFixHookScript] repairs the `.deb` **control** member — the scripts
+     * dpkg executes. That leaves the files dpkg *installs* alone, and a fresh
+     * payload carries the official prefix in two more places:
+     *
+     *  1. **Shebangs of the installed entry points.** `python-pip` ships
+     *     `$PREFIX/bin/pip` starting with `#!/data/data/com.termux/files/usr/bin/
+     *     python3.14`. The package reaches `ii`, and the moment anything runs
+     *     `pip` it dies with `bad interpreter: No such file or directory`.
+     *  2. **Plain-text data files.** Termux's own packages are patched upstream
+     *     to hardcode `/data/data/com.termux/files/usr/etc` as the site config
+     *     root — `pip/_vendor/platformdirs/unix.py` and `pip/_internal/utils/
+     *     appdirs.py` both do. `pip` then writes `/data/data/com.termux/files/
+     *     usr/etc/pip.conf` and fails with `PermissionError: [Errno 13]`.
+     *
+     * Both are rewritten here, right after unpack and before `--configure`, so a
+     * package's own postinst sees a self-consistent prefix. Measured: with this
+     * hook in place `python-pip` configures cleanly and `pip download six` works.
+     *
+     * `grep -I` skips binaries, which is what keeps the sweep safe — an ELF
+     * cannot be length-changed, and [patchElfInPlace] already handled the ones
+     * that matter. The whole prefix costs well under a second (measured: 0 s for
+     * ~1,900 candidate files), so it runs unattended on every transaction rather
+     * than trying to guess which paths a package touched.
+     *
+     * The log lives in `$PREFIX/tmp` and is append-only, so a failed install can
+     * be diagnosed after the fact; the hook always exits 0 and must never turn a
+     * working install into a failing one.
+     */
+    private fun shebangFixHookScript(): String = """
+        #!/system/bin/sh
+        # Boo: repoint official-Termux paths left behind by a freshly unpacked
+        # payload. Runs as dpkg `post-invoke`, i.e. after --unpack and before
+        # --configure, so maintainer scripts see a consistent prefix.
+        PREFIX=$prefixDir
+        T=com.termux
+        OLD=/data/data/${'$'}T/files/usr
+        PATH=${'$'}PREFIX/bin:/system/bin
+        export PATH
+        LOG=${'$'}PREFIX/tmp/boo-fix-paths.log
+        ch=0
+
+        # 1. Shebangs of installed entry points. `bin` holds ~450 files and
+        #    `libexec` ~107; a single `grep -l` over the globs keeps this at a
+        #    few milliseconds instead of a shell loop over every file.
+        for d in bin libexec; do
+          for f in $(grep -l -a "^#!${'$'}OLD" "${'$'}PREFIX/${'$'}d"/* 2>/dev/null); do
+            sed -i "1s|${'$'}OLD|${'$'}PREFIX|" "${'$'}f" 2>/dev/null && echo "shebang ${'$'}f" >> "${'$'}LOG"
+            ch=1
+          done
+        done
+
+        # 2. Maintainer scripts sitting in dpkg's own database. `--unpack`
+        #    extracts every package's scripts into `var/lib/dpkg/info/` and
+        #    `--configure` executes them from there, so this is the copy that
+        #    actually runs, and the sweep above deliberately skips the whole
+        #    `var/lib/dpkg` tree. The `.deb` repair in [debFixHookScript] should
+        #    have already cleaned them at the source; doing it again here is the
+        #    safety net for the case where that hook could not run at all, which
+        #    is exactly how the `ar`-less baseline failed before. Measured on
+        #    device: `dpkg --unpack vim` leaves 11 official-prefix hits in
+        #    `vim.postinst` and 9 in `vim.prerm`, and fixing them here is what
+        #    lets `--configure` succeed.
+        for f in "${'$'}PREFIX"/var/lib/dpkg/info/*.postinst \
+                 "${'$'}PREFIX"/var/lib/dpkg/info/*.preinst \
+                 "${'$'}PREFIX"/var/lib/dpkg/info/*.prerm \
+                 "${'$'}PREFIX"/var/lib/dpkg/info/*.postrm; do
+          [ -f "${'$'}f" ] || continue
+          grep -q "${'$'}OLD" "${'$'}f" 2>/dev/null || continue
+          sed -i "s|${'$'}OLD|${'$'}PREFIX|g" "${'$'}f"
+          # Same DPKG_ROOT trap as in the .deb repair — see that hook for the
+          # full account. Idempotent, so applying it twice is harmless.
+          grep -q '^unset DPKG_ROOT${'$'}' "${'$'}f" || sed -i '1a unset DPKG_ROOT' "${'$'}f"
+          echo "info ${'$'}f" >> "${'$'}LOG"
+          ch=1
+        done
+
+        # 3. Plain-text files anywhere in the prefix. `-I` skips binaries; a
+        #    length-changing sed on an ELF would corrupt it. dpkg's own metadata
+        #    is skipped: rewriting `info/*.list` would desynchronise the file
+        #    list from what dpkg believes it installed, and the apt logs are
+        #    historical records, not live configuration. The hooks are skipped so
+        #    this script cannot rewrite its own needle.
+        for f in $(grep -rl -I "${'$'}OLD" "${'$'}PREFIX" 2>/dev/null); do
+          case "${'$'}f" in
+            "${'$'}PREFIX"/var/lib/dpkg/*|"${'$'}PREFIX"/var/log/*|"${'$'}PREFIX"/tmp/*) continue ;;
+            "${'$'}PREFIX"/etc/apt/hooks/*) continue ;;
+          esac
+          sed -i "s|${'$'}OLD|${'$'}PREFIX|g" "${'$'}f" 2>/dev/null && echo "text ${'$'}f" >> "${'$'}LOG"
+          ch=1
+        done
+
+        # Python bytecode caches the string constants it was compiled from, so a
+        # stale .pyc keeps the old path alive after its .py has been fixed.
+        # Gated on `ch` — an untouched transaction must not throw away every
+        # cache in the prefix, and a recompile on next import is the whole cost.
+        if [ "${'$'}ch" = "1" ]; then
+          find "${'$'}PREFIX/lib/python"* -name '*.pyc' -delete 2>/dev/null
+        fi
+
+        exit 0
+    """.trimIndent()
+
+    /**
+     * Body of `etc/apt/hooks/boo-fix-deb.sh`.
+     *
+     * ⚠️ The official prefix is spelled as `$T` + `/files/usr` on purpose.
+     * [rewriteTermuxPaths] rewrites every plain-text occurrence of
+     * [OLD_TERMUX_ROOT], and it walks this very file — writing the prefix out in
+     * full would make the rewriter blank its own needle, and the hook would then
+     * silently match nothing. Splitting the literal keeps it out of reach.
+     *
+     * The archive is unpacked and repacked with `dpkg-deb`, **not** `ar`.
+     * `ar` is not part of the baseline: the prefix has no `binutils`, and
+     * `$PREFIX/bin/ar` only resolves to `llvm-ar` — which the `llvm` package
+     * provides, and which a cold `pkg install python` pulls in as a dependency
+     * *of that very transaction*. A hook that needs `ar` therefore fails on the
+     * first package that carries a maintainer script, and fails **silently**
+     * (the old code ended the loop iteration on a failed extract), leaving the
+     * `.deb` untouched and the install dead at `dpkg returned an error code
+     * (1)`. Measured 2026-09-27: the model then spent 12 rounds hand-patching
+     * dpkg's own maintainer-script copies under `var/lib/dpkg/info/` on device
+     * to get python installed at all.
+     *
+     * ⚠️ Never write a bare path glob in a KDoc block here. Kotlin block
+     * comments **nest**, so the slash-star that a glob such as `info` + `/*`
+     * contains opens a second comment level, and every `*/` after it closes the
+     * wrong one — the compiler then reports `Unclosed comment` at end of file
+     * and every symbol in the class reads as unresolved. Cost me one build.
+     *
+     * `dpkg-deb` ships inside the `dpkg` package itself, which is already
+     * present before the very first `apt install` — so it is the one extractor
+     * guaranteed to exist. It also removes the hand-rolled `ar` member ordering:
+     * `debian-binary` / `control.tar.*` / `data.tar.*` is emitted by dpkg-deb in
+     * the required order, where the old `ar rc …` had to spell it out.
+     *
+     * ⚠️ `dpkg-deb -R` extracts maintainer scripts as mode 644 while `-b`
+     * refuses anything below 0555 (`maintainer script 'preinst' has bad
+     * permissions 644`), so the scripts are `chmod 755`ed before repacking.
+     * Measured: without that chmod the rebuild aborts and `termux-tools` — the
+     * one baseline package with a `preinst` — fails with `unable to execute new
+     * termux-tools package pre-installation script … No such file or
+     * directory`.
+     */
+    private fun debFixHookScript(): String = """
+        #!/system/bin/sh
+        # Boo: rewrite the Termux prefix baked into .deb control scripts.
+        # apt passes the .deb paths on stdin via DPkg::Pre-Install-Pkgs.
+        PREFIX=$prefixDir
+        T=com.termux
+        OLD=/data/data/${'$'}T/files/usr
+        PATH=${'$'}PREFIX/bin:/system/bin
+        export PATH
+        # ⚠️ Prefer apt's own TMPDIR. Under the `workspace-write` preset the
+        # shell layer relocates TMPDIR into the workspace (and under `read-only`
+        # it clears it entirely), so hardcoding `${'$'}PREFIX/tmp` would scribble
+        # outside the directory the sandbox actually allows. Fall back to the
+        # prefix only when TMPDIR is unset or dangling — that is the
+        # full-access case, where nothing is confined anyway.
+        TMPROOT=${'$'}{TMPDIR:-}
+        [ -n "${'$'}TMPROOT" ] && [ -d "${'$'}TMPROOT" ] || TMPROOT=${'$'}PREFIX/tmp
+        LOG=${'$'}TMPROOT/boo-fix-deb.log
+        TMPD=${'$'}TMPROOT/bfd.${'$'}${'$'}
+        mkdir -p "${'$'}TMPD" || exit 0
+
+        while read -r deb; do
+          [ -f "${'$'}deb" ] || continue
+          case "${'$'}deb" in *.deb) ;; *) continue ;; esac
+
+          # Cheap gate: pull just the control member first. Most of a
+          # transaction needs no repair at all, and a package that is left
+          # byte-identical is strictly better than one needlessly rebuilt.
+          # ⚠️ `-e` writes the control files straight into the directory given,
+          # whereas `-R` nests them under `DEBIAN/` — hence the two spellings.
+          e=${'$'}TMPD/e
+          rm -rf "${'$'}e"; mkdir -p "${'$'}e" || continue
+          dpkg-deb -e "${'$'}deb" "${'$'}e" 2>/dev/null || continue
+
+          need=0
+          for f in "${'$'}e"/postinst "${'$'}e"/preinst "${'$'}e"/prerm \
+                   "${'$'}e"/postrm "${'$'}e"/triggers "${'$'}e"/control; do
+            [ -f "${'$'}f" ] || continue
+            grep -q "${'$'}OLD" "${'$'}f" 2>/dev/null && need=1
+          done
+          [ "${'$'}need" = "0" ] && continue
+
+          d=${'$'}TMPD/w
+          rm -rf "${'$'}d"; mkdir -p "${'$'}d" || continue
+          dpkg-deb -R "${'$'}deb" "${'$'}d" >>"${'$'}LOG" 2>&1 || continue
+
+          ch=0
+          # Real maintainer scripts: rewrite the prefix AND clear DPKG_ROOT.
+          for f in "${'$'}d/DEBIAN"/postinst "${'$'}d/DEBIAN"/preinst \
+                   "${'$'}d/DEBIAN"/prerm "${'$'}d/DEBIAN"/postrm; do
+            [ -f "${'$'}f" ] || continue
+            # 🔴 `-R` drops maintainer scripts to 0644, and `-b` refuses to
+            # rebuild anything below 0555. Measured: the rebuild aborted with
+            # "maintainer script 'preinst' has bad permissions 644" and, because
+            # the repacked file was never produced, `dpkg --unpack` then died on
+            # "/…/tmp.ci/preinst: No such file or directory".
+            chmod 755 "${'$'}f"
+            grep -q "${'$'}OLD" "${'$'}f" 2>/dev/null || continue
+            sed -i "s|${'$'}OLD|${'$'}PREFIX|g" "${'$'}f"
+            # 🔴 dpkg exports `DPKG_ROOT=<aptroot>` to every maintainer script
+            # (probed on device). Tools that honour it — `update-alternatives`,
+            # `dpkg-maintscript-helper` — prepend it to each path they are
+            # handed. The paths above are now real, so that prepending lands on
+            # `<aptroot>/data/user/0/.../bin/nano`, which does not exist, and
+            # the script dies during --configure. Measured: `nano` aborted with
+            # "alternative path ... doesn't exist" and stuck at `iF`.
+            # Clearing it makes the script agree with the paths it now holds.
+            # Inserted after line 1 so a shebang stays first; idempotent.
+            grep -q '^unset DPKG_ROOT${'$'}' "${'$'}f" || sed -i '1a unset DPKG_ROOT' "${'$'}f"
+            ch=1
+          done
+
+          # `triggers`/`control` are metadata parsed by dpkg, not shell — the
+          # prefix is rewritten but nothing may be inserted into them.
+          for f in "${'$'}d/DEBIAN"/triggers "${'$'}d/DEBIAN"/control; do
+            [ -f "${'$'}f" ] || continue
+            grep -q "${'$'}OLD" "${'$'}f" 2>/dev/null || continue
+            sed -i "s|${'$'}OLD|${'$'}PREFIX|g" "${'$'}f"
+            ch=1
+          done
+
+          if [ "${'$'}ch" = "1" ]; then
+            # Rebuild the whole package: `-b` takes the parent of `DEBIAN/`, and
+            # emits a correctly ordered ar archive for us.
+            # 🔴 The output must NOT live inside "${'$'}d" — that directory *is* the
+            # payload being packed, so `-b "${'$'}d" "${'$'}d/fix.deb"` sweeps the
+            # half-written archive into the package and every rebuilt .deb ships
+            # a stray `/fix.deb`. Measured: the first rebuilt package
+            # (libcompiler-rt) claimed it, and python, glib and python-pip then
+            # all died with "trying to overwrite '/fix.deb'". Write to the
+            # sibling scratch dir instead.
+            # ⚠️ `-Zgzip -z1` is deliberate. The default `-Zxz` re-compresses the
+            # payload and costs ~14 s on python's 25 MB of files; python pulls
+            # ~20 packages, so the default would add minutes to a single `pkg
+            # install`. Measured on device: `-Zxz` 14 s / 4.82 MB, `-Zxz -z0`
+            # 1 s / 6.05 MB, `-Zgzip -z1` 0 s / 7.90 MB. The repacked file only
+            # ever lives in apt's archive cache long enough for dpkg to read it,
+            # so the size costs nothing and the seconds are the whole story.
+            # Verified faithful: 1044 of 1044 payload entries preserved with
+            # mode-identical listings, and `dpkg --dry-run -i` accepts it.
+            dpkg-deb -b -Zgzip -z1 "${'$'}d" "${'$'}TMPD/fix.deb" >>"${'$'}LOG" 2>&1 || continue
+            cp "${'$'}TMPD/fix.deb" "${'$'}deb" && echo "fixed $(basename ${'$'}deb)" >> "${'$'}LOG"
+          fi
+        done
+
+        rm -rf "${'$'}TMPD"
+        exit 0
+    """.trimIndent()
+
+    /** Copy GPG keyrings from share/termux-keyring/ into etc/apt/trusted.gpg.d/.
+     *  Symlinks are avoided: on some Android versions Os.symlink fails for
+     *  cross-directory links under the app data dir. */
+    private fun installGpgKeys(prefixDir: File) {
+        val keyDir = File(prefixDir, "share/termux-keyring")
+        if (!keyDir.isDirectory) return
+        val trustedDir = File(prefixDir, "etc/apt/trusted.gpg.d")
+        trustedDir.mkdirs()
+        keyDir.listFiles { f -> f.name.endsWith(".gpg") }?.forEach { key ->
+            val dest = File(trustedDir, key.name)
+            if (!dest.exists()) {
+                try {
+                    key.inputStream().use { src -> dest.outputStream().use { src.copyTo(it) } }
+                    Log.i(TAG, "  gpg key: ${key.name}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "copy gpg key ${key.name}: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Create the short symlinks that the rewritten paths resolve through.
+     *
+     * The real prefix is `/data/data/com.dsh.android/files/termux/usr` (43 bytes).
+     * Termux binaries bake in `/data/data/com.termux/files/usr` (31 bytes), and a
+     * replacement string inside an ELF **cannot grow** — see [patchElfInPlace].
+     * So we rewrite the 27-byte root `/data/data/com.termux/files` to the equally
+     * sized `/data/data/com.dsh.android/`, which leaves binaries asking for
+     * `/data/data/com.dsh.android//usr` (a legal double slash). These links make
+     * both spellings — the ELF one and the text-file one — land on the real
+     * prefix. Creating them is cheap and they are idempotent.
+     */
+    private fun createPrefixAliases() {
+        val appDataRoot = File(dataDir).parentFile ?: return
+        // ELF spelling: /data/data/com.dsh.android//usr
+        ensureSymlink(File(appDataRoot, "usr"), prefixDir)
+        ensureSymlink(File(appDataRoot, "home"), homeDir)
+        // Text spelling: /data/data/com.dsh.android/files/usr
+        ensureSymlink(File(dataDir, "usr"), prefixDir)
+        ensureSymlink(File(dataDir, "home"), homeDir)
+    }
+
+    /**
+     * dpkg opens its compiled-in config directory *before* it parses argv or
+     * environment, so `DPKG_CONFIG_DIR`, `DPKG_ADMINDIR`, `DPKG_ROOT` and even
+     * `--admindir` are all ignored — it dies with EACCES on the com.termux path
+     * regardless. The bootstrap ships `var/lib/dpkg` fully seeded but does not
+     * ship `etc/dpkg` at all, so create that skeleton ourselves.
+     */
+    private fun ensureDpkgDirs() {
+        File(prefixDir, "etc/dpkg/dpkg.cfg.d").mkdirs()
+        File(prefixDir, "etc/dpkg/origins").mkdirs()
+        val cfg = File(prefixDir, "etc/dpkg/dpkg.cfg")
+        if (!cfg.exists()) cfg.writeText("")
+    }
+
+    /**
+     * Build the fake root that makes dpkg unpack into the real prefix.
+     *
+     * Termux `.deb` files store their payload under the absolute path they
+     * expect to be installed at:
+     *   `./data/data/com.termux/files/usr/lib/libz.so.1.3.2`
+     * and dpkg's `instdir` defaults to `/`. So dpkg literally tries to
+     * `stat("./data/data/com.termux")` under the filesystem root — a directory
+     * owned by com.termux, unreadable by this app — and the install dies with
+     *   `unable to stat './data/data/com.termux' …: Permission denied`
+     * even after every path string in dpkg/apt has been rewritten.
+     *
+     * Fix: point `--instdir` at a directory tree that *contains* that path as a
+     * symlink back to our own data dir. dpkg then resolves
+     * `<root>/data/data/com.termux/files/usr/…` straight into the real prefix,
+     * and no package needs repacking. `var/lib/dpkg` is linked for the same
+     * reason: dpkg derives its admin dir from `instdir`, and without the link it
+     * would silently create an *empty* database there (every package would then
+     * look uninstalled and get reinstalled wholesale).
+     *
+     * A symlink rather than a bind mount because this runs as an ordinary app —
+     * no root, no mount namespace.
+     */
+    private fun ensureAptInstdirRoot() {
+        val root = File(rootDir, "aptroot")
+        File(root, "data/data").mkdirs()
+        File(root, "var/lib").mkdirs()
+        val appDataRoot = File(dataDir).parentFile ?: return
+        ensureSymlink(File(root, "data/data/com.termux"), appDataRoot)
+        ensureSymlink(File(root, "var/lib/dpkg"), File(prefixDir, "var/lib/dpkg"))
+    }
+
+    private fun ensureSymlink(linkPath: File, target: File) {
+        try {
+            // Never clobber a real file or directory that happens to sit there.
+            if (Files.isSymbolicLink(linkPath.toPath())) linkPath.delete()
+            else if (linkPath.exists()) return
+            Os.symlink(target.absolutePath, linkPath.absolutePath)
+        } catch (e: Exception) {
+            Log.w(TAG, "symlink ${linkPath.name}: ${e.message}")
+        }
+    }
+
+    /**
+     * Point every baked-in `/data/data/com.termux/files` reference at this install.
+     *
+     * Two rules, because the two kinds of file have different constraints:
+     *
+     * - **Text** (shebangs, profile scripts, configs) is rewritten to the real
+     *   prefix path, length be damned. Kernel shebang resolution can follow the
+     *   `files/usr` alias symlink.
+     * - **ELF binaries** get an **equal-length, in-place** byte substitution:
+     *   `/data/data/com.termux/files` (27 bytes) → `/data/data/com.dsh.android/`
+     *   (27 bytes, trailing slash included). Length is identical, so this is a
+     *   pure overwrite: no offset shifts, no `.dynstr` indices move, no
+     *   neighbouring string that shares a suffix gets clipped, and no NUL
+     *   padding is needed. The old code skipped binaries entirely, which is why
+     *   `dpkg`/`apt` kept reading com.termux's app-private dir and died with
+     *   `Permission denied`.
+     *
+     * Files we cannot patch safely are left untouched on purpose: the
+     * `libtermux-exec*.so` shims carry a bare `/data/data/com.termux` (no
+     * `/files` suffix) and `bin/termux-am*` carries a socket path under
+     * `.../apps/com.termux/` — neither matches the rule, and Boo never invokes
+     * any of them.
+     */
+    private fun rewriteTermuxPaths(prefixDir: File) {
+        val textNew = dataDir
+        if (OLD_TERMUX_ROOT == textNew) return
+
+        val elfOld = OLD_TERMUX_ROOT.toByteArray(Charsets.ISO_8859_1)
+        val elfNew = ELF_ROOT_REPLACEMENT.toByteArray(Charsets.ISO_8859_1)
+        var patched = 0
+
+        prefixDir.walkTopDown()
+            // Do not descend into directory symlinks: the upstream bootstrap
+            // ships links such as `bin/applets`, and following one would let us
+            // walk (and now *write*) outside the prefix.
+            .onEnter { !Files.isSymbolicLink(it.toPath()) }
+            .forEach { file ->
+                if (!file.isFile) return@forEach
+                // Never patch *through* a file symlink either — see onEnter.
+                if (Files.isSymbolicLink(file.toPath())) return@forEach
+                try {
+                    if (isElf(file)) {
+                        if (file.length() <= MAX_ELF_BYTES) {
+                            patched += patchElfInPlace(file, elfOld, elfNew)
+                        }
+                    } else {
+                        if (file.length() > MAX_TEXT_BYTES) return@forEach
+                        val text = file.readText()
+                        if (OLD_TERMUX_ROOT in text) {
+                            // Preserve executable bit: writeText creates a new
+                            // file which resets permissions to 644, but scripts
+                            // in bin/ must stay executable or exec() fails.
+                            val wasExec = file.canExecute()
+                            file.writeText(text.replace(OLD_TERMUX_ROOT, textNew))
+                            if (wasExec) file.setExecutable(true, false)
+                        }
+                    }
+                } catch (_: Exception) { /* skip unreadable files silently */ }
+            }
+        if (patched > 0) Log.i(TAG, "patched $patched ELF path reference(s)")
+    }
+
+    private fun isElf(file: File): Boolean = try {
+        FileInputStream(file).use { `in` ->
+            val magic = ByteArray(4)
+            val n = `in`.read(magic, 0, 4)
+            n == 4 && magic[0] == 0x7F.toByte() && magic[1] == 'E'.code.toByte() &&
+                magic[2] == 'L'.code.toByte() && magic[3] == 'F'.code.toByte()
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Replace every occurrence of [old] with [new] inside an ELF file, in place.
+     *
+     * Requires `old.size == new.size` ([new] must be a pure overwrite). Returns
+     * the number of substitutions. Uses only Java 8 APIs and a manual read loop
+     * — see the project's rule against Java 9+ APIs, which compile fine on the
+     * host JDK and then throw `NoSuchMethodError` on device.
+     */
+    private fun patchElfInPlace(file: File, old: ByteArray, new: ByteArray): Int {
+        if (old.size != new.size) return 0
+        val size = file.length().toInt()
+        if (size <= 0 || size < old.size) return 0
+
+        val bytes = ByteArray(size)
+        FileInputStream(file).use { `in` ->
+            var off = 0
+            while (off < size) {
+                val n = `in`.read(bytes, off, size - off)
+                if (n <= 0) break
+                off += n
+            }
+            // Short read ⇒ the file changed under us. Bail rather than write a
+            // buffer with a zeroed tail over a live binary.
+            if (off != size) return 0
+        }
+
+        var hits = 0
+        var i = 0
+        while (i <= size - old.size) {
+            if (bytes[i] != old[0]) { i++; continue }
+            var k = 1
+            while (k < old.size && bytes[i + k] == old[k]) k++
+            if (k == old.size) {
+                System.arraycopy(new, 0, bytes, i, new.size)
+                hits++
+                i += old.size
+            } else {
+                i++
+            }
+        }
+        if (hits == 0) return 0
+
+        val wasExec = file.canExecute()
+        FileOutputStream(file).use { it.write(bytes) }
+        if (wasExec) file.setExecutable(true, false)
+        return hits
+    }
+
+    companion object {
+        private const val TAG = "TermuxBootstrap"
+
+        /**
+         * Termux's own prefix root, as baked into every shipped binary (27 bytes).
+         *
+         * Note this is the **root**, not `.../usr`: the bootstrap also hardcodes
+         * `/data/data/com.termux/files/home` and `/data/data/com.termux/cache/apt`,
+         * so anchoring on the root covers all of them with one rule.
+         */
+        private const val OLD_TERMUX_ROOT = "/data/data/com.termux/files"
+
+        /**
+         * What [OLD_TERMUX_ROOT] becomes inside ELF binaries.
+         *
+         * ⚠️ Must be **exactly 27 bytes** to match [OLD_TERMUX_ROOT] — the
+         * trailing slash is what makes the lengths equal, and equal length is
+         * the whole reason this patch is safe (pure overwrite, no offsets
+         * move). If you ever change this, re-derive the byte count, do not
+         * eyeball it. Longer is impossible without breaking the ELF; shorter
+         * would clip a NUL and corrupt any string that shares the suffix.
+         */
+        private const val ELF_ROOT_REPLACEMENT = "/data/data/com.dsh.android/"
+
+        /** Plain-text files larger than this are left alone (they are data, not scripts). */
+        private const val MAX_TEXT_BYTES = 2L * 1024 * 1024
+
+        /**
+         * Refuse to buffer a binary bigger than this; keeps the peak allocation sane.
+         *
+         * 🔴 不能是原来的 16 MB：内置的 `node` 是 **47.4 MB**，超限就会被
+         * [rewriteTermuxPaths] 静默跳过（它只做 `if (file.length() <= MAX_ELF_BYTES)`），
+         * 于是 node 继续带着 `/data/data/com.termux/files/usr/lib` 的 RUNPATH 去读
+         * com.termux 的私有目录 —— 链接器报 `library not found`，而根因是一个字节数。
+         * 64 MB 给后续 node 版本留了余量；峰值内存是单次 64 MB 分配，可接受。
+         */
+        private const val MAX_ELF_BYTES = 64L * 1024 * 1024
+
+        /** 内置 Node 运行时资产名（中性后缀，避免 AGP 按扩展名做格式推断）。 */
+        private const val NODE_RUNTIME_ASSET = "node-runtime.bin"
+
+        /**
+         * 运行时版本标识，参与 [nodeMarker] 的文件名。
+         *
+         * ⚠️ **资产内容一变就必须改这里**（`-2`、`-3`…），否则已装机的机器会因为
+         * marker 命中而跳过安装，拿到的是旧运行时且没有任何报错。
+         */
+        private const val NODE_VERSION = "26.4.0-2"
+    }
+}
