@@ -402,7 +402,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-2`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-4`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -415,6 +415,27 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
 这三个都是踩过的坑。
+
+### ⑦ WebView 默认没有文件选择器 —— 必须实现 `onShowFileChooser`
+
+**症状**：composer 里点「+」→「文件」，**静默无反应**，没有报错、没有日志。
+
+**根因**：`WebChromeClient` 只覆写了 `onConsoleMessage`，没覆写 `onShowFileChooser`。
+WebView 的默认实现**立刻回调 `onReceiveValue(null)`**（即"用户没选任何文件"），
+于是页面认为选择被取消，什么都不发生。页面里确实有
+`<input type="file" multiple hidden>`（`.uV2eYG_tools` 内），走的就是标准 file chooser。
+
+⚠️ 该页面**没有** File System Access API（`showOpenFilePicker` / `showSaveFilePicker` /
+`showDirectoryPicker` 全是 `undefined`），所以不需要实现 `onShowFilePicker`（WebView 113+
+的新接口）；`onShowFileChooser` 才是正确的接缝。
+
+**做法**（`MainActivity.kt`）：用 `registerForActivityResult(StartActivityForResult)`
+拉起 `fileChooserParams.createIntent()`，按 `mode == MODE_OPEN_MULTIPLE` 补
+`EXTRA_ALLOW_MULTIPLE`，结果里优先取 `clipData`（多选）再退回 `data.data`（单选）。
+
+⚠️ **取消时必须回调 `null`，不能回调空数组** —— 空数组会被页面解读成"选了 0 个文件"
+而触发一次空提交。`ActivityNotFoundException`（无任何应用能处理）同样要 `null` 并返回 `false`。
+⚠️ 回调是**一次性**的：`filePathCallbackRef` 要在调用前取出并置空，否则第二次点击不会响应。
 
 ## 移动端 UI 插件
 
@@ -482,6 +503,34 @@ let n=0; for (const sh of document.styleSheets){let rs;try{rs=sh.cssRules}catch(
 半屏白块，连「添加一个 API Key」对话框都被压住。
 
 同类隐患还有 `zGbnIq: ["title"]`。**加豁免前先确认该局部名是否唯一。**
+
+### 「+」菜单与键盘的时序（改过，别退回去）
+
+官方「+」的指令菜单**只在编辑区仍持有 DOM 焦点时才会渲染**，而官方
+`onToggleCommandMenu` 是「先把焦点还给编辑区、再 toggle 菜单」
+（`dsh-client-ui-conversation/lib/client.js:17390`）。同时官方 `keepDraftFocus`
+还会在 mousedown 里再 focus 一次。
+
+而插件的两个守卫（修复 29 的 `onFocusIn`、修复 38b 的 `arm`）都会**主动把焦点从编辑区
+拿走**（键盘被手动收起后，只要还有可编辑元素持焦点，Android 就会把输入法挂回来）。
+于是「谁先拿走焦点」直接决定菜单能不能出现。真机三种时序：
+
+| 拿走焦点的时机 | 菜单 | 键盘 |
+|---|---|---|
+| 菜单渲染前（旧行为） | ❌ 不开 | 不弹 |
+| 一直不拿 | ✅ 开 | ❌ 弹回 |
+| **菜单出现之后再拿** | ✅ 开 | ✅ 不弹 |
+
+所以有一条**共享闸门** `mpDeferBlur()` / `mpFlushPendingBlur()`（在
+`setupComposerKeyboardGuard` 上方）：把「拿焦点」挂到 `[data-trigger-menu]` 出现的
+那一刻，并带 700ms 兜底（官方改了渲染方式时也必须把焦点还回去，否则键盘一直挂着）。
+
+⚠️ 闸门**必须对两条守卫都生效** —— 只改 `arm` 无效，`onFocusIn` 会先一步把焦点抢走
+（真机实测：只有 `focusout`，菜单从未进过 DOM）。
+⚠️ **只对 `button[aria-haspopup="listbox"]`（即「+」）延迟**；发送 / 停止 / 模型选择等
+不弹这个菜单，必须维持**立即 blur**，否则白等一个兜底周期，那段时间足够键盘被挂回来。
+⚠️ 不要退回「立即 blur」，也不要改成「在 keepFocus 里 blur」—— 后者同样抢在 React
+渲染菜单之前。
 
 ## 调试真机
 

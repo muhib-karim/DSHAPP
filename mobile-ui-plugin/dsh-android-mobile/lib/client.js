@@ -3015,6 +3015,58 @@ window.__ModuleLoader__.load({
 		// 合理（方便直接打字），移动端会弹出输入法键盘挡住菜单/遮住界面。
 		// 守卫：记录最近一次 pointerdown 的目标，若 textarea 获得的焦点并非
 		// 由用户直接点击输入框引起，则立即 blur（同一事件循环内，键盘不弹出）。
+		/* ══ 修复 64：移走编辑区焦点的**时机**闸门（两个守卫共用）══
+		   真机实测的时序（键盘收起状态点「+」）：
+		     ① 官方 onToggleCommandMenu 是「先把焦点还给编辑区，再 toggle 菜单」
+		        （dsh-client-ui-conversation/lib/client.js:17390 `focusDraftEditor` → `toggleCommandMenu`），
+		        而指令菜单**只在编辑区持焦点时才渲染**；
+		     ② 官方的 keepDraftFocus 还会在 mousedown 里再 focus 一次（preventDefault + focus）。
+		   于是「谁先把焦点从编辑区拿走」就直接决定菜单能不能出现：
+
+		     | 拿焦点的时机        | 菜单 | 键盘 |
+		     |---------------------|------|------|
+		     | 菜单渲染前（旧行为）| ❌ 不开 | 不弹 |
+		     | 一直不拿            | ✅ 开   | ❌ 弹回 |
+		     | **菜单出现之后再拿** | ✅ 开   | ✅ 不弹 |
+
+		   所以把「拿焦点」挂到 `[data-trigger-menu]` 出现的这一刻上，而不是手势里。
+		   闸门对**两条**抢焦点的路径同时生效（它们都会被官方那次 focus 触发）：
+		     · setupComposerKeyboardGuard 的 onFocusIn 守卫（修复 29）
+		     · setupKeepFocusGuard 的 arm 分支（修复 38b）
+		   ⚠️ 兜底定时器必需：万一菜单始终不出现（官方改了渲染方式），也必须把焦点
+		     还回去，否则键盘会一直挂在那里。
+		   ⚠️ 只对会弹指令菜单的按钮延迟（`button[aria-haspopup="listbox"]`）；发送 /
+		     停止 / 模型选择等不弹这个菜单，必须维持**立即 blur** —— 对它们延迟等于
+		     白等一个兜底周期，那段时间足够键盘被挂回来。
+		   ⚠️ 不要退回「立即 blur」，也不要改成「在 keepFocus 里 blur」—— 后者同样抢在
+		     React 渲染菜单之前。 */
+		const MP_MENU_SEL = "[data-trigger-menu]";
+		let mpBlurGateUntilMenu = false;
+		let mpPendingBlurEl = null, mpPendingBlurObs = null, mpPendingBlurTid = 0;
+		const mpFlushPendingBlur = () => {
+			mpBlurGateUntilMenu = false;
+			try { if (mpPendingBlurObs) { mpPendingBlurObs.disconnect(); mpPendingBlurObs = null; } } catch (e) { /* 静默 */ }
+			try { if (mpPendingBlurTid) { window.clearTimeout(mpPendingBlurTid); mpPendingBlurTid = 0; } } catch (e) { /* 静默 */ }
+			const el = mpPendingBlurEl;
+			mpPendingBlurEl = null;
+			if (el) { try { el.blur(); } catch (e) { /* 静默 */ } }
+		};
+		const mpDeferBlur = (el) => {
+			// arm 与 onFocusIn 是同一次手势的两段，盯的是同一个编辑区 → 别互相冲掉
+			if (mpBlurGateUntilMenu && mpPendingBlurEl === el) return;
+			mpFlushPendingBlur();
+			mpBlurGateUntilMenu = true;
+			mpPendingBlurEl = el;
+			try {
+				const obs = new MutationObserver(() => {
+					if (document.querySelector(MP_MENU_SEL)) mpFlushPendingBlur();
+				});
+				obs.observe(document.body, { childList: true, subtree: true });
+				mpPendingBlurObs = obs;
+			} catch (e) { /* 静默 */ }
+			mpPendingBlurTid = window.setTimeout(mpFlushPendingBlur, 700);
+		};
+
 		function setupComposerKeyboardGuard() {
 			if (!mpIsMobile()) return () => {}; // 修复 40：仅移动端（必须返回空清理函数）
 			let lastDownTarget = null;
@@ -3046,6 +3098,20 @@ window.__ModuleLoader__.load({
 					(!!lastDownTarget && typeof lastDownTarget.closest === "function" &&
 						lastDownTarget.closest("[data-composer-input]") === t);
 				if (!userTapped) {
+					// ⭐ 修复 64：官方 onToggleCommandMenu 会先 focus 编辑区再 toggle 菜单，
+					//   而菜单只在编辑区持焦点时渲染 —— 这里若当场 blur，菜单永远不出现
+					//   （真机实测：只有 focusout，菜单从未进过 DOM）。
+					//   故当这次 focus 是「点 + 弹菜单」引起的时候，让路给菜单。
+					//   判据有两条：闸门已开（setupKeepFocusGuard 的 arm 先判定了是「+」），
+					//   或按下的目标本身就是「+」按钮。
+					const menuBtn = mpBlurGateUntilMenu ||
+						(!!lastDownTarget && typeof lastDownTarget.closest === "function" &&
+							!!lastDownTarget.closest('button[aria-haspopup="listbox"]'));
+					if (menuBtn) {
+						e.stopImmediatePropagation?.();
+						mpDeferBlur(t);
+						return;
+					}
 					e.stopImmediatePropagation?.();
 					t.blur();
 				}
@@ -3201,6 +3267,12 @@ window.__ModuleLoader__.load({
 						!!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
 				} catch (e) { return false; }
 			};
+			// 修复 38b 的注记：官方 keepFocus 里的 preventDefault() 让编辑区**始终
+			// 保持 DOM 焦点**（真机信标实测：整个手势 activeElement 恒为编辑区）。
+			// 键盘被用户手动收起后，Android 只要看到「仍有可编辑元素持有焦点」，就会在
+			// 这次 composer 触摸上重新挂回输入法 —— 与官方那次 focus() 无关。
+			// → 键盘不可见时必须真的把焦点移走；但**移走的时机**由修复 64 的共享闸门
+			//   决定（见 setupComposerKeyboardGuard 上方的长注释），不能就地 blur。
 			const restore = () => {
 				clearTimer();
 				if (!stubbed) return;
@@ -3229,9 +3301,19 @@ window.__ModuleLoader__.load({
 					//   实测已中和 focus()（sw=1）、无任何泄漏（pf=空），键盘照样弹起（752→445）。
 					//   反之焦点不在输入框时没有可恢复的输入连接，所以不弹（与啾灵观察一致）。
 					//   → 键盘不可见时，必须**真的把焦点移走**；只吞 focus() 不够。
+					//
+					// ⭐ 修复 64：移走焦点的**时机**由共享闸门决定（见上方长注释）。
+					//   「+」（`button[aria-haspopup="listbox"]`，真机实测 aria-haspopup=listbox）
+					//   要等指令菜单渲染出来再 blur，否则菜单根本不会出现；其余按钮立即 blur。
+					const btn = t.closest("button");
 					if (!imeVisible()) {
 						// 仅触摸端执行：桌面端没有软键盘，抢焦点只会打断打字。
-						if (isTouchUI()) { try { inp.blur(); } catch (e2) { /* 静默 */ } }
+						if (isTouchUI()) {
+							try {
+								if (btn && btn.matches('button[aria-haspopup="listbox"]')) mpDeferBlur(inp);
+								else inp.blur();
+							} catch (e2) { /* 静默 */ }
+						}
 					}
 					prevOwn = Object.prototype.hasOwnProperty.call(inp, "focus");
 					prevVal = prevOwn ? inp.focus : null;
@@ -3262,6 +3344,7 @@ window.__ModuleLoader__.load({
 			window.addEventListener("click", onEnd, false);
 			return () => {
 				restore();
+				mpFlushPendingBlur(); // 修复 64：拆掉待执行的 observer/定时器，别泄漏
 				try { if (window.visualViewport) window.visualViewport.removeEventListener("resize", sampleRest); } catch (e) { /* 静默 */ }
 				window.removeEventListener("resize", sampleRest);
 				document.removeEventListener("touchstart", arm, true);
