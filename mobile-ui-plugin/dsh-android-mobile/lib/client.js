@@ -243,6 +243,63 @@ window.__ModuleLoader__.load({
   min-height: 0 !important;
   height: auto !important;
 }
+
+/* ══ 修复 61：顶部标题栏高度 +25% ═══════════════════════════════════════
+   需求（用户 2026-10-03）：聊天界面顶部标题栏调高 25%。
+
+   ⚠️ 这里**不要写死像素值**。第一版写死 81.25px（= 修复 57 实测的
+      65px × 1.25），但「65px」只是 iPhone 13 一种状态下的实测值：
+      官方 header 是内容驱动高度（修复 30 把官方 min-height:76px 覆盖成 0），
+      自然高度随「模式徽章有无 / 标题是否换行 / 横竖屏」在 55~65px 浮动，
+      写死就会在某些状态下远超 25%（55px 时变成 +48%）——真机反馈「有点高过头」
+      就是这么来的。
+
+   所以改为**运行时自校准**：由 mpSyncHeaderHeight() 先量出「未加高」时的
+   自然高度，再写 --mp-hdr-h = 自然高度 × MP_HDR_SCALE。任何设备、任何
+   方向、任何状态下都精确 +25%。
+   下面的 0px 只是 JS 没跑起来时的兜底 —— 等于不加高，行为同官方。
+
+   为什么这样写：
+     · 官方 header 是 display:grid，隐式行 auto、align-content 默认
+       stretch → 容器给了 min-height 后行会撑满，而 titleRow 自身是
+       align-items:center 的 flex，内容自动垂直居中：只加高度，
+       不需要动布局，也不影响左右两端（汉堡 / ⋯ / utilities / corner）。
+     · 用 min-height 而非 height：标题换行、大字号或横屏时仍能自然变高，
+       不会把内容裁掉（配合上面的 height:auto）。
+     · 本条必须排在修复 30 的 min-height:0 之后：同为
+       [data-mobile] .wSkVaW_header + !important，靠书写顺序取胜。
+     · 想调比例只动 JS 里的 MP_HDR_SCALE（1.25 = +25%），不要回来写死像素。 */
+[data-mobile] .wSkVaW_header {
+  min-height: var(--mp-hdr-h, 0px) !important;
+}
+
+/* ══ 修复 62：恢复标题下方的「当前模式 / Agent 预设」徽章（2026-10-03 反馈）═
+   现象：手机端聊天页标题下方不再显示当前对话用的是哪个模式（预设名 +
+         图标），桌面端却有 —— 用户反应「好像少了点啥」。
+
+   根因（**官方行为，不是本插件引入的**）：
+     · 徽章由 @deepseek-ai/dsh-client-ui-agent-preset 注册进
+       conversation.session.header.actions 槽位（AgentPresetLabel，order -10），
+       渲染为 <span class="SVAs4q_label" title="…">图标 + 预设名</span>；
+     · 它自带的样式里有一条容器查询：
+         @container (width<=540px){ .SVAs4q_label{ display:none } }
+       而官方 .wSkVaW_titleRow 设了 container-type:inline-size ——
+       手机竖屏 titleRow 内联尺寸 ≈ 390 − 50(padL) − 12(padR) ≈ 328px，
+       必然命中 ≤540px → 官方按「窄屏省略」把它隐藏。桌面端 titleRow
+       宽 >540px，所以一直可见，这也解释了为什么只有手机缺。
+
+   为什么放回来是安全的：本插件修复 30 的单行化头部本来就是
+   「标题 + 徽章」两层结构，headerActions 就在 titleCluster 这个列容器里、
+   被 align-items:center 居中 —— 位置早就留好了，只需要把 display 还原，
+   不需要动任何布局。
+
+   ⚠️ SVAs4q_label 是构建期哈希类名，官方升级可能变；所以同时给一条
+      结构性兜底（headerActions 里带 title 的 span）。同槽位的其他条目
+      （subagent-catalog / job-list）都是按钮，不会被这条误伤。 */
+[data-mobile] .wSkVaW_headerActions .SVAs4q_label,
+[data-mobile] .wSkVaW_headerActions span[title] {
+  display: inline-flex !important;
+}
 [data-mobile] .wSkVaW_tabs {
   display: none !important;
 }
@@ -440,6 +497,23 @@ window.__ModuleLoader__.load({
    「内容宽 > 可视宽」的溢出检测将永远失效，分级降档也就永不触发。
    真正的防线是：① label 的 min-width:3em（防 0 宽「消失」）
    ② JS 分级降档（防省略号）。 */
+
+/* ══ 修复 63（方案 A）：给「三组并排」腾出余量 ══════════════════════════
+   文案侧已把 tok/s 与 token 总量移进弹层（见 mpStatsVariants 的注释），
+   这里再把三组之间的横向开销各收一档，给 5~6 位步数留余量：
+     · dock（遥测栏 ↔ 上下文环）gap 12 → 8
+     · 上下文环触发器 padding 8→6、图标↔文字 gap 6→4
+   ⚠️ .JObwrW_* 与 .uV2eYG_* 是官方构建期哈希类名（分别来自
+      ui-conversation 的 ContextMeter / InputBar），官方升级可能变；
+      失效的后果只是「回到官方间距」，不影响功能。 */
+[data-mobile] .uV2eYG_dock {
+  gap: 8px !important;
+}
+[data-mobile] .JObwrW_trigger {
+  padding-left: 6px !important;
+  padding-right: 6px !important;
+  gap: 4px !important;
+}
 
 
 /* 5. 审批面板浮到输入框上方（面板保留在 Cordis layer 内不动，仅重定位）。
@@ -682,26 +756,64 @@ window.__ModuleLoader__.load({
 		//   React 写入新数值时（now !== mpApplied）才重新计算并更新原文缓存。
 		const MP_STATS_RAW = "mpRaw", MP_STATS_APPLIED = "mpApplied";
 
-		// 生成一个药丸的各档候选文案（第 0 档 = **缩写版**，最后一档 = 最省空间）
-		// ⚠️ 第 0 档刻意不是官方原文：官方「缓存命中 92%」「163 tok/s」这类长词
-		//   在 390px 上本来就会顶满（实测文本预算仅 ~229px）。缩写版语义完全不变
-		//   （缓存命中→缓存、tok/s→t/s），只是更短，因此作为基准档可避免
-		//   "一开始就省略号"的观感问题。
+		/* ══ 修复 63：底栏常驻文案精简（方案 A + 用户追加「用量」）══════════════
+
+		   常驻可见 = 轮/步（进度）· token 总量·缓存命中%（用量/成本效率）·
+		   上下文环%（会不会爆，环由 conversation 插件的 ContextMeter 渲染）。
+		   常驻里**去掉**的只有 tok/s。
+
+		   为什么（预算账）：官方「详细」档这一行是三组并排
+		     ⏱「24 轮 1085 步 · 172 tok/s」 🗄「92.9M tok · 缓存命中 93%」 ◔「63%」
+		   需求宽 ~285px，而 390px 屏的 dock 预算 ~283px —— **天生差一点**，
+		   所以永远在省略号边缘蹭，数字一进位就变省略号。精简后实测：
+		     ⏱「24轮 1085步」+ 🗄「92.9M·缓存93%」
+		     = 药丸 93 + 4(药丸间 gap) + 109 ≈ 216px（含图标/padding/内 gap），
+		     对 240px 的保守预算余量 ~24px（真实 dock 预算更宽松，约 298px）。
+		   于是按用户要求把 token 总量放回来仍然放得下；仍是 tok/s 留在弹层
+		   （瞬时值、每秒都在跳，信息半衰期最短，且它是最长的一段）。
+		   ⭐ 关键前提：三组**都能点开**，弹层里一个数据都没少
+		     （时间药丸 → LLM/工具时长、首 token、速度；用量药丸 → 缓存命中率、
+		      输入/缓存读/缓存写/输出 tok；上下文环 → ~已用/窗口 + 分段明细）。
+
+		   下面第 0 档（基准档）就是固定精简文案，其余档位是极端数字
+		   （1085→108570 步、总量涨到 B 级之类）时的兜底降档。 */
 		function mpStatsVariants(raw) {
 			const abbr = (s) => s.replace(/缓存命中/g, "缓存").replace(/(\S)\s*tok\/s/g, "$1 t/s");
-			const v = [abbr(raw)];
-			if (/轮|步/.test(raw)) {
-				// 进度药丸：逐级去掉速度段 → 紧排
-				v.push(v[0].replace(/\s*·\s*\d+(?:\.\d+)?\s*t\/s\s*$/, "").trim()); // 去速度（t/s 变化最频繁，优先级最低）
-				v.push(v[v.length - 1].replace(/\s+(?=\d)/g, " ").replace(/(\d)\s+(轮|步)/g, "$1$2").trim()); // 紧排
+			const src = abbr(raw);
+			const v = [];
+			if (/轮|步|turns|steps/.test(src)) {
+				// 进度药丸：基准档直接就是**紧排**的「24轮 1085步」
+				// （官方原文「24 轮 1085 步」在数字与单位间有空格，白占约 8px，
+				//   而这次改动的目的就是省宽度 → 不把它当基准档）。
+				// 其后依次：去掉中间空格 → 只留步数 → 只留数字。
+				const tight = src.replace(/\s*·\s*[^·]*$/, "").trim()
+					.replace(/(\d)\s+(轮|步|turns|steps)/g, "$1$2");
+				v.push(tight);
+				v.push(tight.replace(/\s+/g, ""));
+				const stepsOnly = tight.replace(/^.*?(\d+)\s*(步|steps)\s*$/, "$1$2");
+				v.push(stepsOnly);
+				if (stepsOnly !== tight) v.push(stepsOnly.replace(/\s*(步|steps)\s*$/, ""));
 			} else {
-				// 缓存药丸：先舍 token 量，最后只留百分比（百分比是核心信息）
-				const noTok = v[0].replace(/^[\d.]+[MKG]?\s*(?:tok)?\s*·?\s*/, "").trim();
-				if (noTok && noTok !== v[0]) v.push(noTok);
-				const pct = (v[0].match(/\d+(?:\.\d+)?%/) || [""])[0];
-				if (pct) v.push(pct);
+				// 用量药丸：基准档 = 官方同款语义「总量·缓存N%」（用户 2026-10-03
+				//   看过实测余量后要求把「用量」放回来）。
+				//   总量与缓存命中%本来就是官方的**同一枚药丸**（UsagePill），
+				//   合在一枚里比拆成两枚省一个图标+间距+间隙（约 31px），
+				//   所以放回总量不必新增药丸。
+				//   降档顺序：舍总量 → 舍「缓存」二字只留百分比。
+				const m = /·\s*([^·]+)$/.exec(src);
+				if (m) {
+					// "92.9M tok" → "92.9M"（图标已表达"token"，单位白占宽）
+					const total = src.slice(0, m.index).trim().replace(/\s*tok\b/g, "").trim();
+					const cache = m[1].trim().replace(/\s+/g, "");
+					if (total) v.push(total + "·" + cache);
+					v.push(cache);
+					const pct = (cache.match(/\d+(?:\.\d+)?%/) || [""])[0];
+					if (pct) v.push(pct);
+				} else {
+					v.push(src.replace(/\s*tok\b/g, "").trim() || src);
+				}
 			}
-			// 去掉空串与重复，保持顺序
+			// 去掉空串与重复，保持顺序（单调递减，降档必然终止）
 			return v.filter((x, i) => x && v.indexOf(x) === i);
 		}
 
@@ -729,8 +841,10 @@ window.__ModuleLoader__.load({
 		     ② **只能单调降档，绝不回写更长的档** —— 候选档位有限（≤4 档），
 		        每次最多降一级，降到最后一档就 next === cur 不再写入 ⇒ 必然终止。
 
-		   信息优先级（啾灵授权我定）：轮/步 与 缓存命中% 必留；
-		   速度 t/s 最先舍（瞬时值、跳得最频繁）；token 总量其次舍。 */
+		   信息优先级（修复 63 / 方案 A 之后的最终形态）：
+		     常驻 = 轮/步 · 缓存命中% · 上下文环%；tok/s 与 token 总量**从基准档
+		     就已移入弹层**（点药丸即得），不再参与常驻竞争。
+		     这里的档位只剩「极端数字兜底」：轮→步→纯数字、缓存标签→纯百分比。 */
 		function processStatsLine() {
 			if (!mpIsMobile()) return; // 修复 40：仅移动端；桌面端完全走官方
 			const root = document.querySelector("[data-composer-stats] .bOPqQW_root") || document.querySelector(".bOPqQW_root");
@@ -746,24 +860,32 @@ window.__ModuleLoader__.load({
 				if (now !== el.dataset[MP_STATS_APPLIED]) el.dataset[MP_STATS_RAW] = now;
 			}
 
-			// ② 不变量①：放得下就立刻返回，**不写任何 DOM**（断环）。
-			//    mpStatsFits 同时检查 root 内容溢出和每个 label 的内部截断
-			//    （label 带 ellipsis 时 root 未必溢出，但 label.scrollWidth 会暴露截断）。
-			if (mpStatsFits(root, labels)) return;
-
-			// ③ 不变量②：溢出才降一档，且只降一级。当前档位用 indexOf 定位，
-			//    定位不到（例如 React 刚写了新的长原文）就视为第 0 档。
+			// ② 档位表（按 mpStatsRaw 生成，一药丸一组，单调递减）
 			const variants = labels.map((el) => mpStatsVariants(el.dataset[MP_STATS_RAW] || el.textContent || ""));
+			// 放得下？（root 内容溢出 + 每个 label 的内部截断都要看：
+			// label 带 ellipsis 时 root 未必溢出，但 label.scrollWidth 会暴露截断）
+			const fits = mpStatsFits(root, labels);
+
+			// ③ 双不变量（修复 60b 的死循环教训必须继续成立）：
+			//    ① **不写 DOM 的路径必须存在且最先命中** —— 当前文案已在候选表里
+			//       且放得下 ⇒ 一个字节都不写 ⇒ 不触发 observer ⇒ 环被切断；
+			//    ② **只能单调降档**，每次最多降一级 ⇒ 必然终止。
+			//
+			//    ⭐ 修复 63 的实质改动：官方原文（idx < 0）**不再看放不放得下**，
+			//       一律先归一到基准档 v[0]（= 精简常驻文案：轮/步 · 缓存N%）。
+			//       因为方案 A 是「常驻就精简」，不是「挤不下才精简」——
+			//       否则数字短的时候 tok/s 和 token 总量又会回到屏幕上。
+			//       归一后下一轮 idx ≥ 0 且放得下 ⇒ 走不变量①，不再写入。
+			//       已在候选表里（idx ≥ 0）才允许、且只在溢出时降一级。
 			labels.forEach((el, i) => {
 				const v = variants[i];
 				const cur = el.textContent || "";
 				const idx = v.indexOf(cur);
-				// ⚠️ idx < 0 表示「当前显示的是官方原文，还不在候选表里」（候选表第 0 档
-				//    是缩写版，与原文不同）。此时 next 必须是 **v[0]**，而不是 v[1]——
-				//    写成 v[1] 会一步跳过缩写档，直接丢掉 token 量。
-				//    已在候选表里（idx ≥ 0）才允许降下一档，且最多降一级 ⇒ 必然终止。
-				const next = idx < 0 ? v[0] : v[Math.min(idx + 1, v.length - 1)];
-				if (next === cur) return; // 不变量②：无变化 ⇒ 不写 DOM ⇒ 不触发 observer
+				let next;
+				if (idx < 0) next = v[0];               // 官方原文 → 归一为精简基准档
+				else if (fits) return;                  // 已是候选档且放得下 → 不写（断环）
+				else next = v[Math.min(idx + 1, v.length - 1)]; // 溢出 → 降一档
+				if (next === cur) return;               // 无变化 ⇒ 不写 ⇒ 不触发 observer
 				el.textContent = next;
 				el.dataset[MP_STATS_APPLIED] = next;
 			});
@@ -2030,6 +2152,66 @@ window.__ModuleLoader__.load({
 				if (now !== next) root.style.setProperty("--mp-hdr-padl", next);
 			}
 
+			/* ══ 修复 61：标题栏高度 ×1.25（运行时自校准，配合上面 CSS 的
+			   min-height: var(--mp-hdr-h)）═════════════════════════════════
+
+			   为什么不能写死：官方 header 是内容驱动高度（修复 30 把官方
+			   min-height:76px 覆盖成 0），自然高度实测在 55~65px 之间浮动：
+			     · 有模式徽章 / 标题换行 → 约 65px
+			     · 无徽章、单行标题      → 约 55px
+			   写死 81.25px（=65×1.25）在 55px 状态下就是 +48% —— 真机反馈
+			   「有点高过头」正是如此。先量再乘，才是任何状态都精确 +25%。
+
+			   怎么量（关键）：把 inline min-height 临时压成 0px → 读高度 →
+			   立刻还原。整段在同一个任务内完成，浏览器不会绘制中间态，
+			   所以没有闪烁、不触发可见跳动。
+
+			   成本控制（修复 59 的教训：别在每帧里反复强制同步布局）：
+			   用 mpHdrKey =「header 宽 : 内容高」当指纹，只有这两者之一
+			   变化时才真的去量。内容高取 titleRow 所有子项的**最大高度**：
+			   这些子项在 titleRow 里都是 align-items:center 的 flex 项、
+			   **不会**被拉伸，所以高度恒等于内容高度；取最大值可覆盖
+			   「模式徽章挂在 headerActions、快照徽章挂在 utilities」等
+			   徽章出现在簇外的情况。其余调用只花几次廉价读 + 比较。 */
+			const MP_HDR_SCALE = 1.25;
+			var mpHdrKey = "";
+			function mpSyncHeaderHeight() {
+				const root = document.documentElement;
+				// 桌面端：清掉变量 → CSS 回落 0px，官方布局零影响
+				if (!root.hasAttribute("data-mobile")) {
+					if (root.style.getPropertyValue("--mp-hdr-h")) root.style.removeProperty("--mp-hdr-h");
+					mpHdrKey = "";
+					return;
+				}
+				const header = document.querySelector(".wSkVaW_header");
+				const row = header && header.querySelector(".wSkVaW_titleRow");
+				// 官方 header 是空壳（Hero 页 / 尚未渲染）时不动，免得把 0 当基线
+				if (!header || !row) return;
+				const cluster = row.querySelector(".wSkVaW_titleCluster") || row;
+				const width = Math.round(header.getBoundingClientRect().width);
+				// 内容高 = titleRow 各子项（含标题簇 / headerActions / utilities /
+				// corner）里的最大高度；它们不被拉伸，故等于内容高度。
+				let contentH = cluster.getBoundingClientRect().height;
+				for (const child of row.children) {
+					const h = child.getBoundingClientRect().height;
+					if (h > contentH) contentH = h;
+				}
+				contentH = Math.round(contentH * 100) / 100;
+				if (width < 1 || contentH < 1) return;
+				const key = width + ":" + contentH;
+				if (key === mpHdrKey) return;
+				// 量自然高度：inline + important 能压过样式表里的 !important
+				const savedPrio = header.style.getPropertyPriority("min-height");
+				const saved = header.style.getPropertyValue("min-height");
+				header.style.setProperty("min-height", "0px", "important");
+				const natural = header.getBoundingClientRect().height;
+				if (saved) header.style.setProperty("min-height", saved, savedPrio);
+				else header.style.removeProperty("min-height");
+				if (!(natural > 0)) return; // 量不到就保持原样，下一帧再试
+				mpHdrKey = key;
+				root.style.setProperty("--mp-hdr-h", Math.round(natural * MP_HDR_SCALE * 100) / 100 + "px");
+			}
+
 			// 修复 59：把 mpSyncHeaderCenter 合并到下一帧执行。
 			// MutationObserver 在 body 上以 subtree:true 观察，触发极频繁
 			// （每次消息流更新都会来一发）→ 同一帧内最多测一次，避免手机上
@@ -2044,6 +2226,8 @@ window.__ModuleLoader__.load({
 				if (mpCenterRaf) return;
 				mpCenterRaf = requestAnimationFrame(() => {
 					mpCenterRaf = 0;
+					// 修复 61：高度自校准与居中留白共用这一帧（共用节流，不额外增加重排次数）
+					try { mpSyncHeaderHeight(); } catch (e) { /* 静默：纯外观，绝不影响功能 */ }
 					try { mpSyncHeaderCenter(); } catch (e) { /* 静默：纯外观，绝不影响功能 */ }
 				});
 			}
