@@ -404,6 +404,128 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 安装 node-pty 的 android-arm64 原生绑定（幂等）。
+     *
+     * **症状**：侧栏终端面板打不开，显示
+     * `终端错误：subprocess-local: terminal inspection is unsupported on platform android`
+     * （那是另一个补丁负责的，见 [patchProcessInspector]；此处解决的是它背后
+     * 真正缺的东西）。
+     *
+     * **根因**：`dsh-subprocess-local` 的终端后端走 `node-pty`，而 node-pty 的
+     * `prebuilds/` 只有 `darwin-arm64` / `darwin-x64` / `linux-arm64` / `linux-x64` /
+     * `win32-*`，**没有 android**。它的 `lib/utils.js` 按
+     * `prebuilds/${process.platform}-${process.arch}` 拼目录名，所以在 Android 上
+     * 会去找 `prebuilds/android-arm64/pty.node`，找不到就
+     * `Failed to load native module: pty.node`。
+     *
+     * **做法**：用 NDK 从 node-pty 自带的 `src/unix/pty.cc` 直接编一份
+     * android-arm64 的 `pty.node`，装到 `prebuilds/android-arm64/`。
+     * 上游源码**无需任何改动** —— 它本来就按平台拼目录名。
+     *
+     * ⚠️ 必须 **`-static-libstdc++`**（静态链 libc++）。默认动态链会引入
+     * `libc++_shared.so`，而 Termux 环境里**没有**这个库，加载即失败。
+     * 静态链之后 `readelf -d` 只剩 `libm/libdl/libc` 三个 bionic 系统库。
+     *
+     * ⚠️ PTY 本身在 Android 上是**可用**的，别被"平台不支持"误导：真机在
+     * app 的 SELinux 域（`untrusted_app`）里实测 `openpty` / `forkpty` /
+     * `open("/dev/ptmx")` 全部成功。
+     *
+     * 真机实测：绑定加载成功，`pty.spawn(bash)` 起得来，写入
+     * `echo PTY_WORKS_$((6*7))` 能收到 `PTY_WORKS_42` 回显。
+     *
+     * 无需改版本戳 —— 判定条件是「绑定存在且非空」。
+     */
+    private fun ensureNodePty() {
+        val nodeModules = File(engineDir, "node_modules")
+        if (!nodeModules.isDirectory) {
+            Log.w(TAG, "引擎尚未解包，跳过 node-pty 安装")
+            return
+        }
+
+        val target = File(nodeModules, "node-pty/prebuilds/android-arm64")
+        val binding = File(target, "pty.node")
+        if (binding.isFile && binding.length() > 0) {
+            return
+        }
+
+        try {
+            java.util.zip.ZipInputStream(context.assets.open(NODE_PTY_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        // 条目形如 node-pty/prebuilds/android-arm64/pty.node，直接相对 node_modules 落盘
+                        val out = File(nodeModules, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            Log.i(TAG, "已安装 node-pty android-arm64 绑定 (${binding.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上不阻断启动：只有终端面板用不了，其余功能照常
+            Log.w(TAG, "安装 node-pty 绑定失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 给 `dsh-subprocess-local` 的进程检查器补 android 分支（幂等）。
+     *
+     * **症状**：终端面板报
+     * `subprocess-local: terminal inspection is unsupported on platform android`。
+     *
+     * **根因**：`createProcessInspector()` 是 linux/darwin/win32 三选一
+     * （`runner-launch-*.js` 的 `createProcessInspector`），android 落不进任何分支
+     * 就 `throw`。而 `spawnTerminal()` 第一件事就是调它。
+     *
+     * **做法**：让 android 复用 **Linux 实现**。这是有依据的，不是将就：
+     *
+     * - `LinuxProcessInspector` 读的全是 `/proc`，Android 就是 Linux 内核，
+     *   格式一致（真机实测 `parseProcStat` 能正常解析）。
+     * - 它需要的 syscall 表里**本来就有 arm64**（`SYSCALLS.arm64`），
+     *   安卓 arm64 正好命中。
+     * - app 域下 `/proc` **目录可读**，只是别的 uid 的进程条目会被 SELinux 挡掉；
+     *   而 `LinuxProcessInspector` 对每个读不到的条目都是「跳过」
+     *   （`readLinuxStat` 吞异常返回 `undefined`），不会因此抛错。
+     *   代价是**只能看见自己 uid 的进程** —— 而终端 shell 及其子进程
+     *   恰好全是本 app 的 uid，正是需要观察的那部分。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败，届时日志里有提示）。
+     */
+    private fun patchProcessInspector() {
+        val dir = File(engineDir, "node_modules/@deepseek-ai/dsh-subprocess-local/lib")
+        if (!dir.isDirectory) {
+            Log.w(TAG, "未找到 subprocess-local，跳过进程检查器平台补丁")
+            return
+        }
+
+        // 实现体在一个带 hash 的 chunk 里（runner-launch-<hash>.js），名字随版本变，
+        // 所以按内容找而不是按文件名找。
+        // ⚠️ 必须先判「已打过补丁」再判「原文在不在」：打完之后原文就不存在了，
+        //    顺序反了会把已完成的状态误报成「未找到」。
+        val candidates = dir.listFiles { f -> f.isFile && f.name.startsWith("runner-launch-") && f.name.endsWith(".js") }
+            ?.toList().orEmpty()
+        val sources = candidates.map { it to it.readText() }
+        if (sources.any { (_, text) -> text.contains(INSPECTOR_ANDROID_ANCHOR) }) {
+            return
+        }
+        val entry = sources.firstOrNull { (_, text) -> text.contains(INSPECTOR_GUARD) }?.first
+        if (entry == null) {
+            Log.w(TAG, "未找到进程检查器的平台判断，跳过补丁")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            entry.writeText(source.replace(INSPECTOR_GUARD, INSPECTOR_ANDROID_ANCHOR))
+            Log.i(TAG, "已放行 subprocess-local 的 android 进程检查器: ${entry.name}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "放行 subprocess-local 的 android 进程检查器失败: ${t.message}")
+        }
+    }
+
+    /**
      * 让 `dsh-attachment-local` 的目录 fsync 容忍「祖先目录打不开」（幂等）。
      *
      * **症状**：图片/文件附件**上传成功**（缩略图都在），但点发送报
@@ -887,6 +1009,10 @@ class EngineManager private constructor(private val context: Context) {
         ensureRipgrep()
         // sharp：官方无 android 预编译二进制，缺了图片附件发送会以 agent-busy 失败
         ensureSharp()
+        // node-pty：官方 prebuilds 无 android，缺了侧栏终端打不开
+        ensureNodePty()
+        // 终端后端的进程检查器只认 linux/darwin/win32，android 要显式放行
+        patchProcessInspector()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
@@ -1126,6 +1252,29 @@ class EngineManager private constructor(private val context: Context) {
         private const val SHARP_ASSET = "sharp-wasm32.zip"
         private const val SHARP_WASM_PACKAGE = "@img/sharp-wasm32"
         private const val SHARP_VERSION = "0.35.5"
+
+        /** node-pty：官方 prebuilds 没有 android，自编译一份（见 `ensureNodePty()`）。 */
+        private const val NODE_PTY_ASSET = "node-pty-android-arm64.zip"
+
+        /**
+         * `dsh-subprocess-local` 里 `createProcessInspector()` 的平台判断原文，
+         * 以及放行 android 之后的文本。见 [patchProcessInspector]。
+         *
+         * ⚠️ 缩进是**一个制表符**，与官方发布件逐字一致。
+         * ⚠️ 文本里的 `${platform}` 是**引擎源码**里的模板插值，不是 Kotlin 的，
+         * 所以 `$` 必须转义成 `\$`，否则 Kotlin 会当成自己的变量去解析。
+         */
+        private const val INSPECTOR_GUARD =
+            "\tif (platform === \"win32\") return createWindowsProcessInspector();\n" +
+                "\tthrow new Error(`subprocess-local: terminal inspection is unsupported on platform \${platform}`);"
+        private const val INSPECTOR_ANDROID_ANCHOR =
+            "\tif (platform === \"win32\") return createWindowsProcessInspector();\n" +
+                "\t/* Android 就是 Linux 内核，/proc 格式一致，且 SYSCALLS 表里本来就有 arm64。\n" +
+                "\t   app 域下 /proc 目录可读，只是别的 uid 的条目会被 SELinux 挡掉 ——\n" +
+                "\t   LinuxProcessInspector 对读不到的条目一律跳过，不抛错。\n" +
+                "\t   代价是只能看见自己 uid 的进程，而终端 shell 及其子进程全是本 app 的 uid。 */\n" +
+                "\tif (platform === \"android\") return new LinuxProcessInspector(arch, internals);\n" +
+                "\tthrow new Error(`subprocess-local: terminal inspection is unsupported on platform \${platform}`);"
 
         /** 沙箱：runner（bwrap 方言翻译）+ LD_PRELOAD 写拦截器。 */
         private const val SANDBOX_RUNNER_ASSET = "boo-sandbox-run.bin"
