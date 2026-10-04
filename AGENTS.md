@@ -408,7 +408,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-4`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-5`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -687,6 +687,47 @@ let n=0; for (const sh of document.styleSheets){let rs;try{rs=sh.cssRules}catch(
 半屏白块，连「添加一个 API Key」对话框都被压住。
 
 同类隐患还有 `zGbnIq: ["title"]`。**加豁免前先确认该局部名是否唯一。**
+
+### ⚠️ 旧 hash 表里可能混着「官方仍在用」的 hash（改过，别退回去）
+
+**症状**：「执行了命令」这类**分组头被居中**（本该左对齐）；同类错位/溢出可能出现在别处。
+
+**根因**：`MP_LEGACY_HASHES` 是手写的「旧 hash → 局部名」表，但它**没有随引擎升级同步**。
+`bOPqQW`（composer 遥测药丸栏）既登记在表里，**又是官方当前仍在用的 hash** ——
+官方 `dsh-client-ui-chat/lib/client.js` 里 `.bOPqQW_root` 与 `.O_Ebla_root`
+**同时存在**，属于两个不同组件。
+
+而 `mpCollectCurrentClasses()` 原先**无条件**把登记过的 hash 从候选池剔除，于是
+`bOPqQW` 丢掉了自己的 4 票证据，转而去认领了恰好共享 `label` + `root` 两个局部名的
+**无关** hash `O_Ebla`（2 票，刚好够门槛）。结果 `O_Ebla_root` 被补上 `bOPqQW_root`，
+而后者官方定义带 `justify-content: center`：
+
+```css
+.bOPqQW_root{…;justify-content:center;gap:12px;display:flex}   /* 遥测药丸栏 */
+.O_Ebla_root{min-width:0}                                        /* 分组头 */
+.O_Ebla_title{…;text-align:left;…}                               /* 明确要求左对齐 */
+```
+
+于是 31 个分组头全部被居中。真机实测 `justify-content` 由 `normal` → `center`。
+
+**修法（三处，缺一不可）**：
+
+1. **样式表是唯一可信的「官方仍在用」判据**：`mpCollectCurrentClasses()` 现在同时返回
+   `pureHashes`（只来自样式表）。若某旧 hash 在 `pureHashes` 里 → **它没过期，跳过**，
+   不参与认领。
+2. **必须排除插件自己的样式表**（判据同 `injectStyles()` 的 `dataset.pluginCss`）：
+   插件 CSS 大量使用旧类名（如 `[data-mobile] .bOPqQW_root`），算进去的话所有旧 hash
+   都会被判为未过期，**桥接彻底失效**。
+3. **防止自我强化**：桥接补上去的类名记进 `mpAliasAdded`，DOM 采集时跳过它们 ——
+   否则下一轮推导会拿自己补的类名当官方证据，越套越偏。
+
+另外加了一道保险：**目标 hash 若自身也登记在旧表里，不许被认领**（它属于另一个组件）。
+
+⚠️ **别再往 `MP_LEGACY_HASHES` 里加官方当前仍在用的 hash。** 加之前先在
+`engine/node_modules/@deepseek-ai/dsh-client-ui-*/lib/client.js` 里
+`Select-String -SimpleMatch "<hash>_"` 搜一遍：**搜得到就说明它没过期，不该进这张表**。
+
+⚠️ 判据用**样式表**而不是 DOM：DOM 里的旧类名可能是桥接上一轮自己补的。
 
 ### 「+」菜单与键盘的时序（改过，别退回去）
 
