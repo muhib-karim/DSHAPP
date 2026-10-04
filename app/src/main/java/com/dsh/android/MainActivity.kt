@@ -6,6 +6,7 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
@@ -39,6 +40,15 @@ class MainActivity : AppCompatActivity() {
 
     /** 资产版本戳：改了引擎内容就改这里，App 会重新解包。 */
     private val assetStamp = "0.2.0-rc.2-1"
+
+    /**
+     * 最近一次已应用的页面底色。
+     *
+     * ⚠️ 由 `StatusBridge`（WebView 的 JS 线程）读写，必须 `@Volatile`；
+     * 用 String 而不是 Int 是为了能区分"还没收到过"（空串）和"收到过黑色"。
+     */
+    @Volatile
+    private var appliedBgHex = ""
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -184,14 +194,48 @@ class MainActivity : AppCompatActivity() {
      * 只有本地引擎会被加载进这个 WebView（`shouldOverrideUrlLoading` 把外链全丢给系统
      * 浏览器），所以不存在"第三方页面拿到这个接口"的风险。
      *
-     * ⚠️ 方法**运行在 WebView 的 JS 线程**上，不能碰 View；这里只转手给
-     * `EngineService.updateStatus()`，它内部只走 NotificationManager。
+     * ⚠️ 方法**运行在 WebView 的 JS 线程**上，不能碰 View；通知交给
+     * `EngineService.updateStatus()`（内部只走 NotificationManager），
+     * 底色则 `runOnUiThread` 切回主线程再设。
      */
     private inner class StatusBridge {
         @android.webkit.JavascriptInterface
         fun onStatus(json: String) {
-            EngineService.updateStatus(this@MainActivity, json)
+            val status = EngineStatus.parse(json) ?: return
+            EngineService.updateStatus(this@MainActivity, status)
+            // 只在底色真变了时才切主线程，避免每次状态刷新都白 post 一个任务
+            val bg = status.bg
+            if (bg.isNotEmpty() && bg != appliedBgHex) {
+                appliedBgHex = bg
+                runOnUiThread { applyPageBackground(bg) }
+            }
         }
+    }
+
+    /**
+     * 把页面实际底色同步到 WebView 与根容器，消除键盘升起时的异色闪块。
+     *
+     * **为什么会闪**：`adjustResize` 让窗口变矮是逐帧动画的，WebView 跟着变矮，
+     * 但页面重排要等下一帧 —— 这个空档里新露出的那条区域还没有内容覆盖，显示的
+     * 就是 WebView 自己的背景色。原先写死的 `#0F1115` 与官方白色页面不一致，
+     * 于是表现为"点输入框时下半屏先黑一下"。
+     *
+     * ⚠️ 颜色由页面上报，**不能写死**：官方主题可切换，写死只是把问题换个方向暴露。
+     * ⚠️ 必须在主线程调用（`runOnUiThread`）。
+     */
+    private fun applyPageBackground(bg: String) {
+        val color = try {
+            Color.parseColor(bg)
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "忽略非法页面底色: $bg")
+            return
+        }
+        binding.webView.setBackgroundColor(color)
+        // 根容器一起改：覆盖层隐藏与 WebView 首次绘制之间露出的就是它
+        binding.root.setBackgroundColor(color)
+        // 窗口底色也跟上：DecorView 与 WebView 是两层独立的合成，窗口缩小时
+        // 两层各自的 Surface 更新并不同步，只改一层仍可能露出一帧旧色
+        window.setBackgroundDrawable(ColorDrawable(color))
     }
 
     /**

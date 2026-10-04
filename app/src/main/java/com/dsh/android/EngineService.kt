@@ -172,10 +172,11 @@ class EngineService : Service() {
          *
          * 状态没变化时直接返回：通知栏不闪、不耗电。
          */
-        fun updateStatus(context: Context, json: String) {
+        fun updateStatus(context: Context, status: EngineStatus) {
             if (!alive) return
-            val status = EngineStatus.parse(json) ?: return
-            if (status == lastStatus) return
+            // ⚠️ `bg` 只影响窗口底色（由 MainActivity 单独应用），**不参与通知去重**：
+            //   主题切换时通知内容一个字都没变，不该因此白发一次通知。
+            if (lastStatus?.copy(bg = "") == status.copy(bg = "")) return
             lastStatus = status
             val nm = NotificationManagerCompat.from(context)
             if (!nm.areNotificationsEnabled()) return
@@ -286,6 +287,12 @@ data class EngineStatus(
     val body: String,
     /** 会话标题，用作通知副标题。 */
     val title: String,
+    /**
+     * 页面实际背景色（`#RRGGBB`），用于对齐 WebView / 容器 / 窗口的底色。
+     *
+     * 只影响窗口底色，不影响通知内容 —— 所以 `updateStatus()` 比较时把它排除。
+     */
+    val bg: String,
 ) {
     companion object {
         /**
@@ -301,6 +308,7 @@ data class EngineStatus(
                 text = o.optString("text", ""),
                 body = o.optString("body", ""),
                 title = o.optString("title", ""),
+                bg = o.optString("bg", ""),
             )
         } catch (t: Throwable) {
             Log.w(DshApplication.TAG, "状态上报解析失败: ${t.message}")

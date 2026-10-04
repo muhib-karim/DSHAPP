@@ -408,7 +408,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-11`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-12`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -643,6 +643,27 @@ adb shell pidof com.dsh.android     # 拿 pid，再用它建 CDP 转发
 adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
 # 期望：hasBridge=true，primaryLabel 与通知里的 ●/○ 一致
 ```
+
+#### 顺带解决：键盘升起时下半屏先闪一块深色
+
+**症状**：点输入框，键盘还没完全升起时，中间有几帧屏幕下半部分是纯黑的占位区域，
+随后才被键盘填充。**不是加载慢**，是底色不一致。
+
+**根因**：`adjustResize` 让窗口变矮是**逐帧动画**的，WebView 跟着变矮，但页面重排要等
+下一帧 —— 这个空档里新露出的那条区域还没有内容覆盖，显示的是 **WebView 自己的背景色**。
+原先三处写死 `#0F1115`（`MainActivity.kt` 的 `setBackgroundColor`、`activity_main.xml`
+的 FrameLayout、`themes.xml` 的 `windowBackground`），而官方页面是白底，于是深色块闪出来。
+
+**做法**：插件把 `document.body`（透明则退到 `html`）的计算色转成 `#RRGGBB`
+（`mpPageBackground()`）搭车同一个状态 JSON 上报，原生侧 `applyPageBackground()`
+在**主线程**把 WebView + 根容器 + 窗口背景一起改成该色。
+
+⚠️ **不能写死白色**：官方主题可切换，写死只是把问题换到深色模式下重新暴露。
+⚠️ **三处都要改**：DecorView 与 WebView 是两层独立合成，窗口缩小时各自的 Surface
+更新不同步，只改一层仍可能露出一帧旧色。
+⚠️ **`bg` 不参与通知去重**（`updateStatus()` 里 `copy(bg = "")` 再比）——
+主题切换时通知内容一个字没变，不该白发一次通知。
+⚠️ 只在底色**真变了**时才 `runOnUiThread`，否则每次状态刷新都白 post 一个任务。
 
 ⚠️ **只做前台服务是不够的**：前台服务只保证进程活着，锁屏后 CPU 仍会 suspend，
 长任务照样断。两件事必须一起做。

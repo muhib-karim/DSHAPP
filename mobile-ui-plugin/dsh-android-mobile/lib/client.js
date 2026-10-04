@@ -2932,6 +2932,34 @@ window.__ModuleLoader__.load({
 			return "";
 		}
 
+		// 页面实际背景色（`#RRGGBB`），用来让原生侧把 WebView / 容器 / 窗口的底色对齐。
+		//
+		// 为什么必须上报：`adjustResize` 让窗口变矮是**逐帧动画**的，WebView 跟着变矮，
+		// 但页面重排要等下一帧 —— 这个空档里新露出的那条区域还没有内容覆盖，
+		// 显示的就是 WebView 自己的背景色。底色若与页面不一致，就会看到一条异色块
+		// （深色底 + 浅色页面 = 用户实测的"点输入框时下半屏先黑一下"）。
+		//
+		// ⚠️ 不能写死颜色：官方主题可切换，写死只是把问题换个方向暴露。
+		// ⚠️ 输出 `#RRGGBB` 而不是 computed style 的 `rgb(...)`：Android 的
+		//   `Color.parseColor` 原生就吃这个格式，省掉在 Kotlin 里再写一套 CSS 颜色解析。
+		function mpPageBackground() {
+			// body 透明时往上找 html；都透明才退回白。
+			for (const el of [document.body, document.documentElement]) {
+				if (!el) continue;
+				const bg = getComputedStyle(el).backgroundColor || "";
+				const m = /^rgba?\(([^)]+)\)$/.exec(bg);
+				if (!m) continue;
+				const parts = m[1].split(",").map((s) => parseFloat(s));
+				if (parts.length < 3 || parts.some((n) => !isFinite(n))) continue;
+				// 完全透明 ⇒ 继续往上找（rgba(0,0,0,0) 是"没设背景"的常见表示）
+				if (parts.length === 4 && parts[3] === 0) continue;
+				const hex = (n) => Math.max(0, Math.min(255, Math.round(n)))
+					.toString(16).padStart(2, "0").toUpperCase();
+				return "#" + hex(parts[0]) + hex(parts[1]) + hex(parts[2]);
+			}
+			return "#FFFFFF";
+		}
+
 		function mpCollectStatus() {
 			const running = mpIsEngineRunning();
 			const { activity, text } = mpCurrentActivity();
@@ -2942,6 +2970,7 @@ window.__ModuleLoader__.load({
 				text: text,
 				body: mpTailAssistantText(400),
 				title: title,
+				bg: mpPageBackground(),
 			};
 		}
 
