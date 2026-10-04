@@ -3,10 +3,13 @@ package com.dsh.android
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
@@ -47,7 +50,38 @@ class MainActivity : AppCompatActivity() {
 
         setupWebView()
         observeEngine()
+        // 前台服务要在引擎启动前拉起：它同时是「进程不被回收」和 WakeLock 的持有者，
+        // 晚一步的话，引擎刚起就切后台仍可能被系统盯上。
+        EngineService.start(this)
+        ensureBatteryExempt()
         bootEngine()
+    }
+
+    /**
+     * 把本 App 加进「忽略电池优化」白名单。
+     *
+     * 前台服务 + WakeLock 只解决 Android 原生框架的回收，**国产 ROM 另有一套后台冻结**
+     * （华为的「应用启动管理」、OPPO 的「耗电保护」），息屏几分钟就把进程冻住，
+     * 长任务照样断。这个白名单是唯一由系统认可的免冻结标记，且必须由用户手动确认。
+     *
+     * 只在**尚未豁免**时弹一次，已豁免则静默返回，不反复打扰。
+     */
+    private fun ensureBatteryExempt() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            Log.i(DshApplication.TAG, "已在电池优化白名单中")
+            return
+        }
+        // 没有该 Activity 的 ROM（部分定制系统）会抛 ActivityNotFoundException
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    .setData(Uri.parse("package:$packageName"))
+            )
+            Log.i(DshApplication.TAG, "已请求加入电池优化白名单")
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "无法请求电池优化白名单: ${t.message}")
+        }
     }
 
     private fun setupWebView() = with(binding.webView) {

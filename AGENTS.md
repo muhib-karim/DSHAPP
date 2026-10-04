@@ -581,6 +581,46 @@ $cxx = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\
 设备实测：绑定加载成功，`pty.spawn(bash)` 起得来，写入 `echo PTY_WORKS_$((6*7))`
 能收到 `PTY_WORKS_42` 回显。
 
+## 后台保活（任务切到后台不能断）
+
+引擎跑在本进程里，所以「App 切后台任务还能继续」= 让本进程既**不被回收**又**不被冻结**。
+两层缺一不可：
+
+| 层 | 手段 | 解决什么 |
+|---|---|---|
+| 系统回收 | `EngineService` 前台服务 + 常驻通知 | oom_adj 钉在前台档，内存压力下不被杀 |
+| CPU 休眠 | `PARTIAL_WAKE_LOCK`（`dsh:engine`） | 锁屏后 CPU 不进 suspend，node 事件循环/定时器/网络回调继续跑 |
+| ROM 冻结 | 电池优化白名单 | 华为「应用启动管理」/ OPPO「耗电保护」息屏几分钟就冻进程 |
+
+⚠️ **只做前台服务是不够的**：前台服务只保证进程活着，锁屏后 CPU 仍会 suspend，
+长任务照样断。两件事必须一起做。
+
+⚠️ **WakeLock 刻意不带超时**（`@SuppressLint("WakelockTimeout")`）。带超时的话到期会
+**静默释放**，任务跑到一半 CPU 就被允许休眠了。生命周期由服务自己管：
+`onCreate` 拿、`onDestroy` 放，服务在则锁在；进程被杀时内核自动释放，不会漏。
+`setReferenceCounted(false)` 保证重复 `acquire()` 不会留下需要等次数的计数。
+
+⚠️ **电池优化白名单是唯一由系统认可的免冻结标记**，且**必须用户手动确认**，
+App 只能拉起系统对话框。`MainActivity.ensureBatteryExempt()` 在**尚未豁免**时才弹，
+已豁免则静默返回，不反复打扰。国产 ROM 上不做这一步，前两层做得再对也会被冻住。
+
+⚠️ `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 在 Google Play 上受政策限制，**本项目侧载分发，
+不受该限制**。不要因为「上架合规」把它删掉。
+
+排查手法（数值证据，别靠猜）：
+
+```powershell
+# 前台服务在不在
+adb shell dumpsys activity services com.dsh.android | Select-String EngineService
+# WakeLock 持没持有
+adb shell dumpsys power | Select-String "dsh:engine"
+#   → mLock:... PARTIAL_WAKE_LOCK 'dsh:engine' ACQ=... (uid=... pid=...)
+# 进程优先级（0 = 前台档）
+adb shell "cat /proc/<pid>/oom_score_adj"
+# 电池优化白名单
+adb shell dumpsys deviceidle whitelist | Select-String dsh
+```
+
 ## 移动端 UI 插件
 
 源码在 `mobile-ui-plugin/dsh-android-mobile/`，打包成 `assets/mobile-ui.zip`。
