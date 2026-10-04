@@ -47,10 +47,8 @@ class BootAnimationView @JvmOverloads constructor(
 ) : View(context, attrs, defStyleAttr) {
 
     // ── 配色（与图标同源）────────────────────────────────────────────
-    private val cDeepBlue = Color.parseColor("#122B76")
     private val cBrightBlue = Color.parseColor("#3A7BD6")
     private val cCyan = Color.parseColor("#C0F0F0")
-    private val cPink = Color.parseColor("#FEE6EA")
 
     /** 进度环底衬（极淡，表达"这里会显示进度"而不制造"卡住了"的错觉）。 */
     private val cTrack = Color.parseColor("#1E2A44")
@@ -110,6 +108,14 @@ class BootAnimationView @JvmOverloads constructor(
     /** 光环的渐变刷子；尺寸确定后重建一次。 */
     private var ringShader: Shader? = null
 
+    /**
+     * 每帧旋转光环 shader 用的矩阵。
+     *
+     * ⚠️ 复用同一个对象，**不要每帧 new** —— 这跑在 onDraw 里，
+     *   每帧分配会在 GC 时造成可见的掉帧。
+     */
+    private val ringMatrix = Matrix()
+
     init {
         // 硬件层：整块是渐变 + 模糊，交给 GPU 合成比软件绘制省电
         setLayerType(LAYER_TYPE_HARDWARE, null)
@@ -132,47 +138,96 @@ class BootAnimationView @JvmOverloads constructor(
     }
 
     /**
-     * 光环用 `SweepGradient` 做「亮 → 透明」的渐隐，这样弧的两端不会突然断掉。
+     * 光环用 `SweepGradient` 做「两端渐隐」——弧的头尾都淡到透明，
+     * 这样它转起来不会有硬边，观感是"划过"而不是"跳出来又消失"。
      *
-     * 两个必须做对的细节（都踩过）：
-     *  1. positions 要按 `ringSpan/360` 压缩进弧的跨度，否则最亮那点落在弧外；
-     *  2. 配旋转矩阵把渐变起点挪到 12 点方向（`SweepGradient` 默认从 3 点开始），
-     *     否则弧头永远停在右边，看起来像画歪了。
+     * ⚠️ **这里曾经有个导致撕裂感的真 bug，改动前务必读这段。**
+     *   原实现用 `Matrix().setRotate(-90f, cx, cy)` 把渐变起点挪到 12 点方向，
+     *   而 `Canvas.drawArc` 的 startAngle **本来就是从 3 点方向起算的** ——
+     *   两者错开 90°。更糟的是 stop 位置被按 `ringSpan/360` 压缩到了 0.21 以内，
+     *   于是整条弧（画在渐变坐标 0.21 之外）全部落进 clamp 区，渲染成**纯色**。
+     *
+     *   真机截图的角向亮度剖面坐实了这一点（`f1.png`，0°=3 点、顺时针）：
+     *     264°:255  270°:252  …  12°:235  18°:110  30°:107  36°:47
+     *   整条弧从头到尾恒定 255，尾部 20° 内直坠、头部 6° 内从 50 跳到 255
+     *   —— 两端都是硬切，根本没有渐隐。
+     *
+     * 正解：**两个角度基准必须一致**。`drawArc` 从 3 点起算，那渐变也从 3 点起算，
+     * 即**不做任何旋转**。stop 的位置按整圈 360° 的比例给出。
      */
     private fun buildRingShader(w: Int, h: Int) {
         val cx = w / 2f
         val cy = h / 2f
-        // ⚠️ SweepGradient 铺满**整圈 360°**，而弧只占 ringSpan（96°）。
-        //   所以要把渐变的位置按 ringSpan/360 压缩到弧的跨度内 ——
-        //   否则「最亮」那一点落在弧之外，弧本身只有很淡的一段（真机实测如此）。
-        val k = ringSpan / 360f
-        val colors = intArrayOf(
-            Color.TRANSPARENT,
-            withAlpha(cDeepBlue, 0x99),
-            withAlpha(cBrightBlue, 0xE6),
-            cCyan,
-        )
-        val raw = floatArrayOf(0f, 0.3f, 0.7f, 1f)
-        val positions = FloatArray(raw.size) { i ->
-            // 最后一点要落在 1.0 之前一点点，否则渐变末端会绕回起点造成硬边
-            (raw[i] * k).coerceAtMost(0.9999f)
+
+        // alpha 沿弧长 t 的分布：两端各渐隐 42%、中间实心。
+        // 刻意做成**对称**的 —— 双弧对转没有单一方向，两端对称才不会读出一个假方向。
+        val edge = 0.42f
+        fun fade(t: Float): Float = when {
+            t < edge -> smoothStep(t / edge)
+            t > 1f - edge -> smoothStep((1f - t) / edge)
+            else -> 1f
         }
-        val g = SweepGradient(cx, cy, colors, positions)
-        val m = Matrix()
-        m.setRotate(-90f, cx, cy)
-        g.setLocalMatrix(m)
-        ringShader = g
+
+        // ⚠️ 一个 shader 同时描述**两段**弧，这样每帧只需旋转一次矩阵。
+        //   若改成每段各转一次，就要两次 setLocalMatrix —— 能跑，但没必要。
+        //   两段在渐变坐标里分别占 [0, span/360] 与 [0.5, 0.5+span/360]，
+        //   中间与末尾都是"全透明"，所以两段之间以及回绕处都不会出现硬边。
+        val n = 4                                   // 每段 5 个采样点
+        val colors = IntArray((n + 1) * 2)
+        val positions = FloatArray((n + 1) * 2)
+        var k = 0
+        for (seg in 0 until 2) {
+            val segStart = seg * ringGap / 360f      // 0 或 0.5
+            for (i in 0..n) {
+                val t = i.toFloat() / n
+                val a = (fade(t) * 255f).toInt().coerceIn(0, 255)
+                // 颜色沿弧长：尾部亮蓝 → 头部青白，与图标同源。
+                colors[k] = withAlpha(lerpColor(cBrightBlue, cCyan, t), a)
+                // ⚠️ stop 的 position 是**整圈 360° 的比例**，不是弧长的比例。
+                positions[k] = (segStart + t * ringSpan / 360f).coerceAtMost(0.9999f)
+                k++
+            }
+        }
+
+        // ⚠️ **不在这里旋转**。每帧由 onDraw 按当前 ringHead 设 localMatrix ——
+        //   shader 是静止的，而 drawArc 的 startAngle 在变，必须让 shader 跟着转，
+        //   否则弧会画到渐变的透明区里（这正是之前撕裂感的来源）。
+        ringShader = SweepGradient(cx, cy, colors, positions)
+    }
+
+    /** 两个颜色之间线性插值，t ∈ [0,1]。 */
+    private fun lerpColor(from: Int, to: Int, t: Float): Int {
+        val u = t.coerceIn(0f, 1f)
+        val a = (Color.alpha(from) + (Color.alpha(to) - Color.alpha(from)) * u).toInt()
+        val r = (Color.red(from) + (Color.red(to) - Color.red(from)) * u).toInt()
+        val g = (Color.green(from) + (Color.green(to) - Color.green(from)) * u).toInt()
+        val b = (Color.blue(from) + (Color.blue(to) - Color.blue(from)) * u).toInt()
+        return Color.argb(a, r, g, b)
+    }
+
+    /** 平滑阶跃 3t²−2t³，让渐隐的两端没有可见的折点。 */
+    private fun smoothStep(x: Float): Float {
+        val t = x.coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
     }
 
     /** 给颜色套一个 alpha（0..255）。 */
     private fun withAlpha(color: Int, alpha: Int): Int =
         (color and 0x00FFFFFF) or (alpha shl 24)
 
-    /** 光环的头部角度（度）。 */
+    /** 光环的头部角度（度，0 = 3 点方向，顺时针为正）。 */
     private var ringHead = 0f
 
-    /** 光环扫过的角度。 */
-    private val ringSpan = 96f
+    /**
+     * 单段弧扫过的角度。
+     *
+     * 双弧对转：两段等长弧相位差 180°。76° 是权衡出来的 ——
+     * 再长两段就快连成一圈（失去"两段"的辨识度），再短则显得单薄。
+     */
+    private val ringSpan = 76f
+
+    /** 双弧相位差。 */
+    private val ringGap = 180f
 
     override fun onDraw(canvas: Canvas) {
         val cx = width / 2f
@@ -209,13 +264,26 @@ class BootAnimationView @JvmOverloads constructor(
             ringPaint.shader = null
         }
 
-        // ── 4. 旋转光环（外圈，叠在最上层）──────────────────────────
+        // ── 4. 旋转光环（外圈，双弧对转，叠在最上层）────────────────
         //
         // 无进度阶段（引擎启动 / 加载界面 / 插件激活）**只画它**：
         // 那几段没有真实进度，画静态底环会被读成"进度满了"，语义正好相反。
+        //
+        // ⚠️ 关键：shader 是**静止**的（描述"相对弧起点"的 alpha 分布），
+        //   而 drawArc 的 startAngle 每帧在变。所以每帧都要把 shader 按 ringHead
+        //   旋转同样的角度，让渐变跟着弧走。**漏掉这一步就是之前撕裂感的来源** ——
+        //   弧跑到渐变的透明/clamp 区里，渲染成两端硬切的纯色。
+        //
+        //   旋转中心用 (cx, cy)，与 SweepGradient 的构造中心一致。
+        ringMatrix.setRotate(ringHead, cx, cy)
+        ringShader?.setLocalMatrix(ringMatrix)
+
+        // 两段弧共用同一个 shader：shader 里已经分别描述了 [0,span] 与 [0.5,0.5+span]
+        // 两段，旋转 ringHead 之后正好与下面两次 drawArc 一一对应。
         rect.set(cx - ringR, cy - ringR, cx + ringR, cy + ringR)
         ringPaint.shader = ringShader
         canvas.drawArc(rect, ringHead, ringSpan, false, ringPaint)
+        canvas.drawArc(rect, ringHead + ringGap, ringSpan, false, ringPaint)
         ringPaint.shader = null
     }
 
