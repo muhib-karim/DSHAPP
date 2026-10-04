@@ -1729,16 +1729,32 @@ window.__ModuleLoader__.load({
 		let mpAliasDirty = true;
 		let mpAliasSig = '';   // 上次生效的映射指纹，用于去重日志与重扫
 
-		/** 采集当前存在的全部 `{hash}_{local}` 类名。 */
+		/** 桥接自己补上去的旧类名。用来防止「自我强化」，见 [mpCollectCurrentClasses]。 */
+		const mpAliasAdded = new Set();
+
+		/**
+		 * 采集当前存在的全部 `{hash}_{local}` 类名。
+		 *
+		 * 返回两套证据：
+		 *   · `byHash`     —— 样式表 + DOM 的并集，用于投票；
+		 *   · `pureHashes` —— **只来自样式表**的 hash 集合。
+		 *
+		 * ⚠️ 为什么要区分这两者（2026-10-04 踩的坑）：桥接会把旧类名**补到 DOM 元素**上，
+		 *   若把这些补上去的类名也算作证据，下一轮推导就会「自己证明自己」，越套越偏。
+		 *   样式表是官方产物、桥接从不写入，所以它是唯一可信的
+		 *   「官方当前仍在用这个 hash」判据。
+		 */
 		function mpCollectCurrentClasses() {
 			const byHash = {};
-			const add = (cls) => {
+			const pureHashes = {};
+			const add = (cls, pure) => {
 				// ⚠️ hash 字符集必须含 "-" 与 "_"，且可能以下划线开头
 				//   （官方实测形如 ZTP-Xa、n_2Q3W、pI_x6G、_0gBrGq）。
 				const mm = /^([A-Za-z0-9_][A-Za-z0-9_-]{2,13})_([A-Za-z][A-Za-z0-9]*)$/.exec(cls);
 				if (!mm) return;
-				// 跳过旧 hash：那些是本桥接自己补上去的，收进来会自我强化。
-				if (MP_LEGACY_HASHES[mm[1]]) return;
+				if (pure) pureHashes[mm[1]] = true;
+				// 跳过桥接自己补的类名：它们不是官方证据
+				if (!pure && mpAliasAdded.has(cls)) return;
 				(byHash[mm[1]] || (byHash[mm[1]] = {}))[mm[2]] = true;
 			};
 			// ① 全部样式表（含尚未挂载组件的规则 —— 拿到完整类名域的关键）
@@ -1746,19 +1762,26 @@ window.__ModuleLoader__.load({
 				let rules;
 				try { rules = sheet.cssRules; } catch (e) { continue; }
 				if (!rules) continue;
+				/* ⚠️ 必须跳过**插件自己**的样式表：本插件的 CSS 大量使用旧类名
+				 *   （如 `[data-mobile] .bOPqQW_root`），若把它当作「官方仍在用」的
+				 *   证据，所有旧 hash 都会被判为未过期，桥接彻底失效。
+				 *   判据同 injectStyles() 打的标记。 */
+				const owner = sheet.ownerNode;
+				if (owner && owner.dataset &&
+					owner.dataset.pluginCss === "dsh-android-mobile/main.css") continue;
 				const walk = (rs) => {
 					for (const r of rs) {
 						if (r.cssRules) { walk(r.cssRules); continue; }
 						const sel = r.selectorText;
 						if (!sel) continue;
-						for (const mm of sel.matchAll(/\.(-?[A-Za-z0-9][A-Za-z0-9_-]*)/g)) add(mm[1]);
+						for (const mm of sel.matchAll(/\.(-?[A-Za-z0-9][A-Za-z0-9_-]*)/g)) add(mm[1], true);
 					}
 				};
 				try { walk(rules); } catch (e) { /* 单条异常不影响其余 */ }
 			}
-			// ② DOM
-			for (const el of document.querySelectorAll('[class]')) for (const cls of el.classList) add(cls);
-			return byHash;
+			// ② DOM（pure=false：其中的旧类名可能是桥接自己补的，不能当证据）
+			for (const el of document.querySelectorAll('[class]')) for (const cls of el.classList) add(cls, false);
+			return { byHash, pureHashes };
 		}
 
 		/**
@@ -1782,12 +1805,23 @@ window.__ModuleLoader__.load({
 		 *   用「当前 hash」直接定位（见 mpCurrentHash 相关辅助）。
 		 */
 		function mpDeriveAliasMap() {
-			const cur = mpCollectCurrentClasses();
+			const { byHash: cur, pureHashes } = mpCollectCurrentClasses();
 			const owners = {};
 			for (const h of Object.keys(cur)) for (const l of Object.keys(cur[h])) (owners[l] || (owners[l] = [])).push(h);
 			const map = {};
 			const used = {};
 			for (const [oldHash, locals] of Object.entries(MP_LEGACY_HASHES)) {
+				/* ⚠️ 官方样式表里仍有这个 hash ⇒ 它**没有过期**，不能拿它去认领别人。
+				 *
+				 * 2026-10-04 踩的坑：`bOPqQW`（composer 遥测药丸）既登记在旧表里，
+				 * 又是官方当前仍在用的 hash。原逻辑无条件把它从候选池剔除，于是它
+				 * 丢掉了自己的 4 票证据，转而去认领了恰好共享 `label` + `root` 两个
+				 * 局部名的**无关** hash `O_Ebla`（2 票，刚好够门槛）——
+				 * 而 `O_Ebla_root` 是「执行了命令」分组头，`bOPqQW_root` 带
+				 * `justify-content: center`，于是那行标题被居中、不再左对齐。
+				 *
+				 * 判据用样式表而非 DOM：DOM 里的旧类名可能是桥接上一轮自己补的。 */
+				if (pureHashes[oldHash]) continue;
 				const votes = {};
 				for (const l of locals) for (const h of (owners[l] || [])) votes[h] = (votes[h] || 0) + 1;
 				const ranked = Object.entries(votes).sort((a, b) => b[1] - a[1]);
@@ -1796,6 +1830,9 @@ window.__ModuleLoader__.load({
 				if (ranked.filter(([, v]) => v === hit).length > 1) continue;
 				/* 只认证据充分的映射：至少 2 个局部名同时命中同一个新 hash */
 				if (hit < 2) continue;
+				/* 该新 hash 若自身也在旧表里登记过（即它也是官方当前 hash），
+				 * 说明它属于另一个组件，不该被认领。 */
+				if (MP_LEGACY_HASHES[bestHash]) continue;
 				if (used[bestHash]) continue;
 				used[bestHash] = true;
 				map[oldHash] = bestHash;
@@ -1827,7 +1864,11 @@ window.__ModuleLoader__.load({
 			if (el.nodeType !== 1 || !el.classList) return;
 			for (const cls of el.classList) {
 				const alias = mpPairIndex.get(cls);
-				if (alias !== undefined && !el.classList.contains(alias)) el.classList.add(alias);
+				if (alias !== undefined && !el.classList.contains(alias)) {
+					el.classList.add(alias);
+					// 记下来：这是桥接自己补的，下一轮推导不能拿它当官方证据
+					mpAliasAdded.add(alias);
+				}
 			}
 		}
 
