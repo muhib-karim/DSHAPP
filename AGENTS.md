@@ -408,7 +408,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-12`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-13`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -664,6 +664,66 @@ adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
 ⚠️ **`bg` 不参与通知去重**（`updateStatus()` 里 `copy(bg = "")` 再比）——
 主题切换时通知内容一个字没变，不该白发一次通知。
 ⚠️ 只在底色**真变了**时才 `runOnUiThread`，否则每次状态刷新都白 post 一个任务。
+
+#### 修复 65：键盘升起时输入框被盖住（原生预判 + 高度自学习）
+
+**症状**：点输入框后键盘从屏幕底部升起，但输入框要等约 200ms 才跳上去，
+中间几帧被键盘压住（用户实测反馈）。
+
+**真机实测**（Huawei CDY-TN90 / Android 10，各 2~3 轮一致）：
+
+| 测量项 | 结果 |
+|---|---|
+| focus → 窗口变矮 | **180~220ms** |
+| 期间窗口高度变化 | `764 → 475`，**只有 1 个 resize 事件、无中间帧** |
+| `visualViewport` vs `innerHeight` | **同一时刻**变化，没有更早的信号 |
+| `navigator.virtualKeyboard.boundingRect` | 恒为 `0`（该内核不提供几何信息） |
+| 主线程最长阻塞 | 76~85ms（不足以解释这 200ms） |
+
+**根因**：这 200ms 内页面**拿不到任何"键盘现在多高"的信息**，只能干等窗口变矮。
+逐帧 insets 回调要 API 30 的 `WindowInsetsAnimation`，本机（API 29）没有。
+**这是平台行为，不是插件或主线程的问题。**
+
+**做法**：**提前告诉原生"键盘要来了"**。页面 `focusin`（点击那一刻）走已有的
+`DSHAndroid` 桥通知原生，原生按**上次实测的键盘高度**先把 WebView 变矮
+（`bottomMargin`），真 insets 到达后归零、交还给 `adjustResize`。
+
+```
+页面 focusin ──onImeWillShow()──► MainActivity.applyImePrejudge()
+                                     └─ setWebViewBottomMargin(缓存的键盘高度)
+真 insets 到 ──onLayoutChangeListener──► 归零 margin + 保存这次实测高度
+700ms 仍无 insets ──► restoreFromPrejudge("超时未见 insets")
+```
+
+⚠️ **要"学"的不是延迟，是高度。** 延迟是系统动画的固有节奏，我们"点击瞬间立即执行"
+就天然覆盖了它，不用学；真正因机器/输入法而异的是**键盘有多高**（本机实测 867 物理 px）。
+⚠️ **高度必须持久化**（`SharedPreferences` 名 `dsh_ime`）。只放内存的话每次冷启动
+都会丢掉，症状变成"每次开机第一次点输入框都要闪一下"。
+⚠️ **横竖屏分开存**（`ime_height_port` / `ime_height_land`）：横屏键盘更矮，
+共用一份会让转屏后预判缩错高度。
+⚠️ **判据不能用 `getWindowVisibleDisplayFrame()`**：`adjustResize` 下窗口本身已被缩小，
+可见区域恒等于窗口高度，算出来永远是 0。改用「静止高度 − 当前根视图高度」
+（`restHeightPx` 取历史最大值；键盘只会让内容区变矮、不会变高），
+与插件侧已验证的 `restVh` 是同一套判据。
+⚠️ **宽度变化（转屏）必须重置 `restHeightPx`**：否则拿竖屏的"历史最大高度"去减横屏的
+当前高度，会得到一个巨大的"隐藏高度"被**误判成键盘可见**。
+⚠️ **不要在 `onLayoutChangeListener` 里写「布局变化但键盘不可见就撤销预判」**：
+预判自己改 `layoutParams` 会让根视图重新布局并触发该回调，那时键盘必然还不可见，
+一撤销就等于预判从未生效。真正的"点了输入框但键盘没弹"由 700ms 超时兜底。
+
+**已知代价**（如实记录，不是缺陷）：
+- 冷启动后**第一次**点输入框仍会闪一下（还没有缓存值），闪完就学到了。
+- 换输入法（键盘高度变了）会有一次轻微错位跳动，随后自愈。
+
+**验收手法**（数值证据）：
+
+```powershell
+# 第一次点输入框（无缓存）→ 只应有"已学习并保存"
+# 第二次起 → 应看到"键盘预判：提前缩矮 <N>px" 和"键盘预判结束（真 insets 已到 …）"
+adb logcat -d -s DSH:I | Select-String "键盘预判|键盘高度已学习"
+# 缓存落盘了没
+adb shell run-as com.dsh.android cat shared_prefs/dsh_ime.xml
+```
 
 ⚠️ **只做前台服务是不够的**：前台服务只保证进程活着，锁屏后 CPU 仍会 suspend，
 长任务照样断。两件事必须一起做。

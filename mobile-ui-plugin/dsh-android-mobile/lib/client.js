@@ -2999,6 +2999,44 @@ window.__ModuleLoader__.load({
 			const t = window.setInterval(mpReportStatus, 5000);   // 兜底：DOM 静默变化时也能纠正
 			return () => window.clearInterval(t);
 		}
+
+		// ══ 修复 65：键盘升起时输入框被盖住（原生预判）════════════════════
+		// 现象：点输入框后，键盘从屏幕底部升起来，但输入框要等约 200ms 才跳上去，
+		//      中间这几帧输入框被键盘压住。
+		//
+		// 真机实测（Huawei CDY-TN90 / Android 10，各 2~3 轮一致）：
+		//   · focus → 窗口变矮 = 180~220ms
+		//   · 期间窗口高度 764 → 475，**只有 1 个 resize 事件、无中间帧**
+		//   · visualViewport 与 innerHeight **同一时刻**变化，没有更早的信号
+		//   · navigator.virtualKeyboard.boundingRect 恒为 0（该内核不提供几何信息）
+		//   · 主线程最长阻塞 76~85ms，不足以解释这 200ms
+		// → 这 200ms 里页面**拿不到任何"键盘现在多高"的信息**，只能等窗口变矮。
+		//   这是平台行为（逐帧 insets 回调要 API 30 的 WindowInsetsAnimation），
+		//   不是插件或主线程的问题。
+		//
+		// 修法：**提前告诉原生"键盘要来了"**。`focusin` 发生在点击那一刻，
+		//   必然早于窗口变矮。原生收到后按**上一次观测到的键盘高度**先把
+		//   WebView 变矮，等真 insets 到达再交回给系统。
+		//
+		// ⚠️ 这里只负责"通知"，不猜高度 —— 高度由原生实测缓存（每台机器、
+		//   每种输入法都不同，写死必错）。
+		// ⚠️ 只认输入框本体。用 `focusin` 的捕获阶段，保证在任何 stopPropagation 之前。
+		function setupImePrejudge() {
+			if (!mpIsMobile()) return () => {};   // 仅移动端（桌面无软键盘）
+			const onFocusIn = (e) => {
+				try {
+					const t = e.target;
+					if (!t || typeof t.closest !== "function") return;
+					// 只认 composer 的编辑区；点「+」等按钮抢焦点不该触发
+					if (!t.closest("[data-composer-input]")) return;
+					const bridge = window.DSHAndroid;
+					if (!bridge || typeof bridge.onImeWillShow !== "function") return;
+					bridge.onImeWillShow();
+				} catch (err) { /* 静默：绝不打断输入 */ }
+			};
+			document.addEventListener("focusin", onFocusIn, true);
+			return () => document.removeEventListener("focusin", onFocusIn, true);
+		}
 		// ══ 修复 35：轨迹详情面板「首 token 时间不可用」回填（2026-09-16 啾灵反馈）══
 		// 现象：轨迹页点开任意一条历史数据，「首 token 延迟 / 生成 / 吞吐量」三行全显示
 		//      「首 token 时间不可用」（实时流式时是有的，落盘后再回看就没了）。
@@ -3624,6 +3662,7 @@ window.__ModuleLoader__.load({
 			document.addEventListener("click", onSessionRowClick, true);
 			const disposePressFeedback = setupPressFeedback();
 			const disposeStatusBridge = mpInstallStatusBridge();
+			const disposeImePrejudge = setupImePrejudge();   /* 修复 65 */
 			mo.observe(document.body, { childList: true, subtree: true, characterData: true });
 			// 启动爆发：apply() 执行时 React 尚未挂载，而 observer 有 300ms 节流，
 			// 导致顶栏会话标题出现偏慢。前 ~1.2s 内主动补 10 轮（120ms 间隔），
@@ -3644,6 +3683,7 @@ window.__ModuleLoader__.load({
 				document.removeEventListener("click", onSessionRowClick, true);
 				disposePressFeedback();
 				disposeStatusBridge();
+				disposeImePrejudge();
 				window.clearInterval(t);
 				window.clearInterval(mpBootBurstTimer);
 				disposeKeyboardGuard();

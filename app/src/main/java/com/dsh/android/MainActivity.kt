@@ -5,14 +5,18 @@ import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -50,6 +54,172 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var appliedBgHex = ""
 
+    // ══ 修复 65：键盘升起时输入框被盖住 ══════════════════════════════════
+    // 现象：点输入框后键盘从底部升起，但输入框要等约 200ms 才跳上去，
+    //      中间几帧被键盘压住。
+    //
+    // 真机实测（Huawei CDY-TN90 / Android 10，各 2~3 轮一致）：
+    //   · focus → 窗口变矮 = 180~220ms
+    //   · 期间窗口高度 764 → 475，**只有 1 个 resize、无中间帧**
+    //   · visualViewport 与 innerHeight 同一时刻变化；没有更早的页面信号
+    //   · navigator.virtualKeyboard.boundingRect 恒为 0
+    // → 这 200ms 内页面拿不到键盘高度，只能干等窗口变矮。
+    //   逐帧 insets 回调要 API 30 的 WindowInsetsAnimation，本机（API 29）没有。
+    //
+    // 修法：页面在 `focusin`（点击那一刻，必然早于 insets）通知原生，
+    //   原生按**上次实测的键盘高度**先把 WebView 变矮；真 insets 到达后校正并
+    //   顺手把这次的实测高度记下来。所以是「预判 + 自学习」：
+    //   高度因机器/输入法而异，不写死；第一次没有缓存值，仍会闪一下。
+
+    /**
+     * 上一次实测的键盘高度（px）。0 = 还没有缓存值，此时不做预判。
+     *
+     * ⚠️ 必须**持久化**（见 `loadImeHeight` / `saveImeHeight`）：只放内存的话，
+     *   App 每次冷启动都会丢掉，于是"每次开机第一次点输入框都要闪一下"。
+     */
+    @Volatile
+    private var lastImeHeightPx = 0
+
+    /** 是否处于「预判缩矮」状态（此时 WebView 被手动改过 bottomMargin）。 */
+    private var imePrejudging = false
+
+    /**
+     * 静止时的根视图高度（px），取历史最大值。
+     *
+     * 键盘只会让内容区变矮、不会变高，所以"历史最大"就是无键盘时的全高。
+     * 与插件侧 `setupKeepFocusGuard` 的 `restVh` 是同一套判据（那里已真机验证）。
+     */
+    private var restHeightPx = 0
+
+    /** 上一次看到的根视图宽度（px）；用于转屏时重置 `restHeightPx` 并换一份缓存。 */
+    private var lastRootWidthPx = 0
+
+    /** 预判兜底：超时仍未等到真 insets（说明键盘其实没弹）就恢复原状。 */
+    private val imeHandler = Handler(Looper.getMainLooper())
+    private val imeRestoreRunnable = Runnable { restoreFromPrejudge("超时未见 insets") }
+
+    /**
+     * 键盘高度缓存的 key。
+     *
+     * ⚠️ 竖屏与横屏的键盘高度不同（横屏键盘更矮），必须分开存，
+     *   否则转屏后预判会缩错高度。
+     */
+    private fun imePrefsKey(): String =
+        if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            "ime_height_land"
+        } else {
+            "ime_height_port"
+        }
+
+    private fun loadImeHeight() {
+        val v = getSharedPreferences(IME_PREFS, MODE_PRIVATE).getInt(imePrefsKey(), 0)
+        lastImeHeightPx = if (v > 0) v else 0
+    }
+
+    private fun saveImeHeight(px: Int) {
+        if (px <= 0) return
+        getSharedPreferences(IME_PREFS, MODE_PRIVATE).edit().putInt(imePrefsKey(), px).apply()
+    }
+
+    /**
+     * 页面通知「输入框即将获得焦点」——这是比键盘 insets 更早的信号。
+     *
+     * ⚠️ 运行在 WebView 的 JS 线程，必须切主线程再碰 View。
+     */
+    private fun onImeWillShow() {
+        runOnUiThread { applyImePrejudge() }
+    }
+
+    /**
+     * 用缓存高度提前把 WebView 缩矮，抵消「窗口变矮滞后约 200ms」造成的遮挡。
+     *
+     * 只改 WebView 的 `bottomMargin`，**不动窗口本身** —— 等真 insets 到达时
+     * `adjustResize` 会正常缩小窗口，我们把 margin 归零即可无缝交接。
+     */
+    private fun applyImePrejudge() {
+        if (imePrejudging) return
+        val cached = lastImeHeightPx
+        if (cached <= 0) return              // 还没学到高度：第一次只能让它闪
+        if (currentImeHeightPx() > 0) return // 键盘已经在了：不用预判
+        imePrejudging = true
+        setWebViewBottomMargin(cached)
+        Log.i(DshApplication.TAG, "键盘预判：提前缩矮 ${cached}px")
+        imeHandler.removeCallbacks(imeRestoreRunnable)
+        imeHandler.postDelayed(imeRestoreRunnable, IME_PREJUDGE_TIMEOUT_MS)
+    }
+
+    /** 退出预判状态，把 WebView 的 margin 还给系统布局。 */
+    private fun restoreFromPrejudge(reason: String) {
+        imeHandler.removeCallbacks(imeRestoreRunnable)
+        if (!imePrejudging) return
+        imePrejudging = false
+        setWebViewBottomMargin(0)
+        Log.i(DshApplication.TAG, "键盘预判结束（$reason）")
+    }
+
+    private fun setWebViewBottomMargin(px: Int) {
+        val lp = binding.webView.layoutParams
+        if (lp is ViewGroup.MarginLayoutParams && lp.bottomMargin != px) {
+            lp.bottomMargin = px
+            binding.webView.layoutParams = lp
+        }
+    }
+
+    /**
+     * 当前键盘占用的高度（px）；0 = 键盘不可见。
+     *
+     * ⚠️ **不能**用 `getWindowVisibleDisplayFrame()`：`adjustResize` 下窗口本身
+     *   已经被缩小，可见区域始终等于窗口高度，算出来恒为 0。
+     *   这里改用「静止高度 − 当前高度」，与插件侧已验证的判据一致。
+     */
+    private fun currentImeHeightPx(): Int {
+        if (restHeightPx <= 0) return 0
+        val hidden = restHeightPx - binding.root.height
+        return if (hidden > IME_VISIBLE_THRESHOLD_PX) hidden else 0
+    }
+
+    /**
+     * 监听根视图高度变化 —— 这就是 `adjustResize` 下"键盘来了"的唯一可靠信号。
+     *
+     * 真机实测：无键盘 764、键盘弹起 475（各 2~3 轮一致，且只有 1 次跳变）。
+     */
+    private fun observeImeInsets() {
+        binding.root.addOnLayoutChangeListener { v, _, top, _, bottom, _, oldTop, _, oldBottom ->
+            val h = bottom - top
+            val oldH = oldBottom - oldTop
+            if (h <= 0) return@addOnLayoutChangeListener
+
+            // ⚠️ 转屏时宽度也变，而"历史最大高度"是竖屏的，会算出一个巨大的
+            //   「隐藏高度」被误判成键盘可见。宽度一变就重新起算，
+            //   并换用该朝向的键盘高度缓存（横竖屏键盘高度不同）。
+            val w = v.width
+            if (w != lastRootWidthPx) {
+                lastRootWidthPx = w
+                restHeightPx = h
+                loadImeHeight()
+                return@addOnLayoutChangeListener
+            }
+            if (h > restHeightPx) restHeightPx = h
+
+            val ime = currentImeHeightPx()
+            if (ime > 0) {
+                // 自学习：记下这台机器 + 当前输入法的真实高度，并**落盘**
+                if (ime != lastImeHeightPx) {
+                    lastImeHeightPx = ime
+                    saveImeHeight(ime)
+                    Log.i(DshApplication.TAG, "键盘高度已学习并保存: ${ime}px")
+                }
+                // 真 insets 到了：把预判设的 margin 交还给系统
+                //（不归零的话 WebView 会比窗口再矮一截）
+                if (imePrejudging) restoreFromPrejudge("真 insets 已到 ${oldH}→${h}")
+            }
+            // ⚠️ 这里**故意不写**「布局变化但 ime==0 就撤销预判」的分支：
+            //   预判自己改 WebView 的 layoutParams 会让根视图重新布局并触发本回调，
+            //   那种情况下 ime 必然为 0，一撤销就等于预判从未生效。
+            //   真正的"点了输入框但键盘没弹"由 IME_PREJUDGE_TIMEOUT_MS 兜底。
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,9 +227,11 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         engine = EngineManager.get(this)
+        loadImeHeight()   // 修复 65：把上次学到的键盘高度取回来（跨冷启动有效）
 
         setupWebView()
         observeEngine()
+        observeImeInsets()   // 修复 65：键盘高度自学习 + 预判交接
         // 前台服务要在引擎启动前拉起：它同时是「进程不被回收」和 WakeLock 的持有者，
         // 晚一步的话，引擎刚起就切后台仍可能被系统盯上。
         EngineService.start(this)
@@ -210,6 +382,16 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { applyPageBackground(bg) }
             }
         }
+
+        /**
+         * 输入框即将获得焦点 —— 比键盘 insets 早约 200ms 的信号（见修复 65）。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程，`onImeWillShow()` 内部会切主线程。
+         */
+        @android.webkit.JavascriptInterface
+        fun onImeWillShow() {
+            this@MainActivity.onImeWillShow()
+        }
     }
 
     /**
@@ -321,6 +503,28 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         // 引擎跟随进程存活，这里不停止，避免转屏/重建时反复冷启动。
+        imeHandler.removeCallbacks(imeRestoreRunnable)
         super.onDestroy()
+    }
+
+    private companion object {
+        /** 键盘高度缓存的 SharedPreferences 文件名。 */
+        const val IME_PREFS = "dsh_ime"
+
+        /**
+         * 判定"键盘可见"的阈值（px）。
+         *
+         * 真机实测键盘高 289 CSS px × 3 = 867 物理 px，取 150 留足余量：
+         * 只用来区分"有键盘"和"没键盘"，不参与高度计算。
+         */
+        const val IME_VISIBLE_THRESHOLD_PX = 150
+
+        /**
+         * 预判兜底超时（ms）。
+         *
+         * 实测真 insets 在 180~220ms 到达。取 700ms：即便本次点输入框没弹键盘
+         * （比如只做选择操作），也不会让 WebView 长时间保持错误高度。
+         */
+        const val IME_PREJUDGE_TIMEOUT_MS = 700L
     }
 }
