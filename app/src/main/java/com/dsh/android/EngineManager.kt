@@ -1383,6 +1383,24 @@ class EngineManager private constructor(private val context: Context) {
         // 一变就永久失效。监听本身由系统 mdnsd 承担，开销可忽略。
         if (adbWireless != null) {
             WirelessDebugging.startWatcher(context, File(dshHome, WirelessDebugging.PORT_FILE))
+            // 启动自愈：重启手机后 5555 会消失（`persist.adb.tcp.port` 写不进去），
+            // 这里顺手切一次，省掉「用户得自己点一下切到固定端口」这一步。
+            // 已在监听时直接返回，无额外开销；失败也不影响任何通道。
+            val adbHomeRef = adbWireless
+            val runnerRef = privRunner
+            if (runnerRef != null) {
+                Thread {
+                    runCatching {
+                        WirelessDebugging.ensureTcpPort(
+                            context = context,
+                            nodeBin = bootstrap.nodeBinary,
+                            runner = runnerRef,
+                            adbHome = adbHomeRef,
+                            dshHome = dshHome,
+                        )
+                    }.onFailure { Log.w(TAG, "启动自动切固定端口失败: ${it.message}") }
+                }.start()
+            }
         }
 
         val proc = try {
@@ -1484,7 +1502,28 @@ class EngineManager private constructor(private val context: Context) {
         // 配对成功后立刻发现一次连接端口并落盘，这样用户不必再等常驻监听
         // 撞上「无线调试已开启」那一刻。失败也无所谓，监听器会补上。
         if (result.ok) {
-            WirelessDebugging.discoverConnectPort(context, File(dshHome, WirelessDebugging.PORT_FILE))
+            val fresh = WirelessDebugging.discoverConnectPort(
+                context,
+                File(dshHome, WirelessDebugging.PORT_FILE),
+            )
+            // ⚠️ runner 在 `--pair` 里已经自己切过一次，但**那一次用的是配对前的
+            // 旧端口**：无线调试在配对过程中会重启 adbd，端口随之改变，于是
+            // `adb -s 127.0.0.1:<旧端口> tcpip 5555` 必然失败，用户看到「配对成功
+            // 但身份还是 app」。这里拿着**刚发现的新端口**补切一次，把那条缝补上。
+            //
+            // 已经切成 5555 时 `switchToTcp` 是幂等的（先探 legacy，通就返回 true），
+            // 所以重复调用没有代价。
+            if (fresh > 0) {
+                val switched = WirelessDebugging.switchToTcp(
+                    nodeBin = bootstrap.nodeBinary,
+                    runner = runner,
+                    adbHome = adbHome,
+                    dshHome = dshHome,
+                )
+                if (!switched.ok) {
+                    Log.w(TAG, "配对成功但补切固定端口失败: ${switched.message}")
+                }
+            }
         }
         return result
     }
@@ -1639,7 +1678,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-22"
+        private const val MOBILE_UI_VERSION = "1.0.0-25"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────

@@ -46,6 +46,14 @@ class AdbMdns(
     private val serviceType: String,
     /** 解析到有效端口时回调。常驻监听靠它把端口写出去。 */
     private val onFound: (Int) -> Unit = {},
+    /**
+     * 之前解析到的那个服务**消失**时回调（典型场景：用户关掉无线调试开关）。
+     *
+     * 常驻监听靠它清掉过期的端口文件 —— 少了这一步，设置页会拿着一个早已
+     * 没人监听的端口显示绿灯（真机实测撞到过：无线调试关着，界面却报
+     * 「无线端口 35589」）。
+     */
+    private val onLost: () -> Unit = {},
 ) {
 
     private val nsdManager: NsdManager = context.getSystemService(NsdManager::class.java)
@@ -87,6 +95,12 @@ class AdbMdns(
 
         override fun onServiceLost(info: NsdServiceInfo) {
             Log.i(DshApplication.TAG, "[mdns] 服务消失 ${info.serviceName}")
+            // 服务消失 = 端口大概率已经没了（无线调试被关掉时就是这个信号）。
+            // 必须先清掉本地缓存的端口与落盘文件，否则设置页会拿着一个
+            // 早已没人监听的端口显示绿灯。
+            port = -1
+            runCatching { onLost() }
+                .onFailure { Log.w(DshApplication.TAG, "[mdns] onLost 回调失败: ${it.message}") }
         }
     }
 

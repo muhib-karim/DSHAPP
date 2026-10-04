@@ -35,6 +35,7 @@
 
 import { spawn } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -62,6 +63,35 @@ const TAG = '[dsh-adb]';
 
 /** runner 回落成 app 身份时的 stderr 文案（原因在中文括号里）。 */
 const FALLBACK_RE = /uid 2000 不可用（(.+?)）/;
+
+/**
+ * 端口是否**真的在监听**。
+ *
+ * 判据与 Kotlin 侧 `AdbMdns.isPortInUse()` 同构，但方向相反、更适合这里：
+ * 那边是「bind 失败 = adbd 在听」，这边直接 **connect 一次**——无线调试的
+ * TLS 端口接受 TCP 连接（TLS 握手之后才发生），连得上就说明 adbd 真的在听。
+ *
+ * ⚠️ **不能只看端口文件里有没有值**：无线调试一关，`onServiceLost` 未必来得及
+ * 清文件（进程可能已被冻结），文件里的陈旧端口会让设置页显示绿灯。真机实测
+ * 撞到过：无线调试关着、35589 早已没人监听，界面却报「无线端口 35589」。
+ *
+ * @param {number} port - 待验证的端口。
+ * @returns {Promise<boolean>} 是否有人监听。
+ */
+function portAlive(port) {
+	return new Promise((resolve) => {
+		const sock = net.connect({ host: '127.0.0.1', port });
+		const done = (ok) => {
+			sock.removeAllListeners();
+			sock.destroy();
+			resolve(ok);
+		};
+		sock.setTimeout(700);
+		sock.on('connect', () => done(true));
+		sock.on('error', () => done(false));
+		sock.on('timeout', () => done(false));
+	});
+}
 
 /**
  * 引擎的 `$DSH_HOME`。
@@ -243,16 +273,25 @@ async function probe() {
 
 	// 无线调试（Android 11+）的端口：由 Kotlin 侧的 `NsdManager` 发现后写入
 	// `$DSH_HOME/adb-wireless-port`。Node 侧读不到也发不出 mDNS（SELinux 挡组播），
-	// 所以这里只读文件，不做任何探测 —— 文件不在就说明无线调试没开。
+	// 所以这里只读文件，不做任何发现 —— 文件不在就说明无线调试没开。
+	//
+	// ⚠️ **但读到的值必须再验一次「端口是否真的在监听」**：文件可能是陈旧的
+	// （无线调试关了、`onServiceLost` 没来得及清）。只信文件会让设置页显示
+	// 一个早已死掉的端口，还点着绿灯。详见 portAlive()。
 	//
 	// 格式 `<connect端口> [<配对端口>]`，见 assets/dsh-android-shell.mjs。
-	snapshot.wireless = { connect: null, pairing: null };
+	snapshot.wireless = { connect: null, pairing: null, stale: null };
 	try {
 		const raw = (await readFile(path.join(home, 'adb-wireless-port'), 'utf8')).trim();
 		const [c, p] = raw.split(/\s+/);
 		const connect = Number.parseInt(c, 10);
 		const pairing = Number.parseInt(p, 10);
-		if (Number.isInteger(connect) && connect > 0) snapshot.wireless.connect = connect;
+		if (Number.isInteger(connect) && connect > 0) {
+			if (await portAlive(connect)) snapshot.wireless.connect = connect;
+			// 文件里有值、端口却没人听 —— 这是「无线调试已关」的确凿证据，
+			// 交给 UI 说明为什么绿灯没了（否则用户会以为是检测坏了）。
+			else snapshot.wireless.stale = connect;
+		}
 		if (Number.isInteger(pairing) && pairing > 0) snapshot.wireless.pairing = pairing;
 	} catch {
 		// 文件不存在 = 无线调试没开或还没发现，属于正常情况

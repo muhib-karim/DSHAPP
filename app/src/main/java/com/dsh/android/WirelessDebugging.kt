@@ -35,6 +35,9 @@ object WirelessDebugging {
     /** 端口文件名，相对 `$DSH_HOME`。Node 侧按同名读取。 */
     const val PORT_FILE = "adb-wireless-port"
 
+    /** 切过去的固定 TCP 端口，与 `dsh-android-shell.mjs` 的 `PORT` 必须一致。 */
+    const val DEFAULT_TCP_PORT = 5555
+
     private const val TAG = DshApplication.TAG
 
     /** 常驻监听器；null 表示未启动。 */
@@ -48,7 +51,14 @@ object WirelessDebugging {
      */
     fun startWatcher(context: Context, portFile: File) {
         if (watcher != null) return
-        val mdns = AdbMdns(context, AdbMdns.TLS_CONNECT) { port -> writePort(portFile, port) }
+        val mdns = AdbMdns(
+            context = context,
+            serviceType = AdbMdns.TLS_CONNECT,
+            onFound = { port -> writePort(portFile, port) },
+            // 服务消失（用户关了无线调试开关）→ 立刻清掉端口文件。
+            // 不清的话设置页会一直拿着那个死端口显示绿灯。
+            onLost = { writePort(portFile, -1) },
+        )
         watcher = mdns
         mdns.start()
     }
@@ -57,6 +67,53 @@ object WirelessDebugging {
     fun stopWatcher() {
         watcher?.stop()
         watcher = null
+    }
+
+    /**
+     * 启动时自愈：5555 不在听、但无线调试可用 → 自动切一次固定端口。
+     *
+     * ## 为什么需要它
+     *
+     * `persist.adb.tcp.port` 写不进去（SELinux 拒绝），所以**重启手机后 5555 会消失**。
+     * runner 里的「通道 1.5」只在模型调 `shell` 时才自愈 —— 用户打开设置页看到的是
+     * 「身份变成 app 身份」，却不知道点一下「切到固定端口」就能修好。
+     *
+     * 这里在引擎启动时顺手补一次，让「重启后要手动点一下」这个前提消失。
+     *
+     * ⚠️ **阻塞调用**（最多约 10 秒：发现端口 + 切换 + 轮询就绪），必须在线程里调。
+     * 失败不影响任何东西 —— legacy 通道、无线通道、app 身份都照旧。
+     *
+     * @return 是否真的切成功（已经是固定端口时也算成功）。
+     */
+    fun ensureTcpPort(
+        context: Context,
+        nodeBin: File,
+        runner: File,
+        adbHome: File,
+        dshHome: File,
+    ): Result {
+        val portFile = File(dshHome, PORT_FILE)
+        // 5555 已经在听就什么都不用做 —— 幂等，且避免每次启动都白跑一遍。
+        if (isPortListening(DEFAULT_TCP_PORT)) {
+            Log.i(TAG, "固定端口 $DEFAULT_TCP_PORT 已在监听，无需切换")
+            return Result(true, "固定端口已在监听")
+        }
+        // 没有无线调试端口就无从下手（切 tcpip 必须先有一条活连接）。
+        val discovered = discoverConnectPort(context, portFile, timeoutMs = 3000)
+        if (discovered <= 0) {
+            return Result(false, "无线调试不可用，跳过自动切换")
+        }
+        return switchToTcp(nodeBin, runner, adbHome, dshHome)
+    }
+
+    /** 本地回环端口是否有人监听（`bind` 失败 = 有人在听，与 [AdbMdns] 同判据）。 */
+    private fun isPortListening(port: Int): Boolean = try {
+        java.net.ServerSocket().use {
+            it.bind(java.net.InetSocketAddress("127.0.0.1", port), 1)
+            false
+        }
+    } catch (_: java.io.IOException) {
+        true
     }
 
     /**

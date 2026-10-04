@@ -3735,8 +3735,19 @@ window.__ModuleLoader__.load({
 			wlPortNone: "未发现（无线调试可能没开）",
 			wlNote: "与上面的电脑引导二选一即可。无线调试那条路更省事，但只在 Android 11 及以上可用；Android 10 只能用电脑引导。",
 			wlTcp: "切到固定端口",
-			wlTcpHint: "建议切一下：无线调试的端口每次重启都会变，而且你一关无线调试开关它立刻就断。切到固定端口后就都不受影响了（关无线调试、关 Wi-Fi 都不断）。重启手机后需要再切一次。",
+			wlTcpHint: "切到固定端口后就不依赖无线调试开关了 —— 关无线调试、关 Wi-Fi 都不断。重启手机后会自动重切，通常不用管。",
 			wlNoBridge: "当前环境没有原生的配对入口（DSHAndroid 桥不可用），无法发起配对。",
+			wlPortStale: "已失效（无线调试可能已关）",
+			recommended: "推荐",
+			pcTitle: "改用电脑引导（Android 10 或没有无线调试时）",
+			pcIntro: "如果系统里找不到「无线调试」（Android 10 及以下），或者无线调试一直配不上，可以插上数据线用电脑引导一次。",
+			setupTitle: "开启引导（当前已就绪，一般不用看）",
+			showDetails: "查看详情",
+			hideDetails: "收起详情",
+			nextAllGood: "已就绪，可以直接用了。",
+			nextPairHint: "还差一步：点右边按钮完成无线调试配对。",
+			nextSwitchHint: "建议切到固定端口，这样关掉无线调试开关也不会断。",
+			nextChoose: "还没开启。按下面「无线调试」那几步走一遍即可，不用电脑。",
 		};
 		const MP_PRIV_EN = {
 			nav: "Privileged access",
@@ -3793,8 +3804,19 @@ window.__ModuleLoader__.load({
 			wlPortNone: "Not found (wireless debugging may be off)",
 			wlNote: "Use either this or the computer-based guide above. Wireless debugging is easier but only exists on Android 11+; on Android 10 only the computer route works.",
 			wlTcp: "Switch to fixed port",
-			wlTcpHint: "Recommended: the wireless debugging port changes on every reboot, and toggling wireless debugging off drops the connection instantly. After switching to a fixed port neither affects it (works with wireless debugging off and Wi-Fi off). Re-run once after a reboot.",
+			wlTcpHint: "After switching to a fixed port the channel no longer depends on the wireless debugging toggle — turning wireless debugging or Wi-Fi off will not break it. It re-switches automatically after a reboot.",
 			wlNoBridge: "The native pairing entry point is unavailable in this environment (the DSHAndroid bridge is missing), so pairing cannot be started.",
+			wlPortStale: "Stale (wireless debugging may be off)",
+			recommended: "Recommended",
+			pcTitle: "Use the computer-based guide instead (Android 10, or no wireless debugging)",
+			pcIntro: "If there is no \"Wireless debugging\" entry in system settings (Android 10 and below), or pairing keeps failing, connect a USB cable and run the computer-based guide once.",
+			setupTitle: "Setup guide (already enabled — normally not needed)",
+			showDetails: "Show details",
+			hideDetails: "Hide details",
+			nextAllGood: "Ready to use.",
+			nextPairHint: "One step left: tap the button to finish wireless pairing.",
+			nextSwitchHint: "Switching to a fixed port is recommended so turning wireless debugging off will not break it.",
+			nextChoose: "Not enabled yet. Follow the \"Wireless debugging\" steps below — no computer needed.",
 		};
 
 		// 全内联样式：设置 dialog 里的既有教训是「匹配 dialog 的 CSS 规则会把弹窗
@@ -3828,6 +3850,29 @@ window.__ModuleLoader__.load({
 			notes: { margin: 0, padding: "0 0 0 18px", display: "flex", flexDirection: "column", gap: "6px" },
 			note: { fontSize: "12px", lineHeight: "18px", color: "var(--dsw-alias-label-tertiary, #888)" },
 			error: { margin: 0, fontSize: "12px", lineHeight: "18px", color: "#c92a2a" },
+
+			// ── 重设计后新增 ────────────────────────────────────────
+			// 首屏「下一步」块：把「点哪里」摆在结论正下方，用户不必自己从
+			// 三行技术明细里翻译出该做什么。
+			stack: { display: "flex", flexDirection: "column", gap: "12px" },
+			summary: { margin: 0, fontSize: "13px", lineHeight: "19px" },
+			next: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", padding: "9px 10px", borderRadius: "8px", background: "var(--dsw-alias-interactive-bg-hover, #f2f2f2)" },
+			nextText: { flex: "1 1 160px", minWidth: 0, fontSize: "13px", lineHeight: "19px" },
+			actions: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" },
+			// 主按钮：整页只有「配对」和「下一步」用实心，避免到处都在喊。
+			btnPrimary: { border: "0.5px solid transparent", background: "var(--dsw-alias-interactive-bg-primary, #2b6cb0)", color: "#fff", font: "inherit", fontSize: "13px", fontWeight: 600, padding: "6px 14px", borderRadius: "8px", cursor: "pointer" },
+			// 次要动作（取消配对 / 查看详情）用弱化样式，和主按钮拉开层级。
+			btnQuiet: { border: "0.5px solid transparent", background: "transparent", color: "var(--dsw-alias-label-tertiary, #888)", font: "inherit", fontSize: "13px", padding: "6px 10px", borderRadius: "8px", cursor: "pointer" },
+			details: { display: "flex", flexDirection: "column", gap: "8px", paddingTop: "4px", borderTop: "0.5px solid var(--dsw-alias-border-l2, #eee)" },
+			// 折叠块：引导与注意事项默认收起，让首屏只剩结论。
+			fold: { border: "0.5px solid var(--dsw-alias-border-l2, #e2e2e2)", borderRadius: "10px", padding: "10px 14px" },
+			foldHead: { fontSize: "14px", fontWeight: 600, cursor: "pointer" },
+			foldBody: { display: "flex", flexDirection: "column", gap: "12px", paddingTop: "10px" },
+			// ⚠️ 这里**不能**引用 `MP_PRIV_TONE` —— 它定义在本对象**之后**，
+			// 在模块求值期引用会抛 `Cannot access 'MP_PRIV_TONE' before
+			// initialization`（整个插件 import 失败、界面直接白屏，踩过一次）。
+			// 所以颜色写死，与 MP_PRIV_TONE.on 保持一致。
+			tagRecommended: { marginLeft: "auto", fontSize: "11px", fontWeight: 600, padding: "2px 8px", borderRadius: "999px", color: "#2f9e44", background: "rgba(47,158,68,0.12)", whiteSpace: "nowrap" },
 		};
 
 		const MP_PRIV_TONE = {
@@ -3925,6 +3970,49 @@ window.__ModuleLoader__.load({
 				: state.phase === "error" ? t("failed")
 					: identityOk ? t("statusOn") : t("statusOff");
 
+			// 当前通道 —— 只有固定端口那条**不依赖无线调试开关**，所以要显式区分，
+			// 否则用户看到「已开启」也不知道关了开关会不会断。
+			const channel = data && data.identity ? data.identity.channel : "none";
+			const channelText = channel === "legacy" ? t("chStable")
+				: channel === "wireless" ? t("chWireless") : "";
+
+			// 「下一步该做什么」—— 由当前状态推出来，摆在首屏。
+			// 用户不该为了知道点哪里而读完全部卡片。
+			const keyReady = !!(data && data.key
+				&& (data.key.origin === "imported" || data.key.origin === "paired"));
+			let next = null;
+			if (data) {
+				if (identityOk) {
+					next = channel === "wireless"
+						? { text: t("nextSwitchHint"), action: "switchTcp", label: t("wlTcp") }
+						: { text: t("nextAllGood"), action: null };
+				} else if (data.key && data.key.origin === "generated") {
+					next = { text: t("nextPairHint"), action: "pair", label: t("wlPair") };
+				} else if (keyReady) {
+					next = { text: t("nextSwitchHint"), action: "switchTcp", label: t("wlTcp") };
+				} else {
+					next = { text: t("nextChoose"), action: null };
+				}
+			}
+
+			// 两个原生动作都要走 JS 桥 —— 配对码得经通知栏输入，而通知是 Android
+			// 的能力，Node 侧（宿主半的 HTTP 路由）够不到。
+			const doAction = (action) => {
+				const b = window.DSHAndroid;
+				const fn = action === "pair" ? "startWirelessPairing"
+					: action === "switchTcp" ? "switchToTcpMode" : null;
+				if (fn === null) return;
+				if (!b || typeof b[fn] !== "function") { window.alert(t("wlNoBridge")); return; }
+				b[fn]();
+			};
+
+			// 无线端口三态：真的在听 / 文件里有值但端口已死 / 没发现。
+			// ⚠️ 中间那态以前会显示成绿灯（只查文件在不在），真机撞到过 ——
+			// 无线调试关着、35589 早已没人监听，界面却报「无线端口 35589」。
+			const wlPort = data && data.wireless ? data.wireless.connect : null;
+			const wlStale = data && data.wireless ? data.wireless.stale : null;
+			const [showDetails, setShowDetails] = React.useState(false);
+
 			const rows = [];
 			if (data) {
 				rows.push({
@@ -3940,7 +4028,6 @@ window.__ModuleLoader__.load({
 				//   null              → 灰点，**来源未知**（标记文件是后加的，
 				//                       老安装的密钥没有它，无法回溯推断）
 				// 未知时**故意不猜**成「已导入」—— 那正是这次要修的误报。
-				const keyReady = data.key.origin === "imported" || data.key.origin === "paired";
 				rows.push({
 					key: "key", label: t("rowKey"), ok: keyReady,
 					warn: data.key.ok && data.key.origin === "generated",
@@ -3995,15 +4082,45 @@ window.__ModuleLoader__.load({
 				e("li", { key: 2, style: S.step }, t("step3"), cmdBlock(t("cmd3"))),
 				e("li", { key: 3, style: S.step }, t("step4")),
 			];
-			return e("div", { style: S.section },
-				e("h2", { style: S.heading }, t("title")),
-				e("p", { style: S.intro }, t("intro")),
 
-				e("div", { style: S.card },
-					e("div", { style: S.cardHead },
-						e("h3", { style: S.cardTitle }, t("statusTitle")),
-						e("span", { style: { ...S.badge, color: MP_PRIV_TONE[tone].color, background: MP_PRIV_TONE[tone].bg } }, badgeText),
-					),
+			// ── 首屏：结论 + 下一步 ────────────────────────────────
+			// 原来的首屏是一张「执行通道 / ADB 密钥 / 实际身份」的技术表格，
+			// 用户得自己把三行翻译成「我现在能不能用、不能的话点哪里」。
+			// 现在把结论摆在最上面，明细折进「查看详情」。
+			const head = e("div", { style: S.card },
+				e("div", { style: S.cardHead },
+					e("h3", { style: S.cardTitle }, t("statusTitle")),
+					e("span", { style: { ...S.badge, color: MP_PRIV_TONE[tone].color, background: MP_PRIV_TONE[tone].bg } }, badgeText),
+				),
+				// 已开启时把「走哪条通道」直接写在结论下面 —— 这是用户唯一需要
+				// 知道的运行期事实（关无线调试/关 Wi-Fi 会不会断）。
+				identityOk && channelText
+					? e("p", { style: S.summary }, channelText)
+					: null,
+				next ? e("div", { style: S.next },
+					e("span", { style: S.nextText }, next.text),
+					next.action ? e("button", {
+						type: "button",
+						style: S.btnPrimary,
+						onClick: () => doAction(next.action),
+					}, next.label) : null,
+				) : null,
+				state.phase === "error" ? e("p", { style: S.error }, state.message) : null,
+				e("div", { style: S.actions },
+					e("button", {
+						type: "button",
+						style: S.btn,
+						disabled: state.phase === "loading",
+						onClick: refresh,
+					}, state.phase === "loading" ? t("checking") : t("recheck")),
+					data ? e("button", {
+						type: "button",
+						style: S.btnQuiet,
+						onClick: () => setShowDetails((v) => !v),
+					}, showDetails ? t("hideDetails") : t("showDetails")) : null,
+				),
+				// 明细：定位问题时才需要，默认收起。
+				showDetails && data ? e("div", { style: S.details },
 					rows.map((row) => e("div", { key: row.key, style: S.row },
 						e("span", {
 							style: {
@@ -4017,89 +4134,91 @@ window.__ModuleLoader__.load({
 						e("span", { style: S.rowLabel }, row.label),
 						e("span", { style: S.rowValue }, row.value),
 					)),
-					state.phase === "error" ? e("p", { style: S.error }, state.message) : null,
-					e("div", null, e("button", {
+				) : null,
+			);
+
+			// ── 无线调试（推荐路径，Android 11+）──────────────────
+			// 放在电脑引导**之前**：它的前提（Android 11+）比电脑引导更窄，
+			// 但它是绝大多数用户该走的那条 —— 不用电脑、不用数据线。
+			const wlCard = e("div", { style: S.card },
+				e("div", { style: S.cardHead },
+					e("h3", { style: S.cardTitle }, t("wlTitle")),
+					e("span", { style: S.tagRecommended }, t("recommended")),
+				),
+				e("p", { style: S.intro }, t("wlIntro")),
+				e("ol", { style: S.steps }, [
+					e("li", { key: 0, style: S.step }, t("wlStep1")),
+					e("li", { key: 1, style: S.step }, t("wlStep2")),
+					e("li", { key: 2, style: S.step }, t("wlStep3")),
+					e("li", { key: 3, style: S.step }, t("wlStep4")),
+				]),
+				// 无线端口是「有没有发现到」的最直接证据 —— 没有它，
+				// 用户只能靠「配对按钮点了没反应」来猜，无从下手。
+				// 三态：真的在听（绿）/ 文件里有值但端口已死（灰，说明无线调试关了）/
+				// 没发现（灰）。中间那态以前会误报成绿灯。
+				data ? e("div", { style: S.row },
+					e("span", {
+						style: {
+							...S.dot,
+							background: wlPort ? MP_PRIV_TONE.on.color
+								: wlStale ? MP_PRIV_TONE.unknown.color : MP_PRIV_TONE.off.color,
+						},
+					}),
+					e("span", { style: S.rowLabel }, t("wlPort")),
+					e("span", { style: S.rowValue }, wlPort ? String(wlPort)
+						: wlStale ? t("wlPortStale") : t("wlPortNone")),
+				) : null,
+				e("div", { style: S.cmdRow },
+					e("button", {
+						type: "button",
+						style: S.btnPrimary,
+						onClick: () => doAction("pair"),
+					}, t("wlPair")),
+					e("button", {
 						type: "button",
 						style: S.btn,
-						disabled: state.phase === "loading",
-						onClick: refresh,
-					}, state.phase === "loading" ? t("checking") : t("recheck"))),
+						onClick: () => doAction("switchTcp"),
+					}, t("wlTcp")),
+					e("button", {
+						type: "button",
+						style: S.btnQuiet,
+						onClick: () => {
+							const bridge = window.DSHAndroid;
+							if (bridge && typeof bridge.cancelWirelessPairing === "function") bridge.cancelWirelessPairing();
+						},
+					}, t("wlCancel")),
 				),
+				e("p", { style: S.note }, t("wlTcpHint")),
+				e("p", { style: S.note }, t("wlPairHint")),
+			);
 
-				e("div", { style: S.card },
-					e("h3", { style: S.cardTitle }, t("guideTitle")),
-					e("ol", { style: S.steps }, guideSteps),
-				),
+			// ── 电脑引导（备用路径）────────────────────────────────
+			const pcCard = e("details", { style: S.fold },
+				e("summary", { style: S.foldHead }, t("pcTitle")),
+				e("p", { style: S.intro }, t("pcIntro")),
+				e("ol", { style: S.steps }, guideSteps),
+			);
 
-				// 无线调试（Android 11+）：与上面的电脑引导二选一。
-				// 放在电脑引导之后，因为它的前提（Android 11+）比电脑引导更窄。
-				e("div", { style: S.card },
-					e("h3", { style: S.cardTitle }, t("wlTitle")),
-					e("p", { style: S.intro }, t("wlIntro")),
-					e("ol", { style: S.steps }, [
-						e("li", { key: 0, style: S.step }, t("wlStep1")),
-						e("li", { key: 1, style: S.step }, t("wlStep2")),
-						e("li", { key: 2, style: S.step }, t("wlStep3")),
-						e("li", { key: 3, style: S.step }, t("wlStep4")),
-					]),
-					// 无线端口是「有没有发现到」的最直接证据 —— 没有它，
-					// 用户只能靠「配对按钮点了没反应」来猜，无从下手。
-					data ? e("div", { style: S.row },
-						e("span", { style: { ...S.dot, background: (data.wireless && data.wireless.connect) ? MP_PRIV_TONE.on.color : MP_PRIV_TONE.off.color } }),
-						e("span", { style: S.rowLabel }, t("wlPort")),
-						e("span", { style: S.rowValue }, (data.wireless && data.wireless.connect)
-							? String(data.wireless.connect)
-							: t("wlPortNone")),
-					) : null,
-					e("div", { style: S.cmdRow },
-						e("button", {
-							type: "button",
-							style: S.btn,
-							onClick: () => {
-								// 走 JS 桥直连原生：配对码要经通知栏输入，而通知是 Android
-								// 的能力，Node 侧（宿主半的 HTTP 路由）够不到。
-								const bridge = window.DSHAndroid;
-								if (!bridge || typeof bridge.startWirelessPairing !== "function") {
-									window.alert(t("wlNoBridge"));
-									return;
-								}
-								bridge.startWirelessPairing();
-							},
-						}, t("wlPair")),
-						e("button", {
-							type: "button",
-							style: S.cmdBtn,
-							onClick: () => {
-								const bridge = window.DSHAndroid;
-								if (bridge && typeof bridge.cancelWirelessPairing === "function") bridge.cancelWirelessPairing();
-							},
-						}, t("wlCancel")),
-						// 把 adbd 切到固定的 TCP 端口 —— 切完就不依赖无线调试开关了。
-						// 这一步**不是必需**的（不切也能用），所以放在配对按钮后面。
-						e("button", {
-							type: "button",
-							style: S.cmdBtn,
-							onClick: () => {
-								const bridge = window.DSHAndroid;
-								if (!bridge || typeof bridge.switchToTcpMode !== "function") {
-									window.alert(t("wlNoBridge"));
-									return;
-								}
-								bridge.switchToTcpMode();
-							},
-						}, t("wlTcp")),
-					),
-					e("p", { style: S.note }, t("wlPairHint")),
-					e("p", { style: S.note }, t("wlTcpHint")),
-					e("p", { style: S.note }, t("wlNote")),
+			// ── 注意事项（同样折起）────────────────────────────────
+			const notesCard = e("details", { style: S.fold },
+				e("summary", { style: S.foldHead }, t("notesTitle")),
+				e("ul", { style: S.notes },
+					[t("note1"), t("note2"), t("note3")].map((text, index) => e("li", { key: index, style: S.note }, text)),
 				),
+			);
 
-				e("div", { style: S.card },
-					e("h3", { style: S.cardTitle }, t("notesTitle")),
-					e("ul", { style: S.notes },
-						[t("note1"), t("note2"), t("note3")].map((text, index) => e("li", { key: index, style: S.note }, text)),
-					),
-				),
+			return e("div", { style: S.section },
+				e("h2", { style: S.heading }, t("title")),
+				e("p", { style: S.intro }, t("intro")),
+				head,
+				// 已就绪时把引导整体折起来 —— 能用的人不该被一堆步骤挡着。
+				identityOk
+					? e("details", { style: S.fold },
+						e("summary", { style: S.foldHead }, t("setupTitle")),
+						e("div", { style: S.foldBody }, wlCard, pcCard),
+					)
+					: e("div", { style: S.stack }, wlCard, pcCard),
+				notesCard,
 			);
 		}
 

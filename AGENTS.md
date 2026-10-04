@@ -19,6 +19,7 @@ APK
  ├─ assets/node-pty-android-arm64.zip  自编译的 node-pty 绑定（官方 prebuilds 无 android）
  ├─ assets/pnpm-android-arm64.zip  pnpm 11.28.3 纯 JS 版，解到 $PREFIX/lib/pnpm
  ├─ assets/mobile-ui.zip           移动端 UI 适配插件（dsh-android-mobile）
+ ├─ assets/adb-wireless-arm64.zip  Termux 官方 adb（无线调试配对要 TLS-PSK，Node 的 tls 不支持）
  ├─ assets/dsh-android-shell.mjs   uid 2000 执行通道（直连 adbd）
  ├─ assets/shell-tool.zip          uid 2000 特权工具插件（注册 `shell` 工具）
  └─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片
@@ -412,10 +413,11 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-19`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-25`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
+| `adb-wireless-arm64.zip` | 无需改（只查 `bin/adb` 存在且非空） |
 | `node-addon-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `node-addon-system-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `ripgrep-android-arm64.zip` | 无需改（只查文件存在且非空） |
@@ -742,7 +744,185 @@ v1 没有 `EXIT` 包，拿不到退出码。
 ⚠️ stream id 要**顺序递增**，不能随机：随机 id 可能与在用的 id 撞车，撞车后
 先关闭的那条流会把另一条活流的队列一起拆掉（AOSP 的注释专门记了这条）。
 
-#### 密钥从哪来：必须由用户用 PC 引导一次
+#### 密钥从哪来（Android 11+）：无线调试配对，**全程不碰电脑**
+
+Android 11（API 30）起有了「无线调试」，它把「推密钥」这件事变成了**设备上
+点几下 + 抄一个 6 位配对码**。配对成功后设备 keystore 里就有了我们的公钥，
+此后走密钥认证，**不用再填码**。
+
+分工（**端口发现必须在 Kotlin 侧**，原因见下）：
+
+| 侧 | 文件 | 做什么 |
+|---|---|---|
+| Kotlin | `AdbMdns.kt` | `NsdManager` 发现 `_adb-tls-connect._tcp` / `_adb-tls-pairing._tcp` 的端口 |
+| Kotlin | `WirelessDebugging.kt` | 编排：常驻监听写端口、配对、切固定端口 |
+| Kotlin | `AdbPairingNotifier.kt` | 通知栏 `RemoteInput` 收配对码 |
+| Node | `dsh-android-shell.mjs` | 读端口文件 → 用**内置 adb** 连上去执行 |
+
+##### ⚠️ 端口发现只能走 `NsdManager`，不能自己实现 mDNS
+
+**app 域发不出 UDP 组播。** 真机实测：
+
+```
+sock.send(q, 0, q.length, 5353, '224.0.0.251')
+  → EPERM send EPERM 224.0.0.251:5353
+```
+
+`bind(5353)` 与 `addMembership` 都**成功**，单播也成功 —— 只有**组播发送**被
+SELinux 层挡掉。而 Android 的 `mdnsd` **只应答组播查询**，所以自实现 mDNS 无解。
+
+`NsdManager` 是**系统服务**：请求经 Binder 交给 **system 域**的 `mdnsd` 代发，
+绕开了 `untrusted_app` 的限制。这正是 Shizuku 的做法（见其 `AdbMdns.kt`）。
+
+⚠️ **因此不要退回「扫端口」。** 最初的实现扫 32768–60999 要 **20 秒**，而端口
+**每次重启/重开都会变**，等于每条特权命令前都可能干等 20 秒。实测
+`NsdManager` 解析耗时 **81 毫秒**。
+
+端口有效性沿用 Shizuku 的判据：**能 `bind(127.0.0.1:port)` 成功 = 没人在听**，
+失败才是 adbd。另外要求解析出的地址必须是本机地址 —— 实测重启后曾收到 PC 侧
+缓存的陈旧 mDNS 条目，被这条规则正确拒绝：
+
+```
+[mdns] 忽略 adb-62291ab7-uzVPim → 192.168.1.85:33217（非本机或端口无人监听）
+```
+
+##### ⚠️ 配对端口只在那个界面开着时才广播
+
+`_adb-tls-pairing._tcp` **只在用户打开「使用配对码配对设备」界面时才存在**，
+界面一关就没了。所以顺序必须是：**用户先打开那个界面 → 再在 App 里点配对**。
+
+顺序反了的表现是（实测）：
+
+```
+Unregistering listener for _adb-tls-pairing._tcp.local
+没发现配对端口，无线调试配对界面可能没打开
+```
+
+⚠️ 这条提示是**正确的**，不是 bug。若将来要改进体验，方向是「先弹输入框、
+用户填码时再去发现端口」，而不是去修发现逻辑。
+
+##### 配对码为什么要走通知栏 `RemoteInput`
+
+用户必须**离开 App** 去系统设置页读那 6 位码，所以不能用 App 内输入框 ——
+切走 App 后它可能被冻结/回收。通知栏可以在用户停留在设置页时接收输入。
+（Shizuku 的 `AdbPairingService` 同理。）
+
+⚠️ **`PendingIntent` 在 API 31+ 必须 `FLAG_MUTABLE`**，否则系统**写不回**
+用户输入的内容，症状是「能打字但点确认没反应」。代码里按
+`SDK >= S ? FLAG_MUTABLE : 0` 处理。
+
+⚠️ **接收器必须静态声明**（`AndroidManifest.xml` 里 `exported="false"`）：
+通知可以比 App 进程活得久，动态注册的接收器会收不到。
+
+⚠️ **`goAsync()` 是必须的**：配对要十几秒（发现端口 8s + SPAKE2 握手 + adb 启动），
+远超广播接收器的 10 秒超时（不 `goAsync()` 直接 ANR）。收尾必须
+`pendingResult.finish()`，放在 `finally` 里。
+
+##### 密钥来源必须落盘记录（否则设置页会误报）
+
+设置页原来只按「密钥文件在不在」显示「已导入 / 未导入」—— **这是错的**：
+密钥有两个来源，而其中一个设备**尚未信任**。
+
+| 来源 | 设备是否信任 | 用户该做什么 |
+|---|---|---|
+| `imported`（从 `/sdcard/dsh_adbkey` 搬来） | **是**（那是 PC 已授权的密钥） | 直接能用 |
+| `generated`（App 现场生成） | **否** | 必须先配对 |
+| `paired`（生成后又配对成功） | **是** | 直接能用 |
+
+来源写在 `$DSH_HOME/adbkey.origin`，由 `markKeyOrigin()` 在**写入密钥那一刻**落盘。
+
+⚠️ **不能靠 stderr 日志判断**：`importKeyIfNeeded()` 是幂等的，导入日志只在
+**第一次**运行出现，之后再也看不到 —— 用它判断会在第二次探测时把
+`imported` 误报成 `generated`。
+
+⚠️ 标记文件是后加的，**老安装没有它**。`keyOrigin()` 此时返回 `null`，
+设置页显示灰点「来源未知」，**故意不猜成「已导入」** —— 那正是要修的误报。
+
+##### ⚠️ 无线调试开关一关，通道就断 —— 所以必须切固定端口
+
+**这是本轮最关键的实测结论。** 无线调试的 TLS 端口**只在开关开着时才存在**，
+而且**关掉开关会立刻掐断已建立的连接**：
+
+```
+settings put global adb_wifi_enabled 0
+  → 已连上的 adb-…._adb-tls-connect._tcp 立刻变 device offline
+```
+
+也就是说「连上后一直用无线调试」这条路是**死的**。而 `adb tcpip 5555` 把 adbd
+重启到 TCP 模式，此后走 `127.0.0.1` 回环：
+
+| 观测项 | 关掉无线调试后 |
+|---|---|
+| `adb_wifi_enabled` | 0 |
+| `service.adb.tcp.port` | 5555 |
+| `ss -tln` | `LISTEN *:5555` |
+| 经 `127.0.0.1:5555` 跑 runner | **`uid=2000(shell)`** |
+
+⚠️ **两者可以并存，不是互斥的**（我原先判断错了）：Android 15 实测
+`adb tcpip 5555` **不会**关闭无线调试（`adb_wifi_enabled` 仍是 1）。所以这是
+**纯增益动作**，不破坏用户设置。
+
+⚠️ **`persist.adb.tcp.port` 实测为空** → **重启手机后 5555 消失**，需要重切。
+所以 `dsh-android-shell.mjs` 的通道级联里加了「1.5 档」：legacy 不通但无线调试
+可用时**自动重切一次**再走 legacy。这样重启后能自愈，用户通常不用手动点。
+
+⚠️ 切换**必须先有一条活着的连接**（`tcpip` 命令本身要通过 adb 发出去）。
+
+通道级联的完整顺序（`main()` 里）：
+
+```
+1   legacy 127.0.0.1:5555        自实现协议，最快；不依赖无线调试开关
+1.5 legacy 不通 + 无线可用 → 切 TCP 再走 legacy    ← 重启后自愈
+2   无线调试 <NsdManager 端口>    内置 adb + TLS
+3   本地执行（app 身份）          回落，不是错误
+```
+
+##### 内置 adb 的二三事
+
+配对走 **SPAKE2 + TLS-PSK**，Node 的 `tls` 模块**不支持外部 PSK**，所以打包了
+Termux 官方的 `android-tools`（`assets/adb-wireless-arm64.zip`，`adb 1.0.41`，
+5.26 MB / 105 个文件，含约 90 个 `libabsl_*.so`）。解到 `filesDir/adbwire/`，
+判据是「`bin/adb` 存在且非空」，**无需版本戳**（与 ripgrep/node-pty 同类）。
+
+⚠️ **adb 的运行环境三个变量缺一不可**（都踩过）：
+
+| 变量 | 为什么 |
+|---|---|
+| `HOME` | adb 在 **`$HOME/.android/adbkey`** 找密钥。推到 `$HOME/adbkey` 会**静默自生成**一把新的 |
+| `LD_LIBRARY_PATH` | adb 是 Termux 的 ELF，要它自己的 `.so`。**只对 adb 需要** —— 引擎进程绝不能设（见上一节） |
+| `TMPDIR` | adb 硬编码往 **`/tmp/adb.<pid>.log`** 写启动日志，app 域无权写 `/tmp`（实测 `cannot open /tmp/adb.10535.log: Permission denied` → server 起不来） |
+
+⚠️ **adb server 必须用 `-L localabstract:<name>`** 指定 socket 名（实测
+`ss -xln` 里能看到 `@dshadb`），否则多进程会抢同一个默认 server。
+
+⚠️ **没有配对需求的设备会「假成功」**：若 PC 的 adbkey 已在设备 keystore 里，
+App 直接用它就能连上，配对流程根本不会被走到。判断依据是比对 md5
+（本次实测 App 的 `$DSH_HOME/adbkey` = PC 的 `%USERPROFILE%\.android\adbkey`
+= `d1f60cbb147060bed588e744a79e360e`）。**要在真机上验证配对，必须先把密钥
+删掉重装**，否则测的是「复用 PC 密钥」那条路。
+
+##### 设置页的无线调试卡片
+
+界面是**结论优先**的：顶部一张 head 卡（状态徽章 + 当前通道摘要 + 一条「下一步该
+做什么」+ `重新检测` / `查看详情`），下面才是可折叠的明细行。无线调试卡片带
+**「推荐」标签**，位置**在电脑引导卡片之前**（Android 11+ 不用碰电脑，那是更短的
+路径）；电脑引导卡片与注意事项都收进 `<details>`，通道已就绪时整个引导折叠成
+「开启引导（当前已就绪，一般不用看）」。
+
+⚠️ 「下一步」是按状态级联挑出来的（已就绪 → 提示可切固定端口；密钥是
+`generated` → 提示配对；有密钥但通道没通 → 提示切固定端口；否则 → 提示选一条路径），
+按钮直接调对应的动作，不再让用户自己从一堆按钮里挑。
+
+⚠️ 「无线调试端口」行是**三态**，不是两态：`绿灯=端口活着` /
+`灰灯=端口文件里那个值已经连不上（多半是无线调试被关了）` / `关=没有端口`。
+判据是宿主半真的去 `connect` 一次（`portAlive()`），**不是「端口文件里有没有数字」** ——
+只看文件会把关掉无线调试后残留的旧端口显示成绿灯（这个 bug 真实发生过）。
+
+⚠️ 「实际身份」行会显示**当前走哪条通道**（`固定端口（关无线调试也不断）` /
+`无线调试（关掉开关会断）`）—— 判据是从 runner 自己打的 `通道: …` 行里读的，
+**不额外探测**。不显示这个的话，用户看到「已就绪」也不知道关掉开关会不会断。
+
+#### 密钥从哪来（Android 10）：只能用 PC 引导一次
 
 Android 10 **没有**无线调试配对机制（那是 API 30+）。而且实测：adbd 在
 **TCP 连接**下**不会**弹「允许 USB 调试吗」对话框 —— 发完公钥后 adbd 直接静默
@@ -863,14 +1043,22 @@ adb shell run-as com.dsh.android sh -c "DSH_HOME=... node files/dsh-android-shel
 #### 设置页的「特权权限」引导分节
 
 用户不该去读 AGENTS.md 才会开这个权限。设置页左侧一级导航里有一项
-**「特权权限」**（`dsh-android-mobile` 的客户端半注册的），内容是
-**静态引导 + 实时状态**：
+**「特权权限」**（`dsh-android-mobile` 的客户端半注册的），布局是
+**结论优先**，不是「先摆一堆步骤让用户自己对照」：
 
-- **静态引导**：4 步（连 USB → `adb tcpip 5555` → `adb push … /sdcard/dsh_adbkey`
-  → 回来点「重新检测」），两条命令单独用等宽块渲染，**每条自带复制按钮**。
-  外加 3 条注意事项。
-- **实时状态**：执行通道 / ADB 密钥 / 实际身份三行 + 「已开启 / 未开启」徽章，
-  带一个「重新检测」按钮。
+- **head 卡（默认展开）**：状态徽章（已开启 / 未开启）+ 一句话通道摘要 +
+  **一条「下一步」**（带一个直达按钮）+ `重新检测` / `查看详情`。
+- **明细行（折叠在「查看详情」里）**：执行通道 / ADB 密钥 / 实际身份 / 无线调试端口。
+- **两条路径的引导卡片**：无线调试（Android 11+，带「推荐」标签）在前，
+  电脑引导（4 步 + 两条带复制按钮的等宽命令）在后，各自收进 `<details>`；
+  通道已就绪时**整个引导**再折一层（「开启引导（当前已就绪，一般不用看）」）。
+- 注意事项卡片同样折叠。
+
+⚠️ 结论优先是**用户明确要求的重设计**（原版是「徽章 + 三行状态 + 一堆按钮平铺」，
+用户要自己判断该点哪个）。改回去之前先问。
+
+⚠️ 折叠用原生 `<details>`，不引入任何 UI 依赖 —— 本插件的定位是「窄屏适配 +
+补充面板」，不重写官方组件。
 
 ⚠️ **复制按钮不是锦上添花，是必需品。** 本插件的全局 CSS 是
 `[data-mobile] * { user-select: none !important }`（文件头 4c，为了消灭长按弹菜单），
@@ -958,6 +1146,37 @@ adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
 bump `EngineManager.MOBILE_UI_VERSION`。漏 bump 的后果是**静默的** ——
 版本戳没变 → 解包被跳过 → 新代码永不生效（本次调试中真实踩到过一次）。
 
+⚠️ **重打 zip 必须先删旧文件，不能用 `-Force`。** PowerShell 的
+`Compress-Archive -Force` 对**已存在的归档不会替换里面的条目**（会保留旧内容），
+于是打出来的 zip 里是**上一版代码**，而版本戳已经 bump 过 → 解包照常执行 →
+装进去的是旧代码。症状是「日志说装了新版本，但新代码一点没生效」。
+
+```powershell
+Remove-Item app\src\main\assets\mobile-ui.zip -Force
+Compress-Archive -Path mobile-ui-plugin\dsh-android-mobile\* `
+  -DestinationPath app\src\main\assets\mobile-ui.zip
+```
+
+⚠️ **验证 zip 里真的是新代码**（别只看文件大小）：
+
+```powershell
+# 把 zip 解开 grep 新加的函数名/文案，计数应为非 0
+```
+
+⚠️ **别在 `MP_PRIV_S` 这类对象字面量里引用它后面才定义的常量。**
+本插件用一堆 `MP_PRIV_S.xxx` 内联样式对象，而 `MP_PRIV_TONE` 定义在
+`MP_PRIV_S` **之后** —— 在 `MP_PRIV_S` 里写 `color: MP_PRIV_TONE.on` 会在
+**模块求值期**抛
+
+```
+Cannot access 'MP_PRIV_TONE' before initialization
+```
+
+整个插件 import 失败，界面是空白的「Failed to load plugins」页
+（日志里是 `dsh-android-mobile: import failed: …` +
+`web boot: 1 entry did not activate`）。**颜色值直接写字面量**，
+`MP_PRIV_S` 里那几处 `MP_PRIV_TONE` 只允许出现在注释里。
+
 #### ⚠️ 不要设 `LD_LIBRARY_PATH`（它只会破坏系统二进制）
 
 启动引擎的 env 里**刻意没有** `LD_LIBRARY_PATH`。这一行曾经存在（当作「RUNPATH 没覆盖
@@ -1026,9 +1245,12 @@ targetSdk = 28 走 legacy 模型，不需要 `MANAGE_EXTERNAL_STORAGE`。
 - **Android 10 每次重启后要重新引导**：`persist.adb.tcp.port` 实测为空，
   重启后 5555 不再监听，需要 PC/USB 再 `adb tcpip 5555` 一次。
   这是平台限制（Android 10 没有无线调试），改不了。
-- Android 11+ 才能真正免 PC（走无线调试配对），本方案**尚未覆盖**。
+- **Android 11+ 可以完全免 PC** —— 走无线调试配对，见上一节
+  「密钥从哪来（Android 11+）」。配对成功后切到固定 TCP 端口，此后**关无线调试、
+  关 Wi-Fi 都不影响**（实测）。
 - **卸载重装会清掉 `$DSH_HOME`**（Termux 环境、全部会话日志、`adbkey`），
-  重装后要重新 bootstrap 并用 PC 再导入一次 adbkey。
+  重装后要重新 bootstrap。Android 10 要再用 PC 导入一次 adbkey；
+  Android 11+ 只需重新配对一次（也是手机上点几下，不用电脑）。
 
 ## 后台保活（任务切到后台不能断）
 
