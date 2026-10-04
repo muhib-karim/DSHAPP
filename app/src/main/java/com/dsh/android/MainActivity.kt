@@ -28,6 +28,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -468,6 +469,29 @@ class MainActivity : AppCompatActivity() {
         @android.webkit.JavascriptInterface
         fun cancelWirelessPairing() {
             AdbPairingNotifier.cancel(this@MainActivity)
+        }
+
+        /**
+         * 设置页「切到固定端口」：把 adbd 切到 `adb tcpip 5555`。
+         *
+         * 切完之后特权通道**不再依赖无线调试开关**（实测关掉开关、关掉 Wi-Fi
+         * 都不影响）。这是个阻塞操作（几秒），所以丢到后台线程，结果用 Toast 回。
+         *
+         * ⚠️ 不能直接在 JS 线程里做：它最多要等约 6 秒（切换 + 轮询端口就绪），
+         * 会卡住 WebView 的 JS 线程。
+         */
+        @android.webkit.JavascriptInterface
+        fun switchToTcpMode() {
+            Log.i(DshApplication.TAG, "设置页请求切到固定 TCP 端口")
+            val app = applicationContext
+            Thread {
+                val engine = EngineManager.get(app)
+                val result = engine.switchToTcpMode()
+                Log.i(DshApplication.TAG, "切到固定端口结果: ${result.ok} ${result.message}")
+                runOnUiThread {
+                    Toast.makeText(app, result.message, Toast.LENGTH_LONG).show()
+                }
+            }.start()
         }
     }
 

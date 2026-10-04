@@ -149,6 +149,63 @@ object WirelessDebugging {
         }
     }
 
+    /**
+     * 把 adbd 切到固定的 TCP 端口（`adb tcpip 5555`）。
+     *
+     * ## 为什么需要它
+     *
+     * 无线调试的 TLS 端口**只在无线调试开关开着时才存在**，而且实测
+     * **关掉开关会立刻掐断已建立的连接**（`adb_wifi_enabled=0` 之后已连上的
+     * `_adb-tls-connect` 立刻变 `device offline`）。所以只靠无线调试的话，
+     * 用户一关开关通道就断。
+     *
+     * `adb tcpip 5555` 把 adbd 重启到 TCP 模式，此后**关无线调试、关 Wi-Fi
+     * 都不受影响**（走 127.0.0.1 回环）。实测 Android 15 上两者**可以并存** ——
+     * `adb tcpip` 不会关闭无线调试，所以这是纯增益动作。
+     *
+     * ⚠️ 代价：`persist.adb.tcp.port` 实测为空，所以**重启手机后需要再切一次**。
+     * 稳态下 `dsh-android-shell.mjs` 的通道级联会在发现 5555 不在听、而无线
+     * 调试可用时自动重切，所以用户通常不用手动点。
+     *
+     * ⚠️ 阻塞调用，**不要在主线调用**。
+     */
+    fun switchToTcp(
+        nodeBin: File,
+        runner: File,
+        adbHome: File,
+        dshHome: File,
+    ): Result {
+        if (!runner.isFile) return Result(false, "执行通道文件不存在：${runner.absolutePath}")
+        if (!nodeBin.isFile) return Result(false, "Node 可执行文件不存在：${nodeBin.absolutePath}")
+
+        val output = StringBuilder()
+        val exit: Int = try {
+            val pb = ProcessBuilder(nodeBin.absolutePath, runner.absolutePath, "--switch-tcp")
+            pb.redirectErrorStream(true)
+            pb.environment().apply {
+                put("DSH_HOME", dshHome.absolutePath)
+                put("DSH_ADB_HOME", adbHome.absolutePath)
+                put("PATH", "/system/bin:/system/xbin")
+                put("HOME", dshHome.parentFile?.absolutePath ?: dshHome.absolutePath)
+            }
+            val proc = pb.start()
+            proc.inputStream.bufferedReader().forEachLine { line ->
+                output.append(line).append('\n')
+                Log.i(TAG, "[switch-tcp] $line")
+            }
+            proc.waitFor()
+        } catch (t: Throwable) {
+            Log.w(TAG, "切换 TCP 模式失败", t)
+            return Result(false, "启动切换进程失败：${t.message}")
+        }
+
+        return if (exit == 0) {
+            Result(true, "已切到固定端口 5555 —— 现在关掉无线调试、关掉 Wi-Fi 都不影响特权通道。")
+        } else {
+            Result(false, "切换失败（退出码 $exit）。请确认无线调试开着，或先用电脑连一次。\n${output.toString().trim()}")
+        }
+    }
+
     /** 把 adb 的报错翻译成用户能照着做的说明。 */
     private fun pairingFailureReason(exit: Int, output: String): String = when {
         output.contains("Failed to parse pairing code") || output.contains("invalid pairing code") ->

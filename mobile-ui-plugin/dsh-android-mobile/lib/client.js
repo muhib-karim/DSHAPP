@@ -3703,6 +3703,9 @@ window.__ModuleLoader__.load({
 			justImported: "刚刚导入",
 			uidOk: "uid 2000",
 			uidApp: "App 身份（未提权）",
+			// 「固定」= 走 legacy 5555，它不依赖无线调试开关，也不会随重启换端口。
+			chStable: "固定端口（关无线调试也不断）",
+			chWireless: "无线调试（关掉开关会断）",
 			bytes: "字节",
 			guideTitle: "开启步骤",
 			step1: "用数据线把手机连到电脑。首次连接时手机会弹「允许 USB 调试吗」，勾选「一律允许」再确定。",
@@ -3731,6 +3734,8 @@ window.__ModuleLoader__.load({
 			wlPort: "无线端口",
 			wlPortNone: "未发现（无线调试可能没开）",
 			wlNote: "与上面的电脑引导二选一即可。无线调试那条路更省事，但只在 Android 11 及以上可用；Android 10 只能用电脑引导。",
+			wlTcp: "切到固定端口",
+			wlTcpHint: "建议切一下：无线调试的端口每次重启都会变，而且你一关无线调试开关它立刻就断。切到固定端口后就都不受影响了（关无线调试、关 Wi-Fi 都不断）。重启手机后需要再切一次。",
 			wlNoBridge: "当前环境没有原生的配对入口（DSHAndroid 桥不可用），无法发起配对。",
 		};
 		const MP_PRIV_EN = {
@@ -3757,6 +3762,8 @@ window.__ModuleLoader__.load({
 			justImported: "just imported",
 			uidOk: "uid 2000",
 			uidApp: "App identity (not escalated)",
+			chStable: "fixed port (survives wireless debugging off)",
+			chWireless: "wireless debugging (breaks when toggled off)",
 			bytes: "bytes",
 			guideTitle: "How to enable it",
 			step1: "Connect the phone to a computer with a USB cable. On first connect the phone asks \"Allow USB debugging?\" — tick \"Always allow\" and confirm.",
@@ -3785,6 +3792,8 @@ window.__ModuleLoader__.load({
 			wlPort: "Wireless port",
 			wlPortNone: "Not found (wireless debugging may be off)",
 			wlNote: "Use either this or the computer-based guide above. Wireless debugging is easier but only exists on Android 11+; on Android 10 only the computer route works.",
+			wlTcp: "Switch to fixed port",
+			wlTcpHint: "Recommended: the wireless debugging port changes on every reboot, and toggling wireless debugging off drops the connection instantly. After switching to a fixed port neither affects it (works with wireless debugging off and Wi-Fi off). Re-run once after a reboot.",
 			wlNoBridge: "The native pairing entry point is unavailable in this environment (the DSHAndroid bridge is missing), so pairing cannot be started.",
 		};
 
@@ -3946,7 +3955,8 @@ window.__ModuleLoader__.load({
 				rows.push({
 					key: "identity", label: t("rowIdentity"), ok: identityOk,
 					value: identityOk
-						? t("uidOk")
+						? `${t("uidOk")}${data.identity && data.identity.channel === "legacy" ? " · " + t("chStable")
+							: data.identity && data.identity.channel === "wireless" ? " · " + t("chWireless") : ""}`
 						: `${t("uidApp")}${data.identity && data.identity.reason ? " · " + data.identity.reason : ""}`,
 				});
 			}
@@ -4064,8 +4074,23 @@ window.__ModuleLoader__.load({
 								if (bridge && typeof bridge.cancelWirelessPairing === "function") bridge.cancelWirelessPairing();
 							},
 						}, t("wlCancel")),
+						// 把 adbd 切到固定的 TCP 端口 —— 切完就不依赖无线调试开关了。
+						// 这一步**不是必需**的（不切也能用），所以放在配对按钮后面。
+						e("button", {
+							type: "button",
+							style: S.cmdBtn,
+							onClick: () => {
+								const bridge = window.DSHAndroid;
+								if (!bridge || typeof bridge.switchToTcpMode !== "function") {
+									window.alert(t("wlNoBridge"));
+									return;
+								}
+								bridge.switchToTcpMode();
+							},
+						}, t("wlTcp")),
 					),
 					e("p", { style: S.note }, t("wlPairHint")),
+					e("p", { style: S.note }, t("wlTcpHint")),
 					e("p", { style: S.note }, t("wlNote")),
 				),
 

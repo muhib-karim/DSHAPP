@@ -1489,6 +1489,31 @@ class EngineManager private constructor(private val context: Context) {
         return result
     }
 
+    /**
+     * 把 adbd 切到固定的 TCP 端口（`adb tcpip 5555`）。
+     *
+     * 切完之后特权通道**不再依赖无线调试开关** —— 实测关掉无线调试、关掉 Wi-Fi
+     * 都不影响（走 127.0.0.1 回环）。详见 [WirelessDebugging.switchToTcp]。
+     *
+     * ⚠️ **阻塞调用**（最多约 6 秒：切换 + 轮询端口就绪），必须在后台线程调用。
+     */
+    fun switchToTcpMode(): WirelessDebugging.Result {
+        val runner = File(context.filesDir, PRIVILEGED_RUNNER_FILE)
+        val adbHome = File(context.filesDir, ADB_WIRELESS_DIR)
+        if (!adbHome.isDirectory) {
+            return WirelessDebugging.Result(
+                false,
+                "内置 adb 工具链未就绪（$ADB_WIRELESS_DIR 不存在），无线调试不可用。",
+            )
+        }
+        return WirelessDebugging.switchToTcp(
+            nodeBin = bootstrap.nodeBinary,
+            runner = runner,
+            adbHome = adbHome,
+            dshHome = dshHome,
+        )
+    }
+
     fun recentLog(): String = synchronized(logLines) { logLines.joinToString("\n") }
 
     companion object {
@@ -1614,7 +1639,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-21"
+        private const val MOBILE_UI_VERSION = "1.0.0-22"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────

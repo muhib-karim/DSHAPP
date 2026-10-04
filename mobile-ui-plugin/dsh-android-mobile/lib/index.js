@@ -178,7 +178,7 @@ async function probe() {
 			importedNow: false,
 			origin: null,
 		},
-		identity: { ok: false, uid: null, reason: '', log: [] },
+		identity: { ok: false, uid: null, reason: '', channel: 'none', log: [] },
 	};
 
 	if (runnerStat === null) {
@@ -194,6 +194,13 @@ async function probe() {
 		.split('\n')
 		.map((line) => line.trim())
 		.filter((line) => line.startsWith(TAG));
+
+	// 这次实际走的是哪条通道 —— 从 runner 自己打的 `通道: …` 行里读，不额外探测。
+	// 只有 legacy 5555 那条**不依赖无线调试开关**，所以设置页要能区分出来，
+	// 否则用户看到「已就绪」也不知道关了无线调试会不会断。
+	snapshot.identity.channel = 'none';
+	if (/通道: legacy/.test(result.stderr)) snapshot.identity.channel = 'legacy';
+	else if (/通道: 无线调试/.test(result.stderr)) snapshot.identity.channel = 'wireless';
 
 	if (uid === '2000') {
 		snapshot.identity.ok = true;
