@@ -408,7 +408,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-5`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-9`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -688,19 +688,18 @@ let n=0; for (const sh of document.styleSheets){let rs;try{rs=sh.cssRules}catch(
 
 同类隐患还有 `zGbnIq: ["title"]`。**加豁免前先确认该局部名是否唯一。**
 
-### ⚠️ 旧 hash 表里可能混着「官方仍在用」的 hash（改过，别退回去）
+### ⚠️ 别名桥接会误认领无关 hash（改过两次，别退回去）
 
-**症状**：「执行了命令」这类**分组头被居中**（本该左对齐）；同类错位/溢出可能出现在别处。
+**症状**：「执行了命令」这类**分组头被居中**（本该左对齐）。真机实测 53 个
+`.O_Ebla_root` 里有 2 个中招、其余正常 —— **同一页面上有的错有的对**。
 
 **根因**：`MP_LEGACY_HASHES` 是手写的「旧 hash → 局部名」表，但它**没有随引擎升级同步**。
-`bOPqQW`（composer 遥测药丸栏）既登记在表里，**又是官方当前仍在用的 hash** ——
+`bOPqQW`（composer 遥测药丸）既登记在表里，**又是官方当前仍在用的 hash** ——
 官方 `dsh-client-ui-chat/lib/client.js` 里 `.bOPqQW_root` 与 `.O_Ebla_root`
-**同时存在**，属于两个不同组件。
-
-而 `mpCollectCurrentClasses()` 原先**无条件**把登记过的 hash 从候选池剔除，于是
+**同时存在**，属于两个不同组件。旧逻辑无条件把登记过的 hash 从候选池剔除，于是
 `bOPqQW` 丢掉了自己的 4 票证据，转而去认领了恰好共享 `label` + `root` 两个局部名的
-**无关** hash `O_Ebla`（2 票，刚好够门槛）。结果 `O_Ebla_root` 被补上 `bOPqQW_root`，
-而后者官方定义带 `justify-content: center`：
+**无关** hash `O_Ebla`（2 票，刚好够门槛）。而 `bOPqQW_root` 官方定义带
+`justify-content: center`：
 
 ```css
 .bOPqQW_root{…;justify-content:center;gap:12px;display:flex}   /* 遥测药丸栏 */
@@ -708,26 +707,62 @@ let n=0; for (const sh of document.styleSheets){let rs;try{rs=sh.cssRules}catch(
 .O_Ebla_title{…;text-align:left;…}                               /* 明确要求左对齐 */
 ```
 
-于是 31 个分组头全部被居中。真机实测 `justify-content` 由 `normal` → `center`。
+**判据演进（三次都踩了坑，最终版才是对的）**：
 
-**修法（三处，缺一不可）**：
+| 版本 | 判据 | 为什么不够 |
+|---|---|---|
+| v1 | 无条件跳过登记过的 hash | `bOPqQW` 丢掉自己的证据 → 认领 `O_Ebla` |
+| v2 | 当下样式表里有没有该 hash | CSS Module **懒注入**，同一 hash 时有时无 → 同页有的中招有的正常 |
+| v3 | 累积证据 `mpOfficialSeen`（只增不减） | 早期样式表未注入时仍会误判 `YDXeBa→oz9t_a` |
+| **v4（现行）** | 累积证据 **+ 重合率 ≥ 60%** | ✅ |
 
-1. **样式表是唯一可信的「官方仍在用」判据**：`mpCollectCurrentClasses()` 现在同时返回
-   `pureHashes`（只来自样式表）。若某旧 hash 在 `pureHashes` 里 → **它没过期，跳过**，
-   不参与认领。
-2. **必须排除插件自己的样式表**（判据同 `injectStyles()` 的 `dataset.pluginCss`）：
-   插件 CSS 大量使用旧类名（如 `[data-mobile] .bOPqQW_root`），算进去的话所有旧 hash
-   都会被判为未过期，**桥接彻底失效**。
-3. **防止自我强化**：桥接补上去的类名记进 `mpAliasAdded`，DOM 采集时跳过它们 ——
-   否则下一轮推导会拿自己补的类名当官方证据，越套越偏。
+**最终判据**（`mpDeriveAliasMap`，三条缺一不可）：
 
-另外加了一道保险：**目标 hash 若自身也登记在旧表里，不许被认领**（它属于另一个组件）。
+1. **`mpOfficialSeen.has(oldHash) || cur[oldHash]` ⇒ 跳过**。前者是「官方样式表
+   **曾经**出现过」，后者是「当下 DOM 里有（且已排除桥接自己补的）」。
+   ⚠️ 必须**累积**：官方 CSS Module 按需注入，未渲染组件的规则此刻不在表里，
+   用快照会让判据抖动。真机实测官方样式表里出现过 114 个 hash。
+2. **重合率 `hit / min(旧局部名数, 新局部名数) ≥ 0.6`**。光有 2 票远不够 ——
+   真机实测 `YDXeBa→oz9t_a` 只因两者偶然共享 `time` + `chevron` 两个**通用**局部名
+   就达成了 2 票。真正的「过期」是**同一组件换 hash**，局部名集合基本不变（接近 100%）。
+   `YDXeBa`(10) vs `oz9t_a`(10)，命中 2 → 20% ⇒ 拒绝。
+3. **目标 hash 自身也登记在旧表里 ⇒ 不许被认领**（它属于另一个组件）。
+
+另外两条必须同时满足：
+
+- **排除插件自己的样式表**：插件 CSS 大量使用旧类名（如 `[data-mobile] .bOPqQW_root`），
+  算进去的话所有旧 hash 都会被判为未过期，**桥接彻底失效**。
+  ⚠️ 判据必须**全等**比较 `dataset.pluginCss === "dsh-android-mobile/main.css"` ——
+  官方 DSH 自己也给每个 CSS Module 的 `<style>` 打 `dataset.pluginCss`（值是模块路径），
+  只判该属性是否存在会误伤 140 个官方样式表（真机实测 143 张表里 140 张被误判）。
+- **防自我强化**：桥接补上去的类名记进 `mpAliasAdded`，DOM 采集时跳过它们 ——
+  否则下一轮推导会拿自己补的类名当官方证据，越套越偏。
+
+⚠️ **误加的类名不会自己消失**：判据修好后，DOM 上残留的旧类名照旧触发官方规则
+（`justify-content: center` 依然生效），用户看到的错位不会恢复。所以有
+`mpPruneStaleAliases()` —— 映射变化时主动撤掉「已补上但当前映射里不再成立」的类名。
 
 ⚠️ **别再往 `MP_LEGACY_HASHES` 里加官方当前仍在用的 hash。** 加之前先在
 `engine/node_modules/@deepseek-ai/dsh-client-ui-*/lib/client.js` 里
 `Select-String -SimpleMatch "<hash>_"` 搜一遍：**搜得到就说明它没过期，不该进这张表**。
+（实测：这张表里 14 个 hash 在当前引擎 `0.2.0-rc.2` 下**全部没过期**，
+所以桥接在当前版本下本就无事可做，任何「认领」都是误伤。）
 
-⚠️ 判据用**样式表**而不是 DOM：DOM 里的旧类名可能是桥接上一轮自己补的。
+**验收手法**（数值证据，别靠截图猜）：
+
+```js
+// 期望：O_EblaWithBOPqQW = 0，justify = "normal"，dataMobileRules ≈ 57
+({
+  O_Ebla_root: document.querySelectorAll('.O_Ebla_root').length,
+  O_EblaWithBOPqQW: document.querySelectorAll('.O_Ebla_root.bOPqQW_root').length,
+  justify: getComputedStyle(document.querySelector('.O_Ebla_root')).justifyContent,
+})
+```
+
+`dataMobileRules` = `document.styleSheets` 里 `[data-mobile]` 规则条数，
+正常 **57**；**0 表示插件 CSS 整体丢失**（退回桌面布局，见上一节）。
+另：logcat 里**不应出现** `[mobile-polish] CSSModule 别名桥接:` 那行 ——
+它一旦打出就说明有 hash 被认领了，在当前引擎版本下即为误伤。
 
 ### 「+」菜单与键盘的时序（改过，别退回去）
 
