@@ -34,7 +34,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -176,6 +176,7 @@ async function probe() {
 			size: keyBefore?.size ?? 0,
 			mtimeMs: keyBefore?.mtimeMs ?? 0,
 			importedNow: false,
+			origin: null,
 		},
 		identity: { ok: false, uid: null, reason: '', log: [] },
 	};
@@ -216,6 +217,38 @@ async function probe() {
 		snapshot.key.size = keyAfter.size;
 		snapshot.key.mtimeMs = keyAfter.mtimeMs;
 		snapshot.key.importedNow = keyBefore === null;
+	}
+
+	// 密钥**来源**：`imported`（从 PC 中转文件搬进来，设备已信任，直接能用）
+	// 还是 `generated`（App 现场生成，**设备尚未信任，必须先配对**）。
+	//
+	// ⚠️ 光看密钥文件在不在会误报 —— 两种情况都"有密钥"，但只有前者能直接拿到
+	// uid 2000。来源由 runner 在写入密钥那一刻落盘到 `adbkey.origin`
+	// （见 assets/dsh-android-shell.mjs 的 `markKeyOrigin()`），上面那次 `id -u`
+	// 已经跑过 `ensureKey()`，所以此刻这个文件一定是最新的。
+	snapshot.key.origin = null;
+	try {
+		const raw = (await readFile(path.join(home, 'adbkey.origin'), 'utf8')).trim();
+		if (raw === 'imported' || raw === 'generated' || raw === 'paired') snapshot.key.origin = raw;
+	} catch {
+		// 老版本装出来的密钥没有这个标记，或者密钥还没生成 —— 交给 UI 兜底
+	}
+
+	// 无线调试（Android 11+）的端口：由 Kotlin 侧的 `NsdManager` 发现后写入
+	// `$DSH_HOME/adb-wireless-port`。Node 侧读不到也发不出 mDNS（SELinux 挡组播），
+	// 所以这里只读文件，不做任何探测 —— 文件不在就说明无线调试没开。
+	//
+	// 格式 `<connect端口> [<配对端口>]`，见 assets/dsh-android-shell.mjs。
+	snapshot.wireless = { connect: null, pairing: null };
+	try {
+		const raw = (await readFile(path.join(home, 'adb-wireless-port'), 'utf8')).trim();
+		const [c, p] = raw.split(/\s+/);
+		const connect = Number.parseInt(c, 10);
+		const pairing = Number.parseInt(p, 10);
+		if (Number.isInteger(connect) && connect > 0) snapshot.wireless.connect = connect;
+		if (Number.isInteger(pairing) && pairing > 0) snapshot.wireless.pairing = pairing;
+	} catch {
+		// 文件不存在 = 无线调试没开或还没发现，属于正常情况
 	}
 
 	return snapshot;

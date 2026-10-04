@@ -1056,6 +1056,83 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出无线调试用的 adb 工具链（`adb-wireless-arm64.zip` → `filesDir/adbwire/`）。
+     *
+     * ## 为什么需要一个 adb 二进制
+     *
+     * Android 11 起有「无线调试」，它和 legacy `adb tcpip 5555` 是两回事：
+     * 端口随机、走 TLS、**重启后依然有效**（legacy 的在 Android 10 上重启即失效）。
+     * 后者才是「免 PC」的关键。
+     *
+     * 但配对（pairing）走 **SPAKE2 + TLS-PSK**，而 Node 的 `tls` 模块**不支持
+     * external PSK**，自己实现等于手写密码学。所以直接内置 Termux 官方
+     * `android-tools` 里的 `adb`，复用 Google 自己的实现。
+     *
+     * ## 为什么带一堆 .so
+     *
+     * 那个 adb 是动态链接的，NEEDED 里有 `libprotobuf` / `libfmt` / `libabsl_*`
+     * / `libbrotli*` / `libc++_shared` / `libz.so.1` / `liblz4` / `libzstd.so.1`。
+     * 它的 RUNPATH 指向 Termux 的 `/data/data/com.termux/files/usr/lib`（本 App 里
+     * 不存在），所以必须把库一并带上，并由 runner 设 `LD_LIBRARY_PATH`。
+     *
+     * ⚠️ **这里的 `LD_LIBRARY_PATH` 只作用于 adb 这一个子进程**，与引擎进程
+     * 那处「刻意不设 LD_LIBRARY_PATH」的结论不冲突 —— 那条结论针对的是**引擎进程
+     * 全局**设置该变量会污染系统二进制（见 [runEngine] 里的长注释）。adb 是自带
+     * 全套依赖的自洽单元，且只跑它自己。
+     *
+     * ⚠️ **两个库必须按 SONAME 改名**：bootstrap 里是 `libz.so.1.3.2` 与
+     * `libzstd.so.1.5.7`，而 adb 找的是 `libz.so.1` / `libzstd.so.1`。
+     * Android 的 SELinux 不给 app 私有目录建符号链接，所以打包时就直接放了
+     * SONAME 名字的副本（见资产构建步骤）。
+     *
+     * ⚠️ **`libc++_shared.so` 必须用与 adb 同期的那份**（来自 `libc++` 包），
+     * 不能用 bootstrap 里那份：bootstrap 的是 9 月版，缺
+     * `_ZNSt6__ndk113__hash_memoryEPKvm`，加载时报
+     * `cannot locate symbol ... referenced by .../bin/adb`。
+     *
+     * @return adb 所在目录，失败给 `null`。
+     */
+    private fun ensureAdbWireless(): File? {
+        val dest = File(context.filesDir, ADB_WIRELESS_DIR)
+        val adb = File(dest, "bin/adb")
+        // 幂等判据与 ripgrep / node-pty 一致：只查文件存在且非空。
+        // 每次启动解 105 个文件 / 5.26MB 会拖慢启动，而这套工具链不随版本变。
+        if (adb.isFile && adb.length() > 0) {
+            adb.setExecutable(true, false)
+            File(dest, "tmp").mkdirs()
+            File(dest, "home").mkdirs()
+            return dest
+        }
+        try {
+            context.assets.open(ADB_WIRELESS_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(dest, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            // ⚠️ 从 APK 资产解出来的文件**没有执行位**，必须显式设，
+            // 否则报 EACCES 而不是「找不到」。
+            adb.setExecutable(true, false)
+            File(dest, "tmp").mkdirs()
+            File(dest, "home").mkdirs()
+            Log.i(TAG, "已解出无线调试 adb 工具链 ($ADB_WIRELESS_DIR, adb ${adb.length()} 字节)")
+            return dest
+        } catch (t: Throwable) {
+            // 解不出来只是没有无线通道，legacy 与 app 身份都不受影响
+            Log.w(TAG, "解出无线调试 adb 工具链失败: ${t.message}")
+            return null
+        }
+    }
+
+    /**
      * 写出挂载 uid 2000 特权工具的 overlay，返回其路径；不可用时返回 null。
      *
      * 走 `--patch` 与移动端 UI 插件同样的理由（不改用户自己的 profile 配置、
@@ -1189,6 +1266,9 @@ class EngineManager private constructor(private val context: Context) {
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
         val privRunner = ensurePrivilegedShell()
+        // 无线调试（Android 11+）用的 adb 工具链：让 uid 2000 通道在
+        // 「只开了无线调试、没做 adb tcpip」的设备上也能用。见 ensureAdbWireless()。
+        val adbWireless = ensureAdbWireless()
         // 把该通道注册成独立的 `shell` 工具（**不是**改 bash 的行为）：
         // 默认走 app 身份，模型读工具描述后自己决定要不要用 2000。见 ensurePrivilegedPlugin()。
         ensurePrivilegedPlugin()
@@ -1293,6 +1373,16 @@ class EngineManager private constructor(private val context: Context) {
             // uid 2000 通道脚本的路径，供特权插件读取（见 [ensurePrivilegedPlugin]）。
             // 经环境变量传递而不是让 Kotlin 拼 JS 字面量：路径里可能有反斜杠与引号。
             privRunner?.let { put("DSH_PRIV_RUNNER", it.absolutePath) }
+            // 无线调试用的 adb 工具链目录，runner 靠它决定要不要启用无线通道。
+            // 缺失时 runner 只走 legacy 5555，行为与改动前完全一致。
+            adbWireless?.let { put("DSH_ADB_HOME", it.absolutePath) }
+        }
+
+        // 无线调试端口由 Kotlin 侧发现（Node 侧发不出 UDP 组播，见 WirelessDebugging）。
+        // 常驻监听：端口会随用户重开无线调试/重启/切网络而变，只在启动时发现一次的话
+        // 一变就永久失效。监听本身由系统 mdnsd 承担，开销可忽略。
+        if (adbWireless != null) {
+            WirelessDebugging.startWatcher(context, File(dshHome, WirelessDebugging.PORT_FILE))
         }
 
         val proc = try {
@@ -1358,10 +1448,46 @@ class EngineManager private constructor(private val context: Context) {
             }
         }
         process = null
+        // 引擎停了就别再占着 mDNS 监听（NsdManager 的 listener 注册是全局资源）
+        WirelessDebugging.stopWatcher()
         _state.value = State.Idle
     }
 
     fun isRunning(): Boolean = process?.isAlive == true
+
+    /**
+     * 用配对码把本 App 的 ADB 密钥授权给设备（无线调试配对，Android 11+）。
+     *
+     * ⚠️ **阻塞调用**（发现端口 + SPAKE2 握手 + adb 启动，可能十几秒），
+     * 必须在后台线程调用。调用方见 [AdbPairingNotifier]（走 `goAsync()`）。
+     *
+     * @param code 用户从系统「使用配对码配对设备」界面抄来的 6 位码。
+     * @param port 配对端口；`<= 0` 时由 [WirelessDebugging.pair] 自己重新发现。
+     */
+    fun pairWirelessDebugging(code: String, port: Int): WirelessDebugging.Result {
+        val runner = File(context.filesDir, PRIVILEGED_RUNNER_FILE)
+        val adbHome = File(context.filesDir, ADB_WIRELESS_DIR)
+        if (!adbHome.isDirectory) {
+            return WirelessDebugging.Result(
+                false,
+                "内置 adb 工具链未就绪（$ADB_WIRELESS_DIR 不存在），无线调试不可用。",
+            )
+        }
+        val result = WirelessDebugging.pair(
+            context = context,
+            nodeBin = bootstrap.nodeBinary,
+            runner = runner,
+            adbHome = adbHome,
+            dshHome = dshHome,
+            code = code,
+        )
+        // 配对成功后立刻发现一次连接端口并落盘，这样用户不必再等常驻监听
+        // 撞上「无线调试已开启」那一刻。失败也无所谓，监听器会补上。
+        if (result.ok) {
+            WirelessDebugging.discoverConnectPort(context, File(dshHome, WirelessDebugging.PORT_FILE))
+        }
+        return result
+    }
 
     fun recentLog(): String = synchronized(logLines) { logLines.joinToString("\n") }
 
@@ -1488,7 +1614,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-19"
+        private const val MOBILE_UI_VERSION = "1.0.0-21"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────
@@ -1516,8 +1642,20 @@ class EngineManager private constructor(private val context: Context) {
          */
         private const val SHELL_TOOL_DIR = "shell-tool"
 
+        /**
+         * 无线调试（Android 11+）用的 adb 工具链。
+         *
+         * 取自 Termux 官方 `android-tools` 包的 `adb`（37.0.0），外加它 NEEDED 的
+         * 全部 `.so`（`libprotobuf` / `libfmt` / `libabsl_*` / `libbrotli*` /
+         * `libc++_shared` / `libz.so.1` / `liblz4` / `libzstd.so.1`）。
+         * 理由与踩过的坑见 [ensureAdbWireless]。
+         */
+        private const val ADB_WIRELESS_ASSET = "adb-wireless-arm64.zip"
+        private const val ADB_WIRELESS_DIR = "adbwire"
+
         /** 特权身份说明写进这个文件 —— agent-instructions 会自动读它并注入系统提示词。 */
         private const val INSTRUCTIONS_FILE = "AGENTS.md"
+
         private const val PRIVILEGED_PROMPT_BEGIN = "<!-- dsh-android:privileged BEGIN（本段由客户端生成，勿手改）-->"
         private const val PRIVILEGED_PROMPT_END = "<!-- dsh-android:privileged END -->"
 

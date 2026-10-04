@@ -448,6 +448,27 @@ class MainActivity : AppCompatActivity() {
         fun onImeWillShow() {
             this@MainActivity.onImeWillShow()
         }
+
+        /**
+         * 设置页点「配对无线调试」—— 发起 Android 11+ 的无线调试配对。
+         *
+         * ⚠️ 走 JS 桥而不是宿主半的 HTTP 路由：配对码要经**通知栏**输入，
+         * 而通知是 Android 的能力，Node 侧够不到。这里立即返回，
+         * 真正的发现在后台协程里做（见 [AdbPairingNotifier.start]）。
+         *
+         * 运行在 WebView 的 JS 线程，所以只做「发一条通知」这种轻量动作。
+         */
+        @android.webkit.JavascriptInterface
+        fun startWirelessPairing() {
+            Log.i(DshApplication.TAG, "设置页请求配对无线调试")
+            AdbPairingNotifier.start(this@MainActivity)
+        }
+
+        /** 设置页取消配对（撤掉那条带输入框的通知）。 */
+        @android.webkit.JavascriptInterface
+        fun cancelWirelessPairing() {
+            AdbPairingNotifier.cancel(this@MainActivity)
+        }
     }
 
     /**

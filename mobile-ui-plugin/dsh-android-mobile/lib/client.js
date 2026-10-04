@@ -3695,7 +3695,10 @@ window.__ModuleLoader__.load({
 			rowIdentity: "实际身份",
 			ready: "已就位",
 			missing: "缺失",
-			imported: "已导入",
+			imported: "已导入（电脑密钥）",
+			generated: "已生成（待配对）",
+			paired: "已配对",
+			keyOriginUnknown: "来源未知",
 			notImported: "未导入",
 			justImported: "刚刚导入",
 			uidOk: "uid 2000",
@@ -3715,6 +3718,20 @@ window.__ModuleLoader__.load({
 			note1: "密钥等同于这台设备的控制权。App 只在私有目录保存它，导入后立刻删除 /sdcard 上的中转文件。",
 			note2: "卸载重装会清掉密钥，需要重新做一遍上面的步骤。",
 			note3: "以特权身份执行的命令不经过沙箱 —— 该身份读不到 App 私有目录，写沙箱和 link 转译对它都不生效。",
+			// ── 无线调试（Android 11+）：免电脑那条路 ──
+			wlTitle: "无线调试（Android 11+，不用电脑）",
+			wlIntro: "Android 11 起系统自带「无线调试」，可以让本应用自己拿到特权身份，全程不用数据线、不用电脑，重启手机也依然有效。首次需要配对一次。",
+			wlStep1: "在系统「设置 → 开发者选项」里打开「无线调试」开关。",
+			wlStep2: "点进「使用配对码配对设备」，会看到 6 位配对码和一个端口号。让这个界面保持显示，然后回到本页点下面的按钮。",
+			wlStep3: "点完按钮后，配对通知会出现在通知栏。下拉通知栏，在通知里直接回复那 6 位配对码（不用切回本应用）。",
+			wlStep4: "配对成功后回到本页点「重新检测」，身份应变成 uid 2000。之后就一直有效，不必再配对。",
+			wlPair: "配对无线调试",
+			wlCancel: "取消配对",
+			wlPairHint: "配对码由系统显示、只能人工输入 —— 这是 SPAKE2 协议的要求，任何应用（包括 Shizuku）都无法代填。",
+			wlPort: "无线端口",
+			wlPortNone: "未发现（无线调试可能没开）",
+			wlNote: "与上面的电脑引导二选一即可。无线调试那条路更省事，但只在 Android 11 及以上可用；Android 10 只能用电脑引导。",
+			wlNoBridge: "当前环境没有原生的配对入口（DSHAndroid 桥不可用），无法发起配对。",
 		};
 		const MP_PRIV_EN = {
 			nav: "Privileged access",
@@ -3732,7 +3749,10 @@ window.__ModuleLoader__.load({
 			rowIdentity: "Effective identity",
 			ready: "In place",
 			missing: "Missing",
-			imported: "Imported",
+			imported: "Imported (PC key)",
+			generated: "Generated (pairing needed)",
+			paired: "Paired",
+			keyOriginUnknown: "Origin unknown",
 			notImported: "Not imported",
 			justImported: "just imported",
 			uidOk: "uid 2000",
@@ -3752,6 +3772,20 @@ window.__ModuleLoader__.load({
 			note1: "The key is equivalent to control of this device. The app keeps it only in its private directory and deletes the /sdcard hand-off file right after importing.",
 			note2: "Uninstalling the app wipes the key; you will need to repeat the steps above.",
 			note3: "Commands run as the privileged identity bypass the sandbox — that identity cannot read the app's private directory, so the write sandbox and the link translation layer do not apply to it.",
+			// ── Wireless debugging (Android 11+): the no-computer path ──
+			wlTitle: "Wireless debugging (Android 11+, no computer)",
+			wlIntro: "Android 11 and later ship \"Wireless debugging\", which lets this app obtain the privileged identity on its own — no cable, no computer, and it survives reboots. A one-time pairing is required.",
+			wlStep1: "In system Settings → Developer options, turn on the \"Wireless debugging\" switch.",
+			wlStep2: "Tap \"Pair device with pairing code\" — you will see a 6-digit code and a port. Leave that screen open, then come back here and tap the button below.",
+			wlStep3: "A pairing notification appears in the notification shade. Pull it down and reply with the 6-digit code right in the notification (no need to switch back to this app).",
+			wlStep4: "Once pairing succeeds, come back here and tap \"Re-check\" — the identity should become uid 2000. It stays valid from then on; no re-pairing needed.",
+			wlPair: "Pair wireless debugging",
+			wlCancel: "Cancel pairing",
+			wlPairHint: "The pairing code is shown by the system and can only be typed by a human — that is a requirement of the SPAKE2 protocol, and no app (Shizuku included) can fill it in for you.",
+			wlPort: "Wireless port",
+			wlPortNone: "Not found (wireless debugging may be off)",
+			wlNote: "Use either this or the computer-based guide above. Wireless debugging is easier but only exists on Android 11+; on Android 10 only the computer route works.",
+			wlNoBridge: "The native pairing entry point is unavailable in this environment (the DSHAndroid bridge is missing), so pairing cannot be started.",
 		};
 
 		// 全内联样式：设置 dialog 里的既有教训是「匹配 dialog 的 CSS 规则会把弹窗
@@ -3790,6 +3824,9 @@ window.__ModuleLoader__.load({
 		const MP_PRIV_TONE = {
 			on: { color: "#2f9e44", bg: "rgba(47,158,68,0.12)" },
 			off: { color: "#e8590c", bg: "rgba(232,89,12,0.12)" },
+			// 「还不能用，但没坏」—— 目前只有一种情况：密钥是 App 现场生成的，
+			// 设备尚未信任，需要走一次配对。用橙色会和「缺失」混淆，所以单列一色。
+			warn: { color: "#f08c00", bg: "rgba(240,140,0,0.12)" },
 			unknown: { color: "#868e96", bg: "rgba(134,142,150,0.12)" },
 		};
 
@@ -3885,10 +3922,25 @@ window.__ModuleLoader__.load({
 					key: "runner", label: t("rowRunner"), ok: data.runner.ok,
 					value: data.runner.ok ? `${t("ready")} · ${data.runner.size} ${t("bytes")}` : t("missing"),
 				});
+				// ⚠️ 徽章不能只看「密钥文件在不在」：**App 现场生成的密钥设备并不信任**，
+				// 显示绿点会让人以为可以用了。
+				//
+				// 三态（判据见 assets/dsh-android-shell.mjs 的 `keyOrigin()`）：
+				//   imported / paired → 绿点，设备已信任，直接能用
+				//   generated         → 黄点，必须先配对
+				//   null              → 灰点，**来源未知**（标记文件是后加的，
+				//                       老安装的密钥没有它，无法回溯推断）
+				// 未知时**故意不猜**成「已导入」—— 那正是这次要修的误报。
+				const keyReady = data.key.origin === "imported" || data.key.origin === "paired";
 				rows.push({
-					key: "key", label: t("rowKey"), ok: data.key.ok,
+					key: "key", label: t("rowKey"), ok: keyReady,
+					warn: data.key.ok && data.key.origin === "generated",
+					unknown: data.key.ok && !keyReady && data.key.origin !== "generated",
 					value: data.key.ok
-						? `${t("imported")} · ${data.key.size} ${t("bytes")}${data.key.importedNow ? " · " + t("justImported") : ""}`
+						? `${data.key.origin === "generated" ? t("generated")
+							: data.key.origin === "paired" ? t("paired")
+								: data.key.origin === "imported" ? t("imported")
+									: t("keyOriginUnknown")} · ${data.key.size} ${t("bytes")}${data.key.importedNow ? " · " + t("justImported") : ""}`
 						: t("notImported"),
 				});
 				rows.push({
@@ -3943,7 +3995,15 @@ window.__ModuleLoader__.load({
 						e("span", { style: { ...S.badge, color: MP_PRIV_TONE[tone].color, background: MP_PRIV_TONE[tone].bg } }, badgeText),
 					),
 					rows.map((row) => e("div", { key: row.key, style: S.row },
-						e("span", { style: { ...S.dot, background: row.ok ? MP_PRIV_TONE.on.color : MP_PRIV_TONE.off.color } }),
+						e("span", {
+							style: {
+								...S.dot,
+								background: (row.ok ? MP_PRIV_TONE.on
+									: row.warn ? MP_PRIV_TONE.warn
+										: row.unknown ? MP_PRIV_TONE.unknown
+											: MP_PRIV_TONE.off).color,
+							},
+						}),
 						e("span", { style: S.rowLabel }, row.label),
 						e("span", { style: S.rowValue }, row.value),
 					)),
@@ -3959,6 +4019,54 @@ window.__ModuleLoader__.load({
 				e("div", { style: S.card },
 					e("h3", { style: S.cardTitle }, t("guideTitle")),
 					e("ol", { style: S.steps }, guideSteps),
+				),
+
+				// 无线调试（Android 11+）：与上面的电脑引导二选一。
+				// 放在电脑引导之后，因为它的前提（Android 11+）比电脑引导更窄。
+				e("div", { style: S.card },
+					e("h3", { style: S.cardTitle }, t("wlTitle")),
+					e("p", { style: S.intro }, t("wlIntro")),
+					e("ol", { style: S.steps }, [
+						e("li", { key: 0, style: S.step }, t("wlStep1")),
+						e("li", { key: 1, style: S.step }, t("wlStep2")),
+						e("li", { key: 2, style: S.step }, t("wlStep3")),
+						e("li", { key: 3, style: S.step }, t("wlStep4")),
+					]),
+					// 无线端口是「有没有发现到」的最直接证据 —— 没有它，
+					// 用户只能靠「配对按钮点了没反应」来猜，无从下手。
+					data ? e("div", { style: S.row },
+						e("span", { style: { ...S.dot, background: (data.wireless && data.wireless.connect) ? MP_PRIV_TONE.on.color : MP_PRIV_TONE.off.color } }),
+						e("span", { style: S.rowLabel }, t("wlPort")),
+						e("span", { style: S.rowValue }, (data.wireless && data.wireless.connect)
+							? String(data.wireless.connect)
+							: t("wlPortNone")),
+					) : null,
+					e("div", { style: S.cmdRow },
+						e("button", {
+							type: "button",
+							style: S.btn,
+							onClick: () => {
+								// 走 JS 桥直连原生：配对码要经通知栏输入，而通知是 Android
+								// 的能力，Node 侧（宿主半的 HTTP 路由）够不到。
+								const bridge = window.DSHAndroid;
+								if (!bridge || typeof bridge.startWirelessPairing !== "function") {
+									window.alert(t("wlNoBridge"));
+									return;
+								}
+								bridge.startWirelessPairing();
+							},
+						}, t("wlPair")),
+						e("button", {
+							type: "button",
+							style: S.cmdBtn,
+							onClick: () => {
+								const bridge = window.DSHAndroid;
+								if (bridge && typeof bridge.cancelWirelessPairing === "function") bridge.cancelWirelessPairing();
+							},
+						}, t("wlCancel")),
+					),
+					e("p", { style: S.note }, t("wlPairHint")),
+					e("p", { style: S.note }, t("wlNote")),
 				),
 
 				e("div", { style: S.card },

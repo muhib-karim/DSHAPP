@@ -78,5 +78,20 @@
                 android:value="Local AI agent engine keeps a long-running conversation session" />
         </service>
 
+        <!--
+            接收通知栏「直接回复」里输入的无线调试配对码。
+
+            ⚠️ 必须静态声明（不能动态注册）：通知可能在 App 进程已被系统回收时
+            仍留在通知栏，那时动态注册的接收器已经不存在了，用户回复的配对码
+            会石沉大海。
+        -->
+        <receiver
+            android:name=".AdbPairingReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.dsh.android.action.PAIRING_REPLY" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>

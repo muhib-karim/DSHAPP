@@ -8,4 +8,19 @@
     <string name="notification_idle">空闲</string>
     <string name="notification_thinking">正在思考</string>
     <string name="notification_no_content">暂无内容</string>
+
+    <!-- 无线调试配对（Android 11+）。流程与文案参考 Shizuku 的 AdbPairingService。 -->
+    <string name="pairing_channel_name">无线调试配对</string>
+    <string name="pairing_channel_desc">用配对码把本应用的密钥授权给系统 adbd，之后就能免电脑使用特权身份</string>
+    <string name="pairing_title">配对无线调试</string>
+    <string name="pairing_failed_title">配对失败</string>
+    <string name="pairing_searching">正在查找配对端口…</string>
+    <string name="pairing_no_port">没找到配对端口。请先在系统「开发者选项 → 无线调试」里点开「使用配对码配对设备」，让那个界面保持显示，再回来点一次「配对」。</string>
+    <string name="pairing_waiting">在下面回复系统显示的 6 位配对码</string>
+    <string name="pairing_input_label">配对码</string>
+    <string name="pairing_reply">输入配对码</string>
+    <string name="pairing_working">正在配对…</string>
+    <string name="pairing_ok">配对成功，特权身份已可用</string>
+    <string name="pairing_empty_code">没有收到配对码，请重新输入</string>
+    <string name="pairing_stop">取消</string>
 </resources>
