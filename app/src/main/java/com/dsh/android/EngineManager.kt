@@ -1488,7 +1488,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-13"
+        private const val MOBILE_UI_VERSION = "1.0.0-19"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────

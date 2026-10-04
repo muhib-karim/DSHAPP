@@ -1289,6 +1289,11 @@ window.__ModuleLoader__.load({
 			agent: '<rect x="3" y="5.4" width="10" height="8" rx="2"/><path d="M8 5.4V3.2"/><circle cx="8" cy="2.2" r="1"/><circle cx="6.1" cy="9.1" r="1"/><circle cx="9.9" cy="9.1" r="1"/><path d="M6.3 11.6h3.4"/>',
 			im: '<rect x="2" y="2.4" width="12" height="8.6" rx="2.2"/><path d="M5.4 14.2l1.6-3.2"/><circle cx="6" cy="6.7" r="0.95"/><circle cx="8" cy="6.7" r="0.95"/><circle cx="10" cy="6.7" r="0.95"/>',
 			market: '<path d="M2 6.6V4.8l.9-2.2c.2-.4.5-.6 1-.6h8.2c.5 0 .8.2 1 .6l.9 2.2v1.8"/><path d="M2 6.6h12v1.6c0 1.2-1 2.2-2.2 2.2S9.6 9.4 9.6 8.2c0 1.2-1 2.2-2.2 2.2S5.2 9.4 5.2 8.2C5.2 9.4 4.2 10.4 3 10.4S2 9.4 2 8.2z"/><path d="M3.4 10.6v3.2c0 .5.4.9.9.9h7.4c.5 0 .9-.4.9-.9v-3.2"/><path d="M6.6 14.7v-3h2.8v3"/>',
+			// 特权权限（uid 2000）：自绘「盾牌 + 钥匙孔」。
+			// 语义是「被管住的提权」—— 盾牌代表边界还在（该身份反而没有沙箱），
+			// 钥匙孔代表拿得到特权。用描边风格（同 plugin/model 等），
+			// 与「通用设置/AI 回复风格」那两个实心官方图标区分开。
+			privileged: '<path d="M8 1.8l5.6 2.1v4.5c0 3.2-2.4 5.6-5.6 6.5-3.2-.9-5.6-3.3-5.6-6.5V3.9z"/><circle cx="8" cy="6.9" r="1.35"/><path d="M8 8.25V10.7"/>',
 		};
 		// 文本 → 图标键。先长后短匹配，避免「插件」抢走「插件市场」。
 		const MP_NAV_ICONS = [
@@ -1304,6 +1309,11 @@ window.__ModuleLoader__.load({
 			["模型", "model"],
 			["插件", "plugin"],
 			["离开提醒", "bell"],
+			// 本插件自己注册的分节。⚠️ 必须排在「插件」之后：mpIconKeyOf 是
+			// 子串匹配、先到先得，「特权权限」不含「插件」所以不冲突，但顺序仍
+			// 保持「长/具体优先」的既有约定。
+			["特权权限", "privileged"],
+			["Privileged access", "privileged"],
 		];
 		const mpIconKeyOf = (label) => {
 			const t = (label || "").trim();
@@ -1492,7 +1502,7 @@ window.__ModuleLoader__.load({
 						{ label: "通用", items: ["通用设置"] },
 						{ label: "模型", items: ["模型"] },
 						{ label: "插件", items: ["插件"] },
-						{ label: "高级", items: ["Agent 预设", "快照", "附件缓存"] },
+						{ label: "高级", items: ["Agent 预设", "快照", "附件缓存", "特权权限"] },
 					];
 					for (const g of groups) {
 						const first = [...navList.querySelectorAll("button")].find((b) => g.items.includes((b.innerText || "").trim()));
@@ -3641,9 +3651,379 @@ window.__ModuleLoader__.load({
 			};
 		}
 
+		// ══════════════════════════════════════════════════════════════════
+		// 特权权限（uid 2000）设置分节
+		//
+		// 需求：设置页加一项，专门引导用户打开 uid 2000 权限。
+		// 方案（用户选定）：静态引导 + 实时状态检测；入口 = 设置页左侧一级导航。
+		//
+		// 接缝 = 官方 `settings.section` 槽位（`dsh-client-ui-settings-plugins` 用的
+		// 是同一个）。注册进去就自动出现在一级导航里，并被**现有的两级导航**接管 ——
+		// `setupSettingsDialog()` 会把 nav 竖向化、点进去全屏显示二级页，
+		// 所以这里**不需要**碰导航 DOM，也不必再写一套页面切换。
+		//
+		// 状态从哪来：浏览器进程读不到 `process.env` / 文件系统，所以状态由宿主半
+		// （`lib/index.js`）的 `GET /api/dsh-android/privileged` 提供。那里返回的是
+		// **端到端跑一次 `id -u`** 的结果，不是「文件在不在」—— 密钥文件存在但未被
+		// adbd 授权时，通道照样拿不到 uid 2000，只查文件会得到**假阳性**。
+		// ══════════════════════════════════════════════════════════════════
+		const MP_PRIV_API = "/api/dsh-android/privileged";
+		const MP_PRIV_NS = "dsh-android-mobile.privileged";
+		// 官方静态模块表（`dsh-web-frontend` 的 `staticModules`）里有 react，
+		// 所以客户端半可以直接 require 它，不需要自己打包一份 React。
+		//
+		// ⚠️ **必须延迟到 apply() 再 require，不能在模块顶层**：本文件的 factory
+		//    会在 `__ModuleLoader__` 的 **queue 模式**下就被调用（模块系统尚未 boot、
+		//    静态模块表还没建立），那时 require 会抛。apply() 一定是 boot 之后跑的。
+		// ⚠️ 用 try/catch 拿：拿不到就**只损失这一个分节**，绝不能让整个插件
+		//    （含移动端 UI 适配）挂掉。
+		let mpPrivReact = null;
+
+		const MP_PRIV_ZH = {
+			nav: "特权权限",
+			title: "特权权限（uid 2000）",
+			intro: "开启后，AI 可以在需要时以系统 shell 身份（uid 2000）执行命令 —— 截图、模拟点击、卸载应用、改系统设置这些原本做不到的事。默认仍走 App 身份，要不要提权由 AI 自己判断。",
+			statusTitle: "当前状态",
+			statusOn: "已开启",
+			statusOff: "未开启",
+			statusUnknown: "检测中",
+			recheck: "重新检测",
+			checking: "检测中…",
+			failed: "检测失败",
+			rowRunner: "执行通道",
+			rowKey: "ADB 密钥",
+			rowIdentity: "实际身份",
+			ready: "已就位",
+			missing: "缺失",
+			imported: "已导入",
+			notImported: "未导入",
+			justImported: "刚刚导入",
+			uidOk: "uid 2000",
+			uidApp: "App 身份（未提权）",
+			bytes: "字节",
+			guideTitle: "开启步骤",
+			step1: "用数据线把手机连到电脑。首次连接时手机会弹「允许 USB 调试吗」，勾选「一律允许」再确定。",
+			step2: "在电脑上打开终端，执行下面这条 —— 它让手机的 adbd 在 5555 端口监听。Android 10 每次重启手机后都要重做一次。",
+			step3: "再执行下面这条，把电脑上已授权的密钥推到手机的共享目录（macOS / Linux 把 %USERPROFILE%\\.android\\adbkey 换成 ~/.android/adbkey）。",
+			step4: "回到本页，点上面的「重新检测」。App 会把密钥搬进自己的私有目录，并立刻删掉共享目录里的中转文件。",
+			cmd2: "adb tcpip 5555",
+			cmd3: "adb push %USERPROFILE%\\.android\\adbkey /sdcard/dsh_adbkey",
+			copy: "复制",
+			copied: "已复制",
+			copyFailed: "复制失败",
+			notesTitle: "几点说明",
+			note1: "密钥等同于这台设备的控制权。App 只在私有目录保存它，导入后立刻删除 /sdcard 上的中转文件。",
+			note2: "卸载重装会清掉密钥，需要重新做一遍上面的步骤。",
+			note3: "以特权身份执行的命令不经过沙箱 —— 该身份读不到 App 私有目录，写沙箱和 link 转译对它都不生效。",
+		};
+		const MP_PRIV_EN = {
+			nav: "Privileged access",
+			title: "Privileged access (uid 2000)",
+			intro: "When enabled, the AI can run commands as the system shell identity (uid 2000) when it needs to — screenshots, synthetic taps, uninstalling apps, changing system settings. Everything still defaults to the app's own identity; the AI decides when to escalate.",
+			statusTitle: "Current status",
+			statusOn: "Enabled",
+			statusOff: "Not enabled",
+			statusUnknown: "Checking",
+			recheck: "Re-check",
+			checking: "Checking…",
+			failed: "Check failed",
+			rowRunner: "Execution channel",
+			rowKey: "ADB key",
+			rowIdentity: "Effective identity",
+			ready: "In place",
+			missing: "Missing",
+			imported: "Imported",
+			notImported: "Not imported",
+			justImported: "just imported",
+			uidOk: "uid 2000",
+			uidApp: "App identity (not escalated)",
+			bytes: "bytes",
+			guideTitle: "How to enable it",
+			step1: "Connect the phone to a computer with a USB cable. On first connect the phone asks \"Allow USB debugging?\" — tick \"Always allow\" and confirm.",
+			step2: "Open a terminal on the computer and run the command below — it makes the phone's adbd listen on port 5555. On Android 10 you must redo this after every reboot.",
+			step3: "Then run the command below to push the computer's already-authorized key to the phone's shared storage (on macOS / Linux replace %USERPROFILE%\\.android\\adbkey with ~/.android/adbkey).",
+			step4: "Come back to this page and tap \"Re-check\" above. The app moves the key into its private directory and immediately deletes the hand-off file from shared storage.",
+			cmd2: "adb tcpip 5555",
+			cmd3: "adb push %USERPROFILE%\\.android\\adbkey /sdcard/dsh_adbkey",
+			copy: "Copy",
+			copied: "Copied",
+			copyFailed: "Copy failed",
+			notesTitle: "Things to know",
+			note1: "The key is equivalent to control of this device. The app keeps it only in its private directory and deletes the /sdcard hand-off file right after importing.",
+			note2: "Uninstalling the app wipes the key; you will need to repeat the steps above.",
+			note3: "Commands run as the privileged identity bypass the sandbox — that identity cannot read the app's private directory, so the write sandbox and the link translation layer do not apply to it.",
+		};
+
+		// 全内联样式：设置 dialog 里的既有教训是「匹配 dialog 的 CSS 规则会把弹窗
+		// 推出屏幕」，而 section 内容住在那个 dialog 里，所以这里不新增 CSS 规则。
+		const MP_PRIV_S = {
+			section: { maxWidth: "760px", display: "flex", flexDirection: "column", gap: "12px", color: "var(--dsw-alias-label-primary, #222)" },
+			heading: { margin: 0, fontSize: "18px", fontWeight: 600 },
+			intro: { margin: 0, fontSize: "13px", lineHeight: "20px", color: "var(--dsw-alias-label-tertiary, #888)" },
+			card: { border: "0.5px solid var(--dsw-alias-border-l2, #e2e2e2)", borderRadius: "10px", padding: "12px 14px", display: "flex", flexDirection: "column", gap: "10px" },
+			cardHead: { display: "flex", alignItems: "center", gap: "8px" },
+			cardTitle: { margin: 0, fontSize: "15px", fontWeight: 600 },
+			badge: { marginLeft: "auto", fontSize: "12px", fontWeight: 600, padding: "3px 9px", borderRadius: "999px", whiteSpace: "nowrap" },
+			btn: { border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)", background: "transparent", color: "inherit", font: "inherit", fontSize: "13px", padding: "6px 14px", borderRadius: "8px", cursor: "pointer" },
+			row: { display: "flex", alignItems: "baseline", gap: "8px", fontSize: "13px", lineHeight: "19px" },
+			dot: { flex: "0 0 auto", width: "7px", height: "7px", borderRadius: "50%", transform: "translateY(-1px)" },
+			rowLabel: { flex: "0 0 auto", color: "var(--dsw-alias-label-tertiary, #888)" },
+			rowValue: { flex: "1 1 auto", minWidth: 0, wordBreak: "break-word" },
+			steps: { margin: 0, padding: "0 0 0 20px", display: "flex", flexDirection: "column", gap: "9px" },
+			step: { fontSize: "13px", lineHeight: "20px" },
+			// 命令块：独立成行 + 可横向滚动。窄屏上命令很长，
+			// 换行会把路径断在中间导致抄错，所以宁可横向滚。
+			// ⚠️ 这里**刻意不**设 user-select：本插件的全局 CSS 是
+			//   `[data-mobile] * { user-select: none !important }`，内联会被压掉，
+			//   写了也是死代码。**正因如此才必须有复制按钮** —— 命令长按选不中，
+			//   而这台设备上用户是在电脑终端里敲，只能照着手机屏幕抄。
+			cmdRow: { display: "flex", alignItems: "stretch", gap: "6px", marginTop: "6px" },
+			cmd: { flex: "1 1 auto", minWidth: 0, display: "block", padding: "7px 9px", borderRadius: "6px", background: "var(--dsw-alias-interactive-bg-hover, #f2f2f2)", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "12px", lineHeight: "18px", overflowX: "auto", whiteSpace: "pre" },
+			// 固定宽度：文案在「复制 / 已复制 / 复制失败」之间切换，
+			// 不固定的话按钮会随字数变宽，把左边的命令块挤得来回跳。
+			cmdBtn: { flex: "0 0 auto", display: "flex", alignItems: "center", justifyContent: "center", minWidth: "62px", border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)", background: "transparent", color: "inherit", font: "inherit", fontSize: "12px", padding: "0 8px", borderRadius: "6px", cursor: "pointer", whiteSpace: "nowrap" },
+			notes: { margin: 0, padding: "0 0 0 18px", display: "flex", flexDirection: "column", gap: "6px" },
+			note: { fontSize: "12px", lineHeight: "18px", color: "var(--dsw-alias-label-tertiary, #888)" },
+			error: { margin: 0, fontSize: "12px", lineHeight: "18px", color: "#c92a2a" },
+		};
+
+		const MP_PRIV_TONE = {
+			on: { color: "#2f9e44", bg: "rgba(47,158,68,0.12)" },
+			off: { color: "#e8590c", bg: "rgba(232,89,12,0.12)" },
+			unknown: { color: "#868e96", bg: "rgba(134,142,150,0.12)" },
+		};
+
+		/**
+		 * 把一段文本写进系统剪贴板。
+		 *
+		 * ⚠️ **必须两条路都留**：官方前端跑在 `http://127.0.0.1:3080` 上，
+		 * 而 `navigator.clipboard` 只在**安全上下文**（https / localhost 域名 /
+		 * file:）里存在 —— `127.0.0.1` 虽是回环地址、Chromium 也把它算作
+		 * potentially trustworthy，但 WebView 上这个判定随内核版本而变，
+		 * 不能赌。所以先用 `navigator.clipboard`，失败或不存在时退回
+		 * `document.execCommand("copy")` + 临时 textarea 的老办法。
+		 *
+		 * @param {string} text - 要复制的文本。
+		 * @returns {Promise<boolean>} 是否成功。
+		 */
+		function mpCopyText(text) {
+			const fallback = () => {
+				try {
+					const area = document.createElement("textarea");
+					area.value = text;
+					// 必须在文档里且可聚焦，execCommand 才会作用于它。
+					// 用 fixed + 透明把它藏起来，避免点按钮时页面跳动。
+					area.setAttribute("readonly", "");
+					area.style.position = "fixed";
+					area.style.top = "0";
+					area.style.left = "0";
+					area.style.opacity = "0";
+					area.style.pointerEvents = "none";
+					document.body.appendChild(area);
+					area.select();
+					area.setSelectionRange(0, text.length);
+					const ok = document.execCommand("copy");
+					document.body.removeChild(area);
+					return ok;
+				} catch (error) {
+					console.warn("[dsh-android-mobile] 复制到剪贴板失败:", error && error.message);
+					return false;
+				}
+			};
+			try {
+				if (navigator.clipboard && navigator.clipboard.writeText) {
+					return navigator.clipboard.writeText(text).then(() => true, fallback);
+				}
+			} catch (error) {
+				/* 落到 fallback */
+			}
+			return Promise.resolve(fallback());
+		}
+
+		/**
+		 * 「特权权限」分节组件。
+		 *
+		 * 官方向 `settings.section` 的组件注入 `t`（由注册项的 `locale` 命名空间绑定）
+		 * 与 `close`；本组件只用 `t`。
+		 *
+		 * @param {object} props - 槽位注入面。
+		 * @returns {object} React 元素。
+		 */
+		function mpPrivSection(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_PRIV_ZH[key] ?? key;
+			const [state, setState] = React.useState({ phase: "loading" });
+			const refresh = React.useCallback(() => {
+				let alive = true;
+				setState({ phase: "loading" });
+				window.fetch(MP_PRIV_API, { cache: "no-store" })
+					.then((res) => {
+						if (!res.ok) throw new Error("HTTP " + res.status);
+						return res.json();
+					})
+					.then((data) => { if (alive) setState({ phase: "ready", data }); })
+					.catch((error) => {
+						if (alive) setState({ phase: "error", message: String((error && error.message) || error) });
+					});
+				return () => { alive = false; };
+			}, []);
+			React.useEffect(refresh, [refresh]);
+
+			const data = state.phase === "ready" ? state.data : null;
+			const identityOk = !!(data && data.identity && data.identity.ok);
+			const tone = state.phase === "loading" ? "unknown"
+				: state.phase === "error" ? "off"
+					: identityOk ? "on" : "off";
+			const badgeText = state.phase === "loading" ? t("statusUnknown")
+				: state.phase === "error" ? t("failed")
+					: identityOk ? t("statusOn") : t("statusOff");
+
+			const rows = [];
+			if (data) {
+				rows.push({
+					key: "runner", label: t("rowRunner"), ok: data.runner.ok,
+					value: data.runner.ok ? `${t("ready")} · ${data.runner.size} ${t("bytes")}` : t("missing"),
+				});
+				rows.push({
+					key: "key", label: t("rowKey"), ok: data.key.ok,
+					value: data.key.ok
+						? `${t("imported")} · ${data.key.size} ${t("bytes")}${data.key.importedNow ? " · " + t("justImported") : ""}`
+						: t("notImported"),
+				});
+				rows.push({
+					key: "identity", label: t("rowIdentity"), ok: identityOk,
+					value: identityOk
+						? t("uidOk")
+						: `${t("uidApp")}${data.identity && data.identity.reason ? " · " + data.identity.reason : ""}`,
+				});
+			}
+
+			// 复制结果按**对象**存（不是布尔、也不是纯字符串）：两个块共用一个
+			// 「最近复制的是哪条」，点第二条时第一条会自己复位成「复制」，
+			// 不会两块同时显示「已复制」让人分不清到底复制了哪条。
+			// 存对象而非字符串还有个作用：连点同一个按钮时 `at` 每次都不同，
+			// 保证 state 一定变化 → effect 重跑 → 复位计时器被重新计时。
+			const [copied, setCopied] = React.useState(null);
+			React.useEffect(() => {
+				if (copied === null) return undefined;
+				const timer = window.setTimeout(() => setCopied(null), 2000);
+				return () => window.clearTimeout(timer);
+			}, [copied]);
+			const e = React.createElement;
+			// 命令块 = 等宽代码 + 复制按钮。**按钮不是锦上添花**：本插件的全局
+			// CSS 把 `user-select` 压成 `none`（见文件头 4c），命令长按选不中，
+			// 而用户是在电脑终端里敲这些命令，只能照着手机屏幕抄 —— 没有按钮就得
+			// 逐字符手抄 `%USERPROFILE%\.android\adbkey`。
+			const cmdBlock = (text) => e("div", { key: text, style: S.cmdRow },
+				e("code", { style: S.cmd }, text),
+				e("button", {
+					type: "button",
+					style: S.cmdBtn,
+					onClick: () => {
+						mpCopyText(text).then((ok) => setCopied({ text, ok, at: Date.now() }));
+					},
+				}, copied && copied.text === text
+					? (copied.ok ? t("copied") : t("copyFailed"))
+					: t("copy")),
+			);
+			const guideSteps = [
+				e("li", { key: 0, style: S.step }, t("step1")),
+				e("li", { key: 1, style: S.step }, t("step2"), cmdBlock(t("cmd2"))),
+				e("li", { key: 2, style: S.step }, t("step3"), cmdBlock(t("cmd3"))),
+				e("li", { key: 3, style: S.step }, t("step4")),
+			];
+			return e("div", { style: S.section },
+				e("h2", { style: S.heading }, t("title")),
+				e("p", { style: S.intro }, t("intro")),
+
+				e("div", { style: S.card },
+					e("div", { style: S.cardHead },
+						e("h3", { style: S.cardTitle }, t("statusTitle")),
+						e("span", { style: { ...S.badge, color: MP_PRIV_TONE[tone].color, background: MP_PRIV_TONE[tone].bg } }, badgeText),
+					),
+					rows.map((row) => e("div", { key: row.key, style: S.row },
+						e("span", { style: { ...S.dot, background: row.ok ? MP_PRIV_TONE.on.color : MP_PRIV_TONE.off.color } }),
+						e("span", { style: S.rowLabel }, row.label),
+						e("span", { style: S.rowValue }, row.value),
+					)),
+					state.phase === "error" ? e("p", { style: S.error }, state.message) : null,
+					e("div", null, e("button", {
+						type: "button",
+						style: S.btn,
+						disabled: state.phase === "loading",
+						onClick: refresh,
+					}, state.phase === "loading" ? t("checking") : t("recheck"))),
+				),
+
+				e("div", { style: S.card },
+					e("h3", { style: S.cardTitle }, t("guideTitle")),
+					e("ol", { style: S.steps }, guideSteps),
+				),
+
+				e("div", { style: S.card },
+					e("h3", { style: S.cardTitle }, t("notesTitle")),
+					e("ul", { style: S.notes },
+						[t("note1"), t("note2"), t("note3")].map((text, index) => e("li", { key: index, style: S.note }, text)),
+					),
+				),
+			);
+		}
+
+		/**
+		 * 把「特权权限」分节注册进官方设置页的一级导航。
+		 *
+		 * 用 `ctx.inject` 等 `slots` / `locale` 就绪：本插件声明的 `inject` 是空数组
+		 * （客户端半刻意不声明依赖，避免因某个服务缺失而整个不激活），所以这里按需
+		 * 开一个子插件来等这两个服务。
+		 *
+		 * @param {object} ctx - 浏览器插件上下文。
+		 */
+		function mpRegisterPrivilegedSection(ctx) {
+			if (mpPrivReact === null) {
+				try { mpPrivReact = require("react"); } catch (e) {
+					console.warn("[dsh-android-mobile] require('react') 失败，跳过特权权限分节:", e && e.message);
+					mpPrivReact = null;
+				}
+			}
+			if (!mpPrivReact) return;   // 拿不到 React 就静默跳过，不影响移动端 UI 适配
+			try {
+				ctx.inject(["slots", "locale"], (scope) => {
+					// ⚠️ **必须用 `scope` 上的服务，不能用外层 `ctx`。**
+					//   Cordis 的 `ctx.locale` 要求**当前 fiber 声明过** `locale` 依赖，
+					//   否则抛 `cannot get property "locale" without inject`。
+					//   本插件的 `inject` 是空数组（客户端半刻意不声明依赖），所以外层
+					//   `ctx.locale` 一定不可用；`scope` 是这个 `ctx.inject` 子 fiber，
+					//   它的依赖表里有 `slots`/`locale`，从它取才对。
+					//   （官方 ui-approval 写 `ctx.locale` 是因为它的 inject 里声明了 locale，
+					//    照抄那行在本插件里必炸 —— 这里踩过一次。）
+					const t = scope.locale.bind(MP_PRIV_NS);
+					scope.effect(
+						() => scope.locale.register(MP_PRIV_NS, { zh: MP_PRIV_ZH, en: MP_PRIV_EN }),
+						"dsh-android-mobile: 特权权限字典",
+					);
+					scope.slots.inject("settings.section", () => scope.slots.register({
+						name: "settings.section",
+						// 刻意不叫 "privileged"：官方若将来加同名分节，我们的会把它顶掉。
+						id: "dsh-android-privileged",
+						// 官方 order：account=-10、general=0、models=10、plugins=15、
+						// agent-presets=20。排在所有官方分节之后，不打乱用户熟悉的顺序。
+						order: 25,
+						label: () => t("nav"),
+						locale: MP_PRIV_NS,
+					}, mpPrivSection));
+				});
+			} catch (e) {
+				/* 注册失败只损失这一个分节，绝不能连累移动端 UI 适配。
+				   但**要打日志**：静默吞异常会让「分节没出现」变成无从下手的哑谜。 */
+				console.warn("[dsh-android-mobile] 注册特权权限分节失败:", e && (e.stack || e.message || e));
+			}
+		}
+
 		function apply(ctx) {
 			mpCtx = ctx;
 			mpSessionsCache = ctx.get("sessions") ?? null;
+			mpRegisterPrivilegedSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */
 			injectStyles();

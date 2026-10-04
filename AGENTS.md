@@ -412,7 +412,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-13`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-19`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -859,6 +859,104 @@ adb shell run-as com.dsh.android sh -c "DSH_HOME=... node files/dsh-android-shel
 `bash` 都应以 app 身份执行（`id -u` 给的是 `u0_a…` 而不是 `2000`）。
 这是本次改动的核心断言 —— 若 `bash` 仍走 uid 2000，说明旧的 `--import` 加载器
 还没删干净（检查启动命令行里是否还有 `--import`）。
+
+#### 设置页的「特权权限」引导分节
+
+用户不该去读 AGENTS.md 才会开这个权限。设置页左侧一级导航里有一项
+**「特权权限」**（`dsh-android-mobile` 的客户端半注册的），内容是
+**静态引导 + 实时状态**：
+
+- **静态引导**：4 步（连 USB → `adb tcpip 5555` → `adb push … /sdcard/dsh_adbkey`
+  → 回来点「重新检测」），两条命令单独用等宽块渲染，**每条自带复制按钮**。
+  外加 3 条注意事项。
+- **实时状态**：执行通道 / ADB 密钥 / 实际身份三行 + 「已开启 / 未开启」徽章，
+  带一个「重新检测」按钮。
+
+⚠️ **复制按钮不是锦上添花，是必需品。** 本插件的全局 CSS 是
+`[data-mobile] * { user-select: none !important }`（文件头 4c，为了消灭长按弹菜单），
+命令块**长按选不中**，而用户是在电脑终端里敲这两条命令、只能照着手机屏幕抄 ——
+没有按钮就得逐字符手抄 `%USERPROFILE%\.android\adbkey`。
+（内联 `user-select: text` 压不过 `!important`，别想靠那个绕。）
+
+⚠️ **写剪贴板必须留降级路径。** 真机实测（Huawei CDY-TN90 / Android 10 WebView）：
+
+| 路径 | 结果 |
+|---|---|
+| `window.isSecureContext` | **true**（`127.0.0.1` 算 trustworthy origin） |
+| `navigator.clipboard.writeText` | 存在，但抛 **`NotAllowedError: Write permission denied`** |
+| `document.execCommand("copy")` + 临时 textarea | **返回 true，内容正确落进剪贴板** |
+
+也就是说**光看 `isSecureContext` 或「API 在不在」都会误判成可用**。
+必须 `navigator.clipboard` 失败后回落到 `execCommand`。已用「复制后粘贴到临时
+textarea 再读回」逐字节验证（`execCommand:true` → 粘贴内容与命令完全一致）。
+
+⚠️ **测这个按钮不能用 `element.click()`**：合成点击**不算用户手势**，`execCommand`
+会返回 `false`，于是测出「复制失败」的**假象** —— 本次调试中真的被它误导过一轮。
+要用 CDP 的 `Input.dispatchMouseEvent`（`mousePressed` + `mouseReleased`）发真实鼠标事件。
+
+实现分两半，**跨进程**：
+
+| 半 | 文件 | 做什么 |
+|---|---|---|
+| 客户端半 | `dsh-android-mobile/lib/client.js` | 注册 `settings.section`（`id: "dsh-android-privileged"`，`order: 25`），渲染分节 UI |
+| 宿主半 | `dsh-android-mobile/lib/index.js` | `GET /api/dsh-android/privileged` 返回状态快照 |
+
+浏览器进程读不到 `process.env` / 文件系统，所以状态必须由宿主半提供。
+宿主半用 `ctx.webServer.register({kind:"exact", path, handler})` 挂路由
+（`inject: ["webServer"]`）—— 这是引擎给插件留的自定义 HTTP 接缝。
+
+⚠️ **状态判据必须是「端到端跑一次 `id -u`」，不能是「`adbkey` 文件在不在」。**
+密钥文件存在但未被 adbd 授权（设备 `adb_keys` 里没有对应公钥）时，通道照样
+拿不到 uid 2000 —— 只查文件会得到**假阳性**。所以宿主半实际 spawn 一次
+runner 跑 `id -u`，看它回什么；文件存在性只作为定位用的分解信息。
+探测会顺带触发 runner 的密钥导入，所以点「重新检测」就等于走完引导最后一步。
+
+⚠️ **`slots.register` 要求槽位已被声明**，而 `settings.section` 由
+`dsh-client-ui-settings-general` 的 `settings.root` factory 在 `children` 里声明。
+用 `ctx.slots.inject("settings.section", …)` 等它 —— 声明已存在时同步执行，
+否则在声明提交后执行。
+
+⚠️ **`ctx.locale` 必须从 `ctx.inject` 的回调参数取，不能从外层 `ctx` 取。**
+Cordis 的 `ctx.locale` 要求**当前 fiber 声明过** `locale` 依赖，否则抛
+
+```
+Error: cannot get property "locale" without inject
+```
+
+本插件的 `inject` 是空数组（客户端半刻意不声明依赖，避免某个服务缺失就整个不激活），
+所以外层 `ctx.locale` **一定**不可用。正确写法是 `ctx.inject(["slots","locale"], (scope) => …)`
+然后用 `scope.locale` / `scope.slots`。
+
+> 官方 `ui-approval` 写的是 `ctx.locale.bind(NS)`，那是**因为它的 `inject` 数组里
+> 声明了 `locale`**。照抄那一行在本插件里必炸 —— 这里踩过一次。
+
+⚠️ **异常会变成全局未捕获异常，`try/catch` 捕不到。** `slots.inject` 内部对回调
+异常的处理是 `queueMicrotask(() => { throw failure })`，所以「分节没出现、
+日志里什么都没有」是典型症状。排查手法：在回调**内部**包 try/catch 并
+`console.warn`（页面 `console` 会转发到 `DSH` tag，前缀 `[web]`）。
+
+**验收手法**（数值证据）：
+
+```powershell
+# 插件版本要变（改了 mobile-ui-plugin 必须 bump MOBILE_UI_VERSION）
+adb logcat -d -s DSH:I | Select-String "移动端 UI 插件"
+#   → 已安装移动端 UI 插件 dsh-android-mobile 1.0.0-19 (<N> 字节)
+
+# 状态接口（用 app 自己的 node 访问，设备上没有 curl）
+adb shell "run-as com.dsh.android sh -c 'cp /data/local/tmp/probe.mjs files/p.mjs; \
+  /data/data/com.dsh.android/files/usr/bin/node files/p.mjs; rm -f files/p.mjs'"
+#   → {"runner":{"ok":true,"size":21322},"key":{"ok":true,"size":1732},
+#      "identity":{"ok":true,"uid":"2000"}}
+
+# 分节真的进了导航、二级页真的渲染（走 CDP）
+adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
+# 在页面里查：navButtons 应含 "特权权限"，点进去 content.innerText 应含
+# "adb tcpip 5555" / "adb push" / "uid 2000"
+```
+
+⚠️ **改了 `mobile-ui-plugin/` 必须同时做两件事**：重新打 `mobile-ui.zip` +
+bump `EngineManager.MOBILE_UI_VERSION`。漏 bump 的后果是**静默的** ——
+版本戳没变 → 解包被跳过 → 新代码永不生效（本次调试中真实踩到过一次）。
 
 #### ⚠️ 不要设 `LD_LIBRARY_PATH`（它只会破坏系统二进制）
 
