@@ -985,9 +985,173 @@ class EngineManager private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * 解出 uid 2000 执行通道（`dsh-android-shell.mjs`，每次启动覆盖写）。
+     *
+     * 该脚本直连本机 adbd（`127.0.0.1:5555`）走 ADB 协议认证，从而以 shell
+     * 身份（uid 2000）执行命令 —— 这是 `screencap` / `input` / `pm uninstall` /
+     * `settings` / `getevent` 等操作唯一可行的路径，app 域全部做不到
+     * （详见 `assets/dsh-android-shell.mjs` 头部的实测对照表）。
+     *
+     * ⚠️ 没有密钥时**不报错**：脚本自己会回落为本地执行（app 域），
+     * 也就是「授权了走 shell，没授权走普通的」。所以这里返回 null 只是
+     * 让引擎不挂 overlay，而不是失败。
+     */
+    private fun ensurePrivilegedShell(): File? {
+        val dest = File(context.filesDir, PRIVILEGED_RUNNER_FILE)
+        return try {
+            // 每次都覆盖写：脚本 20KB 且随 APK 升级而变，比对哈希不值当
+            context.assets.open(PRIVILEGED_RUNNER_ASSET).use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            }
+            dest.setReadable(true, false)
+            Log.i(TAG, "已解出 uid 2000 执行通道 $PRIVILEGED_RUNNER_FILE (${dest.length()} 字节)")
+            dest
+        } catch (t: Throwable) {
+            // 解不出来只是没有特权通道，不该拖垮引擎启动
+            Log.w(TAG, "解出 uid 2000 执行通道失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 解出 uid 2000 特权工具插件（`shell-tool.zip` → `$DSH_HOME/shell-tool/dsh-android-shell/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `shell` 的**独立工具**，它永远以 uid 2000
+     * 执行；`bash` 工具则永远保持 app 身份。两者的机制与取舍见插件源码头部注释
+     * （`mobile-ui-plugin/dsh-android-shell/lib/index.js`）。
+     *
+     * ⚠️ **为什么解到 `$DSH_HOME/shell-tool/` 而不是 profile 的 `node_modules`**：
+     * 与移动端 UI 插件同一个坑 —— 那个目录归 pnpm 管，而本包不在 profile 的
+     * `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`。
+     * 详见 [ensureMobileUi]。
+     *
+     * 与移动端 UI 插件不同，这里**不做版本戳**：`lib/index.js` 每次启动覆盖写，
+     * 逻辑与 linkcompat/boosandbox 那类「每次覆盖」的资产一致 —— 包很小（单文件），
+     * 比对哈希不值当。
+     */
+    private fun ensurePrivilegedPlugin() {
+        val target = File(dshHome, "$SHELL_TOOL_DIR/$SHELL_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(SHELL_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装 uid 2000 特权工具插件 $SHELL_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 shell 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装 uid 2000 特权工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载 uid 2000 特权工具的 overlay，返回其路径；不可用时返回 null。
+     *
+     * 走 `--patch` 与移动端 UI 插件同样的理由（不改用户自己的 profile 配置、
+     * 优先级更高、完全由本 App 拥有）。`name` 用 `file://` 绝对 URL，因为包
+     * 刻意放在 pnpm 管辖之外，按包名解析不到。
+     *
+     * @param available 特权通道是否可用。不可用时**不挂载** —— 插件本身在
+     *   没有 `DSH_PRIV_RUNNER` 时也不会注册工具，但少挂一层就少一处噪音。
+     */
+    private fun writePrivilegedPatch(available: Boolean): File? {
+        val patch = File(dshHome, SHELL_TOOL_PATCH)
+        val entry = File(dshHome, "$SHELL_TOOL_DIR/$SHELL_TOOL_PACKAGE/lib/index.js")
+        if (!available || !entry.isFile) {
+            // 通道不可用：把上次可能留下的 overlay 删掉，否则引擎会挂上一个
+            // 因为找不到文件而报错的模块（或者更糟，挂上旧的残留版本）。
+            if (patch.isFile) patch.delete()
+            if (!available) Log.i(TAG, "uid 2000 通道不可用，跳过挂载 shell 工具")
+            else Log.w(TAG, "uid 2000 特权工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载 uid 2000 特权工具插件：注册一个独立的 `shell` 工具，
+                # 由模型按需选择；`bash` 工具不受影响，永远走 app 身份。
+                - insert:
+                    - id: $SHELL_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入 uid 2000 特权工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入 uid 2000 特权工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 往 `$DSH_HOME/AGENTS.md` 写入特权身份说明（幂等）。
+     *
+     * ## 为什么写这个文件
+     *
+     * `@deepseek-ai/dsh-agent-instructions` 会自动读 `$DSH_HOME/AGENTS.md`
+     * （默认候选名 `AGENTS.md` / `CLAUDE.md`）并注入系统提示词 —— 这是**零代码**
+     * 的提示词通道，不需要改引擎、也不需要挂 overlay。
+     *
+     * ⚠️ 该文件归 DSH 的指令机制所有，用户也可能自己往里写东西。所以本方法
+     * **只管理自己那一段**（`BEGIN`/`END` 标记之间），标记之外的内容原样保留。
+     *
+     * ## 为什么必须让模型知道
+     *
+     * 实测（见 `assets/dsh-android-shell.mjs` 头部对照表）app 域与 uid 2000 的
+     * 差异**不体现在退出码上**：`input keyevent` 在 app 域返回 **rc=0 但屏幕不动**，
+     * `dumpsys battery` 在 app 域返回 **rc=0 但输出 `Can't find service`**。
+     * 模型若不知道自己在哪个身份下，会基于假前提继续推理、越走越错。
+     *
+     * @param available 特权通道是否可用（runner 已解出）。不可用时只写「当前不可用」，
+     *   免得模型去试一个必然回落的功能。
+     */
+    private fun ensurePrivilegedPrompt(available: Boolean) {
+        val file = File(dshHome, INSTRUCTIONS_FILE)
+        try {
+            val existing = if (file.isFile) file.readText() else ""
+            val body = if (available) PRIVILEGED_PROMPT_ENABLED else PRIVILEGED_PROMPT_DISABLED
+            val section = buildString {
+                appendLine(PRIVILEGED_PROMPT_BEGIN)
+                appendLine(body.trimEnd())
+                appendLine(PRIVILEGED_PROMPT_END)
+            }
+
+            val begin = existing.indexOf(PRIVILEGED_PROMPT_BEGIN)
+            val end = existing.indexOf(PRIVILEGED_PROMPT_END)
+            val updated = if (begin >= 0 && end > begin) {
+                // 已有本段：整体替换，保留前后用户内容
+                existing.substring(0, begin) + section + existing.substring(end + PRIVILEGED_PROMPT_END.length).trimStart('\n', '\r')
+            } else if (existing.isBlank()) {
+                section
+            } else {
+                existing.trimEnd() + "\n\n" + section
+            }
+
+            if (updated != existing) {
+                dshHome.mkdirs()
+                file.writeText(updated)
+                Log.i(TAG, "已写入特权身份说明: ${file.name}（通道可用=$available）")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入特权身份说明失败: ${t.message}")
+        }
+    }
+
     /** 启动引擎，等待其打印带 token 的 URL。 */
-    suspend fun start() = withContext(Dispatchers.IO) {
-        if (process?.isAlive == true) {
+    suspend fun start() = withContext(Dispatchers.IO) {        if (process?.isAlive == true) {
             Log.i(TAG, "引擎已在运行")
             return@withContext
         }
@@ -1022,6 +1186,15 @@ class EngineManager private constructor(private val context: Context) {
         val sandboxPatch = writeSandboxPatch(ensureSandbox())
         // link 兼容层：SELinux 不给 app_data_file 的 link 权限，需在 libc 边界转译
         val linkCompat = ensureLinkCompat()
+        // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
+        // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
+        val privRunner = ensurePrivilegedShell()
+        // 把该通道注册成独立的 `shell` 工具（**不是**改 bash 的行为）：
+        // 默认走 app 身份，模型读工具描述后自己决定要不要用 2000。见 ensurePrivilegedPlugin()。
+        ensurePrivilegedPlugin()
+        val privPatch = writePrivilegedPatch(privRunner != null)
+        // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」
+        ensurePrivilegedPrompt(privRunner != null)
 
         // Termux 环境必须先就位：node 从 $PREFIX/bin 来，缺失时下面的检查会给出明确报错。
         if (!bootstrap.installNodeRuntime()) {
@@ -1059,6 +1232,10 @@ class EngineManager private constructor(private val context: Context) {
             // 沙箱 runner：同样是 overlay（--patch 可重复，按顺序应用）
             if (sandboxPatch != null) {
                 add("--patch"); add(sandboxPatch.absolutePath)
+            }
+            // uid 2000 特权工具：也是 overlay，注册成独立的 `shell` 工具
+            if (privPatch != null) {
+                add("--patch"); add(privPatch.absolutePath)
             }
             add("--no-open")
         }
@@ -1100,6 +1277,9 @@ class EngineManager private constructor(private val context: Context) {
             // 沙箱 runner 靠它定位 LD_PRELOAD 拦截器。runner 会把它追加到子进程
             // 的 LD_PRELOAD 里（保留这里已有的 link 兼容层，两个库都生效）。
             put("BOO_SANDBOX_LIB", File(context.filesDir, SANDBOX_LIB_FILE).absolutePath)
+            // uid 2000 通道脚本的路径，供特权插件读取（见 [ensurePrivilegedPlugin]）。
+            // 经环境变量传递而不是让 Kotlin 拼 JS 字面量：路径里可能有反斜杠与引号。
+            privRunner?.let { put("DSH_PRIV_RUNNER", it.absolutePath) }
         }
 
         val proc = try {
@@ -1297,6 +1477,112 @@ class EngineManager private constructor(private val context: Context) {
          */
         private const val MOBILE_UI_VERSION = "1.0.0-13"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
+
+        // ── uid 2000 特权通道 ────────────────────────────────────────
+        //
+        // 把 shell 身份执行注册成一个**独立的 `shell` 工具**（不是改 bash 的行为）。
+        // 机制、实测数据与取舍见 assets/dsh-android-shell.mjs 与
+        // mobile-ui-plugin/dsh-android-shell/lib/index.js 的头部注释。
+
+        /** uid 2000 执行通道脚本（直连本机 adbd，走 ADB 协议）。 */
+        private const val PRIVILEGED_RUNNER_ASSET = "dsh-android-shell.mjs"
+        private const val PRIVILEGED_RUNNER_FILE = "dsh-android-shell.mjs"
+
+        /** 注册 `shell` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val SHELL_TOOL_ASSET = "shell-tool.zip"
+        private const val SHELL_TOOL_PACKAGE = "dsh-android-shell"
+        private const val SHELL_TOOL_PATCH = "shell-tool.patch.yml"
+
+        /**
+         * 插件解包目录，相对 `$DSH_HOME`。
+         *
+         * ⚠️ **刻意不放在 profile 的 `node_modules` 下** —— 与移动端 UI 插件同一个坑：
+         * 那里归 pnpm 管，而本包不在 profile 的 `dependencies` 里，用户每装一次插件
+         * 就会被挪进 `node_modules/.ignored/`，overlay 里的包名随即解析失败。
+         * 详见 [ensureMobileUi]。
+         */
+        private const val SHELL_TOOL_DIR = "shell-tool"
+
+        /** 特权身份说明写进这个文件 —— agent-instructions 会自动读它并注入系统提示词。 */
+        private const val INSTRUCTIONS_FILE = "AGENTS.md"
+        private const val PRIVILEGED_PROMPT_BEGIN = "<!-- dsh-android:privileged BEGIN（本段由客户端生成，勿手改）-->"
+        private const val PRIVILEGED_PROMPT_END = "<!-- dsh-android:privileged END -->"
+
+        private val PRIVILEGED_PROMPT_ENABLED = """
+            ## 特权身份（uid 2000 / shell）
+
+            这台设备上你有**两个工具**可跑命令，默认的那个是受限的：
+
+            | 工具 | 身份 | 能力 |
+            |---|---|---|
+            | `bash`（默认） | 应用身份 | 读写工作区、跑脚本、文件操作；有写沙箱与 link 转译保护 |
+            | `shell` | shell 身份（uid 2000） | 系统级操作；**无写沙箱、无 link 转译** |
+
+            ### 什么时候该用 `shell`
+
+            需要**操作设备本身**时。这些在应用身份下**做不到**，而且失败方式很隐蔽：
+
+            | 操作 | 应用身份的真实表现 | `shell` |
+            |---|---|---|
+            | 截图 `screencap` | rc=1，**stderr 完全为空**，只留下 0 字节文件 | rc=0，真图 |
+            | 点击/滑动 `input` | **rc=0 但屏幕纹丝不动** | rc=0，真的生效 |
+            | 卸载应用 `pm uninstall` | `SecurityException: INTERACT_ACROSS_USERS_FULL` | 走到包管理器 |
+            | 读写系统设置 `settings` | `SecurityException: INTERACT_ACROSS_USERS` | 正常 |
+            | 强制停止 `am force-stop` | `SecurityException: FORCE_STOP_PACKAGES` | 正常 |
+            | 查看电池/窗口 `dumpsys` `wm` | rc=**0**，输出 `Can't find service` | 完整状态 |
+            | 读输入设备 `getevent` | `/dev/input Permission denied` | 能枚举设备 |
+            | 列出全部进程 `ps -A` | rc=0，**只看得见自己 uid 的 6 个进程** | 674 行 |
+
+            ⚠️ **注意退出码骗人**：`input` 在应用身份下返回 0 却什么都没做；
+            `dumpsys`/`ps` 返回 0 但结果是残缺的。所以**不要**用「退出码是不是 0」
+            来判断命令有没有真正生效——上面的操作如果结果可疑，直接改用 `shell` 重试。
+
+            ### 怎么用
+
+            换工具名即可，**命令原文一字不改**：
+
+            ```
+            shell(command="screencap -p /sdcard/s.png",
+                  description="截图到共享目录")
+            ```
+
+            ### ⚠️ 用了 `shell` 会失去什么
+
+            shell 身份**读不到应用私有目录**（`/data/user/0/com.dsh.android` 是
+            `drwx------`），因此：
+
+            - **工作区、`${'$'}PREFIX`、`${'$'}DSH_HOME` 全部不可访问**。不要用 `shell` 跑
+              `ls`、`cat`、相对路径这类依赖工作目录的命令——它们会失败或看到空目录。
+              （`shell` 的 `workdir` 参数只对 `/sdcard` 这类共享路径有意义。）
+            - **写沙箱不生效**：`touch /sdcard/x` 这类命令会真的写下去，不再被拦。
+            - **link 转译不生效**：硬链接语义回到系统默认（应用私有目录里会 EACCES）。
+
+            也就是说：**`shell` 换来的是特权，失去的是隔离**。只在该用的时候用。
+            纯粹的读文件、写文件、跑脚本、装依赖，一律留在默认的 `bash`。
+
+            ⚠️ 若 `shell` 的输出里出现 `${'$'}[dsh-adb] uid 2000 不可用`，说明特权通道
+            此刻不可用，那条命令实际是以应用身份跑的——不要据此认为特权生效了，
+            如实告诉用户需要重新引导。
+        """.trimIndent()
+
+        private val PRIVILEGED_PROMPT_DISABLED = """
+            ## 特权身份（uid 2000 / shell）—— 当前不可用
+
+            本机的 shell 身份通道**尚未启用**：还没有导入 ADB 密钥，或设备上的
+            adbd 未开启 / 未授权。**`shell` 工具因此没有被注册**，你只有 `bash`。
+
+            需要用户先用 USB 连接电脑执行一次引导（把电脑上已授权的 ADB 私钥推到设备）：
+
+            ```
+            adb push %USERPROFILE%\.android\adbkey /sdcard/dsh_adbkey
+            ```
+
+            然后重启本 App 即可。在此之前：
+
+            - **不要**尝试用任何方式绕过应用身份去执行特权命令，那只会回落成应用身份。
+            - 截图、点击屏幕、卸载应用、改系统设置、读 `/dev/input` 这类操作
+              **当前一律做不到**，如实告诉用户并说明需要上面那次引导，不要反复重试。
+        """.trimIndent()
 
         @Volatile
         private var instance: EngineManager? = null

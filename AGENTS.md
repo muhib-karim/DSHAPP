@@ -19,13 +19,17 @@ APK
  ├─ assets/node-pty-android-arm64.zip  自编译的 node-pty 绑定（官方 prebuilds 无 android）
  ├─ assets/pnpm-android-arm64.zip  pnpm 11.28.3 纯 JS 版，解到 $PREFIX/lib/pnpm
  ├─ assets/mobile-ui.zip           移动端 UI 适配插件（dsh-android-mobile）
+ ├─ assets/dsh-android-shell.mjs   uid 2000 执行通道（直连 adbd）
+ ├─ assets/shell-tool.zip          uid 2000 特权工具插件（注册 `shell` 工具）
  └─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片
 
 运行期（filesDir 下）
  ├─ usr/            $PREFIX —— Termux 环境（含 bin/pnpm）
  ├─ engine/         引擎解包目录（含 .stamp 版本戳）
  ├─ home/.dsh/      DSH_HOME：配置、凭据、会话、profiles/web/
- │   └─ mobile-ui/dsh-android-mobile/  移动端 UI 插件（**刻意放在 pnpm 管辖之外**）
+ │   ├─ mobile-ui/dsh-android-mobile/  移动端 UI 插件（**刻意放在 pnpm 管辖之外**）
+ │   └─ shell-tool/dsh-android-shell/  uid 2000 特权工具插件（同上，刻意在 pnpm 之外）
+ ├─ dsh-android-shell.mjs  uid 2000 执行通道（每次启动覆盖写）
  ├─ liblinkcompat.so  link 转译层（每次启动从资产覆盖写）
  ├─ libboosandbox.so  沙箱写拦截器（每次启动从资产覆盖写）
  ├─ boo-sandbox-run   沙箱 runner（每次启动从资产覆盖写）
@@ -418,6 +422,8 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `node-pty-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `linkcompat.bin` | 无需改（每次启动覆盖写） |
 | `boosandbox.bin` / `boo-sandbox-run.bin` | 无需改（每次启动覆盖写） |
+| `dsh-android-shell.mjs` | 无需改（每次启动覆盖写） |
+| `shell-tool.zip` | 无需改（每次启动解包覆盖写） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
@@ -580,6 +586,285 @@ $cxx = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\
 （`untrusted_app`）里实测 `openpty` / `forkpty` / `open("/dev/ptmx")` 全部成功。
 设备实测：绑定加载成功，`pty.spawn(bash)` 起得来，写入 `echo PTY_WORKS_$((6*7))`
 能收到 `PTY_WORKS_42` 回显。
+
+### ⑪ 应用身份权限太低 —— 内建 uid 2000（shell）执行通道
+
+**症状**：截图、点击屏幕、卸载应用、改系统设置、读 `/dev/input` 这些操作
+**全部做不到**。而且失败方式很隐蔽 —— 有些报权限错，有些**静默失败**。
+
+**真机实测（Huawei CDY-TN90 / Android 10）两个身份的差异**：
+
+| 命令 | app 域（u0_a323） | uid 2000（shell） |
+|---|---|---|
+| `screencap -p x.png` | rc=1，**stderr 完全为空**，留下 0 字节文件 | rc=0，708460 字节真图 |
+| `input keyevent 3` | **rc=0 但前台窗口纹丝不动** | rc=0，真的切到桌面 |
+| `pm uninstall x` | `SecurityException: INTERACT_ACROSS_USERS_FULL` | 走到包管理器 |
+| `settings put/get` | `SecurityException: INTERACT_ACROSS_USERS` | 正常 |
+| `am force-stop` | `SecurityException: FORCE_STOP_PACKAGES` | 正常 |
+| `appops get` | `SecurityException: INTERACT_ACROSS_USERS` | 正常 |
+| `getevent -pl` | `could not add watch for /dev/input, Permission denied` | 能枚举输入设备 |
+| `dumpsys battery` | rc=**0**，输出 `Can't find service: battery` | 完整状态（308 B） |
+| `wm size` | rc=**20**，`Can't find service: window` | `Physical size: 1080x2400` |
+| `ps -A` | rc=0，**只有 6 行**（只看得见自己 uid） | **674 行** |
+| `dumpsys activity services` | rc=0，`Permission Denial: … missing DUMP` | 3203 B 正常 |
+
+⚠️ **这张表的关键是 `input` 和 `dumpsys`/`ps` 那几行**：退出码是 0，但结果
+要么没生效、要么残缺。**「失败」不能只看退出码** —— 这也是为什么本方案把
+「要不要用特权身份」交给**模型自己判断**，而不是让宿主去猜哪条命令该走哪个域。
+
+#### 做法：注册一个**独立的 `shell` 工具**（不是给 bash 加参数）
+
+**这一点是本次改动的地基，改动前务必先理解，尤其是「为什么不能用提权参数」。**
+
+引擎确实原生就有提权机制：`@deepseek-ai/dsh-tool-bash` 在
+`ctx.shell.sandboxMode !== undefined` 时会给 `bash` 工具的 schema **自动加上**
+`sandbox_permissions`（enum `["workspace-write","danger-full-access"]`）与
+`justification`（`lib/index.js:513`），模型声明后由 `ctx.approval` 批准。
+
+**但这个机制在本 App 里是坏的，原因是一个耦合：** 它挂在**权限预设**上。
+用户在 GUI 里选「无需审批 / 全部权限开放」时，`defaultPreset` 就是
+`danger-full-access`，于是该模式成了会话默认。而
+`dsh-sandbox/lib/index.js:101` 里 `approveEscalation()` 对
+`mode === effectiveMode` **直接返回原值**（不许"升级"到当前档），
+`approval/policy: "never"` 又让审批一律 `rejected` —— 结果是：
+**每一条 bash 命令都直接以 uid 2000 跑，模型连选择的余地都没有。**
+
+真机后果（会话日志 `session-77e5515b`，事件 `#1 permission/preset: danger-full-access`、
+`#2 sandbox/mode: danger-full-access`、`#3 approval/policy: never`）：
+`pwd` = `/`、`ls: No such file or directory`、`cd /data/data/com.dsh.android/files/engine`
+→ `Permission denied`。**bash 工具整个废掉**，因为 uid 2000 读不到 app 私有目录。
+
+所以正确做法是把「身份」和「预设」**彻底解耦**，注册一个**新工具**：
+
+| 工具 | 身份 | 谁决定 |
+|---|---|---|
+| `bash` | **永远** app 身份（沙箱、link 转译、工作区全部正常） | 引擎，与预设无关 |
+| `shell` | **永远** uid 2000 | 模型读工具描述后自己选 |
+
+这样无论预设怎么设，`bash` 都是 app 身份；要特权就显式调 `shell` ——
+恰好同时满足「默认走 app 权限」与「AI 自己决策要不要用 2000」。
+
+⚠️ `shell` 这个工具名在引擎里**没被占用**（实测 30 个内置工具名），
+可以安全注册。`run_code` 是保留名，不能碰。
+
+#### 执行体：复用 `ctx.shell`，只是换个命令
+
+插件在 `apply()` 里 `ctx.tools.register(defineTool({...}))`，`execute` 时把命令
+换成 `node <runner> '<原命令>'`，并以 `sandboxPolicy: { mode: 'danger-full-access' }`
+调用 `ctx.shell`。`dsh-bash-sandbox/lib/index.js:68` 里 `danger-full-access`
+的语义**恰好**是「不做任何限制、直接跑」：
+
+```js
+if (mode === "danger-full-access") return SandboxBashExecutor.decorateResult(await super.execute(spec), …);
+```
+
+于是外层 `bash -c` 以 **app 身份、无沙箱** 启动（它读得到 app 私有目录里的
+runner），runner 再连 adbd 以 uid 2000 跑真正的命令。**超时、取消、输出收集、
+spill、grace 全部沿用引擎既有实现**，插件不必自己 spawn 一遍。
+
+⚠️ **必须显式给子进程传 `DSH_HOME`**：`dsh-subprocess` 的 `scrubbedParentEnv()`
+会剥掉**所有** `DSH_*` 变量（`lib/index.js:52`）。不传的话 runner 退回
+`os.homedir()/.dsh`，与密钥所在的 `$DSH_HOME` 不一致 → 找不到密钥 →
+**静默回落成 app 身份**。这是个很难查的坑。
+
+⚠️ **插件手工构造 definition，不要 `import { defineTool }`**：包解在
+`$DSH_HOME/shell-tool/` 下，那里没有 `node_modules`，ESM 解析**够不到**引擎的
+`@deepseek-ai/dsh-tools`。`defineTool` 只做「spec schema → raw JSON Schema」+
+「包一层参数校验」，手工写 raw JSON Schema 完全等价；参数校验由
+`ctx.tools.register` 内部的 `validateJsonSchemaValue` 兜底。
+支持的 schema 关键字子集是 `type/oneOf/properties/required/additionalProperties/items/enum/const`
++ 注解（`description/title/default/examples`），**`type` 与 `oneOf` 不能同时出现**。
+
+实现分三块：
+
+| 文件 | 作用 |
+|---|---|
+| `assets/dsh-android-shell.mjs` | 直连 `127.0.0.1:5555` 的 adbd，走 ADB 协议认证后以 uid 2000 执行 |
+| `assets/shell-tool.zip` | host 插件 `dsh-android-shell`，注册 `shell` 工具 |
+| `$DSH_HOME/shell-tool.patch.yml` | overlay，把上面的插件挂进 profile |
+
+`EngineManager.ensurePrivilegedShell()` 每次启动把 runner 覆盖写到 `filesDir`；
+`ensurePrivilegedPlugin()` 把 zip 解到 `$DSH_HOME/shell-tool/dsh-android-shell/`；
+`writePrivilegedPatch()` 生成 overlay（`name` 用 `file://` 绝对 URL）。
+
+⚠️ **为什么解到 `$DSH_HOME/shell-tool/` 而不是 profile 的 `node_modules`**：
+与移动端 UI 插件同一个坑 —— 那里归 pnpm 管，而本包不在 profile 的
+`dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`，
+overlay 里的包名随即解析失败。详见「移动端 UI 插件」一节。
+
+⚠️ **通道不可用时必须删掉 overlay**（`writePrivilegedPatch(false)` 会 `delete()`）：
+插件本身在缺 `DSH_PRIV_RUNNER` 时不会注册工具，但留着一个指向不存在文件的
+overlay 只会制造噪音。
+
+⚠️ **不要改 `node_modules` 里的源码**：会在引擎升级时被覆盖，且改的是打包产物。
+
+#### ⚠️ 历史教训：不要再用 `--import` 挂预加载
+
+早先的实现是 `assets/dsh-android-privileged-loader.mjs` 经 `node --import`
+替换 `SandboxBashExecutor.prototype.execute`。**这条路已经废弃并删除**，
+原因就是上面那个耦合（它只能挂在 `danger-full-access` 上，而那恰好是用户的默认预设）。
+若将来又想走 `--import`，先读这一节。
+
+（技术备注：`--import` 是 **Node 的 flag**，必须排在脚本路径之前 ——
+`node --import <loader> <bin.js> --profile web`；而 `--patch` 改的是配置，
+够不到执行器行为。这些事实仍然成立，只是这个方案本身不成立。）
+
+#### ADB 签名：不是标准的 `crypto.sign('sha1', token)`
+
+**这是整件事最容易踩的坑，卡了很久。** AOSP 的做法是手工拼一个 PKCS#1 v1.5 块，
+把 **token 原文**放进 DigestInfo 的摘要槽（**不是** `sha1(token)`）：
+
+```
+00 01 FF×219 00 ‖ 30 21 30 09 06 05 2b 0e 03 02 1a 05 00 04 14 ‖ token原文
+                 └────────────── SHA1 DigestInfo 前缀 ──────────────┘
+```
+
+用 `crypto.sign('sha1', token, priv)` 会被 adbd 拒绝，症状是**反复重发 AUTH token**
+（试满 2 次后转而要公钥），而不是明确的错误信息。Dadb 的
+`AdbKeyPair.signPayload()` 用的是 `Cipher.getInstance("RSA/ECB/NoPadding")` +
+手写 padding 表，同一回事。
+
+参考实现：`dadb/src/main/kotlin/dadb/AdbKeyPair.kt`。
+
+#### 另一个坑：读完每个 WRTE 必须回 OKAY
+
+ADB 是**窗口式流控**：读完一个 `WRTE` 的 payload 不回 `OKAY`，adbd 会**停在那里
+不再发下一个包** —— 表现为命令挂住、永远等不到 `CLSE`。Dadb 的
+`AdbStreamImpl.read()` 也是读完即 `writeOkay(localId, remoteId)`。
+
+同理，shell 要用 **v2 协议**（`OPEN` 的 destination 写 `shell,v2,raw:<cmd>`）：
+v1 没有 `EXIT` 包，拿不到退出码。
+
+⚠️ **收尾不能用 `process.exit(code)`**：输出走管道时它会在 libc 缓冲区写回之前
+就终止进程，**静默截断大输出** —— 而 `screencap`/`dumpsys`/`ps -A` 恰好都是
+大输出。要用 `process.exitCode` 让事件循环自然排干。
+
+⚠️ stream id 要**顺序递增**，不能随机：随机 id 可能与在用的 id 撞车，撞车后
+先关闭的那条流会把另一条活流的队列一起拆掉（AOSP 的注释专门记了这条）。
+
+#### 密钥从哪来：必须由用户用 PC 引导一次
+
+Android 10 **没有**无线调试配对机制（那是 API 30+）。而且实测：adbd 在
+**TCP 连接**下**不会**弹「允许 USB 调试吗」对话框 —— 发完公钥后 adbd 直接静默
+挂起，永远等不到授权（20s 超时无任何响应）。
+
+所以只能复用一把**设备已授权**的密钥。引导命令（用户执行一次）：
+
+```powershell
+adb push %USERPROFILE%\.android\adbkey /sdcard/dsh_adbkey
+```
+
+`dsh-android-shell.mjs` 首次运行时会自动导入并**立刻删除中转文件**：
+
+```
+[dsh-adb] 已导入 ADB 密钥: /sdcard/dsh_adbkey → .../home/.dsh/adbkey
+[dsh-adb] 已删除中转密钥 /sdcard/dsh_adbkey（共享目录不留私钥）
+```
+
+⚠️ **中转文件必须删。** `/sdcard` 是所有应用可读的共享目录（实测
+`-rw-rw---- root sdcard_rw`），ADB 私钥留在那里等于把设备控制权敞开放着。
+实测 app 域**有权**删除它（`run-as … rm -f /sdcard/dsh_adbkey` 成功）。
+
+⚠️ **公钥必须从私钥现场派生**，不要读 `adbkey.pub`：本机那个文件的格式**不标准**
+（716 字节，缺 `ssh-rsa ` 前缀，且内容与私钥不匹配 —— 实测
+`ssh-keygen -y -f adbkey` 与它不一致）。PC 的 adb 之所以能连上，是因为设备
+`adb_keys` 里存的是**更早的另一把**公钥。派生才是唯一可靠来源。
+
+#### 没授权时怎么办：两级降级
+
+**第一级：通道本身没就位 → 工具根本不注册。**
+`ensurePrivilegedShell()` 失败（资产缺失/落盘失败）时不设 `DSH_PRIV_RUNNER`，
+插件在 `apply()` 里打一条 warning 后 `return`，`shell` 工具**不进工具表**；
+`writePrivilegedPatch(false)` 同时删掉 overlay。此时模型看不到 `shell`，
+而 `$DSH_HOME/AGENTS.md` 里写的是另一段文本（明确说「`shell` 工具没被注册，
+别反复重试、也别试图绕过 app 身份」）。**`bash` 不受任何影响。**
+
+**第二级：密钥没授权 → 逐条命令回落 app 身份。**
+runner 存在但连不上 adbd（无密钥/密钥未授权/5555 没监听）时，
+runner 自己**回落为本地执行（app 域）**，并把原因写进输出：
+
+```
+[dsh-adb] uid 2000 不可用（未找到 ADB 密钥（先用 PC 执行 adb push 导入））→ 回落为本地执行
+```
+
+⚠️ 这一级是**静默降级**：命令照样跑、退出码照样正常，只是身份变回了 app。
+所以插件在 `DESCRIPTION` 里明确告诉模型「输出里出现 `[dsh-adb] uid 2000 不可用`
+就说明这条命令实际是 app 身份跑的」，避免模型基于假前提继续推理。
+
+#### ⚠️ 走这条通道会绕过沙箱（这是固有代价，不是缺陷）
+
+uid 2000 **读不到 app 私有目录**（实测 `/data/user/0/com.dsh.android` 是
+`drwx------`），而 `libboosandbox.so`（写沙箱）与 `liblinkcompat.so`
+（link 转译）都放在那里 —— 所以经 adbd 执行的命令**必然**拿不到 `LD_PRELOAD`，
+**写沙箱与 link 转译对它都不生效**。
+
+也就是说：**shell 身份换来的是特权，失去的是隔离。**
+
+⚠️ 因此**不能**用「首词白名单」之类的方式去猜哪条命令该走哪个域并自动切换 ——
+那会让 `touch /sdcard/x` 这类写在不知不觉中绕过沙箱。**选择权交给模型**
+（它显式选择调 `shell` 而不是 `bash`），调没调这个工具在会话里看得见，边界清清楚楚。
+
+⚠️ **cwd 会丢**：adbd 执行命令的 cwd 恒为 `/`，而工作区 uid 2000 进不去。
+所以 runner 用 `cd '<cwd>' 2>/dev/null; <command>`（**不是** `&&`）——
+切不过去就留在 `/` 继续跑，而不是让整条命令失败。特权命令本就不该依赖
+工作区里的相对路径。（插件只把 `workdir` 透传给 runner，且工具描述里写明
+它只对 `/sdcard` 这类共享路径有意义。）
+
+#### 系统提示词怎么告知模型
+
+**两条通道，分工不同**：
+
+1. **工具描述**（插件里的 `DESCRIPTION` 常量）—— 这是**主通道**。模型是靠工具
+   描述来决定调不调 `shell` 的，所以「什么时候用、什么时候别用、退出码会骗人」
+   三件事都写在那里。
+2. **`$DSH_HOME/AGENTS.md`** —— 补充说明（完整的 app 域 vs shell 域对照表）。
+   `@deepseek-ai/dsh-agent-instructions` 会自动读它并注入系统提示词，
+   **零代码**的通道，不需要改引擎、也不需要挂 overlay。
+
+`EngineManager.ensurePrivilegedPrompt()` 只管理自己那一段
+（`<!-- dsh-android:privileged BEGIN -->` / `END` 之间），**标记之外的用户内容
+原样保留**。通道不可用时写的是另一段文本（明确告诉模型「`shell` 工具没被注册，
+别反复重试」）。
+
+**为什么必须让模型知道**：上面那张表里的 `input`（rc=0 但无效）和
+`dumpsys`/`ps`（rc=0 但残缺）都是**静默失败** —— 模型若不知道自己在哪个身份下，
+会基于假前提继续推理、越走越错。
+
+#### 验收手法（数值证据）
+
+```powershell
+# 插件解出来了没、工具注册了没（两行都要有）
+adb logcat -d -s DSH:I | Select-String "uid 2000|特权工具|特权身份说明|dsh-android-shell"
+#   → 已解出 uid 2000 执行通道 dsh-android-shell.mjs (21322 字节)
+#   → 已安装 uid 2000 特权工具插件 dsh-android-shell (<N> 字节)
+#   → 已写入 uid 2000 特权工具 overlay: shell-tool.patch.yml
+#   → 已写入特权身份说明: AGENTS.md（通道可用=true）
+#   → [engine] [dsh-android-shell] 已注册 uid 2000 特权工具 shell: /data/.../dsh-android-shell.mjs
+
+# 工具真的进了模型可见的工具表（`shell` 应与 bash 并列出现）
+adb shell run-as com.dsh.android cat files/home/.dsh/shell-tool.patch.yml
+adb shell run-as com.dsh.android ls -l files/home/.dsh/shell-tool/dsh-android-shell/lib/index.js
+
+# 通道本身能不能拿到 uid 2000（应输出 2000）
+adb shell run-as com.dsh.android sh -c "DSH_HOME=/data/data/com.dsh.android/files/home/.dsh \
+  /data/data/com.dsh.android/files/usr/bin/node files/dsh-android-shell.mjs 'id -u'"
+#   → 2000
+
+# 截图（app 域是 0 字节，这里应是几百 KB）
+adb shell run-as com.dsh.android sh -c "DSH_HOME=... node files/dsh-android-shell.mjs \
+  'rm -f /sdcard/r.png; screencap -p /sdcard/r.png; ls -l /sdcard/r.png'"
+```
+
+⚠️ **`bash` 的行为必须与改动前一致**：无论 GUI 里的权限预设怎么设，
+`bash` 都应以 app 身份执行（`id -u` 给的是 `u0_a…` 而不是 `2000`）。
+这是本次改动的核心断言 —— 若 `bash` 仍走 uid 2000，说明旧的 `--import` 加载器
+还没删干净（检查启动命令行里是否还有 `--import`）。
+
+**已知代价**（如实记录）：
+- **Android 10 每次重启后要重新引导**：`persist.adb.tcp.port` 实测为空，
+  重启后 5555 不再监听，需要 PC/USB 再 `adb tcpip 5555` 一次。
+  这是平台限制（Android 10 没有无线调试），改不了。
+- Android 11+ 才能真正免 PC（走无线调试配对），本方案**尚未覆盖**。
 
 ## 后台保活（任务切到后台不能断）
 
