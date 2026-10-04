@@ -2019,10 +2019,36 @@ window.__ModuleLoader__.load({
 		 * 原生侧盖了一层不透明的启动动画（头像 + 光环 + 进度环），它需要知道
 		 * 「界面什么时候真的能用了」才能收起来。
 		 *
-		 * 三个候选信号，只有第三个是对的：
+		 * 四个候选信号，只有最后一个是对的：
 		 *   · `apply()` 返回   → React 还没挂载，界面是白的
 		 *   · `document.readyState === "complete"` → 实测在插件激活**之前**就完成
-		 *   · data-mobile 已打上 且 外壳已建 → 本插件的适配真的挂好了 ✅
+		 *   · data-mobile 已打上 且 外壳已建 → 只说明**本插件**挂好了
+		 *   · 上面两条 **且官方前端的启动页已消失** → 界面真的能用了 ✅
+		 *
+		 * ⚠️ 第三条单独用是不够的 —— 这是本轮修掉的真 bug，实测数据：
+		 *
+		 *     t=9339ms  interactive  正文 = "HARNESS Loading plugins…"   官方启动页
+		 *     t=10231ms interactive  data-mobile=true, .mp-nav-btn 已存在  ← 旧判据在此满足
+		 *     t=10475ms complete     正文 = "探索未至之境 选择工作区…"      启动页才消失
+		 *
+		 *   也就是说旧判据比「界面真的可用」早了 **244ms 以上**，这段时间原生层已经
+		 *   收起，用户就看到官方那个 HARNESS / Loading plugins… 白底页闪了几帧。
+		 *
+		 * 所以判据必须是「官方前端的启动页没了」。那个页面**没有稳定的 class 或 id**
+		 * （它由官方前端在运行时构建，随版本变化），但它的**文案**是稳定的英文
+		 * `Loading plugins`。这里按文案判定，并做成宽松匹配（大小写不敏感、
+		 * 允许中间有省略号或空格差异），避免官方改一个字符就失效。
+		 *
+		 * ⚠️ 四条判据的实际分工（真机实测，别想当然）：
+		 *   `apply()` 被调用时，页面通常**已经跑过启动页了** —— 本插件的客户端半有
+		 *   5.5MB，等它解析完就已经接近 `load`，所以 `officialBootVisible()` 在正常
+		 *   路径上测到的是 false（诊断里的 `polls=1 bootSeen=false` 就是这么来的）。
+		 *   真正把收起时机推后的是 `pageLoaded()`。
+		 *   但文案判据**不能删** —— 它是更慢的设备、更冷的缓存下唯一能挡住启动页的
+		 *   那一条，只是在本机复现不出来而已。
+		 *
+		 * ⚠️ 为什么不用「#root 有内容」：`#root` 在启动页阶段就已经有 1 个子节点、
+		 *   24 个字符了（就是那个启动页本身），所以「有内容」判不出来。
 		 *
 		 * ⚠️ 必须轮询而不是监听一次：`mpSyncMobileAttr()` 由 observer 节流驱动
 		 *   （300ms），首次打上 data-mobile 的时刻不确定，单次检查会漏。
@@ -2041,21 +2067,72 @@ window.__ModuleLoader__.load({
 				if (reported) return;
 				reported = true;
 				if (timer) window.clearInterval(timer);
-				try { bridge.onUiReady(); } catch (e) { /* 原生侧异常不影响页面 */ }
+				try {
+					bridge.onUiReady();
+					console.log("[dsh-android-mobile] onUiReady: " + reason);   // 便于真机核对是哪条判据收的
+				} catch (e) { /* 原生侧异常不影响页面 */ }
 			};
+
+			/**
+			 * 官方前端的启动页是否还在。
+			 *
+			 * ⚠️ 判据用 **`body.innerText`** 而不是 `#root.innerText`：
+			 *   实测启动页阶段 `#root` 的 innerText 只有 24 字符，而 `body` 的匹配
+			 *   才是可靠的（两者并非总是同一个文本视图）。用 body 更稳。
+			 *
+			 * ⚠️ 只在启动阶段查，不存在"用户聊天内容里恰好出现这个词"的误判风险 ——
+			 *   这段时间页面里根本还没有会话内容。
+			 */
+			const officialBootVisible = () => {
+				const body = document.body;
+				if (!body) return false;
+				// "Loading plugins…" / "Loading plugins..." / 大小写差异都算
+				return /loading\s*plugins/i.test(body.innerText || "");
+			};
+
+			/**
+			 * 页面是否已经加载完。
+			 *
+			 * ⚠️ 这一条是**文案判据的保险**，不是重复。若官方前端把启动页文案本地化
+			 *   （中文界面下就不是 "Loading plugins"），`officialBootVisible()` 会永远
+			 *   返回 false → 判据提前满足。加上 readyState 之后，那种情况下至少还能
+			 *   等页面真正加载完再收。
+			 *
+			 * 实测冷启动：`readyState` 从 `interactive`（正文 = "HARNESS Loading plugins…"）
+			 * 变为 `complete` 的时刻，正是真实 UI 出现的时刻（t≈11606ms）。
+			 */
+			const pageLoaded = () => document.readyState === "complete";
 
 			const ready = () =>
 				document.documentElement.hasAttribute("data-mobile") &&
-				document.querySelector(".mp-nav-btn") !== null;
+				document.querySelector(".mp-nav-btn") !== null &&
+				pageLoaded() &&
+				!officialBootVisible();
 
 			// 先立刻查一次：apply() 之前可能已经由上一轮 observer 打好属性
 			if (ready()) { report("立即"); return; }
 
 			const t0 = Date.now();
+			let bootSeen = false;      // 是否观测到过官方启动页
+			let polls = 0;
+			let firstText = "";        // 第一次轮询时看到的正文（诊断用）
 			timer = window.setInterval(() => {
-				if (ready()) report("判据满足");
-				else if (Date.now() - t0 > UI_READY_MAX_WAIT_MS) report("超时兜底");
-			}, 100);
+				polls++;
+				const bodyTxt = (document.body && document.body.innerText) || "";
+				if (polls === 1) firstText = bodyTxt.replace(/\s+/g, " ").slice(0, 40);
+				if (officialBootVisible()) bootSeen = true;
+				if (ready()) {
+					// ⚠️ 诊断信息要带**实际观测到的文本**：只报"见到/没见到"无法区分
+					//   "判据正确"与"判据根本没生效"，这一轮就因此多绕了一次。
+					report(
+						(bootSeen ? "官方启动页已消失" : "未见到官方启动页") +
+						" [polls=" + polls + " bootSeen=" + bootSeen +
+						" 首帧正文=" + JSON.stringify(firstText) + "]"
+					);
+				} else if (Date.now() - t0 > UI_READY_MAX_WAIT_MS) {
+					report("超时兜底 [polls=" + polls + " bootSeen=" + bootSeen + "]");
+				}
+			}, 50);
 		}
 
 		function mpSyncMobileAttr() {				// ⚠️ 修复 40：改由 mpIsMobile()（窄屏 且 非鼠标设备）决定 data-mobile，
@@ -3108,7 +3185,15 @@ window.__ModuleLoader__.load({
 		// ⚠️ 只在窄屏且轨迹面板存在时工作；算不出的一律保持原样（不猜、不编）。
 		/* 启动动画收尾的兜底上限（ms）。实测插件激活约 1.4~1.7s，取 6s 留足余量：
 		 * 只有判据真的永远不满足时才会走到这里，目的是避免原生启动层永久盖住界面。 */
-		const UI_READY_MAX_WAIT_MS = 6000;
+		/**
+		 * 等待「界面真的可用」的上限。
+		 *
+		 * ⚠️ 从 6000 提到 9000：判据里新增了「官方前端的启动页已消失」，
+		 *   而那一项实测要等到 `readyState === complete` 之后才满足
+		 *   （旧判据 10231ms 满足，官方启动页 10475ms 才消失），
+		 *   留足余量避免在正常启动路径上误触发超时兜底。
+		 */
+		const UI_READY_MAX_WAIT_MS = 9000;
 
 		const MP_TIMING_UNAVAILABLE = "首 token 时间不可用";		const MP_TIMING_NOT_RECORDED = "未记录";
 		const MP_TIMING_STEP_START_UNAVAILABLE = "步骤开始时间不可用";

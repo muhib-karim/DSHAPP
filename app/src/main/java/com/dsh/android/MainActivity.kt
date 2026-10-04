@@ -118,6 +118,25 @@ class MainActivity : AppCompatActivity() {
      */
     private var overlayDismissed = false
 
+    /** WebView 是否已经提交过至少一帧（见 [awaitWebViewPainted]）。 */
+    private var webViewPainted = false
+
+    /** 是否已有一个等待首帧的回调在飞，避免重复注册。 */
+    private var paintPending = false
+
+    /** `postVisualStateCallback` 的请求号，单调递增即可（它只是个标识）。 */
+    private var paintRequestId = 0L
+
+    /** 等待 WebView 首帧的兜底超时（见 [awaitWebViewPainted]）。 */
+    private val paintTimeoutRunnable = Runnable {
+        if (!webViewPainted) {
+            Log.w(DshApplication.TAG, "等待 WebView 首帧超时，仍收起启动动画")
+            webViewPainted = true
+            paintPending = false
+            hideOverlay()
+        }
+    }
+
     /**
      * 键盘高度缓存的 key。
      *
@@ -637,8 +656,17 @@ class MainActivity : AppCompatActivity() {
                         showOverlay("正在准备界面…", hint = "激活移动端适配插件")
                     }
                     is EngineManager.UiStage.UiReady -> {
-                        Log.i(DshApplication.TAG, "界面已就绪，收起启动动画")
-                        hideOverlay()
+                        // ⚠️ 这里**不能**直接收起 —— DOM 就绪 ≠ 像素上屏。
+                        //
+                        // 真机实测（CDP `Page.startScreencast` 抓 WebView 内部帧）：
+                        //   DOM 变成真实 UI   t=2154ms（body.innerText 已是"探索未至之境"）
+                        //   屏幕真的画出 UI   t≈541s 附近，比 DOM 晚了约 1.6 秒
+                        //   而旧代码在 onUiReady 里立刻收起 → 那一秒多里屏幕上是空的/启动页
+                        //
+                        // 所以必须等 WebView **把这一帧真正提交**再收。
+                        // `postVisualStateCallback` 正是这个语义：回调触发时，
+                        // 这一帧已经可以显示在屏幕上了。
+                        awaitWebViewPainted { hideOverlay() }
                     }
                 }
             }
@@ -655,6 +683,57 @@ class MainActivity : AppCompatActivity() {
                 showOverlay("引擎启动异常", hint = t.message, isError = true)
             }
         }
+    }
+
+    /**
+     * 等 WebView 把当前内容**真正画到屏幕上**，然后执行 [action]。
+     *
+     * **为什么需要它**：DOM 就绪和像素上屏之间有一段落差。真机实测（用 CDP 的
+     * `Page.startScreencast` 抓 WebView 内部帧，85 帧样本）：
+     *
+     * ```
+     *   DOM 已是真实 UI（body.innerText = "探索未至之境…"）  t=2154ms
+     *   WebView 帧从 1939B（启动页白底）跳到 31518B（真实 UI） t≈541s ← 落后 1.6 秒
+     * ```
+     *
+     * 旧代码在 `onUiReady` 里立刻收起启动层，于是这 1.6 秒里屏幕上是启动页或空白，
+     * 用户看到的就是"动画结束后闪过几帧白屏"。
+     *
+     * `postVisualStateCallback` 的语义正是「这一帧已经提交、可以显示了」，
+     * 它比 `onPageFinished`、比任何 DOM 信号都更贴近"用户真的看到了"。
+     *
+     * ⚠️ 回调**不保证一定触发**（WebView 被销毁、渲染进程崩溃时不会来），
+     *   所以配一个 [PAINT_TIMEOUT_MS] 兜底 —— 宁可早收也不能不收，
+     *   启动层永久盖住界面是最糟的失败方式。
+     *
+     * ⚠️ 回调在**主线程**触发，可以直接碰 View。
+     */
+    private fun awaitWebViewPainted(action: () -> Unit) {
+        if (webViewPainted) { action(); return }
+        if (paintPending) return          // 已经在等了，避免重复注册
+        paintPending = true
+
+        val done = {
+            if (!webViewPainted) {
+                webViewPainted = true
+                paintPending = false
+                overlayHandler.removeCallbacks(paintTimeoutRunnable)
+                Log.i(DshApplication.TAG, "WebView 已提交首帧，收起启动动画")
+                action()
+            }
+        }
+
+        // 兜底：到点无条件执行（正常路径实测约几十毫秒内就会回调）
+        overlayHandler.postDelayed(paintTimeoutRunnable, PAINT_TIMEOUT_MS)
+        // ⚠️ 第一个参数是 requestId，回调会原样带回 —— 它只是个标识，
+        //   不是 layerType（写成 LAYER_TYPE_* 会让人误以为有语义）。
+        paintRequestId++
+        binding.webView.postVisualStateCallback(
+            paintRequestId,
+            object : WebView.VisualStateCallback() {
+                override fun onComplete(requestId: Long) = done()
+            },
+        )
     }
 
     /**
@@ -729,6 +808,7 @@ class MainActivity : AppCompatActivity() {
         // 引擎跟随进程存活，这里不停止，避免转屏/重建时反复冷启动。
         imeHandler.removeCallbacks(imeRestoreRunnable)
         overlayHandler.removeCallbacks(overlayTimeoutRunnable)
+        overlayHandler.removeCallbacks(paintTimeoutRunnable)
         super.onDestroy()
     }
 
@@ -767,5 +847,14 @@ class MainActivity : AppCompatActivity() {
          * 目的是避免启动层永久盖住界面。
          */
         const val UI_READY_TIMEOUT_MS = 12000L
+
+        /**
+         * 等待 WebView 提交首帧的兜底超时（ms）。
+         *
+         * `postVisualStateCallback` 正常路径实测在几十毫秒内就回调（它只是等下一帧
+         * 提交），但**不保证一定触发** —— WebView 被销毁、渲染进程崩溃时不会来。
+         * 取 1.5 秒：足够覆盖一次正常的帧提交，又不至于让用户白等。
+         */
+        const val PAINT_TIMEOUT_MS = 1500L
     }
 }
