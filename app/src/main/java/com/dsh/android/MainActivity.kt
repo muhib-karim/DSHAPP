@@ -1,10 +1,12 @@
 package com.dsh.android
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -236,7 +238,61 @@ class MainActivity : AppCompatActivity() {
         // 晚一步的话，引擎刚起就切后台仍可能被系统盯上。
         EngineService.start(this)
         ensureBatteryExempt()
+        ensureStorageAccess()
         bootEngine()
+    }
+
+    /**
+     * 外部存储读写权限的结果。
+     *
+     * 只记日志。拒绝不阻塞任何功能：`bash` 仍走 app 身份、`shell` 仍走 uid 2000，
+     * 只是两者之间传文件要绕道 app 自己的外部目录
+     * （`/sdcard/Android/data/com.dsh.android/files/`，那里的属主是 app 自己）。
+     * 所以不做二次追问。
+     */
+    private val storagePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        Log.i(DshApplication.TAG, "外部存储权限结果: $granted")
+    }
+
+    /**
+     * 申请外部存储读写。
+     *
+     * **只为一件事**：让 app 身份读得到 uid 2000（`shell` 工具）写进 `/sdcard` 的文件。
+     *
+     * uid 2000 在 `/sdcard` 上建的文件属主是 `root:sdcard_rw`、模式 `640` —— 这是
+     * sdcardfs 的固定行为，`chmod 666` 改不动（真机实测）。而 app 进程默认的附加组里
+     * 没有 `sdcard_rw`（实测引擎进程 `Groups: 3003 9997 20324 50324`），于是 `shell`
+     * 截的图 `bash` 读不了，报 Permission denied。
+     *
+     * ⚠️ 机制**不是**「授权后进程多一个 GID」—— 实测同一个 pid 在授权前后 `Groups`
+     * 一个字节都没变。真正变的是 **sdcardfs 按权限把 `/storage/emulated` 绑到不同的
+     * runtime 视图**（真机 A/B，同一个进程）：
+     *
+     *     未授权 -> /storage/emulated ... gid=1015(sdcard_rw), mask=6   ← default 视图
+     *     已授权 -> /storage/emulated ... gid=9997(everybody),  mask=7   ← write 视图
+     *     对照：launcher（无写权限）-> gid=9997, mask=23
+     *
+     * 进程自带 9997 组、**不带** 1015 —— 未授权时它落在 gid=1015 的 default 视图里，
+     * 组对不上，读不了；授权后切到 gid=9997 的 write 视图，组对上了，再配合
+     * `derive_gid`（底层文件的 gid 1015 被派生映射成视图的 gid 9997），就凭自带的
+     * 9997 组读得到那个 `root:sdcard_rw 640` 的文件。
+     *
+     * targetSdk = 28，系统仍走 legacy 存储模型（无分区存储），这两个权限在
+     * Android 10 上照旧生效，不需要 MANAGE_EXTERNAL_STORAGE。
+     */
+    private fun ensureStorageAccess() {
+        val needed = arrayOf(
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE,
+        ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (needed.isEmpty()) {
+            Log.i(DshApplication.TAG, "外部存储权限已就绪")
+            return
+        }
+        Log.i(DshApplication.TAG, "申请外部存储权限: ${needed.joinToString()}")
+        storagePermissionLauncher.launch(needed.toTypedArray())
     }
 
     /**

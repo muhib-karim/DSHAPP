@@ -14,6 +14,38 @@
     -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!--
+        外部存储读写。用途只有一个：让 **app 身份** 能读 uid 2000（`shell` 工具）
+        写进 /sdcard 的文件。
+
+        uid 2000 在 /sdcard 上建的文件属主是 `root:sdcard_rw`、模式 `640`
+        （sdcardfs 的固定行为，`chmod 666` 改不动），而 app 进程默认的附加组里
+        没有 `sdcard_rw`（实测引擎进程 `Groups: 3003 9997 20324 50324`），
+        于是 `shell` 截的图 `bash` 读不了。
+
+        ⚠️ 机制**不是**「授权后进程多一个 GID」—— 实测同一个 pid 在授权前后
+        `Groups` 一个字节都没变，platform.xml 里这两条权限也确实没有 gid 属性。
+        真正变的是 **sdcardfs 按权限把 /storage/emulated 绑到不同的 runtime 视图**：
+
+            未授权 -> /storage/emulated ... gid=1015(sdcard_rw), mask=6   ← default 视图
+            已授权 -> /storage/emulated ... gid=9997(everybody), mask=7   ← write 视图
+            对照：launcher（无写权限）-> gid=9997, mask=23
+
+        进程自带 9997 组、**不带** 1015 —— 所以未授权时它落在 gid=1015 的 default
+        视图里，组对不上，读不了；授权后切到 gid=9997 的 write 视图，组对上了，
+        再配合 `derive_gid`（底层文件的 gid 1015 被派生映射成视图的 gid 9997），
+        就凭自带的 9997 组读得到那个 `root:sdcard_rw 640` 的文件。
+
+        换句话说：**授权是解开跨身份读取的唯一钥匙**，没有别的办法
+        （`chmod` 改不动 sdcardfs 的属主）。
+
+        targetSdk = 28，系统仍走 legacy 存储模型（无分区存储），这两个权限在
+        Android 10 上照旧生效，不必申请 MANAGE_EXTERNAL_STORAGE。
+        用户拒绝时只是退回原状（跨身份交接需绕道 app 自己的外部目录），不影响其它功能。
+    -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
     <application
         android:name=".DshApplication"
         android:allowBackup="false"

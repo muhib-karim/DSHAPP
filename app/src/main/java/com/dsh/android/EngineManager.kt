@@ -1249,12 +1249,25 @@ class EngineManager private constructor(private val context: Context) {
             .redirectErrorStream(true)
 
         pb.environment().apply {
-            // Termux 环境：node 的 RUNPATH 已被等长重写成
-            // /data/data/com.dsh.android//usr/lib（经别名软链解析到真实 prefix），
-            // 但 LD_LIBRARY_PATH 是更可靠的一层 —— 万一某个 .so 的 RUNPATH 没覆盖到，
-            // 这里仍然找得到。PREFIX/HOME 让 DSH 内部按 Termux 习惯推导路径。
+            // ⚠️ 刻意**不设** LD_LIBRARY_PATH。
+            //
+            // 这里原先设了 `LD_LIBRARY_PATH=$prefix/lib`，当作「RUNPATH 没覆盖到时
+            // 的兜底」。但它对 Termux 二进制**完全无用**（真机全量对比 $PREFIX/bin 下
+            // 305 个 ELF，带与不带 LD_LIBRARY_PATH 的输出**零差异** —— Termux 的
+            // RUNPATH 已被等长重写成 /data/data/com.dsh.android//usr/lib，自己找得到），
+            // 却会**污染系统二进制**：它们本来该去 /system/lib64 找依赖，被这行带去
+            // Termux 的 lib 目录，于是 screencap / input / app_process 全部
+            // `CANNOT LINK EXECUTABLE "screencap": cannot locate symbol
+            //  "CrcGenerateTable" referenced by "/system/lib64/libunwindstack.so"`。
+            //
+            // 后果不是「少了个功能」而是**误导**：screencap 在 app 域本来就因权限失败，
+            // 现在失败得更早、错误信息指向动态库，模型会被带偏去反复试
+            // `env -u LD_PRELOAD` 之类的无用方向（真机会话日志里实测发生过）。
+            //
+            // 去掉后 node 与 4 个原生模块（require-builtin / flock / node-pty /
+            // sharp-wasm32）、bash/dpkg/pnpm/rg 全部实测正常。
+            // PREFIX/HOME 让 DSH 内部按 Termux 习惯推导路径，与库搜索无关，保留。
             put("PREFIX", prefix)
-            put("LD_LIBRARY_PATH", "$prefix/lib")
             put("DSH_HOME", dshHome.absolutePath)
             put("HOME", homeDir.absolutePath)
             put("TMPDIR", context.cacheDir.absolutePath)

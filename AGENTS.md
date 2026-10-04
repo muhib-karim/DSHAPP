@@ -860,11 +860,77 @@ adb shell run-as com.dsh.android sh -c "DSH_HOME=... node files/dsh-android-shel
 这是本次改动的核心断言 —— 若 `bash` 仍走 uid 2000，说明旧的 `--import` 加载器
 还没删干净（检查启动命令行里是否还有 `--import`）。
 
+#### ⚠️ 不要设 `LD_LIBRARY_PATH`（它只会破坏系统二进制）
+
+启动引擎的 env 里**刻意没有** `LD_LIBRARY_PATH`。这一行曾经存在（当作「RUNPATH 没覆盖
+到时的兜底」），但它是**净负面**的：
+
+| | 带 `LD_LIBRARY_PATH=$PREFIX/lib` | 不带 |
+|---|---|---|
+| `$PREFIX/bin` 下 **305 个 ELF** 全量对比 | —— | **0 差异** |
+| `screencap` / `input` / `app_process` | **rc=127 `CANNOT LINK EXECUTABLE`** | 正常（该失败还是失败） |
+
+原因：Termux 二进制的 RUNPATH 已被 `patchElfInPlace()` 等长重写成
+`/data/data/com.dsh.android//usr/lib`，**自己就找得到 .so**，根本不需要这行；而系统
+二进制本来该去 `/system/lib64` 找依赖，被这行带去 Termux 的 lib 目录后，加载到 Termux
+的 `libz.so` 而不是系统的，于是报
+
+```
+CANNOT LINK EXECUTABLE "screencap": cannot locate symbol "CrcGenerateTable"
+  referenced by "/system/lib64/libunwindstack.so"
+```
+
+⚠️ **危害是误导而不是功能缺失**：`screencap` 在 app 域本来就因权限失败，现在失败得更早、
+错误信息指向动态库，模型会被带偏去反复试 `env -u LD_PRELOAD` 之类的无用方向 ——
+真机会话日志里实测发生过（连试三轮才放弃）。
+
+去掉后实测正常：node 本体、4 个原生模块（`node-addon-require-builtin` / flock /
+`node-pty` / `sharp-wasm32`）、`bash` / `dpkg` / `pnpm` / `rg` / `apt` / `tar` / `curl`
+全部照常，`LD_PRELOAD=liblinkcompat.so` 也照常生效（link 转译实测仍 OK）。
+
+#### 跨身份文件交接：`/sdcard` 要授权，否则绕道 app 自己的外部目录
+
+`shell`（uid 2000）在 `/sdcard` 上建的文件属主是 **`root:sdcard_rw`、模式 `640`**，
+`chmod 666` **改不动**（sdcardfs 的固定行为）。而 app 进程的附加组里没有 `sdcard_rw`
+（实测引擎进程 `Groups: 3003 9997 20324 50324`），于是 `shell` 截的图 `bash` 读不了。
+
+**机制**（真机 A/B，同一个 pid、同一次进程生命周期内切换）：
+
+| 观测项 | 未授权 | 已授权 |
+|---|---|---|
+| `READ/WRITE_EXTERNAL_STORAGE` | `granted=false` | `granted=true` |
+| 进程 `Groups` | `3003 9997 20324 50324` | **完全没变** |
+| `/storage/emulated` 绑定视图 | `gid=1015(sdcard_rw), mask=6` | **`gid=9997(everybody), mask=7`** |
+
+对照 launcher（无写权限）：`gid=9997, mask=23`。
+
+⚠️ **机制不是「授权后进程多一个 GID」** —— `Groups` 一个字节都没变，
+`platform.xml` 里这两条权限也确实没有 gid 属性。真正变的是 **sdcardfs 按权限把
+`/storage/emulated` 绑到不同的 runtime 视图**：未授权落在 `default` 视图
+（gid=1015，进程没这个组 → 读不了），授权后切到 `write` 视图（gid=9997，进程自带 →
+组对上），再配合 `derive_gid` 把底层文件的 gid 1015 派生映射成视图的 gid 9997。
+**授权是唯一钥匙，`chmod` 绕不过去。**
+
+做法：manifest 声明 `READ_EXTERNAL_STORAGE` + `WRITE_EXTERNAL_STORAGE`，
+`MainActivity.ensureStorageAccess()` 在启动时申请一次（已授予则静默返回）。
+targetSdk = 28 走 legacy 模型，不需要 `MANAGE_EXTERNAL_STORAGE`。
+
+⚠️ **用户拒绝也不阻塞**：退回原状而已 —— 跨身份交接绕道 app 自己的外部目录
+（`/sdcard/Android/data/com.dsh.android/files/`，那里属主是 app 自己，
+`shell` 写进去后 `bash` 读得到）。这条备用路径在真机会话里被模型自己摸索出来过
+（连试 4 轮），值得写进工具描述。
+
+⚠️ **调试时注意 `pm revoke` 要带 `--user 0`**，否则静默不生效；
+而 `run-as` 的组集合含 `sdcard_rw`(1015)/`sdcard_r`(1028)、**不含** `9997`，
+与真实引擎进程**正好相反** —— 用 `run-as` 验证跨身份读取会得到**假阳性**。
+
 **已知代价**（如实记录）：
 - **Android 10 每次重启后要重新引导**：`persist.adb.tcp.port` 实测为空，
   重启后 5555 不再监听，需要 PC/USB 再 `adb tcpip 5555` 一次。
   这是平台限制（Android 10 没有无线调试），改不了。
 - Android 11+ 才能真正免 PC（走无线调试配对），本方案**尚未覆盖**。
+- **卸载重装会清掉 `$DSH_HOME`**（Termux 环境、全部会话日志、`adbkey`），
+  重装后要重新 bootstrap 并用 PC 再导入一次 adbkey。
 
 ## 后台保活（任务切到后台不能断）
 
