@@ -101,6 +101,23 @@ class MainActivity : AppCompatActivity() {
     private val imeHandler = Handler(Looper.getMainLooper())
     private val imeRestoreRunnable = Runnable { restoreFromPrejudge("超时未见 insets") }
 
+    /** 启动层超时的 handler 与 runnable（见 [armOverlayTimeout]）。 */
+    private val overlayHandler = Handler(Looper.getMainLooper())
+    private val overlayTimeoutRunnable = Runnable {
+        if (!overlayDismissed) {
+            Log.w(DshApplication.TAG, "界面就绪回调超时，强制收起启动动画")
+            hideOverlay()
+        }
+    }
+
+    /**
+     * 启动层是否已经收起。
+     *
+     * ⚠️ 一旦置位就不再放动画回来：引擎重启、`uiStage` 重复推送都不该让启动页
+     *   重新盖住用户正在用的界面。
+     */
+    private var overlayDismissed = false
+
     /**
      * 键盘高度缓存的 key。
      *
@@ -362,6 +379,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 Log.i(DshApplication.TAG, "WebView 加载完成: $url")
+                // DOM 到了，但移动端 UI 插件仍在激活（实测还有约 1.7s）——
+                // 这段宿主本来完全感知不到，上报给启动层，动画才不会提前收尾。
+                engine.notifyPageLoaded()
             }
         }
 
@@ -472,6 +492,21 @@ class MainActivity : AppCompatActivity() {
         }
 
         /**
+         * 移动端 UI 插件激活完成 —— 界面真正可用的时刻。
+         *
+         * 这是启动动画该收尾的信号：`onPageFinished` 只代表 DOM 到了，实测之后
+         * 还有约 1.7 秒的插件激活期（前端要解析 5.5MB 的 client.js 并挂载）。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程；`notifyUiReady` 只推一个 StateFlow，
+         *   真正的收起动作由 `lifecycleScope` 在主线程做。
+         */
+        @android.webkit.JavascriptInterface
+        fun onUiReady() {
+            Log.i(DshApplication.TAG, "插件已激活（onUiReady）")
+            engine.notifyUiReady()
+        }
+
+        /**
          * 设置页「切到固定端口」：把 adbd 切到 `adb tcpip 5555`。
          *
          * 切完之后特权通道**不再依赖无线调试开关**（实测关掉开关、关掉 Wi-Fi
@@ -553,23 +588,57 @@ class MainActivity : AppCompatActivity() {
             engine.state.collect { state ->
                 when (state) {
                     is EngineManager.State.Idle -> {
-                        showOverlay("准备中…")
+                        showOverlay("准备中…", hint = "正在初始化本地环境")
                     }
                     is EngineManager.State.Extracting -> {
-                        showOverlay("首次启动，正在解包引擎 ${state.percent}%")
+                        // 首次启动唯一有真实百分比的一段（实测约 15.5s）
+                        showOverlay(
+                            "首次启动，正在解包引擎 ${state.percent}%",
+                            hint = "只需这一次，之后启动会快很多",
+                            progress = state.percent / 100f,
+                        )
                     }
                     is EngineManager.State.Starting -> {
-                        showOverlay("引擎启动中…")
+                        showOverlay("正在启动引擎…", hint = "加载 Node 运行时与本地服务")
                     }
                     is EngineManager.State.Ready -> {
-                        hideOverlay()
+                        // ⚠️ 这里**不能**收起 overlay：引擎就绪只代表 HTTP 服务起来了，
+                        //   页面还没加载、插件更没激活。实测后面还有约 3.8 秒。
+                        showOverlay("正在加载界面…", hint = "渲染 Web GUI")
                         if (binding.webView.url != state.url) {
                             Log.i(DshApplication.TAG, "加载 Web GUI: ${state.url}")
                             binding.webView.loadUrl(state.url)
+                            // ⚠️ 计时必须**从这一刻**起算，不能放在 onCreate。
+                            //   引擎启动本身要 7~10 秒（首次还要先解包 15 秒），
+                            //   从 onCreate 起算会让兜底在引擎还没起来时就触发，
+                            //   把启动层提前收掉 —— 真机实测踩到过（超时 8s 触发于
+                            //   引擎就绪前 2.5s）。这里只兜「页面加载 + 插件激活」，
+                            //   实测共约 3.8 秒。
+                            armOverlayTimeout()
                         }
                     }
                     is EngineManager.State.Failed -> {
-                        showOverlay("引擎启动失败\n\n${state.message}", true)
+                        showOverlay(
+                            "引擎启动失败",
+                            hint = state.message,
+                            isError = true,
+                        )
+                    }
+                }
+            }
+        }
+        // 页面阶段：引擎就绪之后还有两段，宿主原本完全感知不到
+        lifecycleScope.launch {
+            engine.uiStage.collect { stage ->
+                when (stage) {
+                    is EngineManager.UiStage.None -> Unit
+                    is EngineManager.UiStage.PageLoaded -> {
+                        // 实测 onPageFinished 之后还有约 1.7s 插件激活期
+                        showOverlay("正在准备界面…", hint = "激活移动端适配插件")
+                    }
+                    is EngineManager.UiStage.UiReady -> {
+                        Log.i(DshApplication.TAG, "界面已就绪，收起启动动画")
+                        hideOverlay()
                     }
                 }
             }
@@ -583,28 +652,83 @@ class MainActivity : AppCompatActivity() {
                 engine.start()
             } catch (t: Throwable) {
                 Log.e(DshApplication.TAG, "引擎启动异常", t)
-                showOverlay("引擎启动异常: ${t.message}", true)
+                showOverlay("引擎启动异常", hint = t.message, isError = true)
             }
         }
     }
 
-    private fun showOverlay(text: String, isError: Boolean = false) {
-        binding.overlay.visibility = View.VISIBLE
+    /**
+     * 显示启动层并更新文案。
+     *
+     * @param text     阶段名（主文案）
+     * @param hint     补充说明；null 则隐藏该行
+     * @param progress 解包进度 0..1；null 表示当前阶段无真实进度（只显示底环）
+     * @param isError  失败态：环收成红色、不显示进度
+     */
+    private fun showOverlay(
+        text: String,
+        hint: String? = null,
+        progress: Float? = null,
+        isError: Boolean = false,
+    ) {
+        // 已经收起来过（淡出完成）就不再弹回来 —— 否则引擎重启会让动画闪一下
+        if (overlayDismissed && !isError) return
+
+        binding.overlay.animate().cancel()
+        if (binding.overlay.visibility != View.VISIBLE) {
+            binding.overlay.alpha = 1f
+            binding.overlay.visibility = View.VISIBLE
+        }
         binding.overlayText.text = text
         binding.overlayText.setTextColor(
-            if (isError) Color.parseColor("#FF6B6B") else Color.parseColor("#9AA4B2")
+            if (isError) Color.parseColor("#FF8A8A") else Color.parseColor("#8FA3C0")
         )
-        binding.overlayProgress.visibility =
-            if (isError) View.GONE else View.VISIBLE
+        binding.overlayHint.text = hint.orEmpty()
+        binding.overlayHint.visibility = if (hint.isNullOrBlank()) View.GONE else View.VISIBLE
+        binding.bootAnim.setProgress(if (isError) -1f else (progress ?: -1f))
     }
 
+    /**
+     * 淡出并收起启动层。
+     *
+     * ⚠️ 必须淡出，不能直接 `GONE`：这一层是不透明的，硬切会让「深色启动页 →
+     *   已渲染的 WebView」出现一次明显的闪白/闪黑。淡出同时让 WebView 的
+     *   首帧在下面先画好，交接才自然。
+     *
+     * ⚠️ 淡出期间 `overlayDismissed` 立刻置位，防止后续状态回调（引擎重启、
+     *   `uiStage` 重复推送）把动画又弹回来。
+     */
     private fun hideOverlay() {
-        binding.overlay.visibility = View.GONE
+        if (overlayDismissed) return
+        overlayDismissed = true
+        binding.overlay.animate()
+            .alpha(0f)
+            .setDuration(OVERLAY_FADE_OUT_MS)
+            .withEndAction {
+                binding.overlay.visibility = View.GONE
+                binding.overlay.alpha = 1f
+            }
+            .start()
+    }
+
+    /**
+     * 启动层兜底超时。
+     *
+     * 插件激活的完成信号（`onUiReady`）来自 WebView 的 JS 桥，**它是不可靠的**：
+     * 插件版本不匹配、JS 抛异常、桥被清理，任何一种都会让那个回调永远不来，
+     * 于是启动层永久盖住界面 —— 那是最糟的失败方式（看起来像卡死）。
+     *
+     * 所以给一个上限：到点无条件收起。真机实测激活约 1.7 秒，取 8 秒留足余量，
+     * 只有真出问题时才会走到这里。
+     */
+    private fun armOverlayTimeout() {
+        overlayHandler.postDelayed(overlayTimeoutRunnable, UI_READY_TIMEOUT_MS)
     }
 
     override fun onDestroy() {
         // 引擎跟随进程存活，这里不停止，避免转屏/重建时反复冷启动。
         imeHandler.removeCallbacks(imeRestoreRunnable)
+        overlayHandler.removeCallbacks(overlayTimeoutRunnable)
         super.onDestroy()
     }
 
@@ -627,5 +751,21 @@ class MainActivity : AppCompatActivity() {
          * （比如只做选择操作），也不会让 WebView 长时间保持错误高度。
          */
         const val IME_PREJUDGE_TIMEOUT_MS = 700L
+
+        /** 启动层淡出时长（ms）。太快像硬切，太慢显得拖沓。 */
+        const val OVERLAY_FADE_OUT_MS = 420L
+
+        /**
+         * 界面就绪的兜底超时（ms）。
+         *
+         * ⚠️ 计时起点是「开始 `loadUrl`」那一刻（见 `observeEngine`），**不是**
+         *   `onCreate` —— 引擎启动要 7~10 秒、首次还要先解包 15 秒，
+         *   从 onCreate 起算会让兜底在引擎还没起来时就触发。
+         *
+         * 实测这段（页面加载 + 插件激活）共约 3.8 秒，取 12 秒留足余量：
+         * 只在 `onUiReady` 回调丢失时才生效（插件异常、桥不可用），
+         * 目的是避免启动层永久盖住界面。
+         */
+        const val UI_READY_TIMEOUT_MS = 12000L
     }
 }

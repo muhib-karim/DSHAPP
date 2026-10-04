@@ -40,6 +40,53 @@ class EngineManager private constructor(private val context: Context) {
         data class Failed(val message: String) : State
     }
 
+    /**
+     * 页面阶段 —— 引擎就绪**之后**还要走的两段。
+     *
+     * 拆成独立的一条流而不是并进 [State]：`State.Ready` 带着 url，而
+     * MainActivity 要靠它决定 `loadUrl`；如果把后续阶段也塞进同一个枚举，
+     * 状态一推进 url 就丢了，`loadUrl` 的判断也跟着失效。
+     *
+     * 真机实测（OPPO PHY110 / Android 15，冷启动）各段耗时：
+     * ```
+     * responseEnd        231ms   ← 引擎已就绪，开始导航
+     * domInteractive     450ms
+     * domContentLoaded   557ms
+     * loadEvent         2084ms   ← onPageFinished，此时前端 bundle 刚解析完
+     * 插件激活收尾       3808ms   ← 移动端 UI 插件挂完，界面才真正可用
+     * ```
+     * 也就是说 `onPageFinished` 之后**还有约 1.7 秒**宿主完全感知不到，
+     * 而那段时间屏幕上什么都不会变。加这两段就是为了让动画如实反映它。
+     */
+    sealed interface UiStage {
+        /** 还没开始加载页面。 */
+        data object None : UiStage
+
+        /** `onPageFinished`：DOM 到了，但插件仍在激活。 */
+        data object PageLoaded : UiStage
+
+        /** 移动端 UI 插件已激活，界面可用 —— 启动动画到此收尾。 */
+        data object UiReady : UiStage
+    }
+
+    private val _uiStage = MutableStateFlow<UiStage>(UiStage.None)
+    val uiStage: StateFlow<UiStage> = _uiStage.asStateFlow()
+
+    /**
+     * 页面 DOM 就绪（`WebViewClient.onPageFinished`）。
+     *
+     * ⚠️ 幂等且**只前进不后退**：`onPageFinished` 会因转屏、iframe、
+     *   重定向而多次触发，退回 None 会让动画倒放。
+     */
+    fun notifyPageLoaded() {
+        if (_uiStage.value == UiStage.None) _uiStage.value = UiStage.PageLoaded
+    }
+
+    /** 移动端 UI 插件激活完成（由 WebView 的 JS 桥回调）。 */
+    fun notifyUiReady() {
+        _uiStage.value = UiStage.UiReady
+    }
+
     private val _state = MutableStateFlow<State>(State.Idle)
     val state: StateFlow<State> = _state.asStateFlow()
 
@@ -82,23 +129,31 @@ class EngineManager private constructor(private val context: Context) {
         staging.mkdirs()
 
         try {
-            // 进度基准用 assets 里的压缩包总长（约 52MB）。
-            // ⚠️ 只能把 openFd 当作「可能失败」的优化：它仅对**未压缩**的资产有效，
-            // 而 AGP 默认会对 assets 做 deflate 压缩，此时 openFd 抛
-            // FileNotFoundException。拿不到长度就退化为不显示百分比，绝不能因此
-            // 让整个解包失败。
-            val total = try {
-                context.assets.openFd(ASSET_NAME).use { it.length }
-            } catch (t: Throwable) {
-                Log.i(TAG, "资产未压缩长度不可用（${t.javaClass.simpleName}），进度按估算显示")
-                0L
+            // 进度基准：**tar.gz 压缩流的总字节数**（约 54 MB）。
+            //
+            // ⚠️ 这里原先用 `assets.openFd(ASSET_NAME).length`，而它**必然失败**：
+            //   openFd 只对**未压缩**（stored）的资产有效，AGP 对 engine.bin 做了
+            //   deflate，于是抛 FileNotFoundException → total=0 → 下面的
+            //   `if (total > 0)` 恒假 → **进度永远停在 0%**。
+            //   真机实测确认：首次启动那 15 秒里文案一直是「正在解包引擎 0%」。
+            //
+            // 改用 `ZipFile` 直接读 APK 自己的 zip 目录（`sourceDir` 就是 APK 路径），
+            //   那里有权威的未压缩大小。
+            //
+            // ⚠️ 曾经想过读 gzip 尾部的 ISIZE 字段（那是解压后总字节数，实测精确），
+            //   但那要**完整 inflate 一遍 262 MB** 才能摸到最后 4 字节 —— 白白让首次
+            //   启动多花几秒。这里改成「基准 = 压缩流总长 + 实时统计已消费的压缩字节」，
+            //   量纲天然一致，零额外成本。
+            val total = archiveLength() ?: 0L
+            if (total <= 0L) {
+                Log.w(TAG, "读不到归档长度，本次解包不显示百分比")
             }
             var lastPercent = -1
-            context.assets.open(ASSET_NAME).use { input ->
-                TarGz.extract(input, staging) { written ->
-                    if (total > 0) {
-                        // written 是解压后的字节数（约 229MB），按压缩比换算成进度
-                        val pct = ((written * 100) / (total * 5)).toInt().coerceIn(0, 99)
+            context.assets.open(ASSET_NAME).use { raw ->
+                val counting = CountingInputStream(raw)
+                TarGz.extract(counting, staging) {
+                    if (total > 0L) {
+                        val pct = ((counting.count * 100) / total).toInt().coerceIn(0, 99)
                         if (pct != lastPercent) {
                             lastPercent = pct
                             _state.value = State.Extracting(pct)
@@ -119,6 +174,61 @@ class EngineManager private constructor(private val context: Context) {
             _state.value = State.Failed("引擎解包失败: ${t.message}")
             throw t
         }
+    }
+
+    /**
+     * 读 `assets/engine.bin` 在 APK 里的**未压缩大小**（约 54 MB）。
+     *
+     * ⚠️ 为什么不用 `assets.openFd().length`：那只对未压缩资产有效，而 AGP 对
+     *   engine.bin 做了 deflate，必然抛 FileNotFoundException。见调用点的注释。
+     *
+     * `context.applicationInfo.sourceDir` 就是 APK 的绝对路径，用 `ZipFile` 打开它
+     * 即可拿到权威的 zip 目录项大小 —— 只读中央目录，不解压、不落盘，开销可忽略。
+     *
+     * ⚠️ 失败一律返回 null，**绝不能因此让解包失败** —— 没有百分比只是体验差，
+     *   解包失败是功能不可用。
+     */
+    private fun archiveLength(): Long? = try {
+        val apk = File(context.applicationInfo.sourceDir)
+        java.util.zip.ZipFile(apk).use { zip ->
+            // ⚠️ zip 里的条目全名带 `assets/` 前缀，直接用 ASSET_NAME 查会得到 null
+            //   （且**不抛异常**，只是静默返回 null）。这里踩过一次。
+            val entry = zip.getEntry("assets/$ASSET_NAME")
+            val len = entry?.size ?: 0L
+            Log.i(TAG, "engine.bin 归档长度 = $len 字节（entry=${entry?.name}）")
+            len.takeIf { it > 0L }
+        }
+    } catch (t: Throwable) {
+        Log.w(TAG, "读归档长度失败: ${t.message}")
+        null
+    }
+
+    /**
+     * 只统计「从底层流读走了多少字节」的包装流。
+     *
+     * 用于把解包进度换算成**压缩流**的消费比例 —— 与 [archiveLength] 同一量纲。
+     * 不改变任何读写语义，纯粹是个计数器。
+     */
+    private class CountingInputStream(
+        private val delegate: java.io.InputStream,
+    ) : java.io.InputStream() {
+        var count = 0L
+            private set
+
+        override fun read(): Int {
+            val b = delegate.read()
+            if (b >= 0) count++
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val n = delegate.read(b, off, len)
+            if (n > 0) count += n
+            return n
+        }
+
+        override fun available(): Int = delegate.available()
+        override fun close() = delegate.close()
     }
 
     /**
@@ -1678,7 +1788,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-25"
+        private const val MOBILE_UI_VERSION = "1.0.0-26"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────

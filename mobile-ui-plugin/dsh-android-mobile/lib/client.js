@@ -2015,8 +2015,50 @@ window.__ModuleLoader__.load({
 			mpAliasSig = '';   // 重置指纹：否则重装时指纹相同会跳过重新赋值 mpPairIndex
 		}
 
-		function mpSyncMobileAttr() {
-				// ⚠️ 修复 40：改由 mpIsMobile()（窄屏 且 非鼠标设备）决定 data-mobile，
+		/* ══ 启动动画收尾信号 ═══════════════════════════════════════════
+		 * 原生侧盖了一层不透明的启动动画（头像 + 光环 + 进度环），它需要知道
+		 * 「界面什么时候真的能用了」才能收起来。
+		 *
+		 * 三个候选信号，只有第三个是对的：
+		 *   · `apply()` 返回   → React 还没挂载，界面是白的
+		 *   · `document.readyState === "complete"` → 实测在插件激活**之前**就完成
+		 *   · data-mobile 已打上 且 外壳已建 → 本插件的适配真的挂好了 ✅
+		 *
+		 * ⚠️ 必须轮询而不是监听一次：`mpSyncMobileAttr()` 由 observer 节流驱动
+		 *   （300ms），首次打上 data-mobile 的时刻不确定，单次检查会漏。
+		 *   上限 [UI_READY_MAX_WAIT_MS] 后无条件上报 —— 宁可早收也不能不收，
+		 *   否则启动页会永久盖住界面（那是最糟的失败方式）。
+		 *
+		 * ⚠️ 只在移动端生效。桌面端没有原生启动层，上报是空操作（桥不存在）。
+		 */
+		function mpSignalUiReady() {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.onUiReady !== "function") return;   // 桌面端 / 桥不可用
+
+			let reported = false;
+			let timer = 0;
+			const report = (reason) => {
+				if (reported) return;
+				reported = true;
+				if (timer) window.clearInterval(timer);
+				try { bridge.onUiReady(); } catch (e) { /* 原生侧异常不影响页面 */ }
+			};
+
+			const ready = () =>
+				document.documentElement.hasAttribute("data-mobile") &&
+				document.querySelector(".mp-nav-btn") !== null;
+
+			// 先立刻查一次：apply() 之前可能已经由上一轮 observer 打好属性
+			if (ready()) { report("立即"); return; }
+
+			const t0 = Date.now();
+			timer = window.setInterval(() => {
+				if (ready()) report("判据满足");
+				else if (Date.now() - t0 > UI_READY_MAX_WAIT_MS) report("超时兜底");
+			}, 100);
+		}
+
+		function mpSyncMobileAttr() {				// ⚠️ 修复 40：改由 mpIsMobile()（窄屏 且 非鼠标设备）决定 data-mobile，
 				// 全部 CSS 作用域都挂在这个属性上 → CSS 与 JS 永远同一个判据。
 				// 离开移动模式时顺手拆掉我们留下的痕迹（平板旋转 / 跨断点缩放）。
 				const on = mpIsMobile();
@@ -3064,8 +3106,11 @@ window.__ModuleLoader__.load({
 		//   算出每个 step 的 firstTokenTime，再在轨迹详情面板里把「不可用」
 		//   就地替换成正确的时长/吞吐量文案。
 		// ⚠️ 只在窄屏且轨迹面板存在时工作；算不出的一律保持原样（不猜、不编）。
-		const MP_TIMING_UNAVAILABLE = "首 token 时间不可用";
-		const MP_TIMING_NOT_RECORDED = "未记录";
+		/* 启动动画收尾的兜底上限（ms）。实测插件激活约 1.4~1.7s，取 6s 留足余量：
+		 * 只有判据真的永远不满足时才会走到这里，目的是避免原生启动层永久盖住界面。 */
+		const UI_READY_MAX_WAIT_MS = 6000;
+
+		const MP_TIMING_UNAVAILABLE = "首 token 时间不可用";		const MP_TIMING_NOT_RECORDED = "未记录";
 		const MP_TIMING_STEP_START_UNAVAILABLE = "步骤开始时间不可用";
 		const MP_TIMING_DURATION_TOO_SHORT = "时长过短";
 		const MP_TIMING_PENDING = "等待中";
@@ -4309,6 +4354,17 @@ window.__ModuleLoader__.load({
 			}, 120);
 			// 审批徽章可能在侧栏抽屉渲染完成前不存在：轮询兜底（低频）
 			const t = window.setInterval(watchApproval, 5000);
+			/* 启动动画收尾信号：告诉原生「界面真的能用了」。
+			 *
+			 * ⚠️ 不能在这里直接报 —— apply() 返回时 React 还没挂载，`data-mobile`
+			 *   属性与外壳按钮都还不存在，此刻报等于骗原生提前收起启动页，
+			 *   用户会看到一块空白的 WebView。
+			 *   真机实测：apply() 之后约 1.4~1.7s 界面才真正可用。
+			 *
+			 * 判据用「data-mobile 已打上 且 外壳已建」，与 CSS 生效条件同源：
+			 * 这两件事成立就说明本插件的移动端适配已经挂好，界面可以交付了。 */
+			mpSignalUiReady();
+
 			return () => {
 				mo.disconnect();
 				document.removeEventListener("click", onNewSessionClick, true);
