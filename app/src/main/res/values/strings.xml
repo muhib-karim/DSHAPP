@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 桌面显示名：只写 DSH。仓库名与宣传文案用 dsh-app —— 「App」是描述词，
+         放在仓库/宣传里说明「这是 DSH 的安卓客户端」，不适合当应用名。 -->
     <string name="app_name">DSH</string>
     <string name="notification_channel_name">引擎运行中</string>
     <string name="notification_channel_desc">保持本地 AI 引擎在后台运行，并实时显示它当前在做什么</string>
