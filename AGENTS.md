@@ -408,7 +408,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-9`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-11`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -591,6 +591,58 @@ $cxx = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\
 | 系统回收 | `EngineService` 前台服务 + 常驻通知 | oom_adj 钉在前台档，内存压力下不被杀 |
 | CPU 休眠 | `PARTIAL_WAKE_LOCK`（`dsh:engine`） | 锁屏后 CPU 不进 suspend，node 事件循环/定时器/网络回调继续跑 |
 | ROM 冻结 | 电池优化白名单 | 华为「应用启动管理」/ OPPO「耗电保护」息屏几分钟就冻进程 |
+
+### 通知栏实时状态（WebView → 原生）
+
+常驻通知不只写「引擎正在运行」，而是**实时显示 AI 当前在干什么**：标题是当前动作
+（「正在运行命令 · sleep 10」），正文是最后一条助手输出（运行中含正在流式的思考）。
+
+链路：插件读 DOM → `window.DSHAndroid.onStatus(json)`（`addJavascriptInterface`）
+→ `MainActivity.StatusBridge` → `EngineService.updateStatus()` → 用**同一个通知 ID**
+`notify()` 更新（不重启服务）。
+
+| 字段 | 来源（官方 DOM 契约，0.2.0-rc.2 实测） |
+|---|---|
+| `running` | `.uV2eYG_primary` 的 `aria-label` 变成「停止生成」。官方 `primaryStops` 为真时换 `t("input.stop")`（`dsh-client-ui-conversation/lib/client.js:17407`） |
+| `text` | 最后一个 `.O_Ebla_title` 的文本。官方 `ProcessGroupHeader` 未关闭时用 `message.stepProcess.<activity>`（「正在运行命令」），关闭后用 `processTitle()`（「执行了命令」），都可能接 `" · "` + `liveToolDetail` 从工具参数提出来的详情 |
+| `body` | 最后一个 `[data-chat-flow-kind="assistant-step"] .hWmORq_root` |
+| `title` | `document.title` 去掉 `— DeepSeek Harness` 后缀，作通知副标题 |
+
+⚠️ **正文选择器必须限定 `data-chat-flow-kind="assistant-step"`。** `.hWmORq_root`
+是 `AssistantMarkdown` 的类，但同名容器**也会包住用户自己发的话**（真机实测用户消息是
+`data-chat-flow-kind="user"`，内含 `Sixlwa_*` 气泡）。不限定就会把用户的话当成 AI 的进展。
+
+⚠️ **通知卡片高度靠截断控制，不靠布局。** `BigTextStyle` 的展开态按正文**实际行数**
+撑高，而助手输出动辄几百字，不截断会吃掉大半个通知栏（用户实测反馈）。三段各有字符上限
+（`TITLE_MAX_CHARS` / `SUBTITLE_MAX_CHARS` / `BODY_MAX_CHARS`），全部按 **code point**
+切（别按字节，会把 emoji 截成半个）。改这几个常量就是改卡片高度。
+
+⚠️ **正文用 `truncateTail`（保留尾部），标题用 `truncateHead`。** 助手消息是**流式追加**
+的，最新进展在末尾；保留头部会把通知栏钉死在几分钟前那句话上，反而看不出"现在在干什么"。
+
+⚠️ **必须 `setOnlyAlertOnce(true)` + `setSilent(true)`。** 状态每秒都可能更新，
+不加这两条每次刷新都会重新提醒一次（响铃/亮屏）。
+
+⚠️ **`alive` 标志不能省。** 服务没起来时 `notify()` 会**凭空造出一条普通通知**
+（不是前台服务的那条），用户会看到两条。`updateStatus()` 先查 `alive` 再发。
+
+⚠️ 上报节流 1s 且**内容不变则一个字节都不发**（`mpLastStatusJson` 比对）——
+流式输出时 DOM 变化极频繁，不节流会让通知栏闪烁并白耗电。
+
+**验收手法**（数值证据，别靠截图猜）：
+
+```powershell
+# 通知当前内容（真机上最快的一招）
+adb shell dumpsys notification --noredact | Select-String "android.title|android.text|android.subText"
+#   → android.title=String (● 正在分析请求)
+#     android.subText=String (会话标题)
+#     android.text=String (…最后 100 字符，以省略号开头)
+
+# 桥有没有挂上、页面侧判据对不对
+adb shell pidof com.dsh.android     # 拿 pid，再用它建 CDP 转发
+adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
+# 期望：hasBridge=true，primaryLabel 与通知里的 ●/○ 一致
+```
 
 ⚠️ **只做前台服务是不够的**：前台服务只保证进程活着，锁屏后 CPU 仍会 suspend，
 长任务照样断。两件事必须一起做。

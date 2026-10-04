@@ -2719,6 +2719,7 @@ window.__ModuleLoader__.load({
 				bindTitleRename();
 				mpEnsureRefreshItem();
 				mpPatchTrajectoryTiming();
+				mpScheduleStatus();   // 通知栏状态：跟着 DOM 变化走（内部 1s 节流）
 				document.querySelectorAll('[role="dialog"][aria-modal="true"]').forEach(setupSettingsDialog);
 			}, 300);
 		});
@@ -2869,6 +2870,105 @@ window.__ModuleLoader__.load({
 			if (!mpCtx) return null;
 			try { mpSessionsCache = mpCtx.get("sessions") ?? null; } catch (e) { mpSessionsCache = null; }
 			return mpSessionsCache;
+		}
+
+		// ══ 状态上报：把「AI 当前在干什么」实时推给原生通知栏 ══
+		// 原生侧在 WebView 上挂了 `window.DSHAndroid.onStatus(json)`，收到后用**同一个
+		// 通知 ID** 更新前台服务的通知（只 notify，不重启服务）。
+		//
+		// 为什么读 DOM 而不是官方 store：本插件 `inject: []`（无声明依赖），
+		//   直接读 DOM 反而最稳 —— 官方重命名 store 字段时 DOM 契约还在。
+		//
+		// 三个信号的来源（0.2.0-rc.2 实测，均在官方 dsh-client-ui-chat / -conversation 里）：
+		//   · **运行中** = 主按钮变成「停止生成」。官方 `primaryStops` 为真时把
+		//     `uV2eYG_primary` 的 aria-label 换成 `t("input.stop")`
+		//     （dsh-client-ui-conversation/lib/client.js:17407 / 17571）。
+		//   · **在干什么** = 最后一个分组头 `.O_Ebla_title` 的文本。官方
+		//     `ProcessGroupHeader` 在组未关闭时用 `message.stepProcess.<activity>`
+		//     （「正在运行命令」），关闭后用 `processTitle()`（「执行了命令」）；
+		//     两者都可能接 `message.turnProcess.separator`（" · "）+ `liveToolDetail`
+		//     从工具参数里提出来的详情（如 `sleep 10`）。
+		//   · **详细内容** = 最后一条助手正文（`[data-slot="conversation.chat.node"]`
+		//     下的 `.hWmORq_root`），运行中它同时含正在流式的思考内容。
+		//
+		// ⚠️ 通知更新节流 1s：太频繁会让通知栏闪烁并白白耗电；内容没变则一个字节都不发。
+		let mpStatusTimer = 0;
+		let mpStatusPending = false;
+		let mpLastStatusJson = "";
+
+		function mpIsEngineRunning() {
+			// 文案判据（引擎版本与界面语言在本 App 里都固定）。
+			// 兜底：没有主按钮时当作空闲，宁可显示"空闲"也不要谎报在跑。
+			const btn = document.querySelector(".uV2eYG_primary");
+			if (!btn) return false;
+			const label = btn.getAttribute("aria-label") || "";
+			return label.indexOf("停止") >= 0 || /stop/i.test(label);
+		}
+
+		function mpCurrentActivity() {
+			// 取**最后一个**分组头：它就是当前正在跑（或刚跑完）的那一组。
+			const titles = document.querySelectorAll(".O_Ebla_title");
+			if (!titles.length) return { activity: "", text: "" };
+			const el = titles[titles.length - 1];
+			const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+			const kind = el.getAttribute("data-process-activity") || "";
+			return { activity: kind, text: text };
+		}
+
+		function mpTailAssistantText(limit) {
+			// ⚠️ 必须限定 `data-chat-flow-kind="assistant-step"`。
+			//   `.hWmORq_root` 是 AssistantMarkdown 的类，但**不能**只靠它选：
+			//   同名的消息容器会把用户自己发的话也捞进来（真机实测用户消息是
+			//   `data-chat-flow-kind="user"`，内含 Sixlwa_* 气泡）。
+			//   限定 flow-kind 后取到的必然是助手输出（含 reasoning 与 response 两种
+			//   group-part），运行中就是正在流式输出的那段。
+			const nodes = document.querySelectorAll(
+				'[data-chat-flow-kind="assistant-step"] .hWmORq_root'
+			);
+			for (let i = nodes.length - 1; i >= 0; i--) {
+				const t = (nodes[i].textContent || "").replace(/\s+/g, " ").trim();
+				if (t) return t.length > limit ? "…" + t.slice(t.length - limit) : t;
+			}
+			return "";
+		}
+
+		function mpCollectStatus() {
+			const running = mpIsEngineRunning();
+			const { activity, text } = mpCurrentActivity();
+			let title = (document.title || "").replace(/\s*—\s*DeepSeek Harness\s*$/, "").trim();
+			return {
+				running: running,
+				activity: activity,
+				text: text,
+				body: mpTailAssistantText(400),
+				title: title,
+			};
+		}
+
+		function mpReportStatus() {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.onStatus !== "function") return;
+			let json;
+			try { json = JSON.stringify(mpCollectStatus()); } catch (e) { return; }
+			if (json === mpLastStatusJson) return;   // 无变化 ⇒ 不打扰通知栏
+			mpLastStatusJson = json;
+			try { bridge.onStatus(json); } catch (e) { /* 原生侧异常不影响页面 */ }
+		}
+
+		// 节流：流式输出时 DOM 变化极频繁，合并成最多 1 次/秒。
+		function mpScheduleStatus() {
+			if (mpStatusPending) return;
+			mpStatusPending = true;
+			mpStatusTimer = window.setTimeout(() => {
+				mpStatusPending = false;
+				mpReportStatus();
+			}, 1000);
+		}
+
+		function mpInstallStatusBridge() {
+			mpReportStatus();
+			const t = window.setInterval(mpReportStatus, 5000);   // 兜底：DOM 静默变化时也能纠正
+			return () => window.clearInterval(t);
 		}
 		// ══ 修复 35：轨迹详情面板「首 token 时间不可用」回填（2026-09-16 啾灵反馈）══
 		// 现象：轨迹页点开任意一条历史数据，「首 token 延迟 / 生成 / 吞吐量」三行全显示
@@ -3494,6 +3594,7 @@ window.__ModuleLoader__.load({
 			document.addEventListener("click", onNewSessionClick, true);
 			document.addEventListener("click", onSessionRowClick, true);
 			const disposePressFeedback = setupPressFeedback();
+			const disposeStatusBridge = mpInstallStatusBridge();
 			mo.observe(document.body, { childList: true, subtree: true, characterData: true });
 			// 启动爆发：apply() 执行时 React 尚未挂载，而 observer 有 300ms 节流，
 			// 导致顶栏会话标题出现偏慢。前 ~1.2s 内主动补 10 轮（120ms 间隔），
@@ -3513,6 +3614,7 @@ window.__ModuleLoader__.load({
 				document.removeEventListener("click", onNewSessionClick, true);
 				document.removeEventListener("click", onSessionRowClick, true);
 				disposePressFeedback();
+				disposeStatusBridge();
 				window.clearInterval(t);
 				window.clearInterval(mpBootBurstTimer);
 				disposeKeyboardGuard();

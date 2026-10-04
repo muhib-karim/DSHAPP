@@ -126,6 +126,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 插件用它把「AI 当前在干什么」推给通知栏（见 EngineService.updateStatus）。
+        addJavascriptInterface(StatusBridge(), "DSHAndroid")
+
         webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
                 Log.i(DshApplication.TAG, "[web] ${msg.message()} @${msg.lineNumber()}")
@@ -174,6 +177,22 @@ class MainActivity : AppCompatActivity() {
 
     /** 当前挂起的文件选择回调；null 表示没有等待中的选择。 */
     private var filePathCallbackRef: ValueCallback<Array<Uri>>? = null
+
+    /**
+     * 页面 → 原生 的状态通道，暴露成 `window.DSHAndroid`。
+     *
+     * 只有本地引擎会被加载进这个 WebView（`shouldOverrideUrlLoading` 把外链全丢给系统
+     * 浏览器），所以不存在"第三方页面拿到这个接口"的风险。
+     *
+     * ⚠️ 方法**运行在 WebView 的 JS 线程**上，不能碰 View；这里只转手给
+     * `EngineService.updateStatus()`，它内部只走 NotificationManager。
+     */
+    private inner class StatusBridge {
+        @android.webkit.JavascriptInterface
+        fun onStatus(json: String) {
+            EngineService.updateStatus(this@MainActivity, json)
+        }
+    }
 
     /**
      * 文件选择结果。`resultCode`/`data` 一律要回给 WebView —— **成功、取消、失败

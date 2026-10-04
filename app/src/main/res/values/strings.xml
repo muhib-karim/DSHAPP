@@ -2,6 +2,10 @@
 <resources>
     <string name="app_name">DSH</string>
     <string name="notification_channel_name">引擎运行中</string>
-    <string name="notification_channel_desc">保持本地 AI 引擎在后台运行</string>
+    <string name="notification_channel_desc">保持本地 AI 引擎在后台运行，并实时显示它当前在做什么</string>
     <string name="notification_engine_running">DSH 引擎正在运行</string>
+    <!-- 页面还没上报状态时（引擎刚起、WebView 未加载完）的兜底文案 -->
+    <string name="notification_idle">空闲</string>
+    <string name="notification_thinking">正在思考</string>
+    <string name="notification_no_content">暂无内容</string>
 </resources>
