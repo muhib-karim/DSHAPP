@@ -399,11 +399,21 @@ window.__ModuleLoader__.load({
 }
 /* 汉堡按钮：由 fixed 改为锚定 header 左上（mpBuildShell 会把它挪进 header）。
    仍用 absolute 是无害的：header 的左内边距已为它留出 50px，
-   它不参与挤压，也就不影响标题的省略计算。 */
+   它不参与挤压，也就不影响标题的省略计算。
+
+   ⚠️ 修复 62：top 用 max(50%, 20px)，不是裸 50%。
+   未选工作区的 Hero 页，官方 header 是空壳（wSkVaW_headerBlank
+   wSkVaW_headerSessionless），实测高度只有 8px（CDP：rect.h=8、padTop=4px）。
+   裸 50% 在那里算成 4px，再被 translateY(-50%) 上移 20px → 按钮 y = -16px，
+   整个汉堡跑到 header 上方、顶进状态栏（用户反馈「顶栏一整行上移了，
+   选完工作区又恢复」—— 选中后 header 恢复自然高度 ~47px，50% 变正值就"回位"）。
+   max() 的下界取汉堡自身高度的一半（40 / 2 = 20px），保证 translateY 之后
+   顶边不低于 0；header 高度正常时 50% 大于 20px 取 50%，行为与修复前逐像素一致。
+   这个下界只依赖汉堡自己的尺寸，不依赖官方类名语义或 header 自然高度。 */
 [data-mobile] .mp-nav-btn.mp-in-header {
   position: absolute !important;
   left: 6px !important;
-  top: 50% !important;
+  top: max(50%, 20px) !important;
   transform: translateY(-50%) !important;
 }
 /* 修复 57：回到 flex 流内（原先 absolute + right:44px 是重叠的根因）。 */

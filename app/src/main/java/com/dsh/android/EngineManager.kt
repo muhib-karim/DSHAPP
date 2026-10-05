@@ -911,6 +911,81 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 给 workspace controller 指定「文档目录」，让首次使用时能自动建出默认工作区。
+     *
+     * ## 为什么需要
+     *
+     * 全新安装（无工作区、无会话）时，前端会调 `workspaces.initializeDefault()`
+     * 自动建一个默认工作区；失败就弹「无法创建默认工作区，请通过"选择工作区"选择文件夹」。
+     *
+     * host 侧 `@deepseek-ai/dsh-api-workspace-controller/lib/types/default-directory.js`
+     * 的平台分支只认三平台：
+     *
+     * ```js
+     * switch (platform) {
+     *   case 'darwin': ... osascript ...
+     *   case 'win32':  ... powershell ...
+     *   case 'linux':  ... xdg-user-dir ...
+     *   default: throw new Error(`system Documents directory is unavailable on ${platform}`);
+     * }
+     * ```
+     *
+     * Node 在 Android 上 `process.platform === 'android'`，直接落进 `default:` 抛错。
+     * 这是本项目第 ⑫ 处「官方只认 linux/darwin/win32」的同款问题（与 ripgrep / sharp /
+     * node-pty / flock 同类），**不是本 App 的 bug，但必须由本 App 补上**。
+     *
+     * ## 为什么用 `documentsDirectory` 而不是改引擎源码
+     *
+     * 上游 README 明确写了这个口子：「不具备该条件的 Host 必须配置 `documentsDirectory`
+     * 或使用文件夹选择器」。它是 `Config` 里的 `z.string()`，非空时**跳过整个平台探测**
+     * （`let directory = documentsDirectory; if (directory === undefined) { ...switch... }`），
+     * 且构造时会 `validateDocumentsDirectory()` 要求绝对路径。所以只要给一个绝对路径，
+     * Android 就完全绕开那个 switch。
+     *
+     * ## 为什么指向 app 私有目录下的 workspace
+     *
+     * 最终工作区是 `<documentsDirectory>/deepseek-harness/default-workspace`。
+     * 用 `filesDir/workspace`（即 [workspaceDir]）而不是 `/sdcard`：
+     *
+     * - app 私有目录无需任何存储权限，Android 10+ 的分区存储下 `/sdcard` 反而更麻烦；
+     * - 引擎进程的 cwd 本来就是 [workspaceDir]，默认工作区落在同一棵树下，
+     *   agent 的文件操作与沙箱的写边界（`--bind <workspaceRoot>`）天然一致；
+     * - `/sdcard` 在沙箱里是**被拒**的（见 AGENTS.md ④ 的验收项）。
+     *
+     * 注意这里指向 [workspaceDir] 本身，而实际建出来的是它下面的
+     * `deepseek-harness/default-workspace`，不是把 [workspaceDir] 直接当工作区。
+     *
+     * ## 为什么用 `--patch` 而不是用户层
+     *
+     * 这一项**不是 GUI 设置项**（`settings/describe` 里没有它），用户无从覆盖，
+     * 所以不存在「锁死用户配置」的问题；而它是 Host 部署事实（本机文档目录在哪），
+     * 本来就该由 App 拥有。这与 [writeSandboxPatch] 同类，每次启动整体覆盖。
+     */
+    private fun writeWorkspacePatch(): File? {
+        val file = File(dshHome, WORKSPACE_PATCH)
+        val yaml = buildString {
+            appendLine("# 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。")
+            appendLine("# Android 落不进引擎的平台分支（只认 darwin/win32/linux），")
+            appendLine("# 必须显式给 documentsDirectory，否则首次使用建不出默认工作区。")
+            appendLine("# 详见 EngineManager.writeWorkspacePatch() 的注释。")
+            appendLine("- id: workspace-controller")
+            appendLine("  name: '@deepseek-ai/dsh-api-workspace-controller'")
+            appendLine("  config:")
+            appendLine("    documentsDirectory: '${workspaceDir.absolutePath}'")
+        }
+        return try {
+            if (!file.isFile || file.readText() != yaml) {
+                file.writeText(yaml)
+                Log.i(TAG, "已写入工作区 overlay: ${file.name}")
+            }
+            file
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入工作区 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 把 `flock.js` 的平台白名单补上 android（幂等）。
      *
      * 只替换那一处判断，不动其它任何逻辑；找不到锚点就跳过（引擎升级后结构变了
@@ -1461,6 +1536,8 @@ class EngineManager private constructor(private val context: Context) {
         val mobileUiPatch = writeMobileUiPatch()
         // 沙箱：Android 无内核级后端，用自带 runner 保住 workspace-write 的写边界
         val sandboxPatch = writeSandboxPatch(ensureSandbox())
+        // 默认工作区：Android 落不进引擎的平台分支，必须显式给 documentsDirectory
+        val workspacePatch = writeWorkspacePatch()
         // link 兼容层：SELinux 不给 app_data_file 的 link 权限，需在 libc 边界转译
         val linkCompat = ensureLinkCompat()
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
@@ -1512,6 +1589,10 @@ class EngineManager private constructor(private val context: Context) {
             // 沙箱 runner：同样是 overlay（--patch 可重复，按顺序应用）
             if (sandboxPatch != null) {
                 add("--patch"); add(sandboxPatch.absolutePath)
+            }
+            // 默认工作区目录：同上，补上引擎缺的 android 平台分支
+            if (workspacePatch != null) {
+                add("--patch"); add(workspacePatch.absolutePath)
             }
             // uid 2000 特权工具：也是 overlay，注册成独立的 `shell` 工具
             if (privPatch != null) {
@@ -1866,6 +1947,9 @@ class EngineManager private constructor(private val context: Context) {
         private const val SANDBOX_LIB_FILE = "libboosandbox.so"
         private const val SANDBOX_PATCH = "sandbox.patch.yml"
 
+        /** 默认工作区 overlay：补上引擎缺的 android 平台分支。见 [writeWorkspacePatch]。 */
+        private const val WORKSPACE_PATCH = "workspace.patch.yml"
+
         /** pnpm：Termux 的 $PREFIX/bin 里没有，插件管理器靠它装 bundle。 */
         private const val PNPM_ASSET = "pnpm-android-arm64.zip"
         private const val PNPM_VERSION = "11.28.3"
@@ -1878,7 +1962,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-31"
+        private const val MOBILE_UI_VERSION = "1.0.0-33"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
