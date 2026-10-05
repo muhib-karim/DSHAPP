@@ -31,6 +31,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.dsh.android.databinding.ActivityMainBinding
 import kotlinx.coroutines.launch
@@ -573,6 +574,48 @@ class MainActivity : AppCompatActivity() {
         // 窗口底色也跟上：DecorView 与 WebView 是两层独立的合成，窗口缩小时
         // 两层各自的 Surface 更新并不同步，只改一层仍可能露出一帧旧色
         window.setBackgroundDrawable(ColorDrawable(color))
+        // 系统栏只在启动层收起后才跟随，理由见 applySystemBarColor
+        if (overlayDismissed) applySystemBarColor(bg)
+    }
+
+    /**
+     * 把系统栏（状态栏 + 导航栏）的底色与图标明暗同步到页面实际底色。
+     *
+     * **为什么要做**：这两处原先在 `themes.xml` 里写死 `#0F1115`（深色），
+     * 而官方 Web GUI 是浅色的 —— 于是屏幕顶部、底部各留一条黑边，与页面割裂。
+     * 页面底色本来就经 `onStatus` 上报（见 [applyPageBackground]），这里把它一并
+     * 应用到系统栏，App 主题切深色时也会自动跟上（不写死颜色）。
+     *
+     * ⚠️ **必须在启动层收起之后才调用**：启动页是深色的（`#0B0E18`），
+     *   引擎起来之前就把系统栏刷成白色，会在顶部露一条白边（比黑边更刺眼）。
+     *   所以 `applyPageBackground` 里用 `overlayDismissed` 拦一道。
+     * ⚠️ 底色浅时**必须**把图标切成深色：状态栏图标默认是浅色，白底上会看不见。
+     * ⚠️ 必须在主线程调用（`runOnUiThread`）。
+     */
+    private fun applySystemBarColor(bg: String) {
+        val color = try {
+            Color.parseColor(bg)
+        } catch (t: Throwable) {
+            return
+        }
+        window.statusBarColor = color
+        window.navigationBarColor = color
+        val light = isLightColor(color)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = light
+            isAppearanceLightNavigationBars = light
+        }
+    }
+
+    /**
+     * 判断颜色是否算「浅色」，用来决定系统栏图标该用深色还是浅色。
+     *
+     * 用 ITU-R BT.601 的感知亮度权重，不取 RGB 平均：人眼对绿最敏感、对蓝最不敏感，
+     * 取平均会把纯蓝（`#0000FF`）误判成浅色，于是配上深色图标、在蓝底上糊成一片。
+     */
+    private fun isLightColor(color: Int): Boolean {
+        val luminance = 0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)
+        return luminance / 255.0 > 0.5
     }
 
     /**
@@ -780,6 +823,10 @@ class MainActivity : AppCompatActivity() {
     private fun hideOverlay() {
         if (overlayDismissed) return
         overlayDismissed = true
+        // 启动层收起 = 页面底色开始可见，此时才把系统栏交给页面底色
+        // （之前一直保持 themes.xml 的深色，与深色启动页一致）。
+        // 用最近一次上报的底色；还没收到过就保持主题里的深色不动。
+        if (appliedBgHex.isNotEmpty()) applySystemBarColor(appliedBgHex)
         binding.overlay.animate()
             .alpha(0f)
             .setDuration(OVERLAY_FADE_OUT_MS)
