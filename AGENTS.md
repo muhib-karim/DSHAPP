@@ -109,6 +109,8 @@ adb logcat -d -s DSH:I
 | `已解出沙箱 runner boo-sandbox-run (<N> 字节) + libboosandbox.so (<N> 字节)` | 沙箱组件已落盘 |
 | `已写入沙箱 overlay: sandbox.patch.yml` | 沙箱 runner 已挂上 |
 | `已解出 link 兼容层 liblinkcompat.so (<N> 字节)` | link 转译层已落盘（并会被 LD_PRELOAD） |
+| `已还原目录选择器的起始目录（改由主目录下的入口链接提供）` | 老安装里「起点改 /sdcard」的补丁已撤回（见 ③.5） |
+| `已建工作区入口: 手机存储 → /sdcard` | HOME 下的入口链接已就位（只首次启动打印，见 ③.5） |
 | `[engine] dsh web: http://127.0.0.1:3080/?token=...` | 引擎打印了带 token 的 URL |
 | `引擎就绪: http://...` | App 解析到 URL |
 | `WebView 加载完成: http://127.0.0.1:3080/` | 前端已加载 |
@@ -162,14 +164,26 @@ catch (e) { if (e.code === 'EEXIST') return false; throw e; }  // ← EACCES 走
 
 EACCES 不是 EEXIST，于是冒泡成「本轮运行失败 EACCES: permission denied, link ...」。
 
-**真机 syscall 实测（app 私有目录）**：
+**真机 syscall 实测 —— 两个文件系统的 errno 不一样，这是本节的要害**：
 
-| 调用 | 结果 |
-|---|---|
-| `link()` / `linkat()` | **EACCES** |
-| `rename()` | OK |
-| `renameat2(RENAME_NOREPLACE)` | **OK**（目标不存在则成功，已存在则 EEXIST 且不覆盖） |
-| `symlink()` / `copyFile()` / `unlink()` / `mkdir()` / `fsync()` | OK |
+| 调用 | app 私有目录（`app_data_file`） | `/sdcard`（FUSE / sdcardfs） |
+|---|---|---|
+| `link()` / `linkat()` | **EACCES** | **EINVAL**（node 进程内）／**EPERM**（裸 C 探针） |
+| `rename()` | OK | OK |
+| `renameat2(RENAME_NOREPLACE)` | **OK**（目标不存在则成功，已存在则 EEXIST 且不覆盖） | **EINVAL**（FUSE 不认这个 flag） |
+| `symlink()` | OK | **EPERM** |
+| `copyFile()` / `unlink()` / `mkdir()` / `fsync()` / `O_EXCL` 建文件 | OK | OK |
+
+⚠️ **`/sdcard` 上的 `link()` 不是 EACCES**，这一点最初判断错了 —— 转译层因此**根本没被
+触发**（触发条件只写了 EACCES/EPERM），用户把工作区设在 `/sdcard` 时 `write` 工具直接报
+`EINVAL: invalid argument, link ...`。而 `bash`、`edit` 正常（`edit` 走 `dsh-atomic-write`
+的纯 `rename`，不碰 link），所以症状只在 `write` 上。
+
+⚠️ 同一个调用在 node 与裸 C 探针下 errno 不同（EINVAL vs EPERM），所以**两个都得接受**，
+不能只认一个。
+
+⚠️ 即使在 `/sdcard` 上触发了转译，`renameat2(RENAME_NOREPLACE)` 那一层**也会 EINVAL** ——
+降级分支原来只认 `ENOSYS`，于是 EINVAL 原样冒泡，症状与「没触发」一模一样。两处都得改。
 
 **为什么不能靠 JS 侧打补丁**：引擎用 `import { link } from "node:fs/promises"`（ESM 具名
 导入）。实测 `--import` 预加载里改 `fsPromises.link` 得到
@@ -177,8 +191,12 @@ EACCES 不是 EEXIST，于是冒泡成「本轮运行失败 EACCES: permission d
 
 **做法**：`app/src/main/jni/linkcompat.c` 编译成 `assets/linkcompat.bin`，
 `EngineManager.ensureLinkCompat()` 解到 `filesDir/liblinkcompat.so`，启动 node 时
-`LD_PRELOAD` 它。只 hook `link`/`linkat` 两个符号，**先试原生调用，只有被 SELinux 拒
-（EACCES/EPERM）才转译**，其余 errno 原样返回。
+`LD_PRELOAD` 它。只 hook `link`/`linkat` 两个符号，**先试原生调用，只有被系统拒
+（EACCES / EPERM / EINVAL）才转译**，其余 errno 原样返回。
+
+⚠️ **EINVAL 必须在触发条件里**：`/sdcard` 上 `link()` 返回的是 EINVAL，漏了它转译
+根本不会启动（这正是 `write` 工具在 `/sdcard` 工作区失效的根因）。三个 errno 都收，
+是因为同一个调用在不同文件系统、不同调用方（node 的 libuv 线程 vs 裸 C）下报的不一样。
 
 转译语义 = `link(from,to)` ≡ 「把 from 的内容复制到 to，且 to 必须原本不存在」，
 三个性质都要保住：
@@ -202,7 +220,83 @@ EEXIST 语义与内容摘要校验，**没有任何一处依赖同 inode**。
 务必确认不会破坏系统二进制**。
 
 ⚠️ `renameat2` 是 glibc 扩展，bionic **没有导出**，必须走 `syscall(__NR_renameat2, ...)`。
-设备内核 4.14 支持；代码里保留了 `ENOSYS` 时退化为「`O_EXCL` 占位 + rename」的分支。
+降级分支认 `ENOSYS | EINVAL | ENOTSUP`：前者是老内核（< 3.15）没有这个系统调用，
+后两者是 **FUSE/sdcardfs 拒绝 `RENAME_NOREPLACE`** —— 也就是说在 `/sdcard` 上
+**永远**走降级路径，那是正常路径而不是异常路径。
+
+降级 = 「`O_EXCL` 占位 + `rename`」：独占性仍由 `O_EXCL` 保证，但两步之间被杀会留下
+空占位文件，导致该文件名此后永久 `EEXIST`。这个窗口在 `/sdcard` 上是**真实存在**的
+（`app_data_file` 上走不到这里，内核 4.14 支持 renameat2）。取舍依据：占位与 rename
+之间只隔一次系统调用，且被杀的后果是「该文件名写不进去」，不是数据损坏 —— 相比
+「`/sdcard` 工作区里 `write` 工具完全不可用」，代价明显更小。
+
+⚠️ 降级路径的全部原语已在真机 `/sdcard` 上逐条验过（`O_EXCL` 建占位、`rename` 覆盖、
+`fsync`/`fdatasync`/`futimens`、`chmod`、清理），不是推测。
+
+⚠️ 真机验收（`/sdcard`、app 域、`LD_PRELOAD` 新库、node 进程内 `fs.linkSync`）：
+独占新建 ✅、内容一致 ✅、**源文件保留** ✅、二次 link 正确报 `EEXIST` ✅、
+目标目录不存在正确报 `ENOENT` ✅。
+
+### ③.5 目录选择器只在**一棵**树里走 —— 用 HOME 下的入口链接接上手机存储
+
+**症状**：点「选择工作区」，对话框停在 `filesDir/home`（app 私有目录），
+既看不到手机上的文件夹，也**走不上去**（面包屑起点就是那里），
+「选一个手机上的文件夹当工作区」在 App 里根本做不到。
+
+**根因有两层**：
+
+1. `dsh-host-directory-picker-auto` 在 Android 上判成 **`browse`** 后端（判定表：
+   非 darwin/win32、非带 `DISPLAY` 的 linux ⇒ `browse`），其 `list()` 在没给路径时
+   用 `homedir()` 当起点，而本 App 把引擎 `HOME` 设成 `filesDir/home`。
+2. **更要紧的是**：Android 上手机存储与 app 私有目录**互不可达** —— app 域连
+   `readdir("/")`、`readdir("/data")` 都是 EACCES（见 ⑨ 的实测表）。所以起点放在
+   **哪一边，另一边就永远进不去**。
+
+⚠️ **第一版修法是错的，别再走回去**：当时把起点直接改成 `/sdcard`，手机文件夹能选了，
+但用户**再也进不了 app 私有目录**（默认工作区就在那儿）。真机反馈后推翻。
+
+**做法**：起点**留在 HOME**，在 HOME 下建两个入口符号链接：
+
+```
+filesDir/home/手机存储  → /sdcard      选手机上的任意文件夹
+filesDir/home/应用目录  → filesDir     选/建 app 私有目录里的文件夹
+```
+
+用户在对话框里看到「主目录」下的两个入口，点进去各走各的树，点面包屑上的
+「主目录」就能回来 —— **有入口、也有向上导航**。
+
+⚠️ **链接只能建在 app 私有目录这一侧**：`/sdcard` 上 `symlink()` 返回 **EPERM**
+（FUSE/sdcardfs 不支持）。所以不能反过来把私有目录的入口放进手机存储。
+
+⚠️ **browse 后端会跟随符号链接**：`directoryRow()` 对 `isSymbolicLink()` 的条目补一次
+`stat()`，是目录就照常列为可进入的文件夹。真机实测两个链接都 `enterable=true`，
+且经链接列目录（145 项）、建文件夹、写文件全部成功。
+
+⚠️ 用户拒绝存储权限时「手机存储」那行 `stat()` 失败 ⇒ `directoryRow()` 返回 null ⇒
+**该行不显示**（官方逻辑，不会崩），只剩「应用目录」可用。
+
+⚠️ **`home` 字段从头到尾没被碰过**：客户端 `displayCrumbs()` 拿 `listing.home` 折叠
+面包屑。把 `home` 改掉会让面包屑塌成一项，用户失去向上导航 —— 入口链接方案能成立，
+正是因为起点回到了 `home`。
+
+⚠️ **改这一处必须同时「撤回」老安装里已打进去的补丁**：引擎解包目录只在版本戳变化时
+才重解包（`ensureExtracted` + `.stamp`），光改代码不还原的话，老设备会永远停在
+`/sdcard` 起点上。`EngineManager.restoreDirectoryPickerStart()` 就是干这个的，
+幂等判据是「打过补丁的文本在不在」。
+
+⚠️ 涉及的两个常量（`PICKER_START_GUARD` = 官方原文，`PICKER_START_ANCHOR` = 旧补丁
+文本）**两个都必须逐字保留**：少一个，老安装就撤不回来。
+
+代码：`restoreDirectoryPickerStart()` + `ensurePickerRoots()`，调用点在 `start()` 里
+`patchAttachmentDurability()` 之后。日志验收：
+
+```
+已还原目录选择器的起始目录（改由主目录下的入口链接提供）
+已建工作区入口: 手机存储 → /sdcard
+已建工作区入口: 应用目录 → /data/user/0/com.dsh.android/files
+```
+
+（第二、三行只在第一次启动时出现；之后链接已就位，幂等跳过。）
 
 ### ④ Android 没有内核级沙箱后端 —— 用自带 runner 保住写边界
 

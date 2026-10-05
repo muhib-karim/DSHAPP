@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
 /**
@@ -632,6 +633,131 @@ class EngineManager private constructor(private val context: Context) {
             Log.i(TAG, "已放行 subprocess-local 的 android 进程检查器: ${entry.name}")
         } catch (t: Throwable) {
             Log.w(TAG, "放行 subprocess-local 的 android 进程检查器失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 撤回「把选择工作区对话框的起始目录改成 `/sdcard`」那次改动（幂等）。
+     *
+     * **症状**：点「选择工作区」后，对话框停在 `files/home`（app 私有目录），
+     * 既看不到手机上的任何文件夹，也**走不上去**（面包屑起点就是那里），
+     * 于是「选一个手机上的文件夹当工作区」这件事在 App 里根本做不到。
+     *
+     * **根因**：Android 上引擎把目录选择器判成 `browse` 后端
+     * （`dsh-host-directory-picker-auto` 的判定表：非 darwin/win32、非带显示的
+     * linux ⇒ `browse`，真机实测 boot 图里挂的正是
+     * `@deepseek-ai/dsh-client-ui-directory-picker-browse`）。该后端的 `list()`
+     * 在没给路径时用 `homedir()` 当起点：
+     *
+     * ```js
+     * const home = homedir();          // → $HOME，本 App 里是 filesDir/home
+     * const target = resolve(path ?? home);
+     * ```
+     *
+     * 而本 App 把引擎的 `HOME` 设成 `filesDir/home`（Termux 习惯，见 [start]），
+     * 那是应用私有目录 —— 手机存储根本不在它的祖先链上。
+     *
+     * **做法（曾经）**：把 android 下的默认起点换成 `/sdcard`。
+     *
+     * ⚠️ **这个做法已经被推翻，本函数现在负责把它撤回来。** 起点放在 `/sdcard`
+     * 虽然能选手机上的文件夹，但用户**再也进不了 app 私有目录** —— 两棵树在
+     * Android 上互不可达（见 [ensurePickerRoots] 的实测表），而私有目录正是
+     * 默认工作区所在的地方。现在改为「起点留在 HOME + 在 HOME 下建两个入口
+     * 链接」，两边的需求同时成立。
+     *
+     * ⚠️ **必须真的撤回，不能只改代码不还原**：引擎解包目录只在版本戳变化时
+     * 才重解包（[ensureExtracted] + [stampFile]），已经打过补丁的安装里那行
+     * 仍然是 `/sdcard`，改 `assetStamp` 会让所有用户白重解包 100+ MB。
+     *
+     * ⚠️ 幂等判据是「打过补丁的文本在不在」：撤回之后它就不存在了，第二次调用
+     * 直接返回。官方若改了这一行，两个锚点都不匹配 ⇒ 跳过并打日志，不会让
+     * 启动失败（`home` 字段本来就该是 `homedir()`，不改才是对的）。
+     */
+    private fun restoreDirectoryPickerStart() {
+        val entry = File(
+            engineDir,
+            "node_modules/@deepseek-ai/dsh-host-directory-picker-browse/lib/index.js"
+        )
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到目录选择器后端，跳过起始目录还原: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (!source.contains(PICKER_START_ANCHOR)) {
+                return
+            }
+            entry.writeText(source.replace(PICKER_START_ANCHOR, PICKER_START_GUARD))
+            Log.i(TAG, "已还原目录选择器的起始目录（改由主目录下的入口链接提供）")
+        } catch (t: Throwable) {
+            Log.w(TAG, "还原目录选择器起始目录失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 在引擎 HOME 下建两个「选择工作区」的入口链接（幂等）。
+     *
+     * **为什么需要**：目录选择器一次只在**一棵**目录树里走，而 Android 上
+     * 手机存储与 app 私有目录**互不可达** —— app 域连 `readdir("/")`、
+     * `readdir("/data")` 都是 EACCES（实测表见 [patchAttachmentDurability]），
+     * 所以起点无论放在哪一边，另一边都永远进不去。
+     *
+     * **做法**：起点留在 HOME（客户端 `displayCrumbs()` 会把 HOME 折叠成一项
+     * 「主目录」），在 HOME 下建两个符号链接当入口：
+     *
+     * ```
+     * filesDir/home/手机存储  → /sdcard      选手机上的任意文件夹
+     * filesDir/home/应用目录  → filesDir     选/建 app 私有目录里的文件夹
+     * ```
+     *
+     * 用户在对话框里看到的就是「主目录」下的两个入口，点进去各走各的树，
+     * 点面包屑上的「主目录」就能回来 —— 有入口、也有向上导航。
+     *
+     * ⚠️ **链接只能建在 app 私有目录这一侧**：`/sdcard` 上 `symlink()` 返回
+     * **EPERM**（FUSE/sdcardfs 不支持），所以不能反过来把私有目录的入口放进
+     * 手机存储。真机实测：私有目录里建链接成功，`/sdcard` 上失败。
+     *
+     * ⚠️ **browse 后端会跟随符号链接**：`directoryRow()` 对 `isSymbolicLink()`
+     * 的条目补一次 `stat()`，是目录就照常列为可进入的文件夹。真机实测两个链接
+     * 都 `enterable=true`，且经链接列目录（145 项）、建文件夹、写文件全部成功。
+     *
+     * ⚠️ 读得到 `/sdcard` 靠的是 manifest 里已申请的 `READ_EXTERNAL_STORAGE` /
+     * `WRITE_EXTERNAL_STORAGE`（targetSdk 28，legacy 存储模型）。用户拒绝该权限
+     * 时「手机存储」那一行 `stat()` 失败 ⇒ `directoryRow()` 返回 null ⇒
+     * **该行不显示**（官方逻辑，不会崩），只剩「应用目录」可用。
+     *
+     * ⚠️ 建链接失败只打日志，不让启动失败。
+     */
+    private fun ensurePickerRoots() {
+        val home = homeDir
+        if (!home.isDirectory) {
+            Log.w(TAG, "HOME 不存在，跳过工作区入口链接: ${home.absolutePath}")
+            return
+        }
+
+        // 名字会显示在对话框里、也会出现在所选工作区的路径中，用一眼能懂的词。
+        val roots = listOf("手机存储" to File("/sdcard"), "应用目录" to context.filesDir)
+        for ((name, target) in roots) {
+            val link = File(home, name)
+            try {
+                val path = link.toPath()
+                // ⚠️ 用 isSymbolicLink 而不是 exists()：断链时 exists() 返回 false，
+                // 会让我们去 createSymbolicLink 一个已经存在的链接名（EEXIST）。
+                if (Files.isSymbolicLink(path)) {
+                    if (Files.readSymbolicLink(path).toString() == target.absolutePath) {
+                        continue // 已就位
+                    }
+                    Files.delete(path) // 指向变了（换过包名/清过数据），重建
+                } else if (link.exists()) {
+                    Log.w(TAG, "工作区入口被同名文件占位，跳过: ${link.absolutePath}")
+                    continue
+                }
+                Files.createSymbolicLink(path, target.toPath())
+                Log.i(TAG, "已建工作区入口: $name → ${target.absolutePath}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "建工作区入口失败（$name）: ${t.message}")
+            }
         }
     }
 
@@ -1528,6 +1654,10 @@ class EngineManager private constructor(private val context: Context) {
         patchProcessInspector()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
+        // 目录选择器：撤回「起点改 /sdcard」的旧补丁，改由 HOME 下的入口链接提供
+        restoreDirectoryPickerStart()
+        // 手机存储与 app 私有目录在 Android 上互不可达，靠 HOME 下两个链接做入口
+        ensurePickerRoots()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
         ensureMobileUi()
         // 出厂默认设置：只写 profile 的用户 patch 层，且只在它不存在时写一次。
@@ -1885,6 +2015,27 @@ class EngineManager private constructor(private val context: Context) {
                 "\t\tif (err && (err.code === \"EACCES\" || err.code === \"EPERM\")) return;\n" +
                 "\t\tthrow err;\n" +
                 "\t}"
+
+        /**
+         * `dsh-host-directory-picker-browse/lib/index.js` 里 `list()` 决定默认起点
+         * 的那一行（[PICKER_START_GUARD]），以及曾经把它指向手机存储的文本
+         * （[PICKER_START_ANCHOR]，现在只用于**撤回**）。见 [restoreDirectoryPickerStart]。
+         *
+         * ⚠️ 两个锚点都必须逐字保留：`GUARD` 是官方原文（撤回时写回去的内容），
+         * `ANCHOR` 是旧版本打进用户设备的内容（撤回时用来识别）。少一个，
+         * 老安装就永远停在 `/sdcard` 起点上。
+         *
+         * ⚠️ `const home = homedir();` 那一行**从头到尾没被碰过** —— 返回给客户端的
+         * `home` 字段靠它，客户端拿 `home` 折叠面包屑。入口链接方案能work，正是
+         * 因为起点回到了 `home`。
+         *
+         * ⚠️ 缩进是**两个制表符**，与官方发布件逐字一致；引擎升级后若不再匹配，
+         * 撤回会跳过并在日志里提示，不会让启动失败。
+         */
+        private const val PICKER_START_GUARD =
+            "\t\tconst target = resolve(path ?? home);"
+        private const val PICKER_START_ANCHOR =
+            "\t\tconst target = resolve(path ?? (process.platform === 'android' ? '/sdcard' : home));"
 
         /** 移动端 UI 适配插件：包名、资产名，以及挂载它的 overlay 文件名。 */
         private const val MOBILE_UI_ASSET = "mobile-ui.zip"

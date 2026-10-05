@@ -236,10 +236,23 @@ static int compat_link(int olddirfd, const char *from, int newdirfd,
   if (syscall(__NR_renameat2, AT_FDCWD, tmp, AT_FDCWD, dst,
               RENAME_NOREPLACE) != 0) {
     int e = errno;
-    if (e == ENOSYS) {
-      /* 老内核（< 3.15）没有 renameat2。退化为「O_EXCL 占位 + rename」：
-       * 独占性仍由 O_EXCL 保证，但两步之间被杀会留下空占位文件，
-       * 导致后续永久 EEXIST。设备实测内核 4.14 支持 renameat2，走不到这里。 */
+    if (e == ENOSYS || e == EINVAL || e == ENOTSUP) {
+      /* 两条路都到不了 renameat2：
+       *
+       *   ENOSYS  老内核（< 3.15）根本没有这个系统调用。
+       *   EINVAL  **FUSE/sdcardfs 不支持 RENAME_NOREPLACE**（真机实测 /sdcard 上
+       *           返回 EINVAL）。用户把工作区设在 /sdcard 时走的就是这里 ——
+       *           不认这个 errno 的话 write 工具会直接报
+       *           `EINVAL: invalid argument, link ...`。
+       *   ENOTSUP 部分文件系统对 flags 的整体拒绝。
+       *
+       * 退化为「O_EXCL 占位 + rename」：独占性仍由 O_EXCL 保证，但两步之间被杀会
+       * 留下空占位文件，导致后续永久 EEXIST。
+       *
+       * ⚠️ 这个窗口在 /sdcard 上是**真实存在**的（app_data_file 上走不到这里，
+       * 内核 4.14 支持 renameat2）。取舍依据：占位与 rename 之间只隔一次系统调用，
+       * 且被杀的后果是「该文件名此后写不进去」，而不是数据损坏 —— 相比
+       * 「/sdcard 工作区里 write 工具完全不可用」，这个代价明显更小。 */
       int guard = open(dst, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
       if (guard < 0) {
         unlink(tmp);
