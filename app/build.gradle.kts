@@ -1,6 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// 发行版签名凭据从仓库根的 keystore.properties 读（不入库，见 .gitignore）。
+// 文件不存在时不配 signingConfig —— 这样别人 clone 后仍能出 unsigned 包，
+// 且 assembleDebug 完全不受影响。
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
 android {
@@ -31,9 +41,26 @@ android {
         }
     }
 
+    signingConfigs {
+        // ⚠️ 这把钥匙是发行版的终身身份，与 debug 签名**互相独立**。
+        // 一旦发出去就不能换：换签名 = 老用户撞 INSTALL_FAILED_UPDATE_INCOMPATIBLE，
+        // 只能卸载重装，而卸载会清掉 filesDir 下的整个 Termux 环境与 $DSH_HOME。
+        if (keystorePropsFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             packaging {
                 resources {
                     excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -43,6 +70,14 @@ android {
         debug {
             isMinifyEnabled = false
         }
+    }
+
+    lint {
+        // targetSdk=28 是本项目的硬约束（原因见 defaultConfig 里的注释），而
+        // lintVitalRelease 的 ExpiredTargetSdkVersion 会直接判 release 构建失败。
+        // 本 App 只能侧载、不上架 Google Play，该检查在这里无意义，故只关掉这一条，
+        // 其余 lint 检查保持生效。
+        disable += "ExpiredTargetSdkVersion"
     }
 
     // 三个资产都用 assets.open() 读取，压缩与否对调用方透明，所以**不需要**

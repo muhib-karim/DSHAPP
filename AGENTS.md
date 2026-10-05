@@ -79,6 +79,36 @@ $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
   `android.overridePathCheck=true` 放行，别删。
 - 构建需经代理（`gradle.properties` 里的 `127.0.0.1:7897`）。
 
+### 发行版（release）
+
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
+.\gradlew.bat :app:assembleRelease --console=plain
+# 产物：app\build\outputs\apk\release\app-release.apk（约 127 MB，已签名）
+```
+
+**debug 是自用包、release 是发给别人的包，两把钥匙互相独立。**
+
+- 签名凭据是仓库根的 `keystore.properties`（指向 `dsh-release.jks`），
+  **两者都不入库**（`.gitignore` 已覆盖），`app/build.gradle.kts` 读它配
+  `signingConfigs.release`。**文件不存在时自动跳过签名**，产物退化成
+  `app-release-unsigned.apk` —— 别人 clone 后就是这个状态，`assembleDebug`
+  完全不受影响。
+- ⚠️ **这把钥匙是发行版的终身身份，发出去就不能换。** 换签名 ⇒ 老用户撞
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` ⇒ 只能卸载重装，而卸载会清掉 `filesDir`
+  下的整个 Termux 环境与 `$DSH_HOME`（会话、凭据、工作区全没）。
+  **`dsh-release.jks` 与 `keystore.properties` 必须一起离线备份**，丢了同样发不出更新。
+- 侧载**不需要买 CA 证书**，`keytool` 自签即可（Android 只校验前后一致，不校验链）。
+  当前证书 `CN=DSH Android, O=DSH, C=CN`，RSA 4096，有效期 10000 天；
+  `apksigner verify` 显示走 **v2 方案**（`minSdk 26` 用不上 v1）。
+- ⚠️ **`lintVitalRelease` 的 `ExpiredTargetSdkVersion` 会因 `targetSdk = 28` 直接判
+  release 构建失败**（报 "Google Play requires that apps target API level 33 or higher"）。
+  已在 `app/build.gradle.kts` 的 `lint {}` 里**只关掉这一条**——本 App 只能侧载、
+  不上架 Play，该检查在这里无意义——其余 lint 检查保持生效，别改回去。
+  根因是硬约束②，**不要试图靠升 `targetSdk` 来"修"它**。
+- ⚠️ debug 与 release **共用 `applicationId`**，同一台设备上只能存在一个；从 debug
+  换装 release（或反之）会因签名不同而要求先卸载 ⇒ 数据全丢。自用机保持 debug 不动。
+
 ```powershell
 # 安装 + 启动（adb 在 %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe）
 adb install -r app\build\outputs\apk\debug\app-debug.apk
