@@ -585,6 +585,45 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-button-elevated-fill, #fff) !important;
 }
 
+/* 9c-2. 变量级兜底。上面 9c 是逐个类名写死的，只盖住了侧栏那一小撮；
+   真机实测主界面还有一批按钮把 hover 底色挂在设计系统变量上 ——
+   11 个可点元素里有 9 个是同一个 --dsw-alias-interactive-bg-hover
+   (= #2631480f = rgba(38,49,72,0.06)，就是用户看到的"黑印")。
+   官方类名是构建期 hash（换版本就变），所以这一层改成从变量拦截，
+   一次覆盖全部元素，不依赖任何类名。
+
+   ⚠️ 必须排除 [aria-expanded="true"]。官方把"菜单已展开"的持久高亮和 :hover
+   写在同一组规则里、共用同一个变量：
+     .pXSMma_workspace:not(:disabled):hover,
+     .pXSMma_workspace[aria-expanded="true"] { background: var(--dsw-alias-interactive-bg-hover) }
+   连坐清掉会把"当前展开的菜单"高亮一起弄没（真机上唯一带这个属性的是
+   home 工作区按钮）。排除后真机实测：收起+hover → 透明；
+   展开 → 仍是 rgba(38,49,72,0.06)（持久高亮完好）。
+
+   ⚠️ 只包在 (hover: none) 里：接鼠标的设备保留 hover 反馈。
+   测试机 Huawei CDY-TN90 命中该媒体查询（hover:none / pointer:coarse）。 */
+@media (hover: none) {
+  [data-mobile] button:hover:not([aria-expanded="true"]),
+  [data-mobile] [role="button"]:hover:not([aria-expanded="true"]),
+  [data-mobile] [role="tab"]:hover:not([aria-expanded="true"]),
+  [data-mobile] [role="menuitem"]:hover:not([aria-expanded="true"]),
+  [data-mobile] a[href]:hover:not([aria-expanded="true"]),
+  [data-mobile] summary:hover:not([aria-expanded="true"]),
+  [data-mobile] [tabindex]:hover:not([aria-expanded="true"]) {
+    --dsw-alias-interactive-bg-hover: transparent;
+  }
+  /* composer 的 "+" 按钮走的是 -solid 变量（#f1f3f5），把它也归零会变成全透明，
+     比原来的"浅灰→略深灰"更难看，所以这里直接还原成它的静态底色。 */
+  [data-mobile] .uV2eYG_add:hover:not(:disabled) {
+    background: #f5f6f7 !important;
+  }
+  /* 侧栏"新会话"按钮：9c 把它 hover 设成白卡（elevated-fill），
+     而它的静态底色是透明，点完同样留一块白印，这里一并归零。 */
+  [data-mobile] .hHd-Xa_newSession:hover {
+    background: transparent !important;
+  }
+}
+
 /* 9d. 按压反馈（替代触摸端不可用的 hover）：
    JS 在 touchstart/pointerdown 时给按下的行加 .mp-press，抬手即移除。 */
 [data-mobile] .YDXeBa_projectRow.mp-press,
