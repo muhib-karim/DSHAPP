@@ -21,3 +21,4 @@ local.properties
 app/src/main/assets/*
 !app/src/main/assets/webview-polyfill.js
 !app/src/main/assets/dsh-android-shell.mjs
+COMMIT_MSG.tmp
