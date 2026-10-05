@@ -1284,6 +1284,93 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 首次安装时把本 App 的推荐设置播种进 profile 的用户 patch 层（幂等）。
+     *
+     * ## 为什么落在这里，而不是 `--patch` overlay
+     *
+     * 引擎的 patch 层序（`@deepseek-ai/dsh/lib/profile-boot-*.js` 的 `composeProfile`
+     * 注释是权威定义）：
+     *
+     * ```
+     * bundle 层 → profiles/web/cordis.patch.yml（用户）→ $DSH_HOME/cordis.patch.yml → --patch overlay（本 App）
+     * ```
+     *
+     * `--patch` 在**最顶层**，放进去就盖住用户；而且
+     * `@deepseek-ai/dsh-config-editor/lib/index.js` 在用户改这项设置时会直接抛
+     * `Configuration for "<id>" is overridden by a home patch or command-line overlay` ——
+     * 也就是「锁死」，与「用户可覆盖」的产品要求正好相反。
+     *
+     * 所以内置值必须落在**用户层**（`cordis.patch.yml`）：它就是 GUI 设置页
+     * （`POST api/settings/mutate`）实际写入的那份文件，格式是 `id` + `name` + `config`。
+     * 本方法只在用户**从未改过设置**时写一次，之后无论用户怎么改都不再碰
+     * （判据见 [isEmptyProfilePatch]）。
+     *
+     * ## 为什么不会被引擎覆盖
+     *
+     * `@deepseek-ai/dsh-app-boot` 的 `initProfile()` 里是：
+     *
+     * ```js
+     * const patchPath = join(dir, PROFILE_PATCH_FILENAME);
+     * if (!existsSync(patchPath)) writeFileSync(patchPath, PROFILE_PATCH_TEMPLATE);
+     * ```
+     *
+     * 只在缺失时写模板 `[]`，已有文件**一个字节都不动**（同函数上方的注释也写明
+     * "Existing files are never touched"）。所以本方法必须跑在引擎启动**之前**。
+     *
+     * ## 各项取值的出处
+     *
+     * 全部由真机实测得到（Huawei CDY-TN90 / Android 10），不是猜的：在设置页里
+     * 改一项，hook `window.fetch` 抓到 `settings/mutate` 的 payload 与落盘结果，
+     * 再用 `settings/describe` 核对 schema 里的可选项与 `base`/`user` 分层。
+     */
+    private fun seedDefaultSettings() {
+        val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
+        val patch = File(profileDir, PROFILE_PATCH_FILENAME)
+        if (patch.exists() && !isEmptyProfilePatch(patch)) {
+            Log.i(TAG, "profile 用户配置已存在，保留用户设置: ${patch.absolutePath}")
+            return
+        }
+        try {
+            profileDir.mkdirs()
+            patch.writeText(DEFAULT_SETTINGS_PATCH)
+            Log.i(TAG, "已播种默认设置: ${patch.absolutePath}")
+        } catch (t: Throwable) {
+            // 播种失败不能挡住启动：引擎会自己写一份空的模板，只是没有默认值
+            Log.w(TAG, "播种默认设置失败（不影响启动）: ${t.message}")
+        }
+    }
+
+    /**
+     * 判断 profile patch 是否还是引擎生成的那份**空模板**（即用户从未改过任何设置）。
+     *
+     * 为什么需要这一条：引擎的 `initProfile()` 会给缺失的 patch 文件补一份
+     * `PROFILE_PATCH_TEMPLATE`（注释 + 一个 `[]`）。所以「跑过一次引擎但没动过
+     * 设置」的安装，文件是**存在**的 —— 只看 `exists()` 会让这些用户永远拿不到
+     * 出厂默认值。
+     *
+     * 而空模板里没有任何用户意图（全是引擎自己写的注释和空数组），把它当作
+     * 「未设置过」覆盖掉是安全的；只要用户动过任何一项设置，内容就不再是空模板，
+     * 本方法返回 false，用户配置被完整保留。
+     *
+     * 判据取「去掉注释行与空行后只剩 `[]`」，而不是比对整段文本 —— 引擎改注释
+     * 文案（甚至只是换行）时不会误判成「用户改过」。
+     */
+    private fun isEmptyProfilePatch(patch: File): Boolean {
+        val body = try {
+            patch.readText()
+        } catch (t: Throwable) {
+            // 读不出来（权限/编码）时按「有用户内容」处理，宁可不播种也不覆盖
+            Log.w(TAG, "读取 profile patch 失败: ${t.message}")
+            return false
+        }
+        val meaningful = body.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .joinToString("")
+        return meaningful == "[]"
+    }
+
+    /**
      * 往 `$DSH_HOME/AGENTS.md` 写入特权身份说明（幂等）。
      *
      * ## 为什么写这个文件
@@ -1368,6 +1455,9 @@ class EngineManager private constructor(private val context: Context) {
         patchAttachmentDurability()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
         ensureMobileUi()
+        // 出厂默认设置：只写 profile 的用户 patch 层，且只在它不存在时写一次。
+        // 必须早于引擎启动 —— 引擎的 initProfile() 会给缺失的 patch 文件补一份空模板。
+        seedDefaultSettings()
         val mobileUiPatch = writeMobileUiPatch()
         // 沙箱：Android 无内核级后端，用自带 runner 保住 workspace-write 的写边界
         val sandboxPatch = writeSandboxPatch(ensureSandbox())
@@ -1790,6 +1880,66 @@ class EngineManager private constructor(private val context: Context) {
          */
         private const val MOBILE_UI_VERSION = "1.0.0-31"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
+
+        // ── 出厂默认设置 ─────────────────────────────────────────────
+        //
+        // 只在首次安装时播种进 profile 的**用户 patch 层**，之后永不覆盖。
+        // 为什么不能用 `--patch` overlay、为什么不会被引擎覆盖，见 seedDefaultSettings()。
+
+        /** 引擎启动时用的 profile 名（`--profile web`）。 */
+        private const val PROFILE_NAME = "web"
+
+        /** profile 的用户 patch 层文件名（引擎的 `PROFILE_PATCH_FILENAME`）。 */
+        private const val PROFILE_PATCH_FILENAME = "cordis.patch.yml"
+
+        /**
+         * 出厂默认设置。格式与 GUI 设置页写出的完全一致（`id` + `name` + `config`），
+         * 所以用户在设置页里改任何一项，都只是往同一份文件里追加/覆盖对应的 `config`。
+         *
+         * 四项取值均由真机实测确定（Huawei CDY-TN90 / Android 10）：
+         *
+         * | 设置页文案 | ns | 取值 | 为什么是这个值 |
+         * |---|---|---|---|
+         * | 权限 = 完全权限 | `permission` | `defaultPreset: danger-full-access` | 手机上没有桌面那种"逐条审批"的交互条件 |
+         * | 字号大小 = 15 | `ui-theme` | `fontSize: 15` | 引擎默认 14 在手机上偏小 |
+         * | 工作步骤展示 = 标准 | `ui-chat` | `transcriptView: standard` | 引擎默认 `detailed`，手机上太占屏 |
+         * | 繁忙时的发送行为 = 插话发送 | `ui-conversation` | `busyEnter: steer` | 引擎默认 `queue`（排队），插话更符合"打断纠正"的直觉 |
+         *
+         * ⚠️ `permission` 这项 GUI 会连同 `presets` 整块一起写出（实测），
+         * 这里照抄同一形态，保证"用户之后在设置页改这一项"时 diff 最小。
+         * ⚠️ 各项的 `name` 必须与引擎里该 entry 的包名一致，否则 patch 匹配不上。
+         */
+        private val DEFAULT_SETTINGS_PATCH = """
+            # 由 DSH Android 客户端播种的出厂默认设置（仅首次安装时写入一次）。
+            # 这是**你的**配置层：此后在设置页里的任何改动都写在这里，App 不再覆盖。
+            # 想恢复出厂值：删掉本文件后重启 App。
+            - id: ui-theme
+              name: "@deepseek-ai/dsh-client-ui-theme"
+              config:
+                fontSize: 15
+            - id: permission
+              name: "@deepseek-ai/dsh-permission-presets"
+              config:
+                presets:
+                  read-only:
+                    sandbox: read-only
+                    approval: ask
+                  workspace-write:
+                    sandbox: workspace-write
+                    approval: ask
+                  danger-full-access:
+                    sandbox: danger-full-access
+                    approval: never
+                defaultPreset: danger-full-access
+            - id: ui-chat
+              name: "@deepseek-ai/dsh-client-ui-chat"
+              config:
+                transcriptView: standard
+            - id: ui-conversation
+              name: "@deepseek-ai/dsh-client-ui-conversation"
+              config:
+                busyEnter: steer
+        """.trimIndent() + "\n"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────
         //
