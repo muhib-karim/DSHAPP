@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  收起态上方那个状态气泡。
+
+  它是一个**独立的 window**（不是圆形气泡的子 View），原因：
+    · 球的 window 尺寸是 56dp，气泡比它宽得多。塞在一起就得把 window 撑大，
+      而 window 左上角是定位锚点 —— 撑大之后球本身的位置会跟着偏，拖动/吸附
+      那套坐标计算全要重写。
+    · 独立 window 还能单独控制显示时机（空闲时不显示），球本身完全不受影响。
+
+  宽度用 wrap_content + maxWidth 限制在代码里设：状态文字长度不受控
+  （"正在运行命令 · sleep 10" 这类），必须有个上限，否则会横贯整个屏幕。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bubble_status_bg"
+    android:elevation="8dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="10dp"
+    android:paddingTop="7dp"
+    android:paddingEnd="10dp"
+    android:paddingBottom="7dp">
+
+    <!--
+      小圆点：与球里的状态点同色，让"气泡属于这个球"一眼可辨。
+    -->
+    <View
+        android:id="@+id/statusDot"
+        android:layout_width="6dp"
+        android:layout_height="6dp"
+        android:layout_marginEnd="7dp" />
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:maxLines="2"
+        android:textColor="#1A1D21"
+        android:textSize="12sp" />
+</LinearLayout>

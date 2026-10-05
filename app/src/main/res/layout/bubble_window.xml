@@ -174,6 +174,26 @@
                 android:text="发送"
                 android:textColor="#FFFFFF"
                 android:textSize="13sp" />
+
+            <!--
+              停止按钮：AI 在跑时才显示（由 applyStatus 控制 visibility）。
+              它是气泡里唯一能中断 AI 的入口 —— 设备自动化时用户看着 AI 跑偏了
+              要能立刻喊停，否则只能切回 App，而切回去的过程中 AI 可能已经做错事。
+            -->
+            <TextView
+                android:id="@+id/panelStop"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bubble_stop_bg"
+                android:gravity="center"
+                android:minWidth="56dp"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:text="停止"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:visibility="gone" />
         </LinearLayout>
     </LinearLayout>
 </FrameLayout>

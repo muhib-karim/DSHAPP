@@ -145,12 +145,7 @@ class MainActivity : AppCompatActivity() {
      * ⚠️ 竖屏与横屏的键盘高度不同（横屏键盘更矮），必须分开存，
      *   否则转屏后预判会缩错高度。
      */
-    private fun imePrefsKey(): String =
-        if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-            "ime_height_land"
-        } else {
-            "ime_height_port"
-        }
+    private fun imePrefsKey(): String = imePrefsKeyOf(this)
 
     private fun loadImeHeight() {
         val v = getSharedPreferences(IME_PREFS, MODE_PRIVATE).getInt(imePrefsKey(), 0)
@@ -936,6 +931,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun installBubbleBridge() {
         FloatingBubble.sendText = { text -> sendToComposer(text) }
+        FloatingBubble.stopRun = { stopComposerRun() }
         FloatingBubble.openApp = {
             runOnUiThread {
                 startActivity(
@@ -982,6 +978,21 @@ class MainActivity : AppCompatActivity() {
     /** 气泡的延时任务（注入后点发送）。独立于 ime/overlay 两个 handler，互不干扰。 */
     private val bubbleHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * 中断当前这一轮（气泡里的「停止」）。
+     *
+     * 页面侧会先验主按钮此刻是不是「停止生成」—— 不是就拒绝，避免把草稿误发出去。
+     */
+    private fun stopComposerRun(): Boolean {
+        binding.webView.evaluateJavascript(BUBBLE_STOP_JS) { result ->
+            Log.i(DshApplication.TAG, "气泡停止结果: $result")
+            if (result != null && result.contains("NOT_RUNNING")) {
+                Toast.makeText(this, "AI 当前没在运行", Toast.LENGTH_SHORT).show()
+            }
+        }
+        return true
+    }
+
     override fun onDestroy() {
         // 引擎跟随进程存活，这里不停止，避免转屏/重建时反复冷启动。
         imeHandler.removeCallbacks(imeRestoreRunnable)
@@ -990,6 +1001,7 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 必须清掉：WebView 随 Activity 一起销毁，留着这些闭包会让气泡
         //   对着一具"尸体"调 evaluateJavascript（静默无效，用户以为发成功了）。
         FloatingBubble.sendText = null
+        FloatingBubble.stopRun = null
         FloatingBubble.openApp = null
         bubbleHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
@@ -1014,9 +1026,25 @@ class MainActivity : AppCompatActivity() {
         FloatingBubble.onAppBackground(this)
     }
 
-    private companion object {
+    internal companion object {
         /** 键盘高度缓存的 SharedPreferences 文件名。 */
         const val IME_PREFS = "dsh_ime"
+
+        /**
+         * 键盘高度缓存的 key（按朝向分）。
+         *
+         * ⚠️ 悬浮气泡也要读这个值（它拿不到 IME insets，只能靠"输入框聚焦 ⇒
+         *   键盘要来"来预留空间），所以做成 `Context` 入参的静态函数两边共用 ——
+         *   写死两处的话，将来改 key 必然漏改一边，症状是气泡预判高度永远取不到值。
+         */
+        fun imePrefsKeyOf(context: Context): String =
+            if (context.resources.configuration.orientation ==
+                Configuration.ORIENTATION_LANDSCAPE
+            ) {
+                "ime_height_land"
+            } else {
+                "ime_height_port"
+            }
 
         /**
          * 判定"键盘可见"的阈值（px）。
@@ -1148,6 +1176,26 @@ class MainActivity : AppCompatActivity() {
               if (btn.disabled) { return 'SEND_DISABLED'; }
               btn.click();
               return 'SENT';
+            })()
+        """.trimIndent()
+
+        /**
+         * 中断当前这一轮（官方主按钮在运行中会变成「停止生成」）。
+         *
+         * ⚠️ **必须先验 `aria-label`**：同一个 `.uV2eYG_primary` 元素空闲时是
+         *   「发送消息」。盲点它会把用户输入框里的草稿直接发出去 —— 那是破坏性的
+         *   误操作，不是"没反应"那么轻。
+         */
+        val BUBBLE_STOP_JS = """
+            (function () {
+              var btn = document.querySelector('.uV2eYG_primary');
+              if (!btn) { return 'NO_BTN'; }
+              var label = btn.getAttribute('aria-label') || '';
+              if (label.indexOf('停止') < 0 && !/stop/i.test(label)) {
+                return 'NOT_RUNNING';
+              }
+              btn.click();
+              return 'STOPPED';
             })()
         """.trimIndent()
     }

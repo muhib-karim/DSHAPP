@@ -15,6 +15,9 @@ local.properties
 # 合计 112.7 MB，且**无法从本仓库重建**（见 AGENTS.md「重新生成资产」）。
 # 单独备份，不入库。
 #
-# 例外：webview-polyfill.js 是手写源码，必须入库。
+# 例外：手写源码，必须入库。
+#   webview-polyfill.js    —— 旧 WebView 内核兼容垫片
+#   dsh-android-shell.mjs  —— uid 2000 执行通道（含 ADB 协议与密钥信任逻辑）
 app/src/main/assets/*
 !app/src/main/assets/webview-polyfill.js
+!app/src/main/assets/dsh-android-shell.mjs

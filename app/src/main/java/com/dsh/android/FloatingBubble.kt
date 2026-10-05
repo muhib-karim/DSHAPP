@@ -187,12 +187,22 @@ class FloatingBubble(private val context: Context) {
         @Volatile
         var sendText: ((String) -> Boolean)? = null
 
+        /**
+         * 中断当前这一轮的回调。由 `MainActivity` 注入。
+         *
+         * 返回 true 表示已投递。页面侧会先验「主按钮此刻是不是停止键」，
+         * 不是的话拒绝执行 —— 绝不能把用户的草稿误发出去。
+         */
+        @Volatile
+        var stopRun: (() -> Boolean)? = null
+
         /** 打开 App 的回调（气泡面板上那个「打开」）。 */
         @Volatile
         var openApp: (() -> Unit)? = null
 
         /** 主线程 Handler。气泡的一切 UI 操作都必须回到这里。 */
-        private val main = Handler(Looper.getMainLooper())
+        /** 主线程 Handler，所有对 View / window 的操作都走它。 */
+    private val main = Handler(Looper.getMainLooper())
     }
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -208,6 +218,7 @@ class FloatingBubble(private val context: Context) {
     private var panelBody: TextView? = null
     private var panelScroll: ScrollView? = null
     private var panelInput: EditText? = null
+    private var panelStop: View? = null
 
     /** 当前是否展开。 */
     private var expanded = false
@@ -236,6 +247,75 @@ class FloatingBubble(private val context: Context) {
     /** 最近一次状态，展开面板时用它填充。 */
     private var lastStatus: EngineStatus? = null
 
+    // ══ 收起态的状态气泡（球上方那个小标签）══════════════════════════════
+    //
+    // 独立 window。理由见 layout/bubble_status.xml 的头注释：塞进球的 window
+    // 会把 window 撑大，而 window 左上角是定位锚点 —— 球本身的位置会跟着偏。
+    private var statusRoot: View? = null
+    private var statusDot: View? = null
+    private var statusText: TextView? = null
+
+    /**
+     * 键盘高度变了（展开态把面板顶上去，保证输入框露在键盘之上）。
+     *
+     * ⚠️ 由**输入框焦点**驱动，不是由系统 insets 驱动：悬浮窗拿不到 IME insets
+     *   （`TYPE_APPLICATION_OVERLAY` 不在 `adjustResize` 的适用范围里，API 29 上
+     *   也没有 `WindowInsets.Type.ime()`）。所以用「输入框聚焦 ⇒ 键盘即将弹出」
+     *   这个等价条件来预留空间。实测在这台机器上成立。
+     */
+    private fun applyImeHeight(heightPx: Int) {
+        if (imeHeightPx == heightPx) return
+        imeHeightPx = heightPx
+        if (!expanded) return
+        val (nx, ny) = clampInto(curX, curY)
+        moveTo(nx, ny)
+    }
+
+    /**
+     * 键盘高度（px）。
+     *
+     * 优先用 MainActivity 学到的**真实值**（它按「输入法高度 + 朝向」落盘，
+     * 见 `MainActivity.saveImeHeight`）；取不到就按屏高 40% 估一个。
+     * 估值的风险是留多了面板偏高，但比"输入框被键盘盖住"轻得多 ——
+     * 后者会让用户完全看不见自己在打什么。
+     */
+    private fun keyboardHeightPx(): Int {
+        val sp = context.getSharedPreferences(MainActivity.IME_PREFS, Context.MODE_PRIVATE)
+        val learned = sp.getInt(MainActivity.imePrefsKeyOf(context), 0)
+        if (learned > 0) return learned
+        return (context.resources.displayMetrics.heightPixels * 0.4f).roundToInt()
+    }
+
+    /** 展开前（收起态）的位置。收起时用它还原 —— 见 `expand()` 里的说明。 */
+    private var preExpandX = 0
+    private var preExpandY = 0
+
+    /** 状态气泡当前显示的文字，用于去重（内容没变就不重复 setText/移动）。 */
+    private var statusShown = ""
+
+    /** 防重入守卫：`positionStatusBubble` 会改 layoutParams，可能再触发 layout 回调。 */
+    private var positioning = false
+
+    /**
+     * 输入法当前遮住屏幕底部多少像素（0 = 键盘没弹）。
+     *
+     * ⚠️ 悬浮窗**不会**被系统自动顶上去：`adjustPan`/`adjustResize` 只对 Activity 的
+     *   window 生效，`TYPE_APPLICATION_OVERLAY` 不在其中。真机实测（华为 CDY-TN90 /
+     *   Android 10）：键盘弹出后输入框被完全盖住，用户看不见自己打了什么。
+     *   所以高度由 MainActivity 观测到之后**推**过来，这里自己挪。
+     */
+    @Volatile
+    private var imeHeightPx = 0
+
+    /** 状态气泡距球顶部的间距（dp）。 */
+    private val statusGapPx = dp(8)
+
+    /** 状态气泡的宽度上限（dp）。 */
+    private val statusMaxWidthPx = dp(200)
+
+    /** 状态标签的字符数上限。标签是单行小标签，太长会把球顶得很宽。 */
+    private val statusMaxChars = 60
+
     // ══════════════════════════════════════════════════════════════════
     // 生命周期
     // ══════════════════════════════════════════════════════════════════
@@ -259,9 +339,10 @@ class FloatingBubble(private val context: Context) {
         panelBody = view.findViewById(R.id.panelBody)
         panelScroll = view.findViewById(R.id.panelScroll)
         panelInput = view.findViewById(R.id.panelInput)
+        panelStop = view.findViewById(R.id.panelStop)
 
         paintDot(dotView, running = false)
-        paintDot(panelDot, running = false)
+        paintDot(panelDot, running = false, small = true)
 
         // 位置：优先用上次记住的；没有就贴右侧中部
         val screenW = context.resources.displayMetrics.widthPixels
@@ -292,6 +373,7 @@ class FloatingBubble(private val context: Context) {
         if (!attached) return
         val v = root ?: return
         attached = false
+        hideStatusBubble()
         runCatching { wm.removeViewImmediate(v) }
         root = null
         circleView = null
@@ -300,18 +382,189 @@ class FloatingBubble(private val context: Context) {
         expanded = false
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // 收起态的状态气泡
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 显示/更新球上方的状态标签。
+     *
+     * 传空串即隐藏 —— 空闲且没有动作时不该在屏幕上留一个空壳。
+     *
+     * ⚠️ **只在收起态显示**：展开态的面板里已经有同一份信息，再挂一个标签
+     *   会重复，而且面板比球宽得多，标签会横在面板上方很怪。
+     */
+    private fun showStatusBubble(text: String, running: Boolean) {
+        if (text.isEmpty() || expanded) {
+            hideStatusBubble()
+            return
+        }
+
+        if (statusRoot == null) {
+            val v = LayoutInflater.from(context).inflate(R.layout.bubble_status, null)
+            statusRoot = v
+            statusDot = v.findViewById(R.id.statusDot)
+            statusText = v.findViewById(R.id.statusText)
+            // 宽度上限靠 maxWidth 约束 TextView，而不是给 window 定死宽度 ——
+            // 短文案要能收紧，长文案才截断。
+            statusText?.maxWidth = statusMaxWidthPx
+            // 点一下等于点球：展开面板。用户看到状态自然会想去点它。
+            v.setOnClickListener { expand() }
+            try {
+                wm.addView(v, statusParams())
+            } catch (t: Throwable) {
+                Log.w(TAG, "添加状态气泡失败: ${t.message}")
+                statusRoot = null
+                return
+            }
+            // ⚠️ 量出真实尺寸前先藏起来，否则会先按"宽度 0"居中一次、量完再跳到
+            //   正确位置 —— 用户看到的是标签从球中心"弹"到左边。
+            v.alpha = 0f
+            // 尺寸变化时重新摆位：文字变长/变短会改变标签宽度，宽度变了居中位置
+            // 也得跟着变，否则标签会歪向一边（或探出屏幕）。
+            //
+            // ⚠️ 防重入：positionStatusBubble 会改 layoutParams，可能再触发一次
+            //   layout 回调 —— 不加这个守卫就是无限递归（ANR）。
+            v.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                if (!positioning) positionStatusBubble()
+            }
+            v.post {
+                positionStatusBubble()
+                v.animate().alpha(1f).setDuration(120).start()
+            }
+        }
+
+        // 内容没变就不动 —— 状态每秒刷新一次，无脑 setText 会一直触发重排，
+        // 表现为标签文字轻微抖动。
+        if (statusShown != text) {
+            statusShown = text
+            statusText?.text = text
+            paintDot(statusDot, running, small = true)
+        } else if (running) {
+            // 文案没变但运行态变了（比如从"空闲"变成"思考中"又变回来），
+            // 点色也要跟上。
+            paintDot(statusDot, running, small = true)
+        }
+        positionStatusBubble()
+    }
+
+    private fun hideStatusBubble() {
+        val v = statusRoot ?: return
+        statusRoot = null
+        statusDot = null
+        statusText = null
+        statusShown = ""
+        runCatching { wm.removeViewImmediate(v) }
+    }
+
+    /**
+     * 状态气泡的窗口参数。
+     *
+     * ⚠️ **不能加 `FLAG_NOT_TOUCHABLE`** —— 加了它就点不动了，而"点状态标签
+     *   展开面板"是用户看到状态后最自然的下一步。代价是这一小块区域会挡住
+     *   下层应用，但标签本身很小，且它只显示在有进展可看的时候。
+     *
+     * ⚠️ 保留 `FLAG_NOT_FOCUSABLE`：它只是显示，不该抢走下层应用的按键焦点。
+     */
+    private fun statusParams() = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        overlayType(),
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+        PixelFormat.TRANSLUCENT,
+    ).apply {
+        gravity = Gravity.TOP or Gravity.START
+    }
+
+    /**
+     * 把状态气泡摆到球的**正上方**。
+     *
+     * ⚠️ 必须跟着球一起移动（拖动、吸附动画里都要调），否则球跑了标签留在原地。
+     *
+     * 水平方向：与球居中对齐；贴边时会被夹进屏幕内（球在最左/最右时，
+     * 居中对齐会让标签探出屏幕）。
+     */
+    private fun positionStatusBubble() {
+        val v = statusRoot ?: return
+        val p = v.layoutParams as? WindowManager.LayoutParams ?: return
+        positioning = true
+        try {
+            val dm = context.resources.displayMetrics
+            val circleW = root?.width?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+
+            // 标签还没量过尺寸时（刚 addView）先按屏幕内夹一次，量完会再调一次。
+            val labelW = v.width.takeIf { it > 0 } ?: 0
+            val centered = curX + (circleW - labelW) / 2
+            p.x = centered.coerceIn(0, (dm.widthPixels - labelW).coerceAtLeast(0))
+
+            // 竖直方向：默认贴在球上方。上方空间不够（球贴着顶部）时改放球下方 ——
+            // 否则标签会被状态栏挡住或直接跑出屏幕。
+            val labelH = v.height.takeIf { it > 0 } ?: 0
+            val above = curY - statusGapPx - labelH
+            p.y = if (labelH > 0 && above < dp(TOP_MARGIN_DP)) {
+                curY + circleH() + statusGapPx
+            } else {
+                above
+            }
+            runCatching { wm.updateViewLayout(v, p) }
+        } finally {
+            positioning = false
+        }
+    }
+
+    /** 球的当前高度（量过就用实测值，否则退回标称直径）。 */
+    private fun circleH(): Int = root?.height?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+
     private fun baseParams() = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.WRAP_CONTENT,
         overlayType(),
-        // ⚠️ 不含 FLAG_NOT_FOCUSABLE —— 含了输入框永远弹不出键盘。
-        //    靠 FLAG_ALT_FOCUSABLE_IM 实现"平时不抢焦点、点输入框才聚焦"。
-        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-            or WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
+        // 初始按**收起态**配：不抢焦点。
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
             or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
         PixelFormat.TRANSLUCENT,
     ).apply {
         gravity = Gravity.TOP or Gravity.START
+    }
+
+    /**
+     * 按形态切换窗口的焦点标志。**输入法能不能弹出来完全取决于这里。**
+     *
+     * ## 之前为什么弹不出键盘
+     *
+     * 原实现固定带 `FLAG_ALT_FOCUSABLE_IM`，并注释成"平时不抢焦点、点输入框才聚焦"
+     * —— **那个理解是反的**。该标志的语义是"把 `FLAG_NOT_FOCUSABLE` 对输入法的
+     * 含义**取反**"，即：未设 `NOT_FOCUSABLE` 而设了它，窗口就表现为
+     * **不需要与输入法交互**，系统因此不会为它弹出键盘。真机表现就是
+     * 「点输入框毫无反应」。
+     *
+     * ## 正确组合
+     *
+     * | 形态 | 标志 | 效果 |
+     * |---|---|---|
+     * | 收起 | `NOT_FOCUSABLE` | 不抢焦点，下层应用照常收按键，也不弹键盘 |
+     * | 展开 | 去掉 `NOT_FOCUSABLE` | 可聚焦 ⇒ 点输入框能拉起键盘 |
+     *
+     * ⚠️ 两态都要保留 `FLAG_NOT_TOUCH_MODAL`：它让窗口**之外**的触摸照常传给
+     *   下层应用。去掉的话，气泡一显示就会把整个屏幕的触摸都吃掉。
+     *
+     * ⚠️ 展开态**不能**再设 `FLAG_ALT_FOCUSABLE_IM` —— 那正是键盘弹不出来的原因。
+     *
+     * @param focusable 是否允许这个窗口获得焦点（展开态为 true）。
+     */
+    private fun applyFocusFlags(focusable: Boolean) {
+        val v = root ?: return
+        val p = v.layoutParams as? WindowManager.LayoutParams ?: return
+        p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        p.flags = p.flags and WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM.inv()
+        p.flags = if (focusable) {
+            p.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        } else {
+            p.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+        runCatching { wm.updateViewLayout(v, p) }
     }
 
     /** API 26+ 用 TYPE_APPLICATION_OVERLAY；更低版本（本项目 minSdk 26）用不到旧值。 */
@@ -377,16 +630,29 @@ class FloatingBubble(private val context: Context) {
         p.x = x
         p.y = y
         runCatching { wm.updateViewLayout(v, p) }
+        // 状态标签跟着球走 —— 漏了这行的话，拖动时球跑了、标签留在原地。
+        positionStatusBubble()
     }
 
     /** 夹进可见区域（考虑状态栏与底部手势条）。 */
     private fun clampInto(x: Int, y: Int): Pair<Int, Int> {
-        val dm = context.resources.displayMetrics
         val v = root
         val w = v?.width?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
         val h = v?.height?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+        return clampInto(x, y, w, h)
+    }
+
+    /**
+     * 按**指定尺寸**夹进可见区域。
+     *
+     * ⚠️ 需要这个重载是因为切换形态时 `root` 的尺寸还是旧的那个：收起瞬间布局尚未
+     *   重测，`root.width` 仍是展开态的 900 —— 拿它算夹取范围会把球留在面板左上角。
+     */
+    private fun clampInto(x: Int, y: Int, w: Int, h: Int): Pair<Int, Int> {
+        val dm = context.resources.displayMetrics
         val minY = dp(TOP_MARGIN_DP)
-        val maxY = (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP)).coerceAtLeast(minY)
+        // 键盘弹出时可用高度要扣掉键盘，否则"夹进可见区域"会把面板留在键盘底下。
+        val maxY = (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx).coerceAtLeast(minY)
         val nx = x.coerceIn(0, (dm.widthPixels - w).coerceAtLeast(0))
         val ny = y.coerceIn(minY, maxY)
         return nx to ny
@@ -443,9 +709,20 @@ class FloatingBubble(private val context: Context) {
 
     private fun expand() {
         if (expanded) return
+        // ⚠️ **展开前先记住收起态的位置。**
+        //
+        // 展开时为了把 900px 宽的面板夹进屏幕，`curX` 会被改掉（贴右边时
+        // 从 912 变成 180）。收起时如果只做一次 clamp，球就会停在**面板的左上角**
+        // 而不是展开前的位置 —— 用户看到的是"点一下收起，球跑别处去了"。
+        preExpandX = curX
+        preExpandY = curY
         expanded = true
         circleView?.visibility = View.GONE
         panelView?.visibility = View.VISIBLE
+        // 展开态才允许聚焦 —— 否则点输入框弹不出键盘（见 applyFocusFlags）。
+        applyFocusFlags(focusable = true)
+        // 展开态面板里已有同一份信息，收起态那个标签要让位。
+        hideStatusBubble()
         lastStatus?.let { applyStatus(it) }
         // 展开后重新夹一次：面板比圆大得多，原来贴边的位置会露到屏幕外
         root?.post {
@@ -457,14 +734,24 @@ class FloatingBubble(private val context: Context) {
     private fun collapse() {
         if (!expanded) return
         expanded = false
+        // 收起态不抢焦点：让下层应用照常收按键，也顺手收掉键盘。
+        applyFocusFlags(focusable = false)
         panelInput?.let {
             it.setText("")
             it.clearFocus()
         }
         panelView?.visibility = View.GONE
         circleView?.visibility = View.VISIBLE
+        // 回到收起态，状态标签重新露面。
+        lastStatus?.let { refreshStatusBubble(it) }
+        // 回到展开前的位置（不是面板左上角）。
+        //
+        // ⚠️ 这里**不能**用 `clampInto(curX, curY)`：那个重载读的是 `root` 当前尺寸，
+        //   而此刻布局还没重测完，读到的可能仍是展开态的 900×798，算出来的夹取范围
+        //   是错的。收起态尺寸是恒定的 56dp，直接按它算。
         root?.post {
-            val (nx, ny) = clampInto(curX, curY)
+            val side = dp(CIRCLE_DP)
+            val (nx, ny) = clampInto(preExpandX, preExpandY, side, side)
             moveTo(nx, ny)
         }
     }
@@ -485,6 +772,10 @@ class FloatingBubble(private val context: Context) {
         // 「发送」：把输入框内容投给页面里的官方 composer
         view.findViewById<TextView>(R.id.panelSend).setOnClickListener { doSend() }
 
+        // 「停止」：中断当前这一轮。页面侧会先验主按钮此刻是不是停止键 ——
+        // 盲点它会把用户的草稿发出去。
+        view.findViewById<TextView>(R.id.panelStop).setOnClickListener { doStop() }
+
         // 回车也发送。多行内容靠换行符一次性送进去（手机上打不出 Shift+Enter）。
         panelInput?.setOnEditorActionListener { _, actionId, event ->
             val isSend = actionId == EditorInfo.IME_ACTION_SEND ||
@@ -494,6 +785,43 @@ class FloatingBubble(private val context: Context) {
                 doSend()
                 true
             } else false
+        }
+
+        // ⚠️ **点输入框必须主动拉一次输入法。**
+        //
+        // 悬浮窗不是 Activity，系统不会替它自动弹键盘：窗口拿到焦点 ≠ 输入法会
+        // 出现。真机实测（华为 CDY-TN90 / Android 10）：只设可聚焦标志的话，
+        // 点输入框有光标、能收到按键事件，但键盘始终不弹。
+        //
+        // 所以显式调 `showSoftInput`。放在 `post` 里是为了等窗口真正拿到焦点 ——
+        // 展开动画/updateViewLayout 之后焦点才生效，同步调会静默失败。
+        panelInput?.setOnFocusChangeListener { _, hasFocus ->
+            // 聚焦 ⇒ 键盘要来，先给面板腾出空间（否则输入框被键盘盖住，用户看不见
+            // 自己在打什么）；失焦 ⇒ 键盘要走，把空间还回去。高度用 MainActivity
+            // 学到的真实值，取不到就按屏高的 40% 估一个 —— 宁可多留一点，
+            // 也不能让输入框藏在键盘底下。
+            applyImeHeight(if (hasFocus) keyboardHeightPx() else 0)
+            if (hasFocus) {
+                panelInput?.post {
+                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                        as? android.view.inputmethod.InputMethodManager
+                    imm?.showSoftInput(
+                        panelInput,
+                        android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT,
+                    )
+                }
+            }
+        }
+
+        // 点一下输入框本身也要触发上面那条 —— 已经聚焦时再点不会触发
+        // onFocusChange，但用户很可能就是"再点一次想唤出键盘"。
+        panelInput?.setOnClickListener {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                as? android.view.inputmethod.InputMethodManager
+            imm?.showSoftInput(
+                panelInput,
+                android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT,
+            )
         }
     }
 
@@ -524,6 +852,27 @@ class FloatingBubble(private val context: Context) {
         runCatching { android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show() }
     }
 
+    /**
+     * 中断当前这一轮。
+     *
+     * ⚠️ 只回报"已投递"：真正的执行结果由页面决定（它可能发现主按钮此刻不是
+     *   停止键而拒绝）。日志里会有 `STOPPED` / `NOT_RUNNING` 可查。
+     */
+    private fun doStop() {
+        val fn = stopRun
+        if (fn == null) {
+            toast("停止通道未就绪")
+            return
+        }
+        val ok = try {
+            fn()
+        } catch (t: Throwable) {
+            Log.w(TAG, "气泡停止失败: ${t.message}")
+            false
+        }
+        toast(if (ok) "已请求中断" else "中断失败，请打开 App")
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // 状态渲染
     // ══════════════════════════════════════════════════════════════════
@@ -537,7 +886,12 @@ class FloatingBubble(private val context: Context) {
         lastStatus = status
         try {
             paintDot(dotView, status.running)
-            paintDot(panelDot, status.running)
+            paintDot(panelDot, status.running, small = true)
+            refreshStatusBubble(status)
+
+            // 「停止」只在 AI 真在跑时出现。常驻的话用户会去点它 ——
+            // 而空闲时那个位置的主按钮是「发送消息」，点下去会把草稿发出去。
+            panelStop?.visibility = if (status.running) View.VISIBLE else View.GONE
 
             val action = when {
                 status.text.isNotEmpty() -> status.text
@@ -570,6 +924,34 @@ class FloatingBubble(private val context: Context) {
     }
 
     /**
+     * 按一份状态决定收起态标签显示什么。
+     *
+     * **空闲且没有动作时不显示** —— 一个写着「空闲」的标签对用户毫无价值，
+     * 反而常驻在屏幕上碍事。只在真有进展可看时才冒出来。
+     *
+     * ⚠️ 正文（`body`）刻意不放进标签：它是整段助手消息，几行字根本装不下，
+     *   截断后只剩一句没头没尾的话。标签只放**动作**（"正在运行命令 · sleep 10"
+     *   这类短句），要看正文就展开面板。
+     */
+    private fun refreshStatusBubble(status: EngineStatus) {
+        val text = when {
+            status.text.isNotEmpty() -> status.text
+            status.running -> "思考中…"
+            // 空闲时若还有正文（上一轮的结论），也值得露一句 —— 但只取首行，
+            // 且限长，否则标签会变成一大块。
+            status.body.isNotEmpty() -> firstLine(status.body)
+            else -> ""
+        }
+        showStatusBubble(text, status.running)
+    }
+
+    /** 取首行并限长。标签是单行小标签，多行内容会把球顶得老高。 */
+    private fun firstLine(text: String): String {
+        val line = text.lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+        return if (line.length <= statusMaxChars) line else line.take(statusMaxChars - 1) + "…"
+    }
+
+    /**
      * 状态点：在跑=实心绿，空闲=空心灰。
      *
      * ⚠️ 只换 background，**绝不碰 layoutParams**：`dotView` 在 FrameLayout 里、
@@ -577,11 +959,11 @@ class FloatingBubble(private val context: Context) {
      * 强行赋一个 FrameLayout.LayoutParams 会 `ClassCastException`。
      * 尺寸本来就写死在 XML（22dp / 8dp），这里不需要管。
      */
-    private fun paintDot(v: View?, running: Boolean) {
+    private fun paintDot(v: View?, running: Boolean, small: Boolean = false) {
         if (v == null) return
-        // 小点（8dp）用 1dp 描边，大点（22dp）用 2dp —— 同样 2dp 在 8dp 的圆上
+        // 小点（6~8dp）用 1dp 描边，大点（22dp）用 2dp —— 同样 2dp 在 8dp 的圆上
         // 会糊成一坨，看不出是空心。
-        val strokePx = if (v === dotView) dp(2) else dp(1)
+        val strokePx = if (small) dp(1) else dp(2)
         v.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             if (running) {
