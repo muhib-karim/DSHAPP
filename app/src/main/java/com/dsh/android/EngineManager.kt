@@ -1112,6 +1112,94 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 让「添加插件」对话框同时列出镜像源与 npm 官方源（幂等）。
+     *
+     * ## 症状
+     *
+     * 真机对话框的「安装源」下拉只有**一项**（中国大陆镜像源）+ 自定义地址，
+     * 而桌面版有两项（npm 官方源 + 中国大陆镜像源）+ 自定义地址。功能不算坏
+     * （选「自定义地址」填 `https://registry.npmjs.org/` 等效），但用户看到的是
+     * 「手机端少了官方源」。
+     *
+     * ## 根因：不是少配了，而是**被去重合并掉了**
+     *
+     * 列表由官方前端按 Host 返回的源**动态去重**生成
+     * （`dsh-client-ui-plugin-manager/lib/client.js` 的 `offeredRegistries()`），
+     * 遍历三处、按 URL 归一化后去重：
+     *
+     * ```
+     * [config.registry] + [config.fallbackRegistries] + [pnpm 自身配置(~/.npmrc) 指的源]
+     * ```
+     *
+     * 而官方 `fallbackRegistries` 的默认值**恰好就是** `NPMMIRROR_REGISTRY`。
+     * 本机 [MirrorProbe] 测速后把 `registry=https://registry.npmmirror.com` 写进了
+     * `~/.npmrc`，于是上面三项归一化后**全是同一个 URL** → 去重后只剩一项。
+     * 桌面版 `.npmrc` 指的是官方源，与 fallback 的 npmmirror 不同 → 两项都留下。
+     *
+     * ## 为什么显式写 `registry` 且 fallback 里**也要**放镜像
+     *
+     * 两处都写，是因为 `registryPlan()` 的 `ownIsPublic` 判定：
+     *
+     * ```js
+     * const ownIsPublic = own !== null && (own === "https://registry.npmjs.org/" || fallbacks.includes(own));
+     * ```
+     *
+     * `own` 是 pnpm 自己报的源（本机 = npmmirror）。若 fallback 里不放它，
+     * `ownIsPublic` 为 false，于是下面这条会让安装**只试一个源、没有回退**：
+     *
+     * ```js
+     * if ((first === null || firstKey === own) && !ownIsPublic) return [normalizedFirst];
+     * ```
+     *
+     * 把 npmmirror 也放进 fallback ⇒ `ownIsPublic` 为 true ⇒
+     * 列表是 `[npmmirror, npmjs]`（镜像在前，与桌面版顺序一致），
+     * 安装时先走镜像、失败自动回退官方源（`registryPlan` 的 known 序列）。
+     *
+     * ⚠️ URL 必须**逐字**与官方常量一致（含**尾斜杠**）。少了斜杠去重键不同，
+     * 对话框会多出一项看起来重复的源。出处：`dsh-plugin-manager/lib/index.js`
+     * 的 `NPMMIRROR_REGISTRY`。
+     *
+     * ## 为什么用 `--patch` 而不是用户层
+     *
+     * `plugin-manager` 的 `inject` 里**没有 `settings`**，这两项也就不是 GUI 设置项
+     * （`settings/describe` 里没有它们），用户无从覆盖 —— 不存在「锁死用户配置」的
+     * 问题。它们是 Host 部署事实（本机走哪个源），与 [writeSandboxPatch] /
+     * [writeWorkspacePatch] 同类，每次启动整体覆盖。
+     *
+     * ⚠️ `name` 必须与 base 层逐字一致，否则 `applyEntryPatches()` 会
+     * `name mismatch ... skipping` 整条跳过（静默，只在日志里 warn）。
+     * 只写 `config:` 不会动 base 层那行的 `disabled: !!js ...`
+     * —— patch 是**逐字段覆盖**（`target[key] = value`），不是整行替换。
+     */
+    private fun writePluginManagerPatch(): File? {
+        val file = File(dshHome, PLUGIN_MANAGER_PATCH)
+        val yaml = buildString {
+            appendLine("# 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。")
+            appendLine("# 插件安装源：首选国内镜像，回退 npm 官方源。")
+            appendLine("# 官方 fallbackRegistries 的默认值只有镜像源，而本机 ~/.npmrc 指的也是")
+            appendLine("# 镜像源，两者被前端按 URL 去重合并 ⇒ 对话框只剩一项。显式写出两项即可。")
+            appendLine("# 详见 EngineManager.writePluginManagerPatch() 的注释。")
+            appendLine("- id: plugin-manager")
+            appendLine("  name: '@deepseek-ai/dsh-plugin-manager'")
+            appendLine("  config:")
+            appendLine("    registry: '$NPM_MIRROR_REGISTRY'")
+            appendLine("    fallbackRegistries:")
+            appendLine("      - '$NPM_MIRROR_REGISTRY'")
+            appendLine("      - '$NPM_OFFICIAL_REGISTRY'")
+        }
+        return try {
+            if (!file.isFile || file.readText() != yaml) {
+                file.writeText(yaml)
+                Log.i(TAG, "已写入插件源 overlay: ${file.name}")
+            }
+            file
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入插件源 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 把 `flock.js` 的平台白名单补上 android（幂等）。
      *
      * 只替换那一处判断，不动其它任何逻辑；找不到锚点就跳过（引擎升级后结构变了
@@ -1668,6 +1756,8 @@ class EngineManager private constructor(private val context: Context) {
         val sandboxPatch = writeSandboxPatch(ensureSandbox())
         // 默认工作区：Android 落不进引擎的平台分支，必须显式给 documentsDirectory
         val workspacePatch = writeWorkspacePatch()
+        // 插件安装源：官方 fallback 只有镜像源，与本机 ~/.npmrc 撞成同一项被去重掉
+        val pluginManagerPatch = writePluginManagerPatch()
         // link 兼容层：SELinux 不给 app_data_file 的 link 权限，需在 libc 边界转译
         val linkCompat = ensureLinkCompat()
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
@@ -1723,6 +1813,10 @@ class EngineManager private constructor(private val context: Context) {
             // 默认工作区目录：同上，补上引擎缺的 android 平台分支
             if (workspacePatch != null) {
                 add("--patch"); add(workspacePatch.absolutePath)
+            }
+            // 插件安装源：同样是 overlay（--patch 可重复，按顺序应用）
+            if (pluginManagerPatch != null) {
+                add("--patch"); add(pluginManagerPatch.absolutePath)
             }
             // uid 2000 特权工具：也是 overlay，注册成独立的 `shell` 工具
             if (privPatch != null) {
@@ -2100,6 +2194,17 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 默认工作区 overlay：补上引擎缺的 android 平台分支。见 [writeWorkspacePatch]。 */
         private const val WORKSPACE_PATCH = "workspace.patch.yml"
+
+        /** 插件安装源 overlay：让对话框同时列出镜像与官方源。见 [writePluginManagerPatch]。 */
+        private const val PLUGIN_MANAGER_PATCH = "plugin-manager.patch.yml"
+
+        /**
+         * 插件安装源。URL 必须与官方常量逐字一致（含尾斜杠），否则去重键不同、
+         * 会多出一项重复的源。出处：`@deepseek-ai/dsh-plugin-manager` 的
+         * `NPMMIRROR_REGISTRY`，以及 npm 官方源。
+         */
+        private const val NPM_MIRROR_REGISTRY = "https://registry.npmmirror.com/"
+        private const val NPM_OFFICIAL_REGISTRY = "https://registry.npmjs.org/"
 
         /** pnpm：Termux 的 $PREFIX/bin 里没有，插件管理器靠它装 bundle。 */
         private const val PNPM_ASSET = "pnpm-android-arm64.zip"
