@@ -15,7 +15,7 @@
     android:layout_width="wrap_content"
     android:layout_height="wrap_content">
 
-    <!-- ══ 收起态：圆形气泡 ══ -->
+    <!-- ══ 收起态：头像气泡 ══ -->
     <FrameLayout
         android:id="@+id/bubbleCircle"
         android:layout_width="56dp"
@@ -24,15 +24,42 @@
         android:elevation="8dp">
 
         <!--
+          头像：与 App 图标同一个角色（蓝发女仆装 Q 版）。
+
+          资源是**预先裁成圆形**的（各密度一份，见 drawable-*/bubble_avatar.png），
+          不是靠 scaleType 裁 —— 因为裁切要按"非透明包围盒"居中，而 ImageView
+          的 centerCrop 是按图片矩形居中，源图四周各有 15% 空白，直接用会让人物
+          偏小且呆毛被切。裁切框比例取 1.20（相对包围盒），在"不切呆毛"与
+          "人物够大"之间取的折中值。
+        -->
+        <ImageView
+            android:id="@+id/bubbleAvatar"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="@string/bubble_avatar_desc"
+            android:scaleType="fitCenter"
+            android:src="@drawable/bubble_avatar" />
+
+        <!--
           状态指示点：在跑=实心绿，空闲=空心灰。
-          ⚠️ 用 View 而不是 ImageView：一个圆点不值得进 drawable 资源，
-             setBackground 一个 GradientDrawable 就够，且能动态改色。
+
+          ⚠️ 位置从"居中"挪到了**右下角**：以前圆形气泡里只有这一个点，居中最好看；
+          现在底下是头像，居中会正好糊在脸上。
+
+          ⚠️ margin 取 5dp 而不是 1dp：头像本身是圆形，点贴到右下角会被推到圆外
+          （父布局的裁剪是矩形，不管圆形背景），看起来像悬空。5dp 让点**微微压住
+          圆边**，正是头像状态角标该有的样子。
+
+          ⚠️ 白边由 `paintDot()` 用 LayerDrawable 画（见那里的注释）：头像的头发是
+          深蓝色，深色圆点直接贴上去看不清。
         -->
         <View
             android:id="@+id/bubbleDot"
-            android:layout_width="22dp"
-            android:layout_height="22dp"
-            android:layout_gravity="center" />
+            android:layout_width="14dp"
+            android:layout_height="14dp"
+            android:layout_gravity="bottom|end"
+            android:layout_marginEnd="5dp"
+            android:layout_marginBottom="5dp" />
     </FrameLayout>
 
     <!-- ══ 展开态：交互面板 ══ -->

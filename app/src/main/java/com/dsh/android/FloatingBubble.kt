@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -954,17 +955,26 @@ class FloatingBubble(private val context: Context) {
     /**
      * 状态点：在跑=实心绿，空闲=空心灰。
      *
+     * ## 大点带一圈白边（只有收起态的头像气泡需要）
+     *
+     * 头像的头发是深蓝色，灰/绿的圆点直接贴上去对比度很低、看不清。垫一圈白边
+     * 把它从背景里"抠"出来 —— 与系统通知角标同一种手法。
+     *
+     * ⚠️ 白边用 `LayerDrawable` 套两层 Oval 实现，**不用 `<layer-list>` 资源**：
+     * 这里本来就要动态改色，做成资源反而要多传参数。白边层是外层（稍大），
+     * 颜色层是内层，靠 `setLayerInset` 缩进去。
+     *
      * ⚠️ 只换 background，**绝不碰 layoutParams**：`dotView` 在 FrameLayout 里、
-     * `panelDot` 在 LinearLayout 里，两者的 LayoutParams 类型不同，
+     * `panelDot`/`statusDot` 在 LinearLayout 里，两者的 LayoutParams 类型不同，
      * 强行赋一个 FrameLayout.LayoutParams 会 `ClassCastException`。
-     * 尺寸本来就写死在 XML（22dp / 8dp），这里不需要管。
+     * 尺寸本来就写死在 XML（14dp / 8dp / 6dp），这里不需要管。
      */
     private fun paintDot(v: View?, running: Boolean, small: Boolean = false) {
         if (v == null) return
-        // 小点（6~8dp）用 1dp 描边，大点（22dp）用 2dp —— 同样 2dp 在 8dp 的圆上
+        // 小点（6~8dp）用 1dp 描边，大点（14dp）用 2dp —— 同样 2dp 在 8dp 的圆上
         // 会糊成一坨，看不出是空心。
         val strokePx = if (small) dp(1) else dp(2)
-        v.background = GradientDrawable().apply {
+        val fill = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             if (running) {
                 setColor(0xFF34C759.toInt())
@@ -972,6 +982,19 @@ class FloatingBubble(private val context: Context) {
                 setColor(Color.TRANSPARENT)
                 setStroke(strokePx, 0xFFB9BFC7.toInt())
             }
+        }
+        if (small) {
+            // 面板里的小点直接贴在浅色面板上，不需要白边
+            v.background = fill
+            return
+        }
+        val border = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xFFFFFFFF.toInt())
+        }
+        val inset = dp(2)
+        v.background = LayerDrawable(arrayOf(border, fill)).apply {
+            setLayerInset(1, inset, inset, inset, inset)
         }
     }
 

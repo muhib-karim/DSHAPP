@@ -31,4 +31,6 @@
     <string name="pairing_ok">配对成功，特权身份已可用</string>
     <string name="pairing_empty_code">没有收到配对码，请重新输入</string>
     <string name="pairing_stop">取消</string>
+    <!-- 悬浮气泡收起态的头像（与 App 图标同一个角色）。纯装饰，无障碍描述写清用途即可。 -->
+    <string name="bubble_avatar_desc">DSH 助手头像</string>
 </resources>
