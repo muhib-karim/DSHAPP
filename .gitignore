@@ -30,3 +30,13 @@ app/src/main/assets/*
 !app/src/main/assets/webview-polyfill.js
 !app/src/main/assets/dsh-android-shell.mjs
 COMMIT_MSG.tmp
+
+# ── 介绍片：中间产物不入库，源文件与成片入库 ─────────────
+#
+# tmp/   逐帧 PNG/JPEG（3804 张）与探针采样帧，几十 MB，跑一次 render.mjs 就有
+# clips/ 每屏一个 mp4 分段，assemble.mjs 的输入，可由 tmp/ 重建
+#
+# 入库的是：scenes.html（场景页）、video.config.mjs（台词与时长）、*.mjs（渲染
+# 管线）、assets/（实机截图素材）、shots/（真机原始截图）、out/（成片）。
+video/tmp/
+video/clips/
