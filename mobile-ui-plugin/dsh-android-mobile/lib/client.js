@@ -3903,11 +3903,16 @@ window.__ModuleLoader__.load({
 			// ── 无线调试（Android 11+）：免电脑那条路 ──
 			wlTitle: "无线调试（Android 11+，不用电脑）",
 			wlIntro: "Android 11 起系统自带「无线调试」，可以让本应用自己拿到特权身份，全程不用数据线、不用电脑，重启手机也依然有效。首次需要配对一次。",
-			wlStep1: "在系统「设置 → 开发者选项」里打开「无线调试」开关。",
-			wlStep2: "点进「使用配对码配对设备」，会看到 6 位配对码和一个端口号。让这个界面保持显示，然后回到本页点下面的按钮。",
-			wlStep3: "点完按钮后，配对通知会出现在通知栏。下拉通知栏，在通知里直接回复那 6 位配对码（不用切回本应用）。",
+			wlStep1: "在本页点下面的「配对无线调试」按钮 —— 通知栏会出现一条常驻提示，告诉你接下来去哪。",
+			wlStep2: "在系统「设置 → 开发者选项」里打开「无线调试」开关，再点进「使用配对码配对设备」。",
+			wlStep3: "那个界面一打开，通知栏的提示就会自动变成带输入框的（本应用会一直等着，不用回本页重按）。下拉通知栏，在里面直接回复那 6 位配对码。",
 			wlStep4: "配对成功后回到本页点「重新检测」，身份应变成 uid 2000。之后就一直有效，不必再配对。",
 			wlPair: "配对无线调试",
+			wlPairing: "正在等待…",
+			// ⚠️ 这句话是本次体验修复的核心：告诉用户「不用回来重按」。
+			//    原实现发现 8 秒没端口就报失败，用户刚在系统里找到那个按钮，
+			//    通知栏已经说没找到了，只能回本页重按 —— 而重按还是同样结果。
+			wlPairingHint: "已开始等待。请去系统「设置 → 开发者选项 → 无线调试」点开「使用配对码配对设备」，让那个界面保持显示 —— 本应用会一直等着（不会超时），端口一出现通知栏就会变成输入框。想中止请点上面的「取消配对」。",
 			wlCancel: "取消配对",
 			wlPairHint: "配对码由系统显示、只能人工输入 —— 这是 SPAKE2 协议的要求，任何应用（包括 Shizuku）都无法代填。",
 			wlPort: "无线端口",
@@ -4293,6 +4298,16 @@ window.__ModuleLoader__.load({
 				if (fn === null) return;
 				if (!b || typeof b[fn] !== "function") { window.alert(t("wlNoBridge")); return; }
 				b[fn]();
+				// 只有配对需要回写「进行中」—— 它是一条要用户离开本页去系统设置的
+				// 长流程；「切到固定端口」是几秒钟的原生调用，不需要。
+				if (action === "pair") setPairing(true);
+			};
+
+			/** 取消配对：停掉原生侧那条常驻监听，并把本页状态复位。 */
+			const cancelPairing = () => {
+				const b = window.DSHAndroid;
+				if (b && typeof b.cancelWirelessPairing === "function") b.cancelWirelessPairing();
+				setPairing(false);
 			};
 
 			// 无线端口三态：真的在听 / 文件里有值但端口已死 / 没发现。
@@ -4348,6 +4363,14 @@ window.__ModuleLoader__.load({
 				const timer = window.setTimeout(() => setCopied(null), 2000);
 				return () => window.clearTimeout(timer);
 			}, [copied]);
+
+			// 是否已经发起过配对（点了「配对无线调试」但还没取消）。
+			//
+			// ⚠️ 这个状态**必须让用户看见**，否则点了按钮后界面毫无变化，用户会以为
+			// 没点上而反复点 —— 而真实情况是「正在等你去系统里打开那个界面」。
+			// 只存本地 state：真正的监听状态在原生侧，这里只是给个即时反馈，
+			// 不需要（也不该）为此多开一条查询接口。
+			const [pairing, setPairing] = React.useState(false);
 			const e = React.createElement;
 			// 命令块 = 等宽代码 + 复制按钮。**按钮不是锦上添花**：本插件的全局
 			// CSS 把 `user-select` 压成 `none`（见文件头 4c），命令长按选不中，
@@ -4462,8 +4485,9 @@ window.__ModuleLoader__.load({
 					e("button", {
 						type: "button",
 						style: S.btnPrimary,
+						disabled: pairing,
 						onClick: () => doAction("pair"),
-					}, t("wlPair")),
+					}, pairing ? t("wlPairing") : t("wlPair")),
 					e("button", {
 						type: "button",
 						style: S.btn,
@@ -4472,12 +4496,12 @@ window.__ModuleLoader__.load({
 					e("button", {
 						type: "button",
 						style: S.btnQuiet,
-						onClick: () => {
-							const bridge = window.DSHAndroid;
-							if (bridge && typeof bridge.cancelWirelessPairing === "function") bridge.cancelWirelessPairing();
-						},
+						onClick: cancelPairing,
 					}, t("wlCancel")),
 				),
+				// 等待期间把「接下来该做什么」直接铺在按钮下面 —— 用户点了配对之后
+				// 眼神还在这块区域，跑到别处去提示等于没提示。
+				pairing ? e("p", { style: S.note }, t("wlPairingHint")) : null,
 				e("p", { style: S.note }, t("wlTcpHint")),
 				e("p", { style: S.note }, t("wlPairHint")),
 			);

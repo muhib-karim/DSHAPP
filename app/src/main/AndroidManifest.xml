@@ -92,17 +92,21 @@
         </service>
 
         <!--
-            接收通知栏「直接回复」里输入的无线调试配对码。
+            接收通知栏「直接回复」里输入的无线调试配对码，以及通知上的「取消」动作。
 
             ⚠️ 必须静态声明（不能动态注册）：通知可能在 App 进程已被系统回收时
             仍留在通知栏，那时动态注册的接收器已经不存在了，用户回复的配对码
             会石沉大海。
+
+            ⚠️ 「取消」这个 action 尤其依赖静态声明：常驻通知划不掉，用户唯一能
+            中止配对监听的方式就是点它，进程被回收后它必须还能工作。
         -->
         <receiver
             android:name=".AdbPairingReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.dsh.android.action.PAIRING_REPLY" />
+                <action android:name="com.dsh.android.action.PAIRING_CANCEL" />
             </intent-filter>
         </receiver>
 

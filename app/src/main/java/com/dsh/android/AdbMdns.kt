@@ -62,6 +62,23 @@ class AdbMdns(
     private var running = false
     private var registered = false
 
+    /**
+     * 监听是否**仍然有效**（已启动，且没有被系统停掉）。
+     *
+     * 供常驻监听方做看门狗：`NsdManager` 在系统重启 mdnsd 等情况下会回调
+     * `onStartDiscoveryFailed` / `onDiscoveryStopped` 把发现静默掐掉。
+     * 一次性发现不在乎（下次调用会重建），但**常驻等待**必须能发现并重启它 ——
+     * 否则用户按提示去开了无线调试，这边却早已不再监听，永远不会出现输入框。
+     *
+     * ⚠️ **不要写成 `running && registered`**：`registered` 要等
+     * `onDiscoveryStarted` 回调才为 true，而那是异步的。刚 `start()` 完的那一瞬间
+     * `running=true, registered=false`，看门狗会把它误判成「已停」并**反复重建**
+     * 监听，形成死循环（真机踩过）。判据只用 [running] —— 它在 `start()` 里同步
+     * 置 true，在两条「被停掉」的回调里置 false，语义正好。
+     */
+    val isRunning: Boolean
+        get() = running
+
     /** 最近一次解析到并通过有效性校验的端口；-1 表示还没有。 */
     @Volatile
     var port: Int = -1
@@ -80,11 +97,17 @@ class AdbMdns(
 
         override fun onDiscoveryStopped(type: String) {
             registered = false
+            // ⚠️ 必须同时清掉 running：系统**主动**停掉发现时只会走这个回调
+            //    （我们主动 stop() 时 running 本来就是 false，再置一次无害）。
+            //    不清的话 [isRunning] 会一直报 true，常驻监听的看门狗就永远
+            //    不会重建，用户开了无线调试也等不到输入框。
+            running = false
         }
 
         override fun onStopDiscoveryFailed(type: String, errorCode: Int) {
             Log.w(DshApplication.TAG, "[mdns] 停止发现失败 $type error=$errorCode")
             registered = false
+            running = false
         }
 
         override fun onServiceFound(info: NsdServiceInfo) {
