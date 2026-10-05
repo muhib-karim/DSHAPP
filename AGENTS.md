@@ -413,7 +413,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-25`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-36`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -786,20 +786,56 @@ SELinux 层挡掉。而 Android 的 `mdnsd` **只应答组播查询**，所以�
 [mdns] 忽略 adb-62291ab7-uzVPim → 192.168.1.85:33217（非本机或端口无人监听）
 ```
 
-##### ⚠️ 配对端口只在那个界面开着时才广播
+##### ⚠️ 配对端口只在那个界面开着时才广播 —— 所以必须**常驻等待**，不能超时就放弃
 
 `_adb-tls-pairing._tcp` **只在用户打开「使用配对码配对设备」界面时才存在**，
-界面一关就没了。所以顺序必须是：**用户先打开那个界面 → 再在 App 里点配对**。
+界面一关就没了。所以 App 侧必须**一直**监听，直到端口出现。
 
-顺序反了的表现是（实测）：
+⚠️ **原实现是「一次性发现 8 秒，没找到就报没找到」，这是个真实的体验缺陷**
+（真机反馈修掉的）：用户点完配对后要去系统设置里翻找那个界面 —— 进「开发者选项」
+再进「无线调试」再点「使用配对码配对设备」，远超 8 秒。于是：
 
 ```
-Unregistering listener for _adb-tls-pairing._tcp.local
-没发现配对端口，无线调试配对界面可能没打开
+用户刚找到那个按钮 → 通知栏已经显示「没找到端口」→ 只能回 App 重按一次配对
 ```
 
-⚠️ 这条提示是**正确的**，不是 bug。若将来要改进体验，方向是「先弹输入框、
-用户填码时再去发现端口」，而不是去修发现逻辑。
+而重按一次**还是同样的结果**，因为端口本来就还没出现。这个来回毫无意义。
+
+**现在的实现**（`AdbPairingNotifier.start()` → `runWatch()`）：
+
+- 起一个**常驻**任务，用**一个** `AdbMdns` 实例持续监听，端口一出现就把通知换成
+  带输入框的。**不加任何超时** —— 只有用户主动取消（设置页「取消配对」，或通知上的
+  「取消」动作）与配对成功会让它停下。
+- ⚠️ **必须用常驻实例，不能反复调 `AdbMdns.discover(timeout)`**：后者每次都要重新
+  注册 discovery（`NsdManager` 同一 listener 不能重复注册，所以每次都新建对象），
+  中间存在「上一次已停、下一次未注册」的**空窗期**，端口恰好在空窗期出现就会错过，
+  要再等一轮。
+- ⚠️ **常驻通知划不掉**，所以必须挂一个「取消」动作：万一进程被系统回收，监听已经
+  没了而通知还挂着，用户就只能去强制停止应用。这个出口是必需的。
+- ⚠️ 等待端口的那条通知也设为**常驻**：它是「正在等你操作」的指引，被划掉用户就
+  不知道该去哪开无线调试了。
+- ⚠️ 失败（配对码抄错）时**不停监听**：那个界面可能还开着、端口还在，用户改一位
+  数字重发就行。
+- 设置页要同步显示「正在等待…」（按钮禁用 + 把「接下来该做什么」铺在按钮下方）。
+  点了按钮界面毫无变化的话，用户会以为没点上而反复点。
+- ⚠️ 引导步骤的顺序是**先点配对、再去系统里开界面**（通知栏会指引）。原文案写的是
+  反过来的「先开界面再回来点配对」，照旧文案走会白跑一趟。
+
+##### ⚠️ `AdbMdns.isRunning` 的判据只能是 `running`（看门狗用）
+
+常驻等待需要一个看门狗：`NsdManager` 在系统重启 mdnsd 等情况下会回调
+`onStartDiscoveryFailed` / `onDiscoveryStopped` 把发现**静默掐掉**。一次性发现
+不在乎（下次调用会重建），但常驻等待必须能发现并重建它 —— 否则用户按提示去开了
+无线调试，这边却早已不再监听，永远不会出现输入框。
+
+⚠️ **判据不能写成 `running && registered`**：`registered` 要等 `onDiscoveryStarted`
+回调才为 true，而那是**异步**的。刚 `start()` 完那一瞬间 `running=true,
+registered=false`，看门狗会把它误判成「已停」并**反复重建监听**，形成死循环
+（写这一版时踩到过）。
+
+⚠️ **`onDiscoveryStopped` / `onStopDiscoveryFailed` 必须同时清掉 `running`**：
+系统**主动**停掉发现时只走这两个回调（我们主动 `stop()` 时 `running` 本来就是
+false，再置一次无害）。不清的话 `isRunning` 永远报 true，看门狗永远不重建。
 
 ##### 配对码为什么要走通知栏 `RemoteInput`
 
@@ -814,9 +850,9 @@ Unregistering listener for _adb-tls-pairing._tcp.local
 ⚠️ **接收器必须静态声明**（`AndroidManifest.xml` 里 `exported="false"`）：
 通知可以比 App 进程活得久，动态注册的接收器会收不到。
 
-⚠️ **`goAsync()` 是必须的**：配对要十几秒（发现端口 8s + SPAKE2 握手 + adb 启动），
-远超广播接收器的 10 秒超时（不 `goAsync()` 直接 ANR）。收尾必须
-`pendingResult.finish()`，放在 `finally` 里。
+⚠️ **`goAsync()` 是必须的**：配对要十几秒（SPAKE2 握手 + adb 启动 + 实际执行，
+且端口可能还没出现），远超广播接收器的 10 秒超时（不 `goAsync()` 直接 ANR）。
+收尾必须 `pendingResult.finish()`，放在 `finally` 里。
 
 ##### 密钥来源必须落盘记录（否则设置页会误报）
 
@@ -837,6 +873,81 @@ Unregistering listener for _adb-tls-pairing._tcp.local
 
 ⚠️ 标记文件是后加的，**老安装没有它**。`keyOrigin()` 此时返回 `null`，
 设置页显示灰点「来源未知」，**故意不猜成「已导入」** —— 那正是要修的误报。
+
+##### ⚠️⚠️ 绝不要主动发公钥 —— 那会**每条命令**都弹「允许 USB 调试吗」
+
+**这是本项目最严重的一处设计错误，也是唯一一处「删掉功能」才算修好的地方。**
+
+**症状**（真机 OPPO / Android 15）：只要 App 碰一次 adbd，屏幕上就弹一次
+「允许 USB 调试吗」；用户点了「一律允许」下次照样弹。`shell` 工具因此
+**完全不可用** —— 用户不可能为每条命令点一次对话框。
+
+**根因**在 `handshake()` 的失败分支：签名认证失败时它**无条件**发
+`A_AUTH / AUTH_RSA_PUBLIC`（把公钥推给 adbd）。而 adbd 收到公钥后**唯一**的反应
+就是弹那个对话框 —— 于是每一次连接（每条命令、每次探测）都弹一次。
+
+⚠️ **「一律允许」在 TCP 连接下不落盘**：Android 15 实测勾选后
+`/data/misc/adb/adb_keys` 并不会留下我们的公钥，下次连接照样弹。
+也就是说**降低频率没有意义，只能彻底不做**。
+
+**实测结论：这条能力在本 App 的所有场景里都是负收益**（所以不是「少用」而是「删掉」）：
+
+| 场景 | 主动推公钥的结果 |
+|---|---|
+| Android 10 + TCP | adbd **不弹框、静默挂起**，20 s 超时无任何响应 |
+| Android 15 + TCP | 弹框，但「一律允许」不持久化 ⇒ 下一条命令再弹 |
+
+两条路都不通。**能拿到信任的只有两条路**，都不经过「主动发公钥」：
+
+1. **Android 11+ 无线调试配对**：6 位配对码走 SPAKE2，设备把我们的公钥写进
+   keystore，此后是**设备认得我们**，不需要我们推。
+2. **Android 10 用 PC 推一把已授权的密钥**（`adb push %USERPROFILE%\.android\adbkey`）。
+
+**改法**：`handshake(key)` **删掉 `allowAuthorize` 参数、永不发送公钥**，
+签名失败直接抛错（`ADB 密钥被设备拒绝（授权可能已被撤销），请重新配对` /
+`ADB 密钥尚未被设备授权，请用无线调试配对授权它（Android 10 需先用 PC 执行
+adb push 推入已授权的密钥）`）；`connect()` 同步删掉 `allowAuthorize`，
+`AUTH_AUTHORIZE_TIMEOUT_MS` 整个常量删除。
+
+⚠️ **`AUTH_RSA_PUBLIC = 3` 这个常量要留着，并标「不要修好它」**：协议完整性
+（将来抓包分析要用），但**没有任何代码路径会发它**。看到这个常量别手痒去接上。
+
+##### ⚠️ 信任标记存的是**公钥指纹**，不是一个 bool
+
+`$DSH_HOME/adbkey.trusted` 里存的是**公钥 blob 的 md5**，不是 `true`。
+
+⚠️ **不能存布尔值**：密钥可以被替换（导入 PC 密钥、重新生成、重新配对），
+换了一把之后旧的布尔值仍然是 `true`，于是「设备认得这把钥匙」这个判断变成
+**假阳性** —— 而假阳性的后果正是上面那个弹框（我们以为设备认得，实际上不认得）。
+
+- `markKeyTrusted(key)` —— `handshake()` 成功那一刻调用。
+- `clearKeyTrust()` —— `importKeyIfNeeded()` 写入新密钥后调用（新钥匙要有一次
+  被授权的机会），以及 `--pair` 成功后由 `markKeyTrusted(paired)` 覆盖。
+
+##### ⚠️ `keyMayBeAuthorized()`：进「会弹框的通道」之前必须先过这道闸
+
+**这是「删掉发公钥」之后必须补上的一半。** 打包进来的 adb 是**外部进程**，
+它会**自己**弹那个对话框 —— 我们拦不住它。所以只能在**进入那些通道之前**挡掉：
+
+```js
+// 通道 1.5（切 TCP 再走 legacy）与通道 2（内置 adb + TLS）都要带这个条件
+keyMayBeAuthorized()
+```
+
+判据是「**设备已经认得这把钥匙**」，三条**任一**成立即可：
+
+| 条件 | 为什么算 |
+|---|---|
+| `isKeyTrusted(key)`（指纹匹配） | 我们亲手在这台设备上认证成功过 |
+| `origin === 'imported'` | 那是 PC 已经授权过的密钥 |
+| `origin === 'paired'` | 配对时设备把公钥写进了自己的 keystore |
+
+⚠️ **不能只看信任标记。** 会死锁在这个场景：用户刚导入/刚配对完一把密钥，
+**还没成功连过一次**（所以标记文件还没写），此时若 5555 没在监听、
+只剩无线调试那条路 —— 只看标记就会拒绝进入通道 2，而通道 2 恰好是唯一
+能让它连上并写下标记的路。**「刚配对完」正是最需要放行的那一刻。**
+
+⚠️ 这个函数必须**只读**：不导入、不生成、不写盘。它是守卫，不是初始化。
 
 ##### ⚠️ 无线调试开关一关，通道就断 —— 所以必须切固定端口
 
@@ -1251,6 +1362,146 @@ targetSdk = 28 走 legacy 模型，不需要 `MANAGE_EXTERNAL_STORAGE`。
 - **卸载重装会清掉 `$DSH_HOME`**（Termux 环境、全部会话日志、`adbkey`），
   重装后要重新 bootstrap。Android 10 要再用 PC 导入一次 adbkey；
   Android 11+ 只需重新配对一次（也是手机上点几下，不用电脑）。
+
+### ⑫ 悬浮气泡 —— App 退到后台后唯一的交互入口
+
+**为什么需要**：让 AI 去操作微信/设置/别的 App 时，用户**必须离开本 App**，
+于是官方界面看不见了 —— 既不知道 AI 跑到哪一步，也没法中途喊停或补一句话。
+通知栏能显示状态，但点一下就跳走，**没法交互**。
+
+实现：`FloatingBubble.kt`（原生 View，约 1000 行）+ `bubble_window.xml` /
+`bubble_status.xml`。**由 `MainActivity.onStart/onStop` 控制只在后台显示** ——
+前台时官方界面本来就在，气泡是多余的遮挡。所以**要看到气泡必须按 HOME**。
+
+两种形态共用一个 window（靠 `visibility` 切换，**不重建 View**）：
+
+| 形态 | 内容 |
+|---|---|
+| 收起 | 56dp 圆形头像按钮 + 14dp 状态圆点（实心绿=在跑，空心灰=空闲） |
+| 展开 | 300dp 面板：当前动作 / 会话标题 / 最近输出（可滚动）/ 输入框 + 发送/停止 |
+
+#### ⚠️ 状态圆点会掉出圆外 —— 父容器是**矩形裁剪**
+
+圆点是 `bottom|end` + 5dp 边距。⚠️ **不能贴到 1dp**：`bubble_circle_bg.xml`
+是个椭圆 drawable，但**父容器的裁剪区域是矩形**，圆点放太靠角就会露在圆的
+弧线之外。5dp 是实测能贴住弧线的值。
+
+⚠️ 圆点带 **2dp 白描边**（`LayerDrawable` + `setLayerInset`）：
+头像是深蓝色，纯色圆点压在上面辨识度不够。小圆点（状态气泡里的那个）**不描边**，
+它本来就小，描边会把它糊掉。
+
+#### ⚠️⚠️ `FLAG_ALT_FOCUSABLE_IM` 的语义是**反的**，别照着直觉写
+
+**原实现的注释写着「平时不抢焦点、点输入框才聚焦」，那个理解是错的，
+正是键盘弹不出来的原因。**
+
+该标志的真实语义是「**这个窗口不需要输入法交互**」—— 它把
+`FLAG_NOT_FOCUSABLE` 对输入法的豁免**又撤掉了**，所以它是**阻止**键盘的，
+不是允许键盘的。
+
+正确写法（`applyFocusFlags`）：
+
+| 形态 | flags |
+|---|---|
+| 收起 | 加 `FLAG_NOT_FOCUSABLE`（纯显示，不该抢下层应用的按键焦点） |
+| 展开 | **去掉** `FLAG_NOT_FOCUSABLE`，且**永不**设 `FLAG_ALT_FOCUSABLE_IM` |
+
+⚠️ **两态都要保留 `FLAG_NOT_TOUCH_MODAL`**：它让窗口**之外**的触摸照常传给
+下层应用 —— 没有它，气泡一出现整个屏幕就点不动了。
+
+⚠️ 拖动时要**按下即 `setFlags`** 切一次（`applyTouchFlags`）：不切的话手势会被
+输入法层截走。
+
+#### ⚠️ 状态气泡是**独立窗口**，不是圆的子 View
+
+球上方的状态标签（「正在运行命令 · sleep 10」）是**另一个 window**
+（`bubble_status.xml` + `statusParams()`），不是把 56dp 的圆撑大。
+
+⚠️ **不能撑大圆**：圆的**左上角锚点**是所有拖动/吸附数学的基准，改变尺寸会让
+`curX/curY` 的语义整体错位，贴边吸附、位置持久化、夹取范围全要重算。
+独立窗口只是"跟着球走"（`moveTo()` 里调 `positionStatusBubble()`），
+球的位置数学一行都不用动。
+
+- 只在**收起态 + 真有活动**时显示（`text.isEmpty() || expanded` 就隐藏）。
+  展开态面板里已有同一份信息，再挂一个标签是重复的。
+- ⚠️ **故意让它可点**（点一下 = 点球 = 展开面板），所以**不能加
+  `FLAG_NOT_TOUCHABLE`**。代价是这一小块区域会挡住下层应用，但标签只在有进展时出现。
+- ⚠️ **必须防重入**：`positionStatusBubble()` 会改 `layoutParams`，可能再触发一次
+  layout 回调 —— 不加 `positioning` 守卫就是无限递归（ANR）。
+- ⚠️ **首次 `addView` 后先 `alpha = 0`**，量出真实宽度后再摆位并淡入。
+  否则会先按"宽度 0"居中一次、量完再跳一次，用户看到标签从球心"弹"到左边。
+- ⚠️ **内容没变就不 `setText`**：状态每 5 秒刷新一次，无脑 setText 会一直触发重排，
+  表现为标签文字轻微抖动。
+- 竖直方向默认在球**正上方**，`curY` 太小时翻到下方。
+
+#### ⚠️ 收起时位置会漂 —— 展开前必须记住原位
+
+展开时为了把 300dp 宽的面板夹进屏幕，`curX` 会被改掉（贴右边时从 912 变成 180）。
+收起时若只做一次 `clamp`，球会停在**面板的左上角**而不是展开前的位置 ——
+用户看到的是「点一下收起，球跑别处去了」。
+
+所以 `expand()` 里先存 `preExpandX/preExpandY`，`collapse()` 用
+`clampInto(preExpandX, preExpandY, side, side)` 回去。
+
+⚠️ `clampInto` 有**带尺寸的重载**，不是多余的：切换形态那一瞬间 `root` 的尺寸
+还是旧的那个（收起瞬间布局尚未重测，`root.width` 仍是展开态的 900），
+拿它算夹取范围会把球留在面板左上角。
+
+#### 拖动用绝对坐标，不能用 `getRawX()` 的差值当坐标
+
+`WindowManager.updateViewLayout` 的 x/y 是相对**屏幕**的左上角，而 `getRawX()`
+是相对屏幕的触点。必须把位移量**累加到按下时的 window 坐标**上
+（`downWinX + dx`）。直接拿 `rawX` 当 x 会让气泡瞬移到手指位置（左下角对齐触点）。
+
+⚠️ 吸附动画**用 Handler 逐帧**，不用 `ViewPropertyAnimator` ——
+后者动画的是 View 的 `translationX/Y`，而悬浮窗位置由 `layoutParams` 决定，
+两者会打架（松手瞬间闪回原位）。
+
+#### 发消息 / 停止：靠 `evaluateJavascript` 注入官方 DOM 契约
+
+气泡自己**不发请求**，它把操作翻译成对官方页面的操作：
+
+```
+气泡(原生) ──读──> EngineService.currentStatus()/onStatus()  <──推── 页面 mpReportStatus() (5s)
+     │
+     └──发消息/停止──> WebView.evaluateJavascript ──注入──> Lexical 编辑器
+```
+
+- **发消息**：清空走 `__lexicalEditor.update(() => root.clear())`（Lexical 自己的
+  API），插入走在 `contenteditable` 上派发 **`beforeinput`** 事件。
+  ⚠️ 实测过若干方案，**只有 `beforeinput` 单行/多行/引号/反斜杠/emoji/超长文本全部正确**
+  （直接改 `textContent`、`execCommand`、`InputEvent('input')` 都有各自的坏法）。
+- **停止**：先验 `aria-label` 确实是「停止生成」，再点 `.uV2eYG_primary`。
+  不验就点等于盲点，页面状态不同时会误触。
+- ⚠️⚠️ **`BUBBLE_SEND_DELAY_MS = 500` 不能省**：`beforeinput` 是**同步**派发的，
+  但 React 要等**下一次渲染**才会清掉发送按钮的 `disabled`。立刻点 = 点到禁用按钮，
+  表现为「消息进了输入框但没发出去」。
+
+#### 头像
+
+圆形按钮里是 App 图标（`bubble_avatar.png`，五档密度 56/84/112/168/224 px），
+由 `drawable-xxxhdpi/ic_launcher_foreground.png` 预裁成圆生成。
+
+⚠️ **裁切比例取 1.20**，这是量出来的：非透明 bbox 是 `(65,65,366,367)`，
+边长 ×1.00 会把头顶那撮呆毛切掉，×1.45 又缩得太小 ⇒ 1.20。
+生成时用 4× 超采样再降采样（直接按目标尺寸画圆会看到锯齿）。
+
+⚠️ `bubble_circle_bg.xml` 是白底椭圆 + 1dp `#14000000` 描边：
+没有描边的话，浅色背景上圆形按钮的边界会消失。
+
+#### 调试真机：覆盖窗口看不见，坐标要加状态栏高度
+
+⚠️ **`uiautomator dump` 看不到覆盖窗口**（它不是 Activity 的 View 树）。要用：
+
+```powershell
+adb shell dumpsys window windows | Select-String -Context 0,2 APPLICATION_OVERLAY
+```
+
+⚠️ **`dumpsys window` 给的覆盖窗口坐标是相对窗口的，要加上状态栏/挖孔高度才是屏幕坐标。**
+Huawei CDY-TN90 实测**偏移 115 px**：`屏幕 y = 窗口 y + 115`。
+WebView 视口是 360×764 CSS px、dpr 3，所以真实点击坐标是
+`physX = cssX * 3`、`physY = 108 + cssY * 3`。拿窗口坐标直接去 `input tap`
+会点在偏上 115px 的地方 —— 本次调试中真的被它误导过。
 
 ## 后台保活（任务切到后台不能断）
 
@@ -1698,6 +1949,25 @@ Compress-Archive -Path package\* -DestinationPath app\src\main\assets\pnpm-andro
 验收方式：把 `.so` 和一个 14 项断言的测试程序（独占/保源/内容一致/linkat/ENOENT/目录
 EPERM/无残留/大文件完整性）`adb push` 到设备，用 `run-as` 直接跑。一次性脚本，不入库。
 沙箱与 runner 同理（`sbtest2.sh` 8/8、runner 10/10）。
+
+### ⚠️ 手写源码资产要单独加 `.gitignore` 白名单
+
+`.gitignore` 是**整目录忽略**（`app/src/main/assets/*`），因为那些二进制合计 112.7 MB
+且无法从本仓库重建。但 `assets/` 里有**两个手写源码**，必须入库：
+
+```
+app/src/main/assets/*
+!app/src/main/assets/webview-polyfill.js
+!app/src/main/assets/dsh-android-shell.mjs
+```
+
+⚠️ **新增手写源码资产时，记得同步加一条 `!` 例外**，否则它会被静默忽略 ——
+`git status` 里看不见、`git add` 也不报错，改动就这么丢了（`dsh-android-shell.mjs`
+本轮就是这么被发现漏了入库的）。
+
+⚠️ `COMMIT_MSG.tmp` 也在忽略列表里：写提交信息用的临时文件，曾经误入库过一次
+（`9919b27`），用 `git rm --cached` 清掉后补进 `.gitignore`。提交信息用
+`git commit -F <file>` 传，文件放 `.git/` 下或记得删。
 
 ## 与 DSH 桌面端的关系
 
