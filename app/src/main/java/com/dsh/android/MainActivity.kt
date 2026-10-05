@@ -35,6 +35,7 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.dsh.android.databinding.ActivityMainBinding
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /**
  * 主界面：启动内置引擎，然后把 DSH 自带的 Web GUI 加载进 WebView。
@@ -270,6 +271,7 @@ class MainActivity : AppCompatActivity() {
         loadImeHeight()   // 修复 65：把上次学到的键盘高度取回来（跨冷启动有效）
 
         setupWebView()
+        installBubbleBridge()
         observeEngine()
         observeImeInsets()   // 修复 65：键盘高度自学习 + 预判交接
         // 前台服务要在引擎启动前拉起：它同时是「进程不被回收」和 WakeLock 的持有者，
@@ -547,6 +549,69 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(app, result.message, Toast.LENGTH_LONG).show()
                 }
             }.start()
+        }
+
+        // ══ 悬浮气泡：设置页的三个接口 ══════════════════════════════════
+        //
+        // 走 JS 桥而不是宿主半的 HTTP 路由：开关状态是**原生**的事实（SharedPreferences
+        // + Settings.canDrawOverlays），Node 侧读不到；拉起系统授权页更是 Android 的能力。
+        // 宿主半那条路（特权权限用的）是为「需要 spawn 进程探测」的场景准备的，这里不需要。
+
+        /**
+         * 读气泡当前状态。返回 JSON 字符串。
+         *
+         * ⚠️ 必须返回 String —— `@JavascriptInterface` 只支持基本类型和 String，
+         *   返回自定义对象会被序列化成 `undefined`（静默，不报错）。
+         *
+         * `granted` 与 `enabled` 是**两个独立的事实**：用户可能已经授权但没开开关，
+         * 也可能开了开关但授权被系统撤销了。分开报，设置页才能给出正确的下一步。
+         */
+        @android.webkit.JavascriptInterface
+        fun bubbleState(): String = try {
+            JSONObject()
+                .put("enabled", FloatingBubble.isEnabled(this@MainActivity))
+                .put("granted", FloatingBubble.canDrawOverlays(this@MainActivity))
+                .toString()
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "读取气泡状态失败: ${t.message}")
+            "{}"
+        }
+
+        /** 开关气泡。关掉时立刻收起已显示的窗口，不用等下次切后台。 */
+        @android.webkit.JavascriptInterface
+        fun bubbleSetEnabled(enabled: Boolean) {
+            Log.i(DshApplication.TAG, "设置页切换悬浮气泡: $enabled")
+            FloatingBubble.setEnabled(this@MainActivity, enabled)
+            if (!enabled) FloatingBubble.hideNow()
+        }
+
+        /**
+         * 拉起系统的「显示在其他应用上层」授权页。
+         *
+         * ⚠️ `SYSTEM_ALERT_WINDOW` **不能运行时请求**（不是 runtime permission，
+         *   `requestPermissions` 对它无效），只能把用户送到这个设置页手动开。
+         *   个别 ROM 没有这个 Activity，所以要 catch 后回落到应用详情页。
+         */
+        @android.webkit.JavascriptInterface
+        fun bubbleRequestOverlay() {
+            Log.i(DshApplication.TAG, "设置页请求悬浮窗授权")
+            runOnUiThread {
+                val pkgUri = Uri.parse("package:$packageName")
+                val ok = runCatching {
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }.isSuccess
+                if (!ok) {
+                    runCatching {
+                        startActivity(
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkgUri)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -851,12 +916,102 @@ class MainActivity : AppCompatActivity() {
         overlayHandler.postDelayed(overlayTimeoutRunnable, UI_READY_TIMEOUT_MS)
     }
 
+    // ══ 悬浮气泡：注入通道 ══════════════════════════════════════════════
+    //
+    // 气泡里的输入框是**原生 EditText**，而真正的会话输入框是页面里的 Lexical
+    // 编辑器（React 组件）。两者之间只能靠注入 —— 没有别的接缝：
+    //   · 引擎的 HTTP API 不接受"替我发一条 prompt"（prompt 走 WebSocket RPC，
+    //     还要带会话 id、附件、client-request 外壳，自己拼等于重写一个前端）
+    //   · 直接改 React state 拿不到 fiber（跨 bundle，闭包里的 setState 不可达）
+    //
+    // 所以走 DOM 事件：把文本"打字"进官方 composer，再点它的发送按钮 ——
+    // 官方前端完全感知不到区别，后续所有流程（附件、上下文、会话记录）都照旧。
+
+    /**
+     * 装好气泡的两个回调。
+     *
+     * ⚠️ `sendText` 必须在 `onDestroy` 里清掉：WebView 跟着 Activity 一起销毁，
+     *   留着旧闭包会让气泡对着一个已死的 WebView 调 `evaluateJavascript`
+     *   （不报错、静默无效），用户以为发出去了其实没有。
+     */
+    private fun installBubbleBridge() {
+        FloatingBubble.sendText = { text -> sendToComposer(text) }
+        FloatingBubble.openApp = {
+            runOnUiThread {
+                startActivity(
+                    Intent(this, MainActivity::class.java).addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * 把一段文本送进页面的官方 composer，并触发发送。
+     *
+     * **必须在主线程调用**（`evaluateJavascript` 的要求）—— 气泡的按钮回调本来
+     * 就在主线程，这里不额外切。
+     *
+     * 分两步而不是一步，是因为**页面状态更新是异步的**：`beforeinput` 注入完，
+     * 发送按钮的 `disabled` 属性要等 React 下一次渲染才变。实测约 450ms。
+     * 同步点按钮会点到 disabled 的那个，表现为"文字进去了但没发出去"。
+     */
+    private fun sendToComposer(text: String): Boolean {
+        val wv = binding.webView
+        val quoted = JSONObject.quote(text)
+
+        wv.evaluateJavascript(BUBBLE_INSERT_JS.replace(BUBBLE_TEXT_SLOT, quoted)) { result ->
+            Log.i(DshApplication.TAG, "气泡注入结果: $result")
+            // ⚠️ 找不到 composer 时必须让用户知道。静默失败的话，气泡会把输入框
+            //   清空、看起来"发出去了"，而 App 里其实一个字都没进去。
+            if (result != null && result.contains("NO_INPUT")) {
+                Toast.makeText(this, "输入框未就绪，请打开 App 重试", Toast.LENGTH_LONG).show()
+            }
+        }
+
+        bubbleHandler.postDelayed({
+            wv.evaluateJavascript(BUBBLE_SEND_JS) { result ->
+                Log.i(DshApplication.TAG, "气泡发送结果: $result")
+            }
+        }, BUBBLE_SEND_DELAY_MS)
+
+        return true
+    }
+
+    /** 气泡的延时任务（注入后点发送）。独立于 ime/overlay 两个 handler，互不干扰。 */
+    private val bubbleHandler = Handler(Looper.getMainLooper())
+
     override fun onDestroy() {
         // 引擎跟随进程存活，这里不停止，避免转屏/重建时反复冷启动。
         imeHandler.removeCallbacks(imeRestoreRunnable)
         overlayHandler.removeCallbacks(overlayTimeoutRunnable)
         overlayHandler.removeCallbacks(paintTimeoutRunnable)
+        // ⚠️ 必须清掉：WebView 随 Activity 一起销毁，留着这些闭包会让气泡
+        //   对着一具"尸体"调 evaluateJavascript（静默无效，用户以为发成功了）。
+        FloatingBubble.sendText = null
+        FloatingBubble.openApp = null
+        bubbleHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
+    }
+
+    // ══ 悬浮气泡：仅在 App 退到后台时显示 ══════════════════════════════
+    //
+    // 用 onStart/onStop 而不是 onResume/onPause：后者在弹权限对话框、拉下通知栏、
+    // 甚至息屏时都会触发，气泡会频繁闪。onStop 才是"用户真的离开了这个界面"。
+    //
+    // ⚠️ 转屏也会走 onStop→onStart，但那是**配置变更**，不是退到后台 ——
+    //   不排除的话气泡会在转屏瞬间闪一下。
+
+    override fun onStart() {
+        super.onStart()
+        FloatingBubble.onAppForeground()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (isChangingConfigurations) return
+        FloatingBubble.onAppBackground(this)
     }
 
     private companion object {
@@ -903,5 +1058,97 @@ class MainActivity : AppCompatActivity() {
          * 取 1.5 秒：足够覆盖一次正常的帧提交，又不至于让用户白等。
          */
         const val PAINT_TIMEOUT_MS = 1500L
+
+        // ══ 悬浮气泡：注入脚本 ══════════════════════════════════════════
+
+        /** 文本占位符。用 `replace` 而不是字符串拼接，避免文本里的引号破坏 JS 语法。 */
+        const val BUBBLE_TEXT_SLOT = "__DSH_BUBBLE_TEXT__"
+
+        /**
+         * 注入后等多久再点发送（ms）。
+         *
+         * ⚠️ 这个延时**不能省**：`beforeinput` 是同步派发的，但 React 要等下一次
+         * 渲染才会把发送按钮的 `disabled` 去掉。实测约 450ms，取 500 留余量。
+         * 提前点会点到 disabled 的按钮 —— 症状是"文字进去了但没发出去"。
+         */
+        const val BUBBLE_SEND_DELAY_MS = 500L
+
+        /**
+         * 把文本写进官方 composer。
+         *
+         * ## 为什么是 `beforeinput` 事件
+         *
+         * composer 是 **Lexical** 编辑器（`data-lexical-editor="true"`），不是
+         * textarea/input —— `value` 属性根本不存在，`innerText` 也只是渲染结果，
+         * 直接改它 Lexical 的内部 model 完全不认。
+         *
+         * 真机逐一实测过五条路，只有这条全绿：
+         *
+         * | 方法 | 结果 |
+         * |---|---|
+         * | `execCommand("insertText")` | 单行可以，**换行符被吃掉**，且清不掉旧内容 |
+         * | `execCommand("insertLineBreak")` | 文字错乱 |
+         * | `execCommand("selectAll")` + `delete` | Lexical 完全不响应 |
+         * | 真实 Ctrl+A + Backspace（CDP 键盘事件） | 同样无效 |
+         * | 直接构造 Lexical 节点 | `Minified Lexical error #195`（跨 bundle 版本不匹配） |
+         * | **`beforeinput` 事件** | **单行/多行/引号/反斜杠/emoji/超长文本全部正确** |
+         *
+         * Lexical 自己在 `contenteditable` 上监听 `beforeinput`，读到
+         * `inputType: "insertText"` + `data` 就照常走它的插入流程 —— 所以这条路径
+         * 等价于"用户用输入法打了这些字"，是最接近真实的注入方式。
+         *
+         * 清空走 `__lexicalEditor.update(() => root.clear())`：这是 Lexical 自己
+         * 暴露在 DOM 节点上的编辑器实例，用它做事务是**官方 API**，不是 hack。
+         *
+         * ⚠️ 返回时读到的 `innerText` 是**上一帧**的内容（Lexical 异步渲染），
+         *   别拿它判断成败 —— 那正是把发送拆成两步的原因。
+         */
+        val BUBBLE_INSERT_JS = """
+            (function () {
+              var t = $BUBBLE_TEXT_SLOT;
+              var ce = document.querySelector('.uV2eYG_input');
+              if (!ce) { return 'NO_INPUT'; }
+              ce.focus();
+              var ed = ce.__lexicalEditor;
+              if (ed) {
+                try {
+                  ed.update(function () {
+                    var r = ed.getEditorState()._nodeMap.get('root');
+                    if (r && r.clear) { r.clear(); }
+                  });
+                } catch (e) { /* 清空失败不致命，下面照常插入 */ }
+              }
+              if (t) {
+                ce.dispatchEvent(new InputEvent('beforeinput', {
+                  inputType: 'insertText',
+                  data: t,
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true
+                }));
+              }
+              var btn = document.querySelector('.uV2eYG_primary');
+              return JSON.stringify({
+                len: ce.innerText ? ce.innerText.length : 0,
+                sendDisabled: btn ? btn.disabled : null
+              });
+            })()
+        """.trimIndent()
+
+        /**
+         * 点官方 composer 的发送按钮。
+         *
+         * ⚠️ 用 `disabled` 先判一次：按钮在无内容时是 `disabled` 的，点它不报错、
+         *   也不发送 —— 静默失败最难查。这里如实把状态回报给日志。
+         */
+        val BUBBLE_SEND_JS = """
+            (function () {
+              var btn = document.querySelector('.uV2eYG_primary');
+              if (!btn) { return 'NO_SEND_BTN'; }
+              if (btn.disabled) { return 'SEND_DISABLED'; }
+              btn.click();
+              return 'SENT';
+            })()
+        """.trimIndent()
     }
 }

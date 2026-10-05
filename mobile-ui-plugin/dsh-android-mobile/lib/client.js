@@ -3918,6 +3918,9 @@ window.__ModuleLoader__.load({
 			wlNoBridge: "当前环境没有原生的配对入口（DSHAndroid 桥不可用），无法发起配对。",
 			wlPortStale: "已失效（无线调试可能已关）",
 			recommended: "推荐",
+			// Android 10 上「无线调试」根本不存在，说清楚比让用户去系统设置里白找一遍好。
+			wlUnsupported: "本机是 Android 10，系统里没有「无线调试」这个功能（它从 Android 11 才有）。请用下面的「电脑引导」，那是在这台设备上唯一可行的方式。",
+			pcTitlePrimary: "开启引导（Android 10 用这条）",
 			pcTitle: "改用电脑引导（Android 10 或没有无线调试时）",
 			pcIntro: "如果系统里找不到「无线调试」（Android 10 及以下），或者无线调试一直配不上，可以插上数据线用电脑引导一次。",
 			setupTitle: "开启引导（当前已就绪，一般不用看）",
@@ -3927,6 +3930,89 @@ window.__ModuleLoader__.load({
 			nextPairHint: "还差一步：点右边按钮完成无线调试配对。",
 			nextSwitchHint: "建议切到固定端口，这样关掉无线调试开关也不会断。",
 			nextChoose: "还没开启。按下面「无线调试」那几步走一遍即可，不用电脑。",
+			nextChoosePc: "还没开启。按下面的「电脑引导」走一遍 —— 本机是 Android 10，只能用这种方式。",
+		};
+
+		// ══════════════════════════════════════════════════════════════════
+		// 悬浮气泡设置分节
+		//
+		// 需求：App 退到后台时浮一个圆形气泡，用户能看着 AI 干活、也能继续说话。
+		// 场景是**设备自动化** —— AI 去操作别的 App 时用户必须离开本应用，
+		// 否则完全看不见进展、也没法中途补一句话。
+		//
+		// 分节要解决三件事，缺一不可：
+		//   ① 让用户知道有这么个东西（默认关，不主动开就没有）
+		//   ② 把用户送到系统的「显示在其他应用上层」授权页 —— 这是**特殊权限**，
+		//      `requestPermissions` 对它无效，只能手动开
+		//   ③ 开关本身
+		//
+		// 状态由原生提供（`DSHAndroid.bubbleState()`）—— 开关在 SharedPreferences、
+		// 授权在 Settings，两者都在原生侧，浏览器进程读不到。
+		// ══════════════════════════════════════════════════════════════════
+		const MP_BUBBLE_NS = "dsh-android-mobile.bubble";
+		const MP_BUBBLE_ZH = {
+			nav: "悬浮气泡",
+			title: "悬浮气泡",
+			intro: "退到后台后，屏幕上浮一个圆形气泡，实时显示 AI 在干什么，也能直接打字发消息。做设备自动化时用它盯着进度，不用来回切应用。",
+			statusTitle: "当前状态",
+			statusOn: "已开启",
+			statusOff: "未开启",
+			statusUnknown: "检测中",
+			rowSwitch: "开关",
+			rowPerm: "悬浮窗权限",
+			on: "已开启",
+			off: "已关闭",
+			granted: "已授权",
+			notGranted: "未授权",
+			enable: "开启气泡",
+			disable: "关闭气泡",
+			grant: "去授权",
+			recheck: "重新检测",
+			nextNeedPerm: "还差一步：系统还没允许本应用显示在其他应用上层。点右边按钮去开。",
+			nextNeedEnable: "权限已就绪，打开开关即可用。",
+			nextAllGood: "已就绪。退到后台就能看到气泡。",
+			howTitle: "怎么用",
+			how1: "退到后台（按 Home 或切到别的应用）时气泡才出现 —— 在本应用里它不会碍事。",
+			how2: "拖动可以挪位置，松手会自动吸附到最近的屏幕边缘，位置会记住。",
+			how3: "点一下展开面板：上面是当前动作和最近输出，下面是输入框，打字点「发送」即可。",
+			how4: "面板上「打开」回到本应用，「收起」退回圆形。",
+			notesTitle: "几点说明",
+			note1: "「显示在其他应用上层」是特殊权限，系统不允许应用自己弹窗申请，必须手动去系统设置里打开。",
+			note2: "气泡靠前台服务推送的状态刷新，约每秒一次；不额外耗电（引擎本来就在跑）。",
+			note3: "气泡里发消息走的是同一个官方输入框，会进入当前会话，和在本应用里打字完全一样。",
+			noBridge: "当前环境没有原生桥（DSHAndroid 不可用），无法控制气泡。",
+		};
+		const MP_BUBBLE_EN = {
+			nav: "Floating bubble",
+			title: "Floating bubble",
+			intro: "When the app goes to the background, a round bubble floats on screen showing what the AI is doing, with a text box to send messages. Useful for device automation — watch progress without switching apps.",
+			statusTitle: "Current status",
+			statusOn: "Enabled",
+			statusOff: "Not enabled",
+			statusUnknown: "Checking",
+			rowSwitch: "Switch",
+			rowPerm: "Overlay permission",
+			on: "On",
+			off: "Off",
+			granted: "Granted",
+			notGranted: "Not granted",
+			enable: "Turn on",
+			disable: "Turn off",
+			grant: "Grant",
+			recheck: "Re-check",
+			nextNeedPerm: "One step left: the system hasn't allowed this app to draw over other apps. Tap the button to open the setting.",
+			nextNeedEnable: "Permission is ready — just turn the switch on.",
+			nextAllGood: "All set. Send the app to the background to see the bubble.",
+			howTitle: "How it works",
+			how1: "The bubble appears only when the app is in the background — it never gets in your way inside the app.",
+			how2: "Drag to move it; on release it snaps to the nearest screen edge and remembers the position.",
+			how3: "Tap to expand: current action and recent output on top, a text box and Send below.",
+			how4: "\"Open\" returns to the app; \"Collapse\" goes back to the round bubble.",
+			notesTitle: "Notes",
+			note1: "\"Display over other apps\" is a special permission — Android does not allow an app to request it at runtime; you must enable it in system settings.",
+			note2: "The bubble is fed by the foreground service's status, about once per second. No extra battery cost — the engine is already running.",
+			note3: "Messages sent from the bubble go through the same official composer and land in the current session, exactly as if you typed them in the app.",
+			noBridge: "No native bridge (DSHAndroid unavailable) in this environment — cannot control the bubble.",
 		};
 		const MP_PRIV_EN = {
 			nav: "Privileged access",
@@ -3987,6 +4073,8 @@ window.__ModuleLoader__.load({
 			wlNoBridge: "The native pairing entry point is unavailable in this environment (the DSHAndroid bridge is missing), so pairing cannot be started.",
 			wlPortStale: "Stale (wireless debugging may be off)",
 			recommended: "Recommended",
+			wlUnsupported: "This device runs Android 10, which has no \"Wireless debugging\" — that feature starts at Android 11. Use the computer-based guide below; it is the only workable path on this device.",
+			pcTitlePrimary: "Setup guide (use this on Android 10)",
 			pcTitle: "Use the computer-based guide instead (Android 10, or no wireless debugging)",
 			pcIntro: "If there is no \"Wireless debugging\" entry in system settings (Android 10 and below), or pairing keeps failing, connect a USB cable and run the computer-based guide once.",
 			setupTitle: "Setup guide (already enabled — normally not needed)",
@@ -3996,6 +4084,7 @@ window.__ModuleLoader__.load({
 			nextPairHint: "One step left: tap the button to finish wireless pairing.",
 			nextSwitchHint: "Switching to a fixed port is recommended so turning wireless debugging off will not break it.",
 			nextChoose: "Not enabled yet. Follow the \"Wireless debugging\" steps below — no computer needed.",
+			nextChoosePc: "Not enabled yet. Follow the computer-based guide below — this device runs Android 10, so that is the only way.",
 		};
 
 		// 全内联样式：设置 dialog 里的既有教训是「匹配 dialog 的 CSS 规则会把弹窗
@@ -4155,6 +4244,22 @@ window.__ModuleLoader__.load({
 			const channelText = channel === "legacy" ? t("chStable")
 				: channel === "wireless" ? t("chWireless") : "";
 
+			// ── 系统版本：决定走哪条引导路径 ──────────────────────
+			//
+			// ⚠️ **Android 10 及以下没有「无线调试」** —— 那是 Android 11（API 30）
+			//   才有的功能。在 Android 10 上还把它摆在最上面、还挂「推荐」、还给出
+			//   「配对无线调试」按钮，用户照着去系统设置里找只会找不到（真机反馈过）。
+			//
+			// 判据用 UA 里的 `Android <版本>`：浏览器进程拿不到 `Build.VERSION.SDK_INT`，
+			//   而 UA 是现成的、不需要为它新增一条原生桥。
+			const androidMajor = (() => {
+				const m = /Android\s+(\d+)/i.exec(navigator.userAgent || "");
+				return m ? Number.parseInt(m[1], 10) : 0;
+			})();
+			// 版本判不出来时**当作不支持**（走电脑引导）：电脑引导在所有版本上都成立，
+			// 而无线调试在 Android 10 上根本不存在。判错方向宁可保守。
+			const wirelessSupported = androidMajor >= 11;
+
 			// 「下一步该做什么」—— 由当前状态推出来，摆在首屏。
 			// 用户不该为了知道点哪里而读完全部卡片。
 			const keyReady = !!(data && data.key
@@ -4165,12 +4270,17 @@ window.__ModuleLoader__.load({
 					next = channel === "wireless"
 						? { text: t("nextSwitchHint"), action: "switchTcp", label: t("wlTcp") }
 						: { text: t("nextAllGood"), action: null };
-				} else if (data.key && data.key.origin === "generated") {
+				} else if (data.key && data.key.origin === "generated" && wirelessSupported) {
+					// 只有系统真支持无线调试时，才引导去配对 —— 否则那个按钮
+					// 在 Android 10 上永远走不通，点了只是白等。
 					next = { text: t("nextPairHint"), action: "pair", label: t("wlPair") };
 				} else if (keyReady) {
 					next = { text: t("nextSwitchHint"), action: "switchTcp", label: t("wlTcp") };
 				} else {
-					next = { text: t("nextChoose"), action: null };
+					next = {
+						text: wirelessSupported ? t("nextChoose") : t("nextChoosePc"),
+						action: null,
+					};
 				}
 			}
 
@@ -4316,14 +4426,15 @@ window.__ModuleLoader__.load({
 				) : null,
 			);
 
-			// ── 无线调试（推荐路径，Android 11+）──────────────────
-			// 放在电脑引导**之前**：它的前提（Android 11+）比电脑引导更窄，
-			// 但它是绝大多数用户该走的那条 —— 不用电脑、不用数据线。
+			// ── 两条引导路径：按系统版本决定哪条在前、哪条带「推荐」──
+			// （版本判定在函数开头，见 androidMajor / wirelessSupported）
 			const wlCard = e("div", { style: S.card },
 				e("div", { style: S.cardHead },
 					e("h3", { style: S.cardTitle }, t("wlTitle")),
-					e("span", { style: S.tagRecommended }, t("recommended")),
+					wirelessSupported ? e("span", { style: S.tagRecommended }, t("recommended")) : null,
 				),
+				// Android 10 上明确说明为什么这条路不通，而不是让用户白找一遍。
+				!wirelessSupported ? e("p", { style: S.note }, t("wlUnsupported")) : null,
 				e("p", { style: S.intro }, t("wlIntro")),
 				e("ol", { style: S.steps }, [
 					e("li", { key: 0, style: S.step }, t("wlStep1")),
@@ -4371,9 +4482,12 @@ window.__ModuleLoader__.load({
 				e("p", { style: S.note }, t("wlPairHint")),
 			);
 
-			// ── 电脑引导（备用路径）────────────────────────────────
-			const pcCard = e("details", { style: S.fold },
-				e("summary", { style: S.foldHead }, t("pcTitle")),
+			// ── 电脑引导 ──────────────────────────────────────────
+			// Android 10 上它是**唯一**可行的路径，所以默认展开、摆前面；
+			// Android 11+ 上它只是备用，折起来放后面。
+			const pcCard = e("details", { style: S.fold, open: !wirelessSupported },
+				e("summary", { style: S.foldHead },
+					wirelessSupported ? t("pcTitle") : t("pcTitlePrimary")),
 				e("p", { style: S.intro }, t("pcIntro")),
 				e("ol", { style: S.steps }, guideSteps),
 			);
@@ -4391,12 +4505,15 @@ window.__ModuleLoader__.load({
 				e("p", { style: S.intro }, t("intro")),
 				head,
 				// 已就绪时把引导整体折起来 —— 能用的人不该被一堆步骤挡着。
+				// 未就绪时：Android 10 把电脑引导摆前面（那是唯一可行的路），
+				// Android 11+ 反过来 —— 无线调试更省事。
 				identityOk
 					? e("details", { style: S.fold },
 						e("summary", { style: S.foldHead }, t("setupTitle")),
 						e("div", { style: S.foldBody }, wlCard, pcCard),
 					)
-					: e("div", { style: S.stack }, wlCard, pcCard),
+					: e("div", { style: S.stack },
+						...(wirelessSupported ? [wlCard, pcCard] : [pcCard, wlCard])),
 				notesCard,
 			);
 		}
@@ -4451,10 +4568,212 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/**
+		 * 「悬浮气泡」分节组件。
+		 *
+		 * 布局沿用「特权权限」那套**结论优先**的结构：head 卡给状态徽章 + 一条
+		 * 「下一步」+ 直达按钮，明细与说明折进 `<details>`。
+		 *
+		 * @param {object} props - 槽位注入面（只用 `t`）。
+		 * @returns {object} React 元素。
+		 */
+		function mpBubbleSection(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_BUBBLE_ZH[key] ?? key;
+			const [state, setState] = React.useState({ phase: "loading" });
+			const [showDetails, setShowDetails] = React.useState(false);
+
+			/**
+			 * 从原生读一次状态。
+			 *
+			 * ⚠️ 桥**可能不存在**（非 App 环境、或桥被清理），所以先查再调 ——
+			 *   直接调会抛 `TypeError: Cannot read properties of undefined`。
+			 */
+			const refresh = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.bubbleState !== "function") {
+					setState({ phase: "ready", enabled: false, granted: false, noBridge: true });
+					return;
+				}
+				try {
+					// 桥返回的是 JSON 字符串（@JavascriptInterface 只支持基本类型与 String）。
+					const raw = bridge.bubbleState();
+					const o = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+					setState({ phase: "ready", enabled: !!o.enabled, granted: !!o.granted, noBridge: false });
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 读取气泡状态失败:", e && e.message);
+					setState({ phase: "ready", enabled: false, granted: false, noBridge: true });
+				}
+			}, []);
+
+			React.useEffect(() => { refresh(); }, [refresh]);
+
+			/**
+			 * 从系统设置页回来后刷新。
+			 *
+			 * ⚠️ 授权是**在别的界面**完成的，本页拿不到任何回调。只能监听
+			 *   `visibilitychange`（用户切回来时触发）。不加这个的话，用户授完权
+			 *   回来看到的还是「未授权」，会以为没生效。
+			 */
+			React.useEffect(() => {
+				const onVisible = () => { if (!document.hidden) refresh(); };
+				document.addEventListener("visibilitychange", onVisible);
+				window.addEventListener("focus", onVisible);
+				return () => {
+					document.removeEventListener("visibilitychange", onVisible);
+					window.removeEventListener("focus", onVisible);
+				};
+			}, [refresh]);
+
+			const toggle = () => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.bubbleSetEnabled !== "function") return;
+				try {
+					bridge.bubbleSetEnabled(!state.enabled);
+					// 乐观更新：桥是同步的，但立刻重读一次更可靠（也顺带验证写入生效）。
+					refresh();
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 切换气泡失败:", e && e.message);
+				}
+			};
+
+			const grant = () => {
+				const bridge = window.DSHAndroid;
+				if (bridge && typeof bridge.bubbleRequestOverlay === "function") {
+					try { bridge.bubbleRequestOverlay(); } catch (e) { /* 下面统一提示 */ }
+				}
+			};
+
+			if (state.phase === "loading") {
+				return React.createElement("div", { style: S.section },
+					React.createElement("h2", { style: S.heading }, t("title")),
+					React.createElement("p", { style: S.intro }, t("statusUnknown")),
+				);
+			}
+
+			const noBridge = state.noBridge;
+			const ready = state.enabled && state.granted;
+			const tone = ready ? MP_PRIV_TONE.on : MP_PRIV_TONE.off;
+			const badgeText = ready ? t("statusOn") : t("statusOff");
+
+			// 「下一步」按状态级联挑一条 —— 与特权权限分节同一套思路：
+			// 不让用户自己从几行技术明细里翻译出该做什么。
+			let nextText = t("nextAllGood");
+			let nextBtn = null;
+			if (noBridge) {
+				nextText = t("noBridge");
+			} else if (!state.granted) {
+				nextText = t("nextNeedPerm");
+				nextBtn = React.createElement("button", { style: S.btnPrimary, onClick: grant }, t("grant"));
+			} else if (!state.enabled) {
+				nextText = t("nextNeedEnable");
+				nextBtn = React.createElement("button", { style: S.btnPrimary, onClick: toggle }, t("enable"));
+			} else {
+				nextBtn = React.createElement("button", { style: S.btnQuiet, onClick: toggle }, t("disable"));
+			}
+
+			const dot = (ok) => React.createElement("span", {
+				style: { ...S.dot, background: ok ? MP_PRIV_TONE.on.color : MP_PRIV_TONE.off.color },
+			});
+			const row = (label, ok, value) => React.createElement("div", { style: S.row, key: label },
+				dot(ok),
+				React.createElement("span", { style: S.rowLabel }, label),
+				React.createElement("span", { style: S.rowValue }, value),
+			);
+
+			return React.createElement("div", { style: S.section },
+				React.createElement("h2", { style: S.heading }, t("title")),
+				React.createElement("p", { style: S.intro }, t("intro")),
+
+				React.createElement("div", { style: S.card },
+					React.createElement("div", { style: S.cardHead },
+						React.createElement("h3", { style: S.cardTitle }, t("statusTitle")),
+						React.createElement("span", {
+							style: { ...S.badge, color: tone.color, background: tone.bg },
+						}, badgeText),
+					),
+					React.createElement("div", { style: S.next },
+						React.createElement("span", { style: S.nextText }, nextText),
+						nextBtn ? React.createElement("div", { style: S.actions }, nextBtn) : null,
+					),
+					React.createElement("div", { style: S.actions },
+						React.createElement("button", { style: S.btn, onClick: refresh }, t("recheck")),
+						React.createElement("button", {
+							style: S.btnQuiet,
+							onClick: () => setShowDetails((v) => !v),
+						}, showDetails ? t("hideDetails") : t("showDetails")),
+					),
+					showDetails ? React.createElement("div", { style: S.details },
+						row(t("rowSwitch"), state.enabled, state.enabled ? t("on") : t("off")),
+						row(t("rowPerm"), state.granted, state.granted ? t("granted") : t("notGranted")),
+					) : null,
+				),
+
+				React.createElement("details", { style: S.fold },
+					React.createElement("summary", { style: S.foldHead }, t("howTitle")),
+					React.createElement("div", { style: S.foldBody },
+						React.createElement("ul", { style: S.notes },
+							[t("how1"), t("how2"), t("how3"), t("how4")].map((line, i) =>
+								React.createElement("li", { style: S.note, key: i }, line)),
+						),
+					),
+				),
+
+				React.createElement("details", { style: S.fold },
+					React.createElement("summary", { style: S.foldHead }, t("notesTitle")),
+					React.createElement("div", { style: S.foldBody },
+						React.createElement("ul", { style: S.notes },
+							[t("note1"), t("note2"), t("note3")].map((line, i) =>
+								React.createElement("li", { style: S.note, key: i }, line)),
+						),
+					),
+				),
+			);
+		}
+
+		/**
+		 * 把「悬浮气泡」注册进设置页一级导航。
+		 *
+		 * 与特权权限分节同一套接缝（`settings.section`），所以不需要碰导航 DOM。
+		 *
+		 * @param {object} ctx - 浏览器插件上下文。
+		 */
+		function mpRegisterBubbleSection(ctx) {
+			if (mpPrivReact === null) {
+				try { mpPrivReact = require("react"); } catch (e) {
+					console.warn("[dsh-android-mobile] require('react') 失败，跳过悬浮气泡分节:", e && e.message);
+					mpPrivReact = null;
+				}
+			}
+			if (!mpPrivReact) return;
+			try {
+				ctx.inject(["slots", "locale"], (scope) => {
+					// ⚠️ 必须用 `scope` 上的服务（原因见 mpRegisterPrivilegedSection 的注释）。
+					const t = scope.locale.bind(MP_BUBBLE_NS);
+					scope.effect(
+						() => scope.locale.register(MP_BUBBLE_NS, { zh: MP_BUBBLE_ZH, en: MP_BUBBLE_EN }),
+						"dsh-android-mobile: 悬浮气泡字典",
+					);
+					scope.slots.inject("settings.section", () => scope.slots.register({
+						name: "settings.section",
+						id: "dsh-android-bubble",
+						// 紧跟在「特权权限」（25）之后。
+						order: 26,
+						label: () => t("nav"),
+						locale: MP_BUBBLE_NS,
+					}, mpBubbleSection));
+				});
+			} catch (e) {
+				console.warn("[dsh-android-mobile] 注册悬浮气泡分节失败:", e && (e.stack || e.message || e));
+			}
+		}
+
 		function apply(ctx) {
 			mpCtx = ctx;
 			mpSessionsCache = ctx.get("sessions") ?? null;
 			mpRegisterPrivilegedSection(ctx);
+			mpRegisterBubbleSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */
 			injectStyles();

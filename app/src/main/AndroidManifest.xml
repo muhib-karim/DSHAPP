@@ -15,6 +15,19 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!--
+        悬浮气泡（设备自动化时 App 退到后台仍能看到 AI 在干什么、并能继续对话）。
+
+        ⚠️ 这是**特殊权限**，不能靠运行时请求拿到：必须由用户在系统设置里手动开
+        「显示在其他应用上层」。`Settings.canDrawOverlays()` 只读，授权动作只能
+        引导用户去 `ACTION_MANAGE_OVERLAY_PERMISSION`。侧载也绕不过去。
+
+        没授权时气泡整个不显示（`WindowManager.addView` 抛
+        `BadTokenException: permission denied for window type 2038`），
+        所以设置页那张引导卡是必需品。见 FloatingBubble.kt。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!--
         外部存储读写。用途只有一个：让 **app 身份** 能读 uid 2000（`shell` 工具）
         写进 /sdcard 的文件。
 

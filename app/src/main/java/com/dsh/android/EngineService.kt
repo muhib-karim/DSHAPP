@@ -165,6 +165,14 @@ class EngineService : Service() {
         }
 
         /**
+         * 最近一次状态快照；null 表示页面还没上报过。
+         *
+         * 给悬浮气泡用：气泡是在 App 退到后台之后才创建的，创建那一刻拿不到
+         * "上一次推送"（推的时候它还不存在），所以必须能主动拉一次当前值。
+         */
+        fun currentStatus(): EngineStatus? = lastStatus
+
+        /**
          * 用 WebView 上报的状态刷新通知。
          *
          * 由 `MainActivity` 的 JS 桥调用，**运行在 WebView 的 JS 线程**上，
@@ -178,6 +186,9 @@ class EngineService : Service() {
             //   主题切换时通知内容一个字都没变，不该因此白发一次通知。
             if (lastStatus?.copy(bg = "") == status.copy(bg = "")) return
             lastStatus = status
+            // 顺带喂给悬浮气泡。**放在去重之后**：气泡和通知一样只需要变化时刷新，
+            // 而且气泡自己会在展开时主动拉一次当前状态，不怕错过。
+            FloatingBubble.onStatus(status)
             val nm = NotificationManagerCompat.from(context)
             if (!nm.areNotificationsEnabled()) return
             try {

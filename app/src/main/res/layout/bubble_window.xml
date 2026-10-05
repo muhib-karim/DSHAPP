@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  悬浮气泡的根布局。两种形态共用一个 View，靠 visibility 切换：
+
+    · circle  —— 收起态：56dp 圆形按钮，显示一个状态圆点
+    · panel   —— 展开态：300dp 宽的面板，含动作标题 / 输出正文 / 输入框
+
+  ⚠️ 用 FrameLayout 而不是 ViewAnimator：切换靠手写 alpha+scale 动画
+     （ViewAnimator 的默认动画不可控，且会在拖动时抖动）。
+
+  ⚠️ 根布局**不能**设 clickable=true：那会把触摸事件全吃掉，
+     拖动逻辑（FloatingBubble 的 onTouchListener）就再也收不到 DOWN 了。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content">
+
+    <!-- ══ 收起态：圆形气泡 ══ -->
+    <FrameLayout
+        android:id="@+id/bubbleCircle"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:background="@drawable/bubble_circle_bg"
+        android:elevation="8dp">
+
+        <!--
+          状态指示点：在跑=实心绿，空闲=空心灰。
+          ⚠️ 用 View 而不是 ImageView：一个圆点不值得进 drawable 资源，
+             setBackground 一个 GradientDrawable 就够，且能动态改色。
+        -->
+        <View
+            android:id="@+id/bubbleDot"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:layout_gravity="center" />
+    </FrameLayout>
+
+    <!-- ══ 展开态：交互面板 ══ -->
+    <LinearLayout
+        android:id="@+id/bubblePanel"
+        android:layout_width="300dp"
+        android:layout_height="wrap_content"
+        android:background="@drawable/bubble_panel_bg"
+        android:elevation="8dp"
+        android:orientation="vertical"
+        android:padding="14dp"
+        android:visibility="gone">
+
+        <!-- 顶行：状态点 + 当前动作 + 回到 App -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <View
+                android:id="@+id/panelDot"
+                android:layout_width="8dp"
+                android:layout_height="8dp"
+                android:layout_marginEnd="7dp" />
+
+            <TextView
+                android:id="@+id/panelAction"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="2"
+                android:text="空闲"
+                android:textColor="#1A1D21"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/panelOpenApp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:padding="6dp"
+                android:text="打开"
+                android:textColor="#3B6FE0"
+                android:textSize="12sp" />
+
+            <!--
+              收起按钮是**必需**的：展开态把圆形气泡换掉了，用户必须有明确的路
+              退回圆形。原先想用「长按面板收起」，但面板上装着 ScrollView 与
+              EditText，长按手势会被它们吃掉，试了不灵。
+            -->
+            <TextView
+                android:id="@+id/panelCollapse"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="2dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:padding="6dp"
+                android:text="收起"
+                android:textColor="#8A9099"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 会话标题：同时开多个会话时用来分辨是哪个在跑 -->
+        <TextView
+            android:id="@+id/panelTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="#8A9099"
+            android:textSize="11sp"
+            android:visibility="gone" />
+
+        <!--
+          输出正文：AI 最近的内容，可滚动。
+          ⚠️ 固定高度而不是 wrap_content：内容长度不受控，wrap 会让面板在流式
+             输出时不停长高/变矮，拖动时更是灾难。固定 132dp 约 6 行。
+        -->
+        <ScrollView
+            android:id="@+id/panelScroll"
+            android:layout_width="match_parent"
+            android:layout_height="132dp"
+            android:layout_marginTop="10dp"
+            android:background="#F7F8FA"
+            android:padding="9dp"
+            android:scrollbars="none">
+
+            <TextView
+                android:id="@+id/panelBody"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:lineSpacingExtra="3dp"
+                android:textColor="#3A4048"
+                android:textIsSelectable="true"
+                android:textSize="12.5sp" />
+        </ScrollView>
+
+        <!-- 输入行：输入框 + 发送 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="bottom"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/panelInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:background="@drawable/bubble_input_bg"
+                android:hint="发消息给 AI…"
+                android:importantForAutofill="no"
+                android:inputType="textMultiLine|textCapSentences"
+                android:maxLines="4"
+                android:minHeight="40dp"
+                android:paddingStart="12dp"
+                android:paddingTop="10dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="10dp"
+                android:textColor="#1A1D21"
+                android:textColorHint="#A0A6AE"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/panelSend"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bubble_send_bg"
+                android:gravity="center"
+                android:minWidth="56dp"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:text="发送"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>
