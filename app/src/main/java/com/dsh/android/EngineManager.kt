@@ -1577,6 +1577,11 @@ class EngineManager private constructor(private val context: Context) {
             appendLine("        models:")
             for (m in KEY_MODELS) {
                 appendLine("          - id: $m")
+                // 声明输入模态，否则默认 ["text"] ⇒ 图片在附加前就被拒（见 [KEY_MODEL_INPUT]）。
+                appendLine("            input:")
+                for (modality in KEY_MODEL_INPUT) {
+                    appendLine("              - $modality")
+                }
                 // ⚠️ 刻意**不声明** `off` 档，理由见 [KEY_EFFORT_LEVELS]。
                 appendLine("            reasoningEfforts:")
                 for (e in KEY_EFFORT_LEVELS) {
@@ -2614,6 +2619,43 @@ class EngineManager private constructor(private val context: Context) {
          * 保留全部 6 档是为了不挡用户，而不是因为选了真会想得更多。
          */
         private val KEY_EFFORT_LEVELS = listOf("minimal", "low", "medium", "high", "xhigh", "max")
+
+        /**
+         * 内置号池模型对外声明的**输入模态**（`input` 字段）。
+         *
+         * ## 为什么必须声明
+         *
+         * `dsh-llm-pi-ai` 的 `DEFAULT_INPUT = ["text"]`，且解析顺序是
+         *
+         * ```js
+         * input: declaredInput(entry.input) ?? base?.input ?? [...request.defaultInput]
+         * ```
+         *
+         * `agnes` 是自定义路由、pi-ai 内置目录里没有它 ⇒ `base` 不存在 ⇒
+         * 不声明就落到 `["text"]`。后果是**图片在附加前就被拒**：
+         * composer 里选好图、点发送，引擎报「该模型不接受图片输入」，
+         * 而 Agnes 本身是能识图的 —— 属于「能力被配置挡住」。
+         *
+         * ## 依据来自实测，不是照抄文档
+         *
+         * 拿真实 PNG（64×64 红底黄圆）走 OpenAI 兼容的 `image_url` 数据 URI
+         * 直连两家站点，**14 把密钥 14/14 都正确答出「红色、黄色」**，
+         * 且 `usage.prompt_tokens_details.image_tokens = 64` —— 图片确实进了模型
+         * 并按图计费，不是被忽略后靠文本猜的。
+         *
+         * ⚠️ 手搓的 base64 PNG 会被服务端判成
+         * `Could not decode image: broken data stream`（HTTP 400），
+         * 那是**图坏了**而不是不支持图片 —— 与 AGENTS.md ⑧ 记的 sharp 那条同一个坑。
+         * 看到这个 400 别急着下「不支持」的结论，换一张真图再测。
+         *
+         * ## ⚠️ over-claim 的代价（所以这里只声明实测过的能力）
+         *
+         * pi-ai 的注释写得很明确：少声明只是「附加前被拒、并指名模型」，
+         * 多声明则是「图进去了、供应商中途拒绝」，而那时消息**已经落盘**，
+         * 会话会卡在一条永远发不出去的请求上反复重试。
+         * 所以这个列表只放实测通过的模态，不要凭「多模态」这个词顺手加。
+         */
+        private val KEY_MODEL_INPUT = listOf("text", "image")
 
         /** ripgrep：官方 `@vscode/ripgrep` 没有 android 平台包，这里补一个。 */
         private const val RIPGREP_ASSET = "ripgrep-android-arm64.zip"
