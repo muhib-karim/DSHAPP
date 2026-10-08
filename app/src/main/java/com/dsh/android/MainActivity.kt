@@ -580,43 +580,6 @@ class MainActivity : AppCompatActivity() {
             if (!enabled) FloatingBubble.hideNow()
         }
 
-        // ══ 路由日志：设置页的调试入口 ══════════════════════════════════
-        //
-        // 号池每次请求随机抽一把钥匙，但**抽到了哪把从界面上完全看不出来** ——
-        // 用户没法确认轮换是否生效。这两条接口把它暴露出来：日志由
-        // `libkeyinject.so` 写、由 [EngineManager.readKeyInjectLog] 读。
-        //
-        // 走 JS 桥而不是宿主半的 HTTP 路由：日志在 App 私有目录里，而宿主半
-        // 那条路（`/api/dsh-android/*`）是为「需要 spawn 进程探测」的场景准备的，
-        // 读一个文件不需要。
-
-        /**
-         * 读路由日志。返回 JSON 字符串。
-         *
-         * ⚠️ 必须返回 String —— `@JavascriptInterface` 只支持基本类型和 String。
-         *
-         * 返回 `{ text, lines }`：`lines` 是行数，界面用它决定显示「还没有记录」
-         * 还是内容。
-         */
-        @android.webkit.JavascriptInterface
-        fun keyInjectLog(): String = try {
-            val text = EngineManager.get(this@MainActivity).readKeyInjectLog()
-            JSONObject()
-                .put("text", text)
-                .put("lines", if (text.isEmpty()) 0 else text.count { it == '\n' } + 1)
-                .toString()
-        } catch (t: Throwable) {
-            Log.w(DshApplication.TAG, "读取路由日志失败: ${t.message}")
-            """{"text":"","lines":0}"""
-        }
-
-        /** 清空路由日志（截断，不删文件 —— 理由见 `clearKeyInjectLog`）。 */
-        @android.webkit.JavascriptInterface
-        fun keyInjectLogClear() {
-            Log.i(DshApplication.TAG, "设置页清空路由日志")
-            EngineManager.get(this@MainActivity).clearKeyInjectLog()
-        }
-
         /**
          * 拉起系统的「显示在其他应用上层」授权页。
          *

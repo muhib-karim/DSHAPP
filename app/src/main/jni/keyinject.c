@@ -22,14 +22,13 @@
  * 加密之前那一刻才拼出来，写完立刻抹回去。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ## 四个 hook 的分工
+ * ## 三个 hook 的分工
  *
  * | hook | 做什么 |
  * |---|---|
  * | `SSL_set_alpn_protos` | 把 ALPN 列表**扣住**，等知道域名之后再设 |
  * | `SSL_ctrl`（SET_SNI） | 拿到域名 → 只对目标域名降级 `http/1.1` |
  * | `SSL_write` | **随机抽一把钥匙**换上；国内站的钥匙**顺带改写 Host 头**（两处都等长） |
- * | `SSL_read` | 看响应状态行，非 2xx 时记一行路由日志（不干预） |
  *
  * ─────────────────────────────────────────────────────────────────────
  * ## combo：把两个站点合成「一个供应商」
@@ -107,8 +106,7 @@
  *   · 单个钥匙的速率被摊薄到 1/14，**撞 429 的概率显著下降**；
  *   · 不再需要「失败才换」那套退避逻辑 —— 下一个请求本来就会换一把。
  *
- * ⚠️ **抽到哪把是每个请求独立的**，不维护「当前是哪把」的概念。缓存
- * （`cur_key_slot`）只是「这个槽位解过了」的 memo，不是「当前钥匙」。
+ * ⚠️ **抽到哪把是每个请求独立的**，不维护「当前是哪把」的概念。
  *
  * ⚠️ **随机源用 `arc4random_uniform` 而不是 `rand()`**：后者要 `srand()` 播种，
  * 而本库在 `LD_PRELOAD` 里没有可靠的初始化时机（构造函数里播种还会与调用方的
@@ -117,25 +115,6 @@
  * ⚠️ **不重试当前请求**：密钥是在 `SSL_write` 里换的，请求字节已经发出去了，
  * 401 的响应回来时改不了这一次。引擎自己的 `retryPolicy` 会重发失败请求，
  * 重发时抽到的是新的一把 —— 那才是恢复路径。
- *
- * ─────────────────────────────────────────────────────────────────────
- * ## 路由日志（排查用，可关）
- *
- * 每次真正换了钥匙，就往 `DSH_KEYINJECT_LOG` 指向的文件追加一行：
- *
- *     <时间戳> INTL idx=3
- *
- * 用来回答「轮换到底有没有生效」—— 光看界面是看不出来的。
- *
- * ⚠️ **只记站点与下标，绝不记密钥本身**：日志会被用户看到（App 设置页里就有
- * 入口），把密钥写进去等于把整个方案的目的抹掉。下标是「第几把」，不是密钥。
- *
- * ⚠️ 写日志用 `O_APPEND` + 单次 `write`，不做缓冲 —— 多线程并发时 `O_APPEND`
- * 由内核保证「偏移 + 写」是原子的，所以行不会互相穿插。
- *
- * ⚠️ 日志有上限（`KI_LOG_MAX_BYTES`）：到顶就**停止写**（不轮转、不截断）。
- * 轮转要 `rename`，而 App 侧可能正在读这个文件；截断要重写，都会让读取方看到
- * 半个文件。停止写最安全，且此时信息量早已足够。
  *
  * ─────────────────────────────────────────────────────────────────────
  * ## 密钥怎么存
@@ -170,12 +149,10 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "keyinject-keys.h"
@@ -227,13 +204,6 @@ _Static_assert(sizeof KI_HOST_CN - 1 == KI_HOST_LEN,
 #define POOL_COUNT (KI_INTL_COUNT + KI_CN_COUNT)
 
 /**
- * 路由日志的写入上限。到顶就**停止写**（不轮转、不截断，理由见文件头）。
- *
- * 256 KB 够记约 4000 条 —— 远超「确认轮换生效」所需。
- */
-#define KI_LOG_MAX_BYTES (256 * 1024)
-
-/**
  * 第 slot 把钥匙属于哪个站点、是对应表里的第几个。
  *
  * **交错**排列（偶数位国际站、奇数位国内站）。
@@ -252,23 +222,11 @@ static void keyref_at(int slot, int *site, int *idx) {
 /** 每个 SSL 对象是否属于目标域名（0 = 不干预）。 */
 static SSL *slot_ssl[MAX_SSL_SLOTS];
 static int slot_target[MAX_SSL_SLOTS];
-/**
- * 这个连接上一次实际用的是池子里第几把 —— **只给 SSL_read 记日志用**，
- * 不参与选钥匙（选钥匙是每请求独立随机的，见文件头）。
- */
-static int slot_keyref[MAX_SSL_SLOTS];
 /** 被扣住的 ALPN 列表，等 SNI 到达再设。 */
 static unsigned char slot_alpn[MAX_SSL_SLOTS][128];
 static unsigned int slot_len[MAX_SSL_SLOTS];
 
-/* ── 路由日志（`DSH_KEYINJECT_LOG`，只在排查时开） ─────────────────────── */
-
-static int log_fd = -1;
-static long log_written;
-static int log_disabled;   /* 达到上限、或写失败过，之后不再尝试 */
-
 static int (*real_SSL_write)(SSL *, const void *, int);
-static int (*real_SSL_read)(SSL *, void *, int);
 static int (*real_SSL_set_alpn_protos)(SSL *, const unsigned char *, unsigned int);
 static int (*real_SSL_ctrl)(SSL *, int, long, void *);
 
@@ -313,43 +271,10 @@ static void derive_key(int site, int idx, char *out) {
     out[KI_KEY_LEN] = '\0';
 }
 
-/**
- * 往路由日志追加一行（`<时间戳> <站点> idx=<下标>`）。
- *
- * ⚠️ **只记站点与下标，绝不记密钥本身** —— 这个文件 App 设置页里就能看，
- * 把密钥写进去等于把整个方案的目的抹掉。
- *
- * ⚠️ 打开失败 / 写到上限 / 写失败 ⇒ 置 `log_disabled` 之后不再尝试。日志是
- * 排查用的旁路，**绝不能因为它拖慢或干扰正常的请求路径**。
- */
-static void route_log(const char *site, int idx) {
-    if (log_disabled || log_fd < 0) return;
-    if (log_written >= KI_LOG_MAX_BYTES) {
-        log_disabled = 1;
-        return;
-    }
-    char line[80];
-    time_t now = time(NULL);
-    struct tm tm;
-    if (localtime_r(&now, &tm) == NULL) memset(&tm, 0, sizeof tm);
-    int n = snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d:%02d %s idx=%d\n",
-                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                     tm.tm_hour, tm.tm_min, tm.tm_sec, site, idx);
-    if (n <= 0) return;
-    /* O_APPEND 保证「定位 + 写」原子，多线程并发也不会互相穿插。 */
-    ssize_t w = write(log_fd, line, (size_t)n);
-    if (w != n) {
-        log_disabled = 1;   /* 磁盘满之类 —— 之后不再试，免得每次请求都白跑一次 */
-        return;
-    }
-    log_written += n;
-}
-
 static void init_once(void) {
     if (inited) return;
     inited = 1;
     real_SSL_write = (int (*)(SSL *, const void *, int))dlsym(RTLD_NEXT, "SSL_write");
-    real_SSL_read = (int (*)(SSL *, void *, int))dlsym(RTLD_NEXT, "SSL_read");
     real_SSL_set_alpn_protos =
         (int (*)(SSL *, const unsigned char *, unsigned int))dlsym(RTLD_NEXT, "SSL_set_alpn_protos");
     real_SSL_ctrl = (int (*)(SSL *, int, long, void *))dlsym(RTLD_NEXT, "SSL_ctrl");
@@ -359,12 +284,6 @@ static void init_once(void) {
     if (off != NULL && off[0] == '1') inject_enabled = 0;
     const char *dbgv = getenv("DSH_KEYINJECT_DEBUG");
     if (dbgv != NULL && dbgv[0] == '1') debug_on = 1;
-    /* 路由日志：路径由 App 通过环境变量给出（App 私有目录，别的进程读不到）。 */
-    const char *logpath = getenv("DSH_KEYINJECT_LOG");
-    if (logpath != NULL && logpath[0] != '\0') {
-        log_fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (log_fd < 0) log_disabled = 1;
-    }
 }
 
 /** 找出 ssl 的槽位，没有就分配一个。返回 -1 表示槽位耗尽。 */
@@ -376,7 +295,6 @@ static int slot_of(SSL *ssl) {
         if (slot_ssl[i] == NULL) {
             slot_ssl[i] = ssl;
             slot_target[i] = 0;
-            slot_keyref[i] = 0;
             return i;
         }
     }
@@ -476,13 +394,11 @@ int SSL_write(SSL *ssl, const void *buf, int num) {
                  * 钥匙、B 线程立刻把它覆盖成国内站的」—— 于是 A 拿着国际站密钥去
                  * 打国内站域名，稳定 401。栈上 52 字节，代价可忽略。 */
                 derive_key(site, idx, key);
-                slot_keyref[i] = slot;
-                const char *site_name = (site == SITE_INTL) ? "INTL" : "CN";
-                route_log(site_name, idx);
                 if (debug_on) {
                     /* 只打站点与下标，不打密钥本身 —— 调试日志不该成为泄露面。 */
                     char m[64];
-                    snprintf(m, sizeof m, "%s idx=%d", site_name, idx);
+                    snprintf(m, sizeof m, "%s idx=%d",
+                             (site == SITE_INTL) ? "INTL" : "CN", idx);
                     dbg("use", m);
                 }
                 hit = (char *)found;
@@ -520,41 +436,6 @@ int SSL_write(SSL *ssl, const void *buf, int num) {
     if (host_hit != NULL) {
         memcpy(host_hit, host_original, KI_HOST_LEN);
         memset(host_original, 0, sizeof host_original);
-    }
-    return rc;
-}
-
-/* ── hook 4：看响应状态行，只观测不干预 ──────────────────────────────── */
-
-int SSL_read(SSL *ssl, void *buf, int num) {
-    init_once();
-    if (real_SSL_read == NULL) return -1;
-
-    int rc = real_SSL_read(ssl, buf, num);
-
-    /* 密钥是**每请求随机抽**的，所以这里**不再轮换** —— 没有「当前钥匙」这个
-     * 状态需要推进，下一个请求本来就会换一把。
-     *
-     * 保留这段只为排查：把 401/429 这类失败记进路由日志，用户就能对照
-     * 「上一次用的哪把钥匙」判断是「配额用尽」还是「钥匙本身失效」。
-     *
-     * "HTTP/1.1 " 是 9 字节，状态码从下标 9 开始。只在响应**开头**判断：
-     * 分片的后段不会以状态行开头，body 里出现该前缀的概率也极低。误判的后果
-     * 仅仅是日志里多一行，不影响任何行为。 */
-    if (inject_enabled && rc >= 12 && buf != NULL && memcmp(buf, "HTTP/1.1 ", 9) == 0) {
-        const char *code = (const char *)buf + 9;
-        int auth_fail = (code[0] == '4' && code[1] == '0' && code[2] == '1');
-        int throttled = (code[0] == '4' && code[1] == '2' && code[2] == '9');
-        if ((auth_fail || throttled) && !log_disabled && log_fd >= 0) {
-            int i = slot_of(ssl);
-            /* 记的是「这条连接上一次实际用的那把」—— 每条连接是串行复用的，
-             * 所以这个对应关系成立，用户能对照上一行日志定位是哪把钥匙出的问题。 */
-            if (i >= 0 && slot_target[i]) {
-                int site, idx;
-                keyref_at(slot_keyref[i], &site, &idx);
-                route_log(auth_fail ? "FAIL-401" : "FAIL-429", idx);
-            }
-        }
     }
     return rc;
 }

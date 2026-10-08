@@ -603,7 +603,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-37`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-38`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -1875,14 +1875,13 @@ resolveWebPort()?.let { port -> add("--port"); add(port.toString()) }
 **追加**进 `LD_PRELOAD`（与 linkcompat 并存），并把 `AGNES_CREDENTIAL`
 环境变量设成**占位符**。
 
-#### 四个 hook 的分工
+#### 三个 hook 的分工
 
 | hook | 做什么 |
 |---|---|
 | `SSL_set_alpn_protos` | 把 ALPN 列表**扣住**，等知道域名之后再设 |
 | `SSL_ctrl`（SET_SNI） | 拿到域名 → 判断是不是目标域名，是才降级 `http/1.1` |
 | `SSL_write` | **每个请求随机抽一把**钥匙；**国内站的钥匙顺带改写 Host 头**（两处都等长）→ 写完**立刻还原** |
-| `SSL_read` | 看响应状态行，`401`/`429` 时往路由日志记一行（**只观测，不干预**） |
 
 #### combo：两个站点，一个供应商
 
@@ -1962,38 +1961,12 @@ node 的连接池**跨线程调用**，而随机化之后两个并发请求抽�
 **401 无法「就地重试」**：响应已经发完，字节改不了。引擎自己的 `retryPolicy`
 会重发失败请求，重发时自然重新抽一把。
 
-#### 路由日志（排查用，可随时关掉）
-
-「抽到哪把」从界面上完全看不出来，所以本库可以往一个文件里追加一行：
-
-```
-2026-10-08 08:26:11 INTL idx=3
-2026-10-08 08:26:12 CN idx=0
-2026-10-08 08:26:12 FAIL-401 idx=5
-```
-
-- 路径由环境变量 **`DSH_KEYINJECT_LOG`** 给出，由 `EngineManager.start()` 传
-  （`$DSH_HOME/keyinject-route.log`，App 私有目录、`0600`）。
-- **只记站点与下标，绝不记密钥本身** —— 这个文件在设置页「路由日志」分节里
-  用户直接能看到，写进密钥等于把整个方案的目的抹掉。
-- ⚠️ 环境变量名**不能含 `KEY`/`PASSWORD`/`SECRET`/`TOKEN`**：`dsh-subprocess`
-  的 `scrubbedParentEnv()` 会按这几个词剥变量。另外 `DSH_` 前缀的变量只会被
-  **引擎 spawn 的子进程**剥掉，而 TLS 发生在引擎主进程里，所以不受影响。
-- 写入用 `O_APPEND` + 单次 `write`（原子，多线程并发不会互相穿插）。
-- 上限 **256 KB**，到顶就停止记录（`log_disabled`）。**不轮转、不截断** ——
-  轮转要 `rename`、截断要重写，两者都可能让读的一方看到半个文件。
-- 任何失败（打不开、写不动）都置 `log_disabled`，**绝不让日志拖慢请求路径**。
-- ⚠️ 设置页的「清空」按钮走**截断**（`O_TRUNC`）而不是删文件：本库持有的是
-  `open()` 得到的 fd，删掉再新建的话它仍往那个已被 unlink 的 inode 里写，
-  用户会看到「清空了，但新日志再也不出现」。
-
-**关掉它**：删掉 `EngineManager.start()` 里 `put(KEYINJECT_LOG_ENV, …)` 那一行，
-并把 `MainActivity` 的 `keyInjectLog` / `keyInjectLogClear` 桥接口、
-`client.js` 的 `dsh-android-route-log` 分节一并移除。
-
-⚠️ 打开调试日志（`DSH_KEYINJECT_DEBUG=1`）打的是**同一份信息**（`use CN idx=0`），
-区别只在于它走 stderr、需要 `adb logcat` 才能看 —— 路由日志是为了让用户
-**在 App 里自己看**，不必接电脑。
+⚠️ 排查「抽到哪把」只能靠 `DSH_KEYINJECT_DEBUG=1`（打 `use CN idx=0` 到 stderr，
+用 `adb logcat` 看）。**曾经**为此做过一套写文件的「路由日志」+ 设置页分节，
+调试完之后**已经整套删掉** —— 不要再加回来。删掉的东西包括：本库里的
+`route_log` / `DSH_KEYINJECT_LOG` / `SSL_read` hook、`EngineManager` 的
+`readKeyInjectLog` / `clearKeyInjectLog`、`MainActivity` 的两个桥接口、
+`client.js` 的 `dsh-android-route-log` 分节。
 
 #### ⚠️ 必须降级 HTTP/1.1 —— 这是本方案最反直觉的一点
 
@@ -2067,15 +2040,13 @@ ALPN 列表、等 SNI 到达再决定是否降级。
 | `已写入内置号池 overlay: keyinject.patch.yml` | overlay 已生成 |
 | 设备上的 overlay 内容 | **单** provider `agnes`、`displayName: 'Agnes'`、baseURL 是 apihub、**只有 `agnes-3.0-flash` 一个模型** |
 | 引擎启动 | `引擎就绪` + `WebView 加载完成` |
-| `已安装移动端 UI 插件 dsh-android-mobile 1.0.0-37` | 带「路由日志」分节的插件已解包 |
+| `已安装移动端 UI 插件 dsh-android-mobile 1.0.0-38` | 已去掉「路由日志」分节的插件已解包 |
 
 ⚠️ **下面这些要人工确认**（GUI 观感与真实对话，离线探针测不到）：
 
 1. 主界面模型选择器里**只有一个「Agnes」分组**，下面**只有 `agnes-3.0-flash`**。
 2. 选它发一条消息，能正常回复（证明 combo 在真机上把钥匙与 Host 配对了）。
-3. 设置 → 高级 → **「路由日志」**：发几条消息后回来点「刷新」，应看到多行
-   `<时间戳> INTL idx=N` / `<时间戳> CN idx=N`，且**站点与 idx 每行都在变**
-   （随机抽取生效）。看到 `FAIL-401`/`FAIL-429` 说明那一次被拒了，引擎会重发。
+3. 设置 → 高级 里**不应再有「路由日志」分节**（那套东西已随调试一起删掉）。
 
 体积代价：`keyinject.bin` 12,576 字节 —— 对 132.8 MB 的发行包约 0.01%，可忽略。
 真正的代价是维护面（一个原生组件、一条 `LD_PRELOAD`、一个启动顺序依赖，

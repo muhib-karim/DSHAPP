@@ -1485,47 +1485,6 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
-     * 读路由日志（最近 [maxLines] 行，最新的在最后）。
-     *
-     * 给设置页的「路由日志」分节用 —— 它是唯一能回答「每次请求到底用了哪把钥匙」
-     * 的地方。文件不存在（还没发过请求 / 没内置号池）时返回空串，不是错误。
-     *
-     * ⚠️ 日志里**没有密钥**，只有站点与下标（见 `keyinject.c` 的 `route_log`）。
-     *
-     * 只读尾部：文件上限 256 KB，全读进内存没必要。
-     */
-    fun readKeyInjectLog(maxLines: Int = 200): String {
-        val f = File(dshHome, KEYINJECT_LOG_FILE)
-        if (!f.isFile) return ""
-        return try {
-            val lines = f.readLines()
-            val tail = if (lines.size <= maxLines) lines else lines.subList(lines.size - maxLines, lines.size)
-            tail.joinToString("\n")
-        } catch (t: Throwable) {
-            Log.w(TAG, "读取路由日志失败: ${t.message}")
-            ""
-        }
-    }
-
-    /**
-     * 清空路由日志（设置页的「清空」按钮）。
-     *
-     * ⚠️ 用**截断**而不是删除：`keyinject.c` 持有的是 `open()` 得到的 fd，
-     * 删掉文件再新建的话，注入库仍然往那个已被 unlink 的 inode 里写 ——
-     * 用户会看到「清空了，但新日志再也不出现」。截断（`O_TRUNC`）保留 inode，
-     * fd 继续有效。
-     */
-    fun clearKeyInjectLog() {
-        val f = File(dshHome, KEYINJECT_LOG_FILE)
-        try {
-            if (f.isFile) f.writeText("")
-            Log.i(TAG, "已清空路由日志")
-        } catch (t: Throwable) {
-            Log.w(TAG, "清空路由日志失败: ${t.message}")
-        }
-    }
-
-    /**
      * 解出 uid 2000 执行通道（`dsh-android-shell.mjs`，每次启动覆盖写）。
      *
      * 该脚本直连本机 adbd（`127.0.0.1:5555`）走 ADB 协议认证，从而以 shell
@@ -2107,9 +2066,6 @@ class EngineManager private constructor(private val context: Context) {
             // libkeyinject.so 换上。所以这里泄露出去也无所谓 —— 这正是设计意图。
             if (keyInject != null) {
                 put(KEY_ENV, KEY_PLACEHOLDER)
-                // 路由日志：每次换钥匙追加一行「站点 + 第几把」。
-                // 路径给绝对路径（注入库在 node 进程里跑，工作目录不固定）。
-                put(KEYINJECT_LOG_ENV, File(dshHome, KEYINJECT_LOG_FILE).absolutePath)
             }
             // 沙箱 runner 靠它定位 LD_PRELOAD 拦截器。runner 会把它追加到子进程
             // 的 LD_PRELOAD 里（保留这里已有的 link 兼容层，两个库都生效）。
@@ -2408,29 +2364,6 @@ class EngineManager private constructor(private val context: Context) {
         private const val KEYINJECT_PATCH = "keyinject.patch.yml"
 
         /**
-         * 路由日志文件名（落在 `$DSH_HOME` 下）。
-         *
-         * `keyinject.c` 每次换钥匙都往它追加一行「站点 + 第几把」，用来回答
-         * 「轮换到底有没有生效」—— 光看界面看不出来。设置页里有个入口能看。
-         *
-         * ⚠️ **日志里没有密钥**，只有站点与下标。这一点是刻意的：这个文件用户
-         * 能看到，写进密钥等于把整个方案的目的抹掉。
-         */
-        private const val KEYINJECT_LOG_FILE = "keyinject-route.log"
-
-        /**
-         * 传给注入库的日志路径环境变量名。
-         *
-         * ⚠️ 名字不能带 `KEY`/`TOKEN`/`SECRET` 这类词：`dsh-subprocess` 的
-         * `scrubbedParentEnv()` 会把匹配 `/KEY|PASSWORD|SECRET|TOKEN/i` 的变量
-         * 连同所有 `DSH_*` 一起剥掉（本库要读它的正是被 spawn 的子进程）。
-         * `DSH_KEYINJECT_LOG` 两个条件都不满足 —— `DSH_` 前缀是给**我们自己**
-         * 的库读的，剥掉它的只有引擎自己 spawn 的子进程，而 TLS 只发生在引擎
-         * 主进程里，不受影响。见 `keyinject.c` 的 `init_once()`。
-         */
-        private const val KEYINJECT_LOG_ENV = "DSH_KEYINJECT_LOG"
-
-        /**
          * 引擎配置里的匿名占位符。
          *
          * ⚠️ **必须与 `keyinject.c` 的 `KI_PLACEHOLDER` 逐字一致**，长度也必须等于
@@ -2555,7 +2488,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-37"
+        private const val MOBILE_UI_VERSION = "1.0.0-38"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
