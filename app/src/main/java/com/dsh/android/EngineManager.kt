@@ -1577,6 +1577,11 @@ class EngineManager private constructor(private val context: Context) {
             appendLine("        models:")
             for (m in KEY_MODELS) {
                 appendLine("          - id: $m")
+                // ⚠️ 刻意**不声明** `off` 档，理由见 [KEY_EFFORT_LEVELS]。
+                appendLine("            reasoningEfforts:")
+                for (e in KEY_EFFORT_LEVELS) {
+                    appendLine("              '$e': $e")
+                }
             }
         }
         return try {
@@ -2549,6 +2554,66 @@ class EngineManager private constructor(private val context: Context) {
          * 那些模型。要放开时在这里加一行即可。
          */
         private val KEY_MODELS = listOf("agnes-3.0-flash")
+
+        /**
+         * 内置号池模型对外声明的思考强度档位（`reasoningEfforts` 的键）。
+         *
+         * ## 为什么必须声明
+         *
+         * 不声明时 `dsh-llm-pi-ai` 的 `resolveModelReasoning()` 走
+         * `base?.reasoning ?? false`，而 `agnes` 是自定义路由、pi-ai 内置目录里
+         * 没有它，于是 `reasoning` 落到 **false**；`openai-completions` 的两个
+         * 分支都要求 `model.reasoning`，**请求里根本不会带 `reasoning_effort`**。
+         * Agnes 不传该参数就不返回 `reasoning_content` —— 界面上「思考过程」永远
+         * 是空的。声明之后引擎才会带上它，思考内容才会流回来。
+         *
+         * ## 合法值来自实测，不是抄文档
+         *
+         * 给 `reasoning_effort: 'off'` 时 Agnes 直接 400，报错原文把合法集合列全了：
+         *
+         * ```
+         * Input should be 'none', 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max'
+         * ```
+         *
+         * ## ⚠️⚠️ 为什么这里**刻意不声明 `off` 档**
+         *
+         * 这是踩过的坑，改回去会让「思考混进正文」重现，务必读完再动。
+         *
+         * 发送侧是**硬编码**的（`dsh-llm-pi-ai` 的 `streamSimple`）：
+         *
+         * ```js
+         * const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+         * ```
+         *
+         * 也就是说**只要档位是 `off`，引擎就不发 `reasoning_effort`** —— 无论
+         * overlay 里把 `off` 映射成什么（`null` 也一样）都改变不了这一点。
+         * 而 Agnes 收不到「已关闭」这个信号时，会**把思考直接写进 `content`**
+         * （实测 7 次里中 1 次，且内容是第一人称英文推理，例如
+         * "The existing file is just a minimal placeholder…"），
+         * 于是界面上思考内容就出现在正文里，而不是 thinking 块里。
+         *
+         * 更要命的是 `off` **一旦写进 `reasoningEfforts` 反而会变成可选档**：
+         *
+         * | overlay 里 | `thinkingLevelMap['off']` | `getSupportedThinkingLevels()` |
+         * |---|---|---|
+         * | 不写 `off` 键 | `null`（`wire === void 0` 分支） | `mapped === null` ⇒ **不可选** ✅ |
+         * | 写 `'off': null` | `undefined`（`wire !== null` 跳过赋值） | 不为 null ⇒ **可选** ❌ |
+         *
+         * 所以唯一可靠的修法是**整档不声明**：off 从选择器里消失，
+         * `clampThinkingLevel()` 把默认档落到 `minimal`，而 `minimal` 实测
+         * **7/7 都走 `reasoning_content`**，思考正确进 thinking 块。
+         *
+         * ⚠️ 也别想用 `none` 顶替 `off`：`none` 同样不产生思考，但它会被真的发出去，
+         * 与「不发字段」不是同一条路径，且实测出现过指令复述混进 `content` 的情况。
+         *
+         * ## ⚠️ 实测：这 6 档没有强度梯度
+         *
+         * 同一道推理题反复测，思考长度在 minimal=479 / low=1593 / medium=589 /
+         * high=877 / xhigh=923 / max=1225 之间**随机乱跳**，不随档位递增。
+         * 也就是说 Agnes 目前实际只区分「开 / 关」，档位名只是被接受而已。
+         * 保留全部 6 档是为了不挡用户，而不是因为选了真会想得更多。
+         */
+        private val KEY_EFFORT_LEVELS = listOf("minimal", "low", "medium", "high", "xhigh", "max")
 
         /** ripgrep：官方 `@vscode/ripgrep` 没有 android 平台包，这里补一个。 */
         private const val RIPGREP_ASSET = "ripgrep-android-arm64.zip"
