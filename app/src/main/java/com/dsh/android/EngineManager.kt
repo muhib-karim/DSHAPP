@@ -2180,9 +2180,103 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出 root 执行通道（`dsh-android-root.mjs`，每次启动覆盖写）。
+     *
+     * 与 [ensurePrivilegedShell] 同构，差别只在身份：那条走 adbd 拿 uid 2000，
+     * 这条走 `su -c` 拿 uid 0。**不返回 null 表示「有 root」** —— 那件事由
+     * [RootAccess] 单独探测，本方法只负责把脚本落盘。
+     *
+     * ⚠️ 与 `shell` 通道的关键差别：**root 通道不回落**。脚本自己会在拿不到
+     *   uid 0 时以专属退出码 77/78 失败，而不是静默降级成 app 身份。
+     *   理由见 `assets/dsh-android-root.mjs` 头部。
+     */
+    private fun ensureRootShell(): File? {
+        val dest = File(context.filesDir, ROOT_RUNNER_FILE)
+        return try {
+            context.assets.open(ROOT_RUNNER_ASSET).use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            }
+            dest.setReadable(true, false)
+            Log.i(TAG, "已解出 root 执行通道 $ROOT_RUNNER_FILE (${dest.length()} 字节)")
+            dest
+        } catch (t: Throwable) {
+            Log.w(TAG, "解出 root 执行通道失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 解出 root 特权工具插件（`root-tool.zip` → `$DSH_HOME/root-tool/dsh-android-root/`）。
+     *
+     * 结构、放置位置与不做版本戳的理由与 [ensurePrivilegedPlugin] 完全一致
+     * （⚠️ 同样**不能**放进 profile 的 `node_modules` —— 会被 pnpm 挪走）。
+     */
+    private fun ensureRootPlugin() {
+        val target = File(dshHome, "$ROOT_TOOL_DIR/$ROOT_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(ROOT_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装 root 特权工具插件 $ROOT_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "安装 root 特权工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载 root 特权工具的 overlay，返回其路径；不可用时返回 null。
+     *
+     * @param available 是否**确实能拿到 uid 0**（由 [RootAccess.detect] 端到端探测得出，
+     *   不是「存在 su 文件」）。不可用时把上次留下的 overlay 删掉 —— 与
+     *   [writePrivilegedPatch] 同理：留着一个指向不存在文件的 overlay 只会制造噪音，
+     *   更糟的是让模型以为这台设备有 root。
+     */
+    private fun writeRootPatch(available: Boolean): File? {
+        val patch = File(dshHome, ROOT_TOOL_PATCH)
+        val entry = File(dshHome, "$ROOT_TOOL_DIR/$ROOT_TOOL_PACKAGE/lib/index.js")
+        if (!available || !entry.isFile) {
+            if (patch.isFile) patch.delete()
+            if (!available) Log.i(TAG, "未检测到可用 root，跳过挂载 root 工具")
+            else Log.w(TAG, "root 特权工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载 root 特权工具插件：注册一个独立的 `root` 工具，
+                # 由模型按需选择；`bash` 与 `shell` 都不受影响。
+                - insert:
+                    - id: $ROOT_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入 root 特权工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入 root 特权工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出无线调试用的 adb 工具链（`adb-wireless-arm64.zip` → `filesDir/adbwire/`）。
      *
      * ## 为什么需要一个 adb 二进制
+
      *
      * Android 11 起有「无线调试」，它和 legacy `adb tcpip 5555` 是两回事：
      * 端口随机、走 TLS、**重启后依然有效**（legacy 的在 Android 10 上重启即失效）。
@@ -2407,21 +2501,62 @@ class EngineManager private constructor(private val context: Context) {
      *   免得模型去试一个必然回落的功能。
      */
     private fun ensurePrivilegedPrompt(available: Boolean) {
+        writePromptSection(
+            begin = PRIVILEGED_PROMPT_BEGIN,
+            end = PRIVILEGED_PROMPT_END,
+            body = if (available) PRIVILEGED_PROMPT_ENABLED else PRIVILEGED_PROMPT_DISABLED,
+            label = "特权身份说明（uid 2000）",
+        )
+    }
+
+    /**
+     * 把「这台设备有没有 root」写进 agent 指令。
+     *
+     * 与 [ensurePrivilegedPrompt] 同一个理由：模型必须知道自己**有没有**这个能力。
+     * 不说的话它会去试 `su`（然后拿到 77 号退出码一脸茫然），或者反过来以为
+     * 自己没有 root 而放弃本来做得到的事。
+     *
+     * ⚠️ 与 uid 2000 那段的差别：**没有 root 是常态**，所以不可用时那段文本要
+     * 明确写「不要尝试绕过」，而不是像 shell 那样给一套引导步骤（root 只能由
+     * 用户自己在设备上装/授权，App 帮不上忙）。
+     *
+     * @param available root 工具是否已注册（= 探测确认能拿到 uid 0 且 overlay 已挂）。
+     */
+    private fun ensureRootPrompt(available: Boolean) {
+        writePromptSection(
+            begin = ROOT_PROMPT_BEGIN,
+            end = ROOT_PROMPT_END,
+            body = if (available) ROOT_PROMPT_ENABLED else ROOT_PROMPT_DISABLED,
+            label = "root 身份说明",
+        )
+    }
+
+    /**
+     * 把一段由本 App 拥有的说明写进 `$DSH_HOME/AGENTS.md` 的 `BEGIN`/`END` 标记之间。
+     *
+     * ⚠️ 该文件归 DSH 的指令机制所有，用户也可能自己往里写东西。所以**只管理
+     * 自己那一段**，标记之外的内容原样保留。标记不存在时追加到末尾。
+     *
+     * @param begin 段落起始标记（必须逐字唯一，用作幂等判据）
+     * @param end 段落结束标记
+     * @param body 段落正文
+     * @param label 日志里用的名字
+     */
+    private fun writePromptSection(begin: String, end: String, body: String, label: String) {
         val file = File(dshHome, INSTRUCTIONS_FILE)
         try {
             val existing = if (file.isFile) file.readText() else ""
-            val body = if (available) PRIVILEGED_PROMPT_ENABLED else PRIVILEGED_PROMPT_DISABLED
             val section = buildString {
-                appendLine(PRIVILEGED_PROMPT_BEGIN)
+                appendLine(begin)
                 appendLine(body.trimEnd())
-                appendLine(PRIVILEGED_PROMPT_END)
+                appendLine(end)
             }
 
-            val begin = existing.indexOf(PRIVILEGED_PROMPT_BEGIN)
-            val end = existing.indexOf(PRIVILEGED_PROMPT_END)
-            val updated = if (begin >= 0 && end > begin) {
+            val at = existing.indexOf(begin)
+            val atEnd = existing.indexOf(end)
+            val updated = if (at >= 0 && atEnd > at) {
                 // 已有本段：整体替换，保留前后用户内容
-                existing.substring(0, begin) + section + existing.substring(end + PRIVILEGED_PROMPT_END.length).trimStart('\n', '\r')
+                existing.substring(0, at) + section + existing.substring(atEnd + end.length).trimStart('\n', '\r')
             } else if (existing.isBlank()) {
                 section
             } else {
@@ -2431,10 +2566,12 @@ class EngineManager private constructor(private val context: Context) {
             if (updated != existing) {
                 dshHome.mkdirs()
                 file.writeText(updated)
-                Log.i(TAG, "已写入特权身份说明: ${file.name}（通道可用=$available）")
+                Log.i(TAG, "已写入${label}: ${file.name}")
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "写入特权身份说明失败: ${t.message}")
+            // ⚠️ 必须写 `${label}` 而不是 `$label`：中文是合法的 Kotlin 标识符字符，
+            //   `"写入$label失败"` 会被解析成标识符 `label失败` → Unresolved reference。
+            Log.w(TAG, "写入${label}失败: ${t.message}")
         }
     }
 
@@ -2589,6 +2726,22 @@ class EngineManager private constructor(private val context: Context) {
         // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」
         ensurePrivilegedPrompt(privRunner != null)
 
+        // root（uid 0）通道：**先端到端探测**再决定挂不挂。
+        // ⚠️ 顺序是硬性的 —— 探测要起 su 进程（可能弹授权框），必须早于引擎进程
+        //   启动，否则用户会在界面已经可用之后才看到那个框。见 [RootAccess]。
+        // ⚠️ 探测结果有 24h 缓存，所以稳态下这里只是一次文件读。
+        val rootRunner = ensureRootShell()
+        val rootState = RootAccess.detect(context)
+        ensureRootPlugin()
+        val rootPatch = writeRootPatch(rootRunner != null && rootState.granted)
+        if (rootState.granted) {
+            Log.i(TAG, "root 可用（${rootState.detail}），已挂载 root 工具")
+        } else {
+            Log.i(TAG, "root 不可用（${rootState.state}: ${rootState.detail}），root 工具未挂载")
+        }
+        // 让模型知道「这台设备有没有 root」，否则它会去猜、去反复试
+        ensureRootPrompt(rootPatch != null)
+
         // Termux 环境必须先就位：node 从 $PREFIX/bin 来，缺失时下面的检查会给出明确报错。
         if (!bootstrap.installNodeRuntime()) {
             _state.value = State.Failed(
@@ -2649,6 +2802,10 @@ class EngineManager private constructor(private val context: Context) {
             // uid 2000 特权工具：也是 overlay，注册成独立的 `shell` 工具
             if (privPatch != null) {
                 add("--patch"); add(privPatch.absolutePath)
+            }
+            // root 特权工具：同样是 overlay，注册成独立的 `root` 工具
+            if (rootPatch != null) {
+                add("--patch"); add(rootPatch.absolutePath)
             }
             // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
             // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
@@ -2732,6 +2889,9 @@ class EngineManager private constructor(private val context: Context) {
             // uid 2000 通道脚本的路径，供特权插件读取（见 [ensurePrivilegedPlugin]）。
             // 经环境变量传递而不是让 Kotlin 拼 JS 字面量：路径里可能有反斜杠与引号。
             privRunner?.let { put("DSH_PRIV_RUNNER", it.absolutePath) }
+            // root 通道脚本的路径，供 root 插件读取（见 [ensureRootPlugin]）。
+            // 同上：走环境变量而不是拼 JS 字面量。
+            rootRunner?.let { put("DSH_ROOT_RUNNER", it.absolutePath) }
             // 无线调试用的 adb 工具链目录，runner 靠它决定要不要启用无线通道。
             // 缺失时 runner 只走 legacy 5555，行为与改动前完全一致。
             adbWireless?.let { put("DSH_ADB_HOME", it.absolutePath) }
@@ -3335,7 +3495,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-39"
+        private const val MOBILE_UI_VERSION = "1.0.0-42"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -3423,6 +3583,24 @@ class EngineManager private constructor(private val context: Context) {
          */
         private const val SHELL_TOOL_DIR = "shell-tool"
 
+        // ── root（uid 0）特权通道 ────────────────────────────────────
+        //
+        // 与 uid 2000 通道**同一套做法、同一套取舍**（见上面那段），只是身份档位不同：
+        // 注册一个独立的 `root` 工具，仅在**宿主探测到确实能提权**时才挂载。
+        // 检测方式与「存在 su ≠ 有 root」的三种假阳性见 [RootAccess]。
+
+        /** root 执行通道脚本（经 `su -c` 以 uid 0 执行）。 */
+        private const val ROOT_RUNNER_ASSET = "dsh-android-root.mjs"
+        private const val ROOT_RUNNER_FILE = "dsh-android-root.mjs"
+
+        /** 注册 `root` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val ROOT_TOOL_ASSET = "root-tool.zip"
+        private const val ROOT_TOOL_PACKAGE = "dsh-android-root"
+        private const val ROOT_TOOL_PATCH = "root-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 与 [SHELL_TOOL_DIR] 同理，刻意在 pnpm 管辖之外。 */
+        private const val ROOT_TOOL_DIR = "root-tool"
+
         /**
          * 无线调试（Android 11+）用的 adb 工具链。
          *
@@ -3439,6 +3617,80 @@ class EngineManager private constructor(private val context: Context) {
 
         private const val PRIVILEGED_PROMPT_BEGIN = "<!-- dsh-android:privileged BEGIN（本段由客户端生成，勿手改）-->"
         private const val PRIVILEGED_PROMPT_END = "<!-- dsh-android:privileged END -->"
+
+        private const val ROOT_PROMPT_BEGIN = "<!-- dsh-android:root BEGIN（本段由客户端生成，勿手改）-->"
+        private const val ROOT_PROMPT_END = "<!-- dsh-android:root END -->"
+
+        /**
+         * root 可用时写给模型的说明。
+         *
+         * 与 uid 2000 那段同样，重点在**边界**：什么时候用、什么时候别用、
+         * 失败长什么样。root 的边界与 shell 不同 —— 它能读到 app 私有目录，
+         * 所以「读工作区」不再是禁区；但**沙箱与 link 转译依然不生效**。
+         */
+        private val ROOT_PROMPT_ENABLED = """
+            ## root 身份（uid 0）
+
+            本机**已确认可以提权**，因此多了一个 `root` 工具：
+
+            | 工具 | 身份 | 能力边界 |
+            |---|---|---|
+            | `bash`（默认） | 应用身份 | 工作区、沙箱、link 转译全部正常 |
+            | `shell` | uid 2000 | 系统级操作；读不到应用私有目录 |
+            | `root` | **uid 0** | 内核/分区/SELinux 等最高权限操作 |
+
+            ### 什么时候该用 `root`
+
+            只有 `shell`（uid 2000）也做不到时才用：
+
+            - 读写 `/data` 下非本应用的数据（`/data/local/tmp`、`/data/misc`、别的应用私有目录）
+            - `mount` / 重新挂载分区、改 SELinux 策略或标签（`setenforce`、`chcon`）
+            - `iptables`、`/proc/sys` 下的内核参数
+            - 读改属主是 `root` 且不 world-readable 的文件
+
+            截图、点击、装卸载应用、`settings`、`appops`、`dumpsys` 这类
+            **`shell` 就够了，优先用 `shell`** —— 权限越小越安全。
+
+            ### ⚠️ `root` 通道的两个专属退出码
+
+            | 退出码 | 含义 |
+            |---|---|
+            | **77** | 没拿到 root（没有 `su` / 被拒 / 授权框超时）—— **命令根本没跑** |
+            | **78** | `su` 跑了但身份不是 uid 0 —— 命令**没有真正以 root 执行** |
+
+            看到这两个码：**不要重试、不要假设操作成功**，如实告诉用户需要重新授权
+            root 权限。它们与命令自己的非零退出码是两回事。
+
+            ### ⚠️ 用了 `root` 会失去什么
+
+            与 `shell` 一样：**没有写沙箱、没有 link 转译**（`LD_PRELOAD` 传不进去）。
+            这条通道上的任何写操作都**不会被拦**，误删就是真删。执行前把命令的作用
+            写进 `description`，破坏性的操作先跟用户确认。
+        """.trimIndent()
+
+        /**
+         * root 不可用时写给模型的说明。
+         *
+         * ⚠️ 这里**不给引导步骤**（与 shell 那段不同）：root 只能由用户自己在设备上
+         * 装（Magisk / KernelSU）并授权，App 侧没有任何办法推进。所以只需明确
+         * 「没有这个能力」+「不要瞎试」，否则模型会去反复跑 `su` 然后被 77 号码困住。
+         */
+        private val ROOT_PROMPT_DISABLED = """
+            ## root 身份（uid 0）—— 当前不可用
+
+            本机**没有**可用的 root：探测未发现 `su`，或存在 `su` 但拿不到 uid 0
+            （未授权 / 被拒 / 授权框超时）。**`root` 工具因此没有被注册**，
+            你只有 `bash` 与（若可用）`shell`。
+
+            在此之前：
+
+            - **不要**尝试用任何方式绕过：`su`、`sudo`、`magisk`、`busybox` 之类的
+              调用都不会成功，只会浪费一轮。
+            - 读写 `/data` 下别的应用的数据、`mount`、改 SELinux、`iptables` 这类
+              操作**当前一律做不到**，如实告诉用户即可，不要反复重试。
+            - 需要系统级操作时用 `shell`（uid 2000）—— 它能覆盖截图、输入注入、
+              包管理、`settings`、`appops`、`dumpsys` 等绝大多数场景。
+        """.trimIndent()
 
         private val PRIVILEGED_PROMPT_ENABLED = """
             ## 特权身份（uid 2000 / shell）

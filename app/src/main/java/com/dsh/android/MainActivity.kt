@@ -29,6 +29,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -266,6 +267,7 @@ class MainActivity : AppCompatActivity() {
         loadImeHeight()   // 修复 65：把上次学到的键盘高度取回来（跨冷启动有效）
 
         setupWebView()
+        setupBackNavigation()
         installBubbleBridge()
         observeEngine()
         observeImeInsets()   // 修复 65：键盘高度自学习 + 预判交接
@@ -454,6 +456,69 @@ class MainActivity : AppCompatActivity() {
     /** 当前挂起的文件选择回调；null 表示没有等待中的选择。 */
     private var filePathCallbackRef: ValueCallback<Array<Uri>>? = null
 
+    // ══ 系统返回键 ══════════════════════════════════════════════════════
+    //
+    // 现象：本 App 是一个 WebView 壳，界面里所有的"层级"（设置一级/二级、
+    //   各种弹窗、侧栏抽屉、插件面板）**全部活在网页里**，Android 一无所知。
+    //   于是系统返回键在**任何**界面下都直接退出 App —— 用户在设置二级页
+    //   按返回，期望回一级，结果整个 App 没了。
+    //
+    // 做法：原生拦下返回键 → 问页面「这一层要不要消费」→ 页面返回 false 才退出。
+    //   页面侧的状态机在 `mobile-ui-plugin/dsh-android-mobile/lib/client.js` §12，
+    //   它按由内到外的顺序处理：重命名弹窗 → 设置二级 → 设置一级 → 关闭设置
+    //   → 官方其它模态弹窗 → composer 菜单 → 侧栏抽屉 → 官方主面板 → 都没有则退出。
+    //
+    // ⚠️ **不能只靠 `webView.canGoBack()`**：这是个单页应用（SPA），路由不走
+    //   history —— 实测从头到尾 `canGoBack()` 恒为 false，用它判等于没做。
+    //
+    // ⚠️ **回调是异步的**（`evaluateJavascript` 走 WebView 的 JS 线程），所以
+    //   不能直接在回调里调 `finish()` 之外的 Activity 操作；这里只在"页面说
+    //   没得关"时才收尾，动作单一，安全。
+
+    /** 是否有一次"问页面"的往返正在进行中（防止连按返回键叠加调用）。 */
+    private var backQueryPending = false
+
+    /**
+     * 安装返回键处理。
+     *
+     * 用 `OnBackPressedCallback` 而不是覆写 `onBackPressed()`：
+     * `AppCompatActivity` 会把返回键分发给注册的回调，`onBackPressed()` 那条路
+     * 在 API 33+ 已被废弃，且与 `OnBackInvokedDispatcher`（Android 13+ 的
+     * 预测式返回手势）不互通 —— 用回调注册才对两条路都生效。
+     */
+    private fun setupBackNavigation() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                queryPageBack()
+            }
+        })
+    }
+
+    /**
+     * 问页面「有没有一层可以退」，有就消费掉，没有才退出 App。
+     *
+     * 页面侧的 `window.__DSH_MOBILE_BACK__()` 返回布尔值（`evaluateJavascript`
+     * 会把它序列化成字符串 `"true"` / `"false"`）。
+     *
+     * ⚠️ **桥不存在时必须直接退出**，不能"当作页面说 true" —— 那会让返回键
+     *   在插件还没激活（或激活失败）时**完全失效**，用户被困在 App 里出不去。
+     *   反过来，插件没起来时页面里也确实没有任何自建层级需要关，退出是对的。
+     */
+    private fun queryPageBack() {
+        val wv = binding.webView
+        if (backQueryPending) return
+        backQueryPending = true
+        wv.evaluateJavascript(BACK_PROBE_JS) { result ->
+            backQueryPending = false
+            // 页面回 "true" ⇒ 已消费；其余（"false" / "null" / 异常）一律退出。
+            val consumed = result != null && result.trim('"') == "true"
+            if (!consumed) {
+                Log.i(DshApplication.TAG, "返回键：页面已无可退层级，退出 App")
+                finish()
+            }
+        }
+    }
+
     /**
      * 页面 → 原生 的状态通道，暴露成 `window.DSHAndroid`。
      *
@@ -607,6 +672,63 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+        }
+
+        // ══ root（uid 0）：设置页的状态显示与重新检测 ══════════════════════
+        //
+        // 为什么必须显示出来：`root` 工具**只在检测到 root 时才注册**，所以没有
+        // root 的设备上，用户在任何地方都看不到它的痕迹 —— 分不清「这台机器没有
+        // root」与「有 root 但 App 没检测到」。状态与原因都得可见，否则用户连
+        // 该不该去装/授权 Magisk 都无从判断。
+        //
+        // 走 JS 桥而不是宿主半的 HTTP 路由：探测结论落在 `filesDir`（原生私有目录），
+        // 而「重新检测」要起 `su` 进程、可能弹授权框 —— 两件都是 Android 侧的事。
+
+        /**
+         * 读 root 探测结论。返回 JSON 字符串。
+         *
+         * ⚠️ 必须返回 String —— `@JavascriptInterface` 只支持基本类型和 String，
+         *   返回自定义对象会被序列化成 `undefined`（静默，不报错）。
+         *
+         * ⚠️ **只读缓存、不触发探测**，这是有意的：本方法运行在 WebView 的 JS
+         *   线程上，而探测最多要等 [RootAccess.PROBE_TIMEOUT_SEC] 秒，会卡住整个
+         *   页面。要重新探测走 [rootRecheck]。
+         *
+         * `at` 是结论的落盘时刻（毫秒）：一个 23 小时前的结论与刚测出来的不是
+         * 一回事，界面要能表达这个差别，所以时间戳必须一起给出去。
+         */
+        @android.webkit.JavascriptInterface
+        fun rootState(): String = try {
+            val snap = RootAccess.snapshot(this@MainActivity)
+            JSONObject()
+                .put("known", snap != null)
+                .put("state", snap?.result?.state?.name ?: "")
+                .put("granted", snap?.result?.granted ?: false)
+                .put("detail", snap?.result?.detail ?: "")
+                .put("at", snap?.at ?: 0L)
+                .toString()
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "读取 root 状态失败: ${t.message}")
+            "{}"
+        }
+
+        /**
+         * 设置页点「重新检测」：清掉缓存并**在后台**强制重探一次。
+         *
+         * ⚠️ 必须丢到后台线程：探测要起 `su` 进程，首次还会弹授权框（最多等
+         *   [RootAccess.PROBE_TIMEOUT_SEC] 秒），在 JS 线程上做会卡死页面。
+         * ⚠️ 立即返回、不在这里回结果：界面靠轮询 [rootState] 拿结论（见客户端半
+         *   的 `recheckRoot()`）。所以**不能**同步等它跑完 —— 那样就退回了上面那个
+         *   卡页面的问题。
+         */
+        @android.webkit.JavascriptInterface
+        fun rootRecheck() {
+            Log.i(DshApplication.TAG, "设置页请求重新检测 root")
+            val app = applicationContext
+            Thread {
+                val result = RootAccess.detect(app, force = true)
+                Log.i(DshApplication.TAG, "root 重新检测结果: ${result.state} ${result.detail}")
+            }.start()
         }
     }
 
@@ -1091,6 +1213,33 @@ class MainActivity : AppCompatActivity() {
 
         /** 文本占位符。用 `replace` 而不是字符串拼接，避免文本里的引号破坏 JS 语法。 */
         const val BUBBLE_TEXT_SLOT = "__DSH_BUBBLE_TEXT__"
+
+        /**
+         * 问页面「系统返回键该退哪一层」。
+         *
+         * 页面侧在 `mobile-ui-plugin/dsh-android-mobile/lib/client.js` §12 挂了
+         * `window.__DSH_MOBILE_BACK__`，它返回布尔值：true = 已消费（原生不退出）。
+         *
+         * ⚠️ 桥不存在时返回 `false` ⇒ 原生直接退出。这是**故意的**：
+         *   插件没激活时页面里没有任何自建层级，退出正是正确行为；若反过来
+         *   当作"已消费"，返回键会彻底失效，用户被困在 App 里。
+         *
+         * ⚠️ 整段包 try/catch：页面里任何异常都该退化成"没得关"，而不是让
+         *   `evaluateJavascript` 拿到 `null` —— 那虽然也走退出分支，但日志里
+         *   看不到原因。
+         */
+        val BACK_PROBE_JS = """
+            (function () {
+              try {
+                var fn = window.__DSH_MOBILE_BACK__;
+                if (typeof fn !== 'function') { return false; }
+                return fn() === true;
+              } catch (e) {
+                console.warn('[dsh-android] 返回键处理异常: ' + (e && e.message));
+                return false;
+              }
+            })()
+        """.trimIndent()
 
         /**
          * 注入后等多久再点发送（ms）。

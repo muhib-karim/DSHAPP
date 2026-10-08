@@ -1579,11 +1579,17 @@ window.__ModuleLoader__.load({
 					options.style.overflowY = "auto";
 				}
 			};
-			backBtn.addEventListener("click", () => {
+			// 设置页的「退一层」语义（二级 → 一级 → 关闭），返回按钮与**系统返回键**共用。
+			// 系统返回键由原生经 `window.__DSH_MOBILE_BACK__` 调进来，见 §12。
+			const backOneLevel = () => {
 				const atList = !content || content.style.display === "none";
 				if (atList) closeDialog();
 				else showList();
-			});
+			};
+			backBtn.addEventListener("click", backOneLevel);
+			// ⚠️ 用 WeakMap 而不是 DOM 属性存回调：DOM 属性只能存字符串，
+			//   而这里要存的是带闭包的函数（`content`/`closeDialog` 都在闭包里）。
+			mpDialogBack.set(dialog, backOneLevel);
 			// nav 竖向化 + 分类小标题 + 可滚动
 			const applyNavStyle = () => {
 				if (!isNarrow()) return;
@@ -1687,6 +1693,9 @@ window.__ModuleLoader__.load({
 			// 修复 56：等待官方侧栏收起期间用的观察器与兜底定时器。
 			let mpCollapseObs = null;
 			let mpCollapseFallback = null;
+			// §12：设置弹窗 → 它的「退一层」回调。用 WeakMap 而非 DOM 属性，
+			//   因为存的是带闭包的函数（`content`/`closeDialog` 都在 setupSettingsDialog 的闭包里）。
+			const mpDialogBack = new WeakMap();
 
 			function mpIsNarrow() { return window.innerWidth < MP_NARROW; }
 
@@ -2652,6 +2661,118 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			// ══════════════════════════════════════════════════════════════════
+			// §12 系统返回键：把 Android 的返回手势/按键接到 Web UI 上
+			// ══════════════════════════════════════════════════════════════════
+			//
+			// 原生侧（MainActivity）拦下返回键后调 `window.__DSH_MOBILE_BACK__()`，
+			// 返回值 = 「这一层被消费了吗」。**只有返回 false，原生才退出 App**，
+			// 所以下面这个顺序就是用户感知的"返回栈"。
+			//
+			// 由内到外（与屏幕上的层次一致）：
+			//   ① 自建的重命名弹窗
+			//   ② 设置弹窗：二级 → 一级 → 关闭（复用返回按钮那一套语义）
+			//   ③ 官方其它模态弹窗（兜底：点遮罩 / 派 Escape）
+			//   ④ composer 的触发菜单（「/」指令、@ 引用等）
+			//   ⑤ 侧栏抽屉
+			//   ⑥ 官方主面板（插件管理器 / 日程 / 快照…）→ 回对话
+			//   都没有 ⇒ false，交原生退出
+			//
+			// ⚠️ 判据一律用**可见性**，不能用 DOM 存在性：官方弹窗关掉后节点往往
+			//   仍留在 DOM 里（只改 display），按存在性判会永远认为"有东西可关"，
+			//   返回键就再也退不出 App 了。
+
+			/** 元素是否真的显示在屏幕上（`display:none` / 已卸载 ⇒ false）。 */
+			function mpVisible(el) {
+				if (!el || !el.isConnected) return false;
+				try { return el.getClientRects().length > 0; } catch (e) { return false; }
+			}
+
+			/** 当前可见的官方模态弹窗；没有则 null。 */
+			function mpVisibleModal() {
+				const all = document.querySelectorAll('[role="dialog"][aria-modal="true"]');
+				for (const d of all) if (mpVisible(d)) return d;
+				return null;
+			}
+
+			/**
+			 * 派发一次 Escape —— 官方大量组件用它做"退一层"
+			 * （原生返回键在桌面端的对应物）。
+			 *
+			 * ⚠️ 两处都发：官方有的监听在 `document` 上，有的挂在获得焦点的元素上。
+			 */
+			function mpDispatchEscape() {
+				try {
+					const ev = new KeyboardEvent("keydown", {
+						key: "Escape", code: "Escape",
+						bubbles: true, cancelable: true, composed: true,
+					});
+					const target = document.activeElement || document.body;
+					if (target) target.dispatchEvent(ev);
+					document.dispatchEvent(ev);
+				} catch (e) { /* 静默：派发失败也不该让返回键卡住 */ }
+			}
+
+			/** 官方 `ctx.layout` 服务（拿不到就返回 null，绝不抛）。 */
+			function mpLayout() {
+				if (!mpCtx) return null;
+				try { return mpCtx.get("layout") ?? null; } catch (e) { return null; }
+			}
+
+			/**
+			 * 处理一次系统返回键。
+			 * @returns {boolean} true = 已消费（原生不退出）；false = 无层级可退。
+			 */
+			function mpHandleSystemBack() {
+				// ① 自建的重命名弹窗
+				const rename = document.querySelector(".mp-rename-mask");
+				if (mpVisible(rename)) { closeRename(rename); return true; }
+
+				// ② / ③ 模态弹窗
+				const dialog = mpVisibleModal();
+				if (dialog) {
+					const step = mpDialogBack.get(dialog);
+					if (typeof step === "function") {
+						try { step(); return true; } catch (e) { /* 落到下面的兜底 */ }
+					}
+					// 没注册回调（`setupSettingsDialog` 因结构不符早退过）或回调抛错：
+					// 按官方自己的关闭方式兜底 —— 先点遮罩，没有遮罩再派 Escape。
+					const mask = dialog.parentElement;
+					if (mask && mask.classList && mask.classList.contains("VOzbGW_mask")) {
+						mask.click();
+						return true;
+					}
+					mpDispatchEscape();
+					return true;
+				}
+
+				// ④ composer 的触发菜单：能读到 store 就按 store 关，否则派 Escape
+				const ctrl = mpTriggerController();
+				if (ctrl && ctrl.menu && typeof ctrl.menu.getSnapshot === "function") {
+					try {
+						if (ctrl.menu.getSnapshot().open) { ctrl.dismiss(); return true; }
+					} catch (e) { /* 静默 */ }
+				}
+				if (document.querySelector("[data-trigger-menu]")) { mpDispatchEscape(); return true; }
+
+				// ⑤ 侧栏抽屉。判据用**视觉开**（与 mpCloseDrawer 内部同源）：
+				//    设置弹窗打开期间抽屉会被"视觉收起"（官方仍是 expanded），
+				//    那种状态下按返回键不该去动抽屉。
+				const col = mpSidebarCol();
+				if (col && col.classList.contains("mp-drawer-open")) { mpCloseDrawer(); return true; }
+
+				// ⑥ 官方主面板 → 回对话
+				const layout = mpLayout();
+				if (layout) {
+					try {
+						const info = layout.panelInfo && layout.panelInfo.getSnapshot();
+						if (info && info.activePanelId != null) { layout.selectPanel(null); return true; }
+					} catch (e) { /* 静默：拿不到就当没有主面板 */ }
+				}
+
+				return false;   // 真的没层级可退 ⇒ 原生退出 App
+			}
+
 			// ⚠️ 修复 40：这里只装**常驻监听器**（宽窄屏都要装）。
 			// 若把监听器留在 mpBuildShellForMobile 里，桌面端启动时直接 return
 			// → 用户把窗口缩窄就没人发现（宽→窄切换彻底失效）。
@@ -2676,6 +2797,11 @@ window.__ModuleLoader__.load({
 					mpCloseDrawer();
 				}, { capture: true });
 				window.addEventListener("resize", () => { mpSyncMobileAttr(); mpSyncDrawer(); mpScheduleHeaderCenter(); }, { passive: true });
+				// §12：把返回键处理器交给原生。原生拦下系统返回键后调它，
+				//   返回值 = 「这一层被消费了吗」；只有 false 才退出 App。
+				//   ⚠️ 挂在 mpBuildShell 里（与上面三个监听器同处，只执行一次）；
+				//   拆解时**不摘**，理由与 mpShellBuilt 不复位相同。
+				window.__DSH_MOBILE_BACK__ = mpHandleSystemBack;
 				mpBuildShellForMobile();
 			}
 
@@ -3959,8 +4085,8 @@ window.__ModuleLoader__.load({
 
 		const MP_PRIV_ZH = {
 			nav: "特权权限",
-			title: "特权权限（uid 2000）",
-			intro: "开启后，AI 可以在需要时以系统 shell 身份（uid 2000）执行命令 —— 截图、模拟点击、卸载应用、改系统设置这些原本做不到的事。默认仍走 App 身份，要不要提权由 AI 自己判断。",
+			title: "特权权限（uid 2000 / root）",
+			intro: "开启后，AI 可以在需要时以更高身份执行命令 —— 截图、模拟点击、卸载应用、改系统设置这些原本做不到的事。默认仍走 App 身份，要不要提权由 AI 自己判断。",
 			statusTitle: "当前状态",
 			statusOn: "已开启",
 			statusOff: "未开启",
@@ -4035,6 +4161,30 @@ window.__ModuleLoader__.load({
 			nextSwitchHint: "建议切到固定端口，这样关掉无线调试开关也不会断。",
 			nextChoose: "还没开启。按下面「无线调试」那几步走一遍即可，不用电脑。",
 			nextChoosePc: "还没开启。按下面的「电脑引导」走一遍 —— 本机是 Android 10，只能用这种方式。",
+
+			// ── root（uid 0）────────────────────────────────────────
+			// ⚠️ 这一块**必须存在**：`root` 工具只在检测到 root 时才注册，所以没有
+			//   root 的设备上用户看不到它的任何痕迹，分不清「本机没有 root」与
+			//   「有 root 但没检测到」。状态与原因都得摆出来。
+			rootTitle: "root 权限（uid 0）",
+			rootOn: "已开启",
+			rootDenied: "未授权",
+			rootAbsent: "无 root",
+			rootUnknown: "未检测",
+			rootRowState: "状态",
+			rootRowDetail: "探测结论",
+			rootRowAt: "检测时间",
+			rootRecheck: "重新检测",
+			rootChecking: "检测中…",
+			// 「下一步」按三态各写一句 —— 三种情况下用户该做的事完全不同。
+			rootNextOn: "root 工具已注册，AI 可以直接以 uid 0 执行命令（读写 /data、改挂载、iptables 等）。",
+			rootNextDenied: "本机有 su，但本应用没拿到 uid 0。请在 Magisk / SuperSU 之类的授权管理里给「DSH」授权，然后点「重新检测」。",
+			rootNextAbsent: "本机没有 root（也没找到 su）。需要 root 的功能用不了，其余功能不受影响 —— 上方的 uid 2000 通道与之无关，照常可用。",
+			rootNextUnknown: "还没检测过。点「重新检测」跑一次（首次可能会弹 root 授权框）。",
+			// ⚠️ 这里是**纯文本**渲染（React 直接塞进 DOM），不能写 Markdown 标记 ——
+			//   写 `**加粗**` 或反引号会原样显示出来（第一版就这么错了）。
+			rootNote: "root 工具只在检测到 uid 0 时才注册。检测方式是真的跑一次 su -c id -u、看输出是不是 0，而不是查 su 文件在不在 —— 占位 su、装了 Magisk 但没授权、root 升级后失效这三种情况文件都在却提不了权。结果会缓存 24 小时。",
+			rootDetailNever: "（无）",
 		};
 
 		// ══════════════════════════════════════════════════════════════════
@@ -4121,8 +4271,8 @@ window.__ModuleLoader__.load({
 
 		const MP_PRIV_EN = {
 			nav: "Privileged access",
-			title: "Privileged access (uid 2000)",
-			intro: "When enabled, the AI can run commands as the system shell identity (uid 2000) when it needs to — screenshots, synthetic taps, uninstalling apps, changing system settings. Everything still defaults to the app's own identity; the AI decides when to escalate.",
+			title: "Privileged access (uid 2000 / root)",
+			intro: "When enabled, the AI can run commands as a higher identity when it needs to — screenshots, synthetic taps, uninstalling apps, changing system settings. Everything still defaults to the app's own identity; the AI decides when to escalate.",
 			statusTitle: "Current status",
 			statusOn: "Enabled",
 			statusOff: "Not enabled",
@@ -4190,6 +4340,30 @@ window.__ModuleLoader__.load({
 			nextSwitchHint: "Switching to a fixed port is recommended so turning wireless debugging off will not break it.",
 			nextChoose: "Not enabled yet. Follow the \"Wireless debugging\" steps below — no computer needed.",
 			nextChoosePc: "Not enabled yet. Follow the computer-based guide below — this device runs Android 10, so that is the only way.",
+
+			// ── root (uid 0) ──────────────────────────────────────
+			// ⚠️ This block must exist: the `root` tool is only registered when root is
+			//   detected, so on a non-rooted device the user sees no trace of it at all
+			//   and cannot tell "this device has no root" from "root exists but was not
+			//   detected". Both the state and the reason have to be visible.
+			rootTitle: "root access (uid 0)",
+			rootOn: "Enabled",
+			rootDenied: "Not authorized",
+			rootAbsent: "No root",
+			rootUnknown: "Not checked",
+			rootRowState: "Status",
+			rootRowDetail: "Probe result",
+			rootRowAt: "Checked at",
+			rootRecheck: "Re-check",
+			rootChecking: "Checking…",
+			rootNextOn: "The root tool is registered — the AI can run commands as uid 0 directly (read/write /data, remount, iptables, and so on).",
+			rootNextDenied: "This device has su, but the app did not obtain uid 0. Grant \"DSH\" root access in Magisk / SuperSU or similar, then tap \"Re-check\".",
+			rootNextAbsent: "This device has no root (no su found either). Root-only features are unavailable; everything else is unaffected — the uid 2000 channel above is unrelated and still works.",
+			rootNextUnknown: "Not checked yet. Tap \"Re-check\" to run a probe (the first one may show a root authorization dialog).",
+			// ⚠️ Plain-text rendering (React puts this straight into the DOM) — no
+			//   Markdown markers, they would show up literally.
+			rootNote: "The root tool is registered only when uid 0 is detected. Detection actually runs su -c id -u and checks whether the output is 0, rather than looking for a su file — a placeholder su, Magisk installed but not authorized, and a root that broke after an upgrade all leave the file present while escalation fails. The result is cached for 24 hours.",
+			rootDetailNever: "(none)",
 		};
 
 		// 全内联样式：设置 dialog 里的既有教训是「匹配 dialog 的 CSS 规则会把弹窗
@@ -4231,6 +4405,14 @@ window.__ModuleLoader__.load({
 			summary: { margin: 0, fontSize: "13px", lineHeight: "19px" },
 			next: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", padding: "9px 10px", borderRadius: "8px", background: "var(--dsw-alias-interactive-bg-hover, #f2f2f2)" },
 			nextText: { flex: "1 1 160px", minWidth: 0, fontSize: "13px", lineHeight: "19px" },
+			// root 卡片专用的「下一步」文案样式：与上面那条的区别只有换行基线。
+			//
+			// ⚠️ **不复用 `nextText`**：它的 `flex: "1 1 160px"` 在 360 CSS px 宽的
+			//   卡片里会把长文案挤成每行十来个字的一窄列（root 那三条文案都挺长）。
+			//   用 100% 作基线则文案先占满整行、按钮自然掉到下一行，读起来才是一段话。
+			//   之所以单独开一条而不是改上面那条：上面那条是 uid 2000 卡片在用的，
+			//   改它会连带改掉那张已经定型的卡片 —— 只修自己新加的那张。
+			nextTextWide: { flex: "1 1 100%", minWidth: 0, fontSize: "13px", lineHeight: "19px" },
 			actions: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" },
 			// 主按钮：整页只有「配对」和「下一步」用实心，避免到处都在喊。
 			btnPrimary: { border: "0.5px solid transparent", background: "var(--dsw-alias-interactive-bg-primary, #2b6cb0)", color: "#fff", font: "inherit", fontSize: "13px", fontWeight: 600, padding: "6px 14px", borderRadius: "8px", cursor: "pointer" },
@@ -4333,6 +4515,114 @@ window.__ModuleLoader__.load({
 				return () => { alive = false; };
 			}, []);
 			React.useEffect(refresh, [refresh]);
+
+			// ══ root（uid 0）状态 ══════════════════════════════════════════
+			//
+			// 与上面的 uid 2000 状态**来源不同**：那条走宿主半的 HTTP 路由（探测要
+			// spawn runner），而 root 的结论在**原生**侧（探测要起 `su` 进程、可能弹
+			// 授权框），所以走 JS 桥 `window.DSHAndroid.rootState()`。
+			//
+			// ⚠️ 桥上的 `rootState()` **只读缓存、不触发探测** —— 它跑在 WebView 的
+			//   JS 线程上，同步探测会把页面卡住。重新探测走 `rootRecheck()`，那是
+			//   后台线程，界面靠下面的轮询拿结果。
+			const [root, setRoot] = React.useState({ known: false, state: "", granted: false, detail: "", at: 0 });
+			const [rootBusy, setRootBusy] = React.useState(false);
+			// 在跑的轮询计时器。用 ref 而不是普通变量：`recheckRoot` 是 useCallback，
+			// 闭包捕获的必须是一个**跨渲染稳定**的容器，否则每次渲染新建一个 Set，
+			// 卸载时的清理就清不到真正的计时器。
+			const rootTimers = React.useRef(null);
+			if (rootTimers.current === null) rootTimers.current = new Set();
+
+			/** 读一次缓存里的 root 结论（不触发探测）。 */
+			const readRoot = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.rootState !== "function") {
+					setRoot({ known: false, state: "", granted: false, detail: "", at: 0 });
+					return;
+				}
+				try {
+					// 桥返回 JSON 字符串（@JavascriptInterface 只支持基本类型与 String）。
+					const raw = bridge.rootState();
+					const o = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+					setRoot({
+						known: !!o.known,
+						state: String(o.state || ""),
+						granted: !!o.granted,
+						detail: String(o.detail || ""),
+						at: Number(o.at) || 0,
+					});
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 读取 root 状态失败:", e && e.message);
+					setRoot({ known: false, state: "", granted: false, detail: "", at: 0 });
+				}
+			}, []);
+
+			React.useEffect(() => { readRoot(); }, [readRoot]);
+
+			/**
+			 * 请求重新检测，然后**轮询**直到结论变化。
+			 *
+			 * ⚠️ 必须轮询，不能等一个返回值：原生侧是「立即返回、后台线程里探测」，
+			 *   因为探测最多要等 5 秒（首次还会弹授权框），同步等会把页面卡死。
+			 * ⚠️ 轮询上限（10 秒）要比原生的探测超时（5 秒）宽，否则会在原生还没
+			 *   出结论时就把按钮恢复，用户以为检测完了、看到的却是旧结论。
+			 * ⚠️ 判据是**时间戳变化**（`at`），不是结论变化：连续两次都测出
+			 *   「无 root」时结论字符串一样，只看结论会一直轮询到超时。
+			 */
+			const recheckRoot = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.rootRecheck !== "function") return;
+				let before = 0;
+				try {
+					const raw = bridge.rootState();
+					before = Number((typeof raw === "string" ? JSON.parse(raw) : (raw || {})).at) || 0;
+				} catch (e) { /* 拿不到旧时间戳就退化成「轮询到超时」，仍然正确 */ }
+				try {
+					bridge.rootRecheck();
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 请求重新检测 root 失败:", e && e.message);
+					return;
+				}
+				setRootBusy(true);
+				const startedAt = Date.now();
+				const timer = window.setInterval(() => {
+					const b = window.DSHAndroid;
+					let at = 0;
+					try {
+						const raw = b && b.rootState ? b.rootState() : "{}";
+						at = Number((typeof raw === "string" ? JSON.parse(raw) : (raw || {})).at) || 0;
+					} catch (e) { /* 读失败当作还没出结果，继续等 */ }
+					if (at > before || Date.now() - startedAt > 10000) {
+						window.clearInterval(timer);
+						rootTimers.current.delete(timer);
+						readRoot();
+						setRootBusy(false);
+					}
+				}, 700);
+				// 记账以便卸载时清理（本函数没有 cleanup 出口，所以交给下面的 effect）。
+				rootTimers.current.add(timer);
+			}, [readRoot]);
+
+			// 组件卸载时清掉所有在跑的轮询 —— 否则用户切走分节后计时器仍在打桥。
+			React.useEffect(() => {
+				const timers = rootTimers.current;
+				return () => {
+					timers.forEach((id) => window.clearInterval(id));
+					timers.clear();
+				};
+			}, []);
+
+			// 从授权界面回来后刷新：给 root 授权是在 Magisk 之类的**别的应用**里完成的，
+			// 本页拿不到任何回调，只能靠 visibilitychange / focus（与气泡分节同一手法）。
+			React.useEffect(() => {
+				const onVisible = () => { if (!document.hidden) readRoot(); };
+				document.addEventListener("visibilitychange", onVisible);
+				window.addEventListener("focus", onVisible);
+				return () => {
+					document.removeEventListener("visibilitychange", onVisible);
+					window.removeEventListener("focus", onVisible);
+				};
+			}, [readRoot]);
 
 			const data = state.phase === "ready" ? state.data : null;
 			const identityOk = !!(data && data.identity && data.identity.ok);
@@ -4624,10 +4914,62 @@ window.__ModuleLoader__.load({
 				),
 			);
 
+			// ── root（uid 0）卡片 ──────────────────────────────────
+			//
+			// 为什么单独一张卡：uid 2000 与 root 是**两条独立的通道**，可用性互不
+			// 影响（没 root 的设备照样能用 uid 2000）。所以不能把 root 塞进上面那张
+			// 状态卡的徽章里 —— 那个徽章只回答「uid 2000 能不能用」。
+			//
+			// ⚠️ 三态各自对应**完全不同的下一步**（去授权 / 什么都不用做 / 去检测），
+			//   所以文案必须分开，不能合成一句「root 不可用」。
+			const rootTone = !root.known ? MP_PRIV_TONE.unknown
+				: root.granted ? MP_PRIV_TONE.on
+					: root.state === "DENIED" ? MP_PRIV_TONE.warn : MP_PRIV_TONE.off;
+			const rootBadge = !root.known ? t("rootUnknown")
+				: root.granted ? t("rootOn")
+					: root.state === "DENIED" ? t("rootDenied") : t("rootAbsent");
+			const rootNext = !root.known ? t("rootNextUnknown")
+				: root.granted ? t("rootNextOn")
+					: root.state === "DENIED" ? t("rootNextDenied") : t("rootNextAbsent");
+			// 检测时间：结论是 24 小时缓存的，用户需要知道这是刚测的还是昨天的。
+			const rootAtText = root.at > 0 ? new Date(root.at).toLocaleString() : t("rootDetailNever");
+
+			const rootCard = e("div", { style: S.card },
+				e("div", { style: S.cardHead },
+					e("h3", { style: S.cardTitle }, t("rootTitle")),
+					e("span", { style: { ...S.badge, color: rootTone.color, background: rootTone.bg } }, rootBadge),
+				),
+				e("div", { style: S.next },
+					e("span", { style: S.nextTextWide }, rootNext),
+					e("button", {
+						type: "button",
+						style: S.btnPrimary,
+						disabled: rootBusy,
+						onClick: recheckRoot,
+					}, rootBusy ? t("rootChecking") : t("rootRecheck")),
+				),
+				e("div", { style: S.row },
+					e("span", { style: { ...S.dot, background: rootTone.color } }),
+					e("span", { style: S.rowLabel }, t("rootRowDetail")),
+					// 结论原文由原生给出（`su=/system/bin/su, id -u → 0` 这类），
+					// 直接透出比翻译成一句话更有助于排查。
+					e("span", { style: S.rowValue }, root.known && root.detail ? root.detail : t("rootDetailNever")),
+				),
+				e("div", { style: S.row },
+					e("span", { style: { ...S.dot, background: MP_PRIV_TONE.unknown.color } }),
+					e("span", { style: S.rowLabel }, t("rootRowAt")),
+					e("span", { style: S.rowValue }, rootAtText),
+				),
+				e("p", { style: S.note }, t("rootNote")),
+			);
+
 			return e("div", { style: S.section },
 				e("h2", { style: S.heading }, t("title")),
 				e("p", { style: S.intro }, t("intro")),
 				head,
+				// root 卡片**始终显示**（不像引导那样按状态折叠）—— 它的全部意义就是
+				// 让「本机有没有 root」这件事可见，折起来等于没做。
+				rootCard,
 				// 已就绪时把引导整体折起来 —— 能用的人不该被一堆步骤挡着。
 				// 未就绪时：Android 10 把电脑引导摆前面（那是唯一可行的路），
 				// Android 11+ 反过来 —— 无线调试更省事。

@@ -26,12 +26,14 @@ keystore.properties
 # 例外：手写源码，必须入库。
 #   webview-polyfill.js    —— 旧 WebView 内核兼容垫片
 #   dsh-android-shell.mjs  —— uid 2000 执行通道（含 ADB 协议与密钥信任逻辑）
+#   dsh-android-root.mjs   —— root（uid 0）执行通道（经 su，含 77/78 专属退出码）
 #
 # 例外：内置号池的注入库（手写源码 + 生成脚本），必须入库。
 #   详见 app/src/main/jni/keyinject.c 头部与 tools/build-keyinject.ps1。
 app/src/main/assets/*
 !app/src/main/assets/webview-polyfill.js
 !app/src/main/assets/dsh-android-shell.mjs
+!app/src/main/assets/dsh-android-root.mjs
 COMMIT_MSG.tmp
 
 # ── 内置号池的密钥：绝不入库 ─────────────────────────────
