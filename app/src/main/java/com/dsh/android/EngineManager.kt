@@ -2,6 +2,8 @@ package com.dsh.android
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -1453,6 +1455,276 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出 Agnes 多模态插件（`generate_image` / `generate_video` + 多模态配置页）。
+     *
+     * 与 [ensureMobileUi] 同一套做法、同一套理由：包解到 `$DSH_HOME/agnes-multimodal/`
+     * 而不是 profile 的 `node_modules`（那里归 pnpm 管，本包不在 profile 的
+     * `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`，
+     * overlay 里的包名随即解析失败）。
+     *
+     * 幂等判据是版本戳而不是「文件在不在」：插件随 APK 升级而变，只看文件存在
+     * 会让老设备永远停在旧版。
+     */
+    private fun ensureAgnesMultimodal() {
+        val target = File(dshHome, "$AGNES_MM_DIR/$AGNES_MM_PACKAGE")
+        val clientJs = File(target, "lib/client.js")
+        val stamp = File(target, AGNES_MM_STAMP)
+
+        if (clientJs.isFile && clientJs.length() > 0 &&
+            stamp.isFile && stamp.readText().trim() == AGNES_MM_VERSION
+        ) {
+            return
+        }
+
+        try {
+            target.deleteRecursively()
+            java.util.zip.ZipInputStream(context.assets.open(AGNES_MM_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(target, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            stamp.writeText(AGNES_MM_VERSION)
+            Log.i(TAG, "已安装 Agnes 多模态插件 $AGNES_MM_PACKAGE $AGNES_MM_VERSION (${clientJs.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上不阻断启动：只是少了两个生成工具
+            Log.w(TAG, "安装 Agnes 多模态插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 把内置号池接到 Agnes 多模态插件上（写 `$DSH_HOME/ag-multimodal.json`）。
+     *
+     * ## 为什么这样接得上
+     *
+     * 插件调 `readAccounts()` 拿账号池，每条形如 `{endpoint, key}`，然后直接
+     * `Authorization: Bearer <key>` 发出去。而内置号池的真密钥**不在 JS 层** ——
+     * 它们由 `libkeyinject.so` 在 `SSL_write` 里换掉，条件是「头部区域含
+     * [KEY_PLACEHOLDER]」。所以这里写的 `key` 就是那个**占位符**：
+     * 插件照常拼请求头，注入层在加密前把它换成随机抽中的真钥匙，与聊天那条链路
+     * 走的是同一个机制、同一个池子。
+     *
+     * ## ⚠️ endpoint 必须用国际站域名
+     *
+     * 抽到国内站钥匙时，注入层靠**等长改写 Host 头**把请求路由到国内站，而基准
+     * 域名只能是较长的 `apihub`（`api.agnes-ai.cn` 加 4 个尾空格才够 18 字节）。
+     * 这里若写 `api.agnes-ai.cn`，注入层找不到 `KI_HOST_INTL` 可改 —— 抽到国内站
+     * 钥匙就会拿国内站密钥去打国内站域名之外的路由，稳定 401。见 [KEY_BASE_URL]。
+     *
+     * ## ⚠️ 内置号是「不可删除、不可更改」的，所以每次启动都要修复
+     *
+     * 与 [seedDefaultSettings] 那种「只播种一次、之后不碰」的策略**刻意不同**。
+     * 内置号是 App 提供的免费号池，属于产品能力的一部分，不是用户数据：用户删掉它
+     * 就等于把内置号池弄丢了。所以这里每次都确保它存在且是权威值。
+     *
+     * 三重保护，缺一不可：
+     *
+     * 1. **服务端强制**（插件 `lib/index.js` 的 `set` 分支）：传回去的内置条目
+     *    一律丢弃、用权威值重建 —— 绕过 UI 直接调 API 也改不动。
+     * 2. **UI 只读**（插件 `lib/client.js`）：内置行没有地区切换、没有可编辑的
+     *    输入框、没有「移除」按钮。
+     * 3. **每次启动修复**（本方法）：兜住「用户改了磁盘上的文件」这种情况。
+     *
+     * ⚠️ 只**补回/纠正**内置条目，绝不触碰用户自己加的行，也不改它们的顺序 ——
+     * 用户的号必须保持排在前面（优先级更高）。
+     */
+    private fun seedAgnesAccounts() {
+        val state = File(dshHome, AGNES_MM_STATE)
+        try {
+            val root = if (state.isFile) {
+                // 解析失败（手改坏了 / 空文件）时退回空对象，下面会重建出内置号。
+                JSONObject(state.readText().trim().ifEmpty { "{}" })
+            } else {
+                JSONObject()
+            }
+
+            val accounts = root.optJSONArray("accounts") ?: JSONArray()
+            val next = JSONArray()
+            // 用户行原样保留、保持原有顺序（它们排在前面 ⇒ 优先级更高）。
+            for (i in 0 until accounts.length()) {
+                val row = accounts.optJSONObject(i) ?: continue
+                // 内置行（认标记，也认占位符 —— 老配置里只有 endpoint/key 两个字段）
+                // 一律跳过，下面统一追加权威值。
+                if (row.optBoolean("builtin") || row.optString("key") == KEY_PLACEHOLDER) continue
+                if (row.optString("key").isBlank()) continue
+                next.put(JSONObject().put("endpoint", row.optString("endpoint")).put("key", row.optString("key")))
+            }
+            // 内置号恒在最后一位（池尾兜底），带 builtin 标记。
+            next.put(
+                JSONObject()
+                    .put("endpoint", KEY_BASE_URL)
+                    .put("key", KEY_PLACEHOLDER)
+                    .put("builtin", true)
+            )
+            root.put("accounts", next)
+
+            val body = root.toString() + "\n"
+            // 内容一致就不写盘：避免每次启动都动文件（也少一次 rename）。
+            if (!state.isFile || state.readText() != body) {
+                state.writeText(body)
+                Log.i(TAG, "已把内置号池接入 Agnes 多模态插件: ${state.absolutePath}")
+            }
+        } catch (t: Throwable) {
+            // 修复失败不阻断启动：插件会回落到它自带的默认账号
+            Log.w(TAG, "写入 Agnes 账号池失败（不影响启动）: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载 Agnes 多模态插件的 overlay，返回其路径；不可用时返回 null。
+     *
+     * 与 [writeMobileUiPatch] 同构：`--patch` 在 profile 层**之后**应用，优先级
+     * 更高，且完全由本 App 拥有，升级时整体覆盖即可。`name` 用 `file://` 绝对
+     * URL，因为包在 pnpm 管辖之外、按裸包名解析不到。
+     */
+    private fun writeAgnesMultimodalPatch(): File? {
+        val patch = File(dshHome, AGNES_MM_PATCH)
+        val entry = File(dshHome, "$AGNES_MM_DIR/$AGNES_MM_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "Agnes 多模态插件入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载 Agnes 多模态插件；插件包随 APK 分发，已解到 .dsh/${AGNES_MM_DIR}。
+                # 用 file:// 绝对路径挂载：包刻意放在 profile 的 node_modules 之外，
+                # 否则用户每次用插件管理器装东西都会被 pnpm 挪进 .ignored/。
+                - insert:
+                    - id: $AGNES_MM_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入 Agnes 多模态 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 把内置预设 dsh-preset-razor 解到 `$DSH_HOME/preset-razor/dsh-preset-razor/`（幂等）。
+     *
+     * 与 [ensureMobileUi] / [ensureAgnesMultimodal] 同一套做法、同一套理由：包解到
+     * `$DSH_HOME` 下而不是 profile 的 `node_modules`（那里归 pnpm 管，本包不在 profile
+     * 的 `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`）。
+     *
+     * ⚠️ 但本包比它们更简单：它**没有任何 JS 代码**，只有一份 `cordis.patch.yml`。
+     * 那份 YAML 本身就是一份合法的 patch 列表（顶层 `- insert:` 数组），所以既不需要
+     * pnpm、也不需要按包名解析 —— [writePresetRazorPatch] 直接把它当 `--patch` 用。
+     *
+     * 幂等判据是版本戳而不是「文件在不在」：预设随 APK 升级而变，只看文件存在
+     * 会让老设备永远停在旧版提示词。
+     */
+    private fun ensurePresetRazor() {
+        val target = File(dshHome, "$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE")
+        val upstream = File(target, "cordis.patch.yml")
+        val stamp = File(target, PRESET_RAZOR_STAMP)
+
+        if (upstream.isFile && upstream.length() > 0 &&
+            stamp.isFile && stamp.readText().trim() == PRESET_RAZOR_VERSION
+        ) {
+            return
+        }
+
+        try {
+            target.deleteRecursively()
+            java.util.zip.ZipInputStream(context.assets.open(PRESET_RAZOR_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(target, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            stamp.writeText(PRESET_RAZOR_VERSION)
+            Log.i(TAG, "已安装内置预设 $PRESET_RAZOR_PACKAGE $PRESET_RAZOR_VERSION (${upstream.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上不阻断启动：只是少了这个预设
+            Log.w(TAG, "安装内置预设失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载内置预设的 overlay，返回其路径；不可用时返回 null。
+     *
+     * 生成的内容 = 「把 registry 的出厂默认预设改成 razor」+「razor 的预设声明行原文」。
+     * 两件事合在**一份**文件里，因为它们本就是同一个功能（内置该预设并默认使用它），
+     * 拆成两份只会多一次 `--patch`。
+     *
+     * ## 为什么是改 `default` 而不是 `selectedDefault`
+     *
+     * registry 的 config 有两个字段（`dsh-agent-preset-registry/lib/index.js`）：
+     *
+     * ```js
+     * default: z.string().required(),
+     * selectedDefault: z.string().volatile(),
+     * // …
+     * return this.config.selectedDefault.get() ?? this.config.default;
+     * ```
+     *
+     * `selectedDefault` 是 **volatile** 字段 —— 它由用户在 GUI 里选默认预设时写入，
+     * 且**不由任何 patch 提供**。所以这里只改 `default`（出厂默认位）：用户没选过时
+     * 新会话用 razor；用户选过之后 `selectedDefault` 优先，**用户在 GUI 里的选择依然
+     * 生效**。反过来若去写 `selectedDefault`，就变成 App 每次启动都把用户的默认设置
+     * 按回 razor —— 那是把「默认用它」做成了「锁死它」。
+     *
+     * ## 为什么可以整块替换 registry 的 config
+     *
+     * patch 语义是**整块替换 config 而不是深合并**（见 AGENTS.md 里同名警告）。
+     * 官方那行（`dsh-web-app/cordis.patch.yml`）的 config 只有 `default: standard`
+     * 一个字段，没有别的会被这里抹掉，所以替换是安全的。
+     *
+     * ## ⚠️ 与用户自己装同名插件会撞车
+     *
+     * 上游 README 已警告：`- insert:` 行**不按 id 去重**，是无条件追加；若 profile 里
+     * 另有一行用了同样的 `id: razor`，registry 会报 `Duplicate agent preset: razor`
+     * 并让其中一个挂载失败。本 App 已内置，用户无需再装 dsh-preset-razor。
+     */
+    private fun writePresetRazorPatch(): File? {
+        val patch = File(dshHome, PRESET_RAZOR_PATCH)
+        val upstream = File(dshHome, "$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE/cordis.patch.yml")
+        if (!upstream.isFile) {
+            Log.w(TAG, "内置预设声明不存在，跳过挂载: ${upstream.absolutePath}")
+            return null
+        }
+        return try {
+            val body = upstream.readText().trimStart()
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 内置预设 dsh-preset-razor（「快准狠模式（通用）」）并默认使用它。
+                #
+                # 下面第一行是 registry 的出厂默认预设位；用户若在 GUI 里另选了默认，
+                # selectedDefault（volatile，不来自 patch）优先，用户的选择依然生效。
+                # 之后是预设声明行原文，来自 .dsh/$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE/cordis.patch.yml。
+                - id: agent-preset-registry
+                  name: '@deepseek-ai/dsh-agent-preset-registry'
+                  config:
+                    default: $PRESET_RAZOR_ID
+
+                """.trimIndent() + "\n" + body + "\n"
+            )
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入内置预设 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 把 link()/linkat() 的语义转译层解到真实文件路径（幂等），返回其路径。
      *
      * 为什么需要：SELinux 的 `untrusted_app(_27)` 域对 `app_data_file` **没有
@@ -2035,6 +2307,17 @@ class EngineManager private constructor(private val context: Context) {
         // 必须早于引擎启动 —— 引擎的 initProfile() 会给缺失的 patch 文件补一份空模板。
         seedDefaultSettings()
         val mobileUiPatch = writeMobileUiPatch()
+        // Agnes 多模态插件：generate_image / generate_video 两个工具 + 多模态配置页。
+        // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
+        ensureAgnesMultimodal()
+        // 把内置号池接到该插件上（写插件自己的账号池文件，只在缺失时播种一次）。
+        // 必须早于引擎启动：插件读不到账号池就会回落到它自带的默认账号。
+        seedAgnesAccounts()
+        val agnesMmPatch = writeAgnesMultimodalPatch()
+        // 内置预设 dsh-preset-razor（「快准狠模式（通用）」）并默认使用它。
+        // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
+        ensurePresetRazor()
+        val presetRazorPatch = writePresetRazorPatch()
         // 沙箱：Android 无内核级后端，用自带 runner 保住 workspace-write 的写边界
         val sandboxPatch = writeSandboxPatch(ensureSandbox())
         // 默认工作区：Android 落不进引擎的平台分支，必须显式给 documentsDirectory
@@ -2092,6 +2375,14 @@ class EngineManager private constructor(private val context: Context) {
             // 移动端 UI 适配：作为 profile 层之上的 overlay 挂载
             if (mobileUiPatch != null) {
                 add("--patch"); add(mobileUiPatch.absolutePath)
+            }
+            // Agnes 多模态插件（generate_image / generate_video）：同样是 overlay
+            if (agnesMmPatch != null) {
+                add("--patch"); add(agnesMmPatch.absolutePath)
+            }
+            // 内置预设 dsh-preset-razor：声明行 + registry 默认位，同样是 overlay
+            if (presetRazorPatch != null) {
+                add("--patch"); add(presetRazorPatch.absolutePath)
             }
             // 沙箱 runner：同样是 overlay（--patch 可重复，按顺序应用）
             if (sandboxPatch != null) {
@@ -2487,6 +2778,43 @@ class EngineManager private constructor(private val context: Context) {
          * 失败 → 客户端半不编入 → 界面静默退回桌面布局。详见 ensureMobileUi()。
          */
         private const val MOBILE_UI_DIR = "mobile-ui"
+
+        /** Agnes 多模态插件（dsh-agnes-multimodal）：资产名、包名、overlay 文件名。 */
+        private const val AGNES_MM_ASSET = "agnes-multimodal.zip"
+        private const val AGNES_MM_PACKAGE = "dsh-agnes-multimodal"
+        private const val AGNES_MM_PATCH = "agnes-multimodal.patch.yml"
+
+        /** 解包目录，相对 `$DSH_HOME`；与 [MOBILE_UI_DIR] 同理，刻意在 pnpm 管辖之外。 */
+        private const val AGNES_MM_DIR = "agnes-multimodal"
+
+        /** 插件内容版本戳：改了 `agnes-multimodal.zip` 里任何东西都必须改这里。 */
+        private const val AGNES_MM_VERSION = "1.0.0-2"
+        private const val AGNES_MM_STAMP = ".agnes_mm_version"
+
+        /** 插件自己的账号池状态文件（`lib/index.js` 的 `readAccounts()` 读的就是它）。 */
+        private const val AGNES_MM_STATE = "ag-multimodal.json"
+
+        /**
+         * 内置预设 dsh-preset-razor（「快准狠模式（通用）」）：资产名、包名、overlay 文件名。
+         *
+         * ⚠️ 本包与其它插件不同：它**没有任何 JS 代码**，`cordis.patch.yml` 里就一行
+         * `- insert:`，挂的是官方包 `@deepseek-ai/dsh-agent-preset`，携带的是一份
+         * **预设定义**（工具组装 + 系统提示词）。所以这里不需要 pnpm、不需要
+         * `node_modules`，只需把那份 YAML 原样解出来当 `--patch` overlay 用。
+         */
+        private const val PRESET_RAZOR_ASSET = "preset-razor.zip"
+        private const val PRESET_RAZOR_PACKAGE = "dsh-preset-razor"
+        private const val PRESET_RAZOR_PATCH = "preset-razor.patch.yml"
+
+        /** 解包目录，相对 `$DSH_HOME`；与 [MOBILE_UI_DIR] 同理，刻意在 pnpm 管辖之外。 */
+        private const val PRESET_RAZOR_DIR = "preset-razor"
+
+        /** 内容版本戳：改了 `preset-razor.zip` 里任何东西都必须改这里。 */
+        private const val PRESET_RAZOR_VERSION = "1.0.0-1"
+        private const val PRESET_RAZOR_STAMP = ".preset_razor_version"
+
+        /** 预设标识符，必须与 razor 的 `cordis.patch.yml` 里 `config.id` 一致。 */
+        private const val PRESET_RAZOR_ID = "razor"
 
         /**
          * link()/linkat() 语义转译层（LD_PRELOAD）。
