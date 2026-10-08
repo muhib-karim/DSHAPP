@@ -1891,7 +1891,7 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
-     * 写入内置号池的 provider 配置 overlay（`$DSH_HOME/keyinject.patch.yml`）。
+     * 把内置号池并入 profile 的用户配置层（`profiles/web/cordis.patch.yml`）。
      *
      * **只有一个供应商**，但底下的 14 把钥匙分属两个站点。合并靠的是
      * `keyinject.c` 在 TLS 层当小路由：选中哪把钥匙，就把 Host 头改成那把钥匙
@@ -1909,53 +1909,203 @@ class EngineManager private constructor(private val context: Context) {
      * 占位符随请求进入 TLS 缓冲区后，由 `libkeyinject.so` 在加密前换成真密钥。
      * **整条链路上密钥只存在于 C 库的内存里**，这是本方案的全部要害。
      *
-     * ## 为什么用 `--patch` 而不是让用户在设置页里配
+     * ## ⚠️ 为什么落在用户层，而不是 `--patch` overlay（踩过，就是本次要修的 bug）
      *
-     * 这是 App 内置的能力，粉丝不该看到、也不该改（改了号池就废了）。patch 层
-     * 由 App 每次启动整体覆盖，用户层改不动它。与 [writeSandboxPatch] 同类。
+     * 老写法是 `- id: llm-pi-ai` 的 `--patch` overlay。patch 语义是**整块替换该行
+     * 的 config**（不是深合并），而 overlay 在层序**最顶层** ⇒ 用户在 GUI 里新建的
+     * provider 会被内置号池那一份 config 整个盖掉。于是
+     * `@deepseek-ai/dsh-config-editor/lib/index.js` 的写入校验（它会把刚写下的值
+     * 经**完整层序含 overlay**重新 compose 一遍再比对）直接抛：
+     *
+     * ```
+     * Configuration for "llm-pi-ai" is overridden by a home patch or command-line overlay
+     * ```
+     *
+     * 用户看到的就是「一添加第三方 API 就报错」。所以内置值必须落在**用户层** ——
+     * 那正是 GUI 自己写入的那份文件，格式一致、语义一致（同 [seedDefaultSettings]）。
+     *
+     * ⚠️ 也不能给号池另开一行同名插件：`dsh-llm-pi-ai` 的 `apply()` 会**无条件**
+     * 声明 pi-ai 内置目录的 41 个 provider，第二个实例必然撞
+     * `DUPLICATE_DIRECTORY`（`configurable provider "anthropic" is already declared`）
+     * ⇒ 整个目录注册失败、模型列表空掉。详见 [KEY_POOL_NS]。
+     *
+     * ⚠️ 与 [seedDefaultSettings] 的「只播种一次」**刻意不同**：内置号是产品能力
+     * 的一部分，用户删掉它就等于弄丢了号池，所以每次启动都要确保它在。但**只补缺**
+     * （见 [mergeKeyPoolProvider]），已有 `agnes:` 时一个字节都不动。
      */
-    private fun writeKeyInjectPatch(inject: File?): File? {
-        if (inject == null) return null
-        val file = File(dshHome, KEYINJECT_PATCH)
-        val yaml = buildString {
-            appendLine("# 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。")
-            appendLine("# 内置号池：一个供应商，密钥在 TLS 层由 libkeyinject.so 注入；")
-            appendLine("# 国内站/国际站两套密钥由它在 TLS 层改写 Host 头自动分流。")
-            appendLine("# 配置里只有占位符，真密钥不落盘、不进 JS、不进环境变量。")
-            appendLine("# 详见 app/src/main/jni/keyinject.c。")
-            appendLine("- id: llm-pi-ai")
-            appendLine("  name: '@deepseek-ai/dsh-llm-pi-ai'")
-            appendLine("  config:")
-            appendLine("    providers:")
-            appendLine("      $KEY_PROVIDER:")
-            appendLine("        displayName: '$KEY_PROVIDER_NAME'")
-            appendLine("        api: openai-completions")
-            appendLine("        baseURL: '$KEY_BASE_URL'")
-            appendLine("        apiKeyEnv: $KEY_ENV")
-            appendLine("        models:")
-            for (m in KEY_MODELS) {
-                appendLine("          - id: $m")
-                // 声明输入模态，否则默认 ["text"] ⇒ 图片在附加前就被拒（见 [KEY_MODEL_INPUT]）。
-                appendLine("            input:")
-                for (modality in KEY_MODEL_INPUT) {
-                    appendLine("              - $modality")
-                }
-                // ⚠️ 刻意**不声明** `off` 档，理由见 [KEY_EFFORT_LEVELS]。
-                appendLine("            reasoningEfforts:")
-                for (e in KEY_EFFORT_LEVELS) {
-                    appendLine("              '$e': $e")
-                }
-            }
+    private fun ensureKeyPoolProvider(inject: File?): Boolean {
+        // 老版本把内置号池写成 --patch overlay（keyinject.patch.yml）。那个写法会
+        // 在最顶层整块替换 `llm-pi-ai` 那行，把用户自己的 provider 一起盖掉 ——
+        // 见 [KEY_POOL_NS]。这份残留**必须无条件删掉**（与号池资产在不在无关）：
+        // 它本身就是那个 bug，留着它「一加第三方 API 就报错」就还在。
+        File(dshHome, KEYINJECT_PATCH).takeIf { it.isFile }?.let {
+            if (it.delete()) Log.i(TAG, "已删除旧的内置号池 overlay: ${it.name}")
+        }
+        if (inject == null) return false
+
+        val patch = File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME")
+        val existing = try {
+            if (patch.isFile) patch.readText() else ""
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取 profile 用户配置失败: ${t.message}")
+            return false
+        }
+        val updated = mergeKeyPoolProvider(existing)
+        if (updated == existing) {
+            Log.i(TAG, "内置号池已在 profile 用户配置里: ${patch.absolutePath}")
+            return true
         }
         return try {
-            if (!file.isFile || file.readText() != yaml) {
-                file.writeText(yaml)
-                Log.i(TAG, "已写入内置号池 overlay: ${file.name}")
-            }
-            file
+            patch.parentFile?.mkdirs()
+            patch.writeText(updated)
+            Log.i(TAG, "已把内置号池并入 profile 用户配置: ${patch.absolutePath}")
+            true
         } catch (t: Throwable) {
-            Log.w(TAG, "写入内置号池 overlay 失败: ${t.message}")
-            null
+            Log.w(TAG, "写入内置号池失败: ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 把内置号池那一行并进 profile 用户配置文本（纯函数，便于离线验证）。
+     *
+     * 判据是「`llm-pi-ai` 那一行的 `providers:` 下有没有 `agnes:` 键」：
+     *
+     * - 整行不存在 ⇒ 追加完整的一行；
+     * - 有行但没有 `providers:` ⇒ 在该行块内补出 `config.providers`；
+     * - 有 `providers:` 但没有 `agnes:` ⇒ 在 `providers:` 之后插入内置块；
+     * - 已有 `agnes:` ⇒ **一个字节都不动**（用户/引擎写下的值原样保留）。
+     *
+     * ⚠️ 为什么只做「补缺」而不整块重写：这一行是 `dsh-config-editor` 实际读写
+     * 的那份文档，用户每次在 GUI 里改模型设置都会被它整体重写。我们只在缺失时
+     * 补一笔，才既能保证内置号池始终在，又不会覆盖用户自己加的 provider。
+     */
+    private fun mergeKeyPoolProvider(body: String): String {
+        val lines = body.lines().toMutableList()
+        val idIndex = lines.indexOfFirst { isEntryIdLine(it, KEY_POOL_NS) }
+
+        if (idIndex < 0) {
+            // 这一行还不存在。⚠️ 必须先摘掉空模板的 `[]` —— 留着它会变成
+            // `[]` 后面又跟一个 entry，是**非法 YAML**（一个文档不能既是流式
+            // 空数组又是块序列）。注释原样保留，YAML 允许注释出现在数组之前。
+            // 只认**顶层**的 `[]`（引擎模板就长这样），免得误删别处的空数组值。
+            lines.indexOfFirst { it.isNotBlank() && it.indexOfFirst { c -> c != ' ' } == 0 && it.trim() == "[]" }
+                .takeIf { it >= 0 }?.let { lines.removeAt(it) }
+            while (lines.isNotEmpty() && lines.last().isBlank()) lines.removeAt(lines.size - 1)
+            if (lines.isNotEmpty()) lines.add("")
+            lines.addAll(keyPoolEntryYaml(0).trimEnd('\n').lines())
+            return lines.joinToString("\n") + "\n"
+        }
+
+        // 缩进不写死：GUI（js-yaml）与用户手写的缩进都照各自的来。
+        val idIndent = lines[idIndex].indexOfFirst { it != ' ' }.coerceAtLeast(0)
+        val child = idIndent + 2
+
+        // 该 entry 的块范围：到下一个同级或更浅的项为止。
+        var end = lines.size
+        for (i in idIndex + 1 until lines.size) {
+            val line = lines[i]
+            if (line.isBlank()) continue
+            if (line.indexOfFirst { it != ' ' } <= idIndent) {
+                end = i
+                break
+            }
+        }
+
+        /** 块内缩进恰好为 [indent] 的 `key:` 行下标，找不到给 -1。 */
+        fun findKey(key: String, indent: Int, from: Int): Int {
+            for (i in from until end) {
+                val line = lines[i]
+                if (line.isBlank()) continue
+                if (line.indexOfFirst { it != ' ' } == indent && line.trim() == key) return i
+            }
+            return -1
+        }
+
+        fun insert(at: Int, text: String) {
+            lines.addAll(at, text.trimEnd('\n').lines())
+        }
+
+        val configIndex = findKey("config:", child, idIndex + 1)
+        if (configIndex < 0) {
+            // 行在、但没有 config（只有 id + name）：只补 config 子树。
+            // ⚠️ 不能再输出一遍 `name:` —— YAML 重复键是非法文档（踩过）。
+            insert(end, keyPoolConfigBody(child))
+            return lines.joinToString("\n")
+        }
+        val providersIndex = findKey("providers:", child + 2, configIndex + 1)
+        if (providersIndex < 0) {
+            insert(configIndex + 1, " ".repeat(child + 2) + "providers:")
+            insert(configIndex + 2, keyPoolAgnesYaml(child + 4))
+            return lines.joinToString("\n")
+        }
+        // 已有内置号池：一个字节都不动（用户/引擎写下的值原样保留）。
+        if (findKey(KEY_PROVIDER + ":", child + 4, providersIndex + 1) >= 0) return body
+        insert(providersIndex + 1, keyPoolAgnesYaml(child + 4))
+        return lines.joinToString("\n")
+    }
+
+    /** [mergeKeyPoolProvider] 的判据：这一行是不是 `- id: <ns>`。 */
+    private fun isEntryIdLine(line: String, ns: String): Boolean {
+        val trimmed = line.trimStart()
+        if (!trimmed.startsWith("-")) return false
+        val rest = trimmed.removePrefix("-").trimStart()
+        if (!rest.startsWith("id:")) return false
+        return rest.removePrefix("id:").trim().trim('\'', '"') == ns
+    }
+
+    /** 完整的一行（`- id:` + 内容），[indent] 为整行基准缩进。 */
+    private fun keyPoolEntryYaml(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            append(pad)
+            appendLine("- id: $KEY_POOL_NS")
+            append(keyPoolEntryBody(indent + 2))
+        }
+    }
+
+    /** 一行 entry 除 `- id:` 之外的部分（`name` + `config`），[indent] 为 `name:` 的缩进。 */
+    private fun keyPoolEntryBody(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            appendLine("${pad}name: '@deepseek-ai/dsh-llm-pi-ai'")
+            append(keyPoolConfigBody(indent))
+        }
+    }
+
+    /** 只有 `config` 子树（用于「行已存在但没写 config」的情况），[indent] 为 `config:` 的缩进。 */
+    private fun keyPoolConfigBody(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            appendLine("${pad}config:")
+            appendLine("${pad}  providers:")
+            append(keyPoolAgnesYaml(indent + 4))
+        }
+    }
+
+    /** 内置号池那一个 provider 的 YAML 块，[indent] 为 `agnes:` 的缩进。 */
+    private fun keyPoolAgnesYaml(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            appendLine("${pad}$KEY_PROVIDER:")
+            appendLine("$pad  displayName: '$KEY_PROVIDER_NAME'")
+            appendLine("$pad  api: openai-completions")
+            appendLine("$pad  baseURL: '$KEY_BASE_URL'")
+            appendLine("$pad  apiKeyEnv: $KEY_ENV")
+            appendLine("$pad  models:")
+            for (m in KEY_MODELS) {
+                appendLine("$pad    - id: $m")
+                // 声明输入模态，否则默认 ["text"] ⇒ 图片在附加前就被拒（见 [KEY_MODEL_INPUT]）。
+                appendLine("$pad      input:")
+                for (modality in KEY_MODEL_INPUT) {
+                    appendLine("$pad        - $modality")
+                }
+                // ⚠️ 刻意**不声明** `off` 档，理由见 [KEY_EFFORT_LEVELS]。
+                appendLine("$pad      reasoningEfforts:")
+                for (e in KEY_EFFORT_LEVELS) {
+                    appendLine("$pad        '$e': $e")
+                }
+            }
         }
     }
 
@@ -2419,7 +2569,13 @@ class EngineManager private constructor(private val context: Context) {
         // 内置号池：密钥在 TLS 层注入，配置与磁盘上只有占位符。
         // 资产缺失（没跑生成脚本）时返回 null，引擎照常启动、只是没有内置号池。
         val keyInject = ensureKeyInject()
-        val keyInjectPatch = writeKeyInjectPatch(keyInject)
+        // ⚠️ **不能**走 `--patch` overlay：overlay 在最顶层整块替换 `llm-pi-ai`
+        // 那一行的 config，会把用户在 GUI 里新建的 provider 一起盖掉，于是
+        // `dsh-config-editor` 的写入校验直接抛
+        // `Configuration for "llm-pi-ai" is overridden by a home patch or
+        // command-line overlay` —— 用户表现为「一添加第三方 API 就报错」。
+        // 所以改为把内置号池**补进 profile 的用户配置层**（见 [ensureKeyPoolProvider]）。
+        ensureKeyPoolProvider(keyInject)
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
         val privRunner = ensurePrivilegedShell()
@@ -2494,10 +2650,8 @@ class EngineManager private constructor(private val context: Context) {
             if (privPatch != null) {
                 add("--patch"); add(privPatch.absolutePath)
             }
-            // 内置号池：provider 路由 + 占位符引用（真密钥由 LD_PRELOAD 的库注入）
-            if (keyInjectPatch != null) {
-                add("--patch"); add(keyInjectPatch.absolutePath)
-            }
+            // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
+            // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
             // 端口：默认沿用引擎内置的 3080；被占用时改让内核分配空闲端口。
             // 不这么做的话 webserver（required）会以 EADDRINUSE 激活失败 →
             // `dsh: startup failed: 2 required plugins did not activate` → 引擎退出。
@@ -2932,7 +3086,32 @@ class EngineManager private constructor(private val context: Context) {
         /** 内置号池的注入库（见 `ensureKeyInject()` 与 `app/src/main/jni/keyinject.c`）。 */
         private const val KEYINJECT_ASSET = "keyinject.bin"
         private const val KEYINJECT_FILE = "libkeyinject.so"
+
+        /**
+         * 旧版内置号池 overlay 的文件名。**只用于删除**：那个写法（`- id: llm-pi-ai`
+         * 的 `--patch`）会把用户新建的 provider 一起盖掉，导致 GUI 一加第三方 API
+         * 就报 `Configuration for "llm-pi-ai" is overridden by a home patch or
+         * command-line overlay`。老安装里残留的这份必须删掉，否则它仍会生效。
+         */
         private const val KEYINJECT_PATCH = "keyinject.patch.yml"
+
+        /**
+         * 内置号池落在哪一行：**必须复用引擎自己的 `llm-pi-ai` entry**，
+         * 不能另开一行同名插件。
+         *
+         * ⚠️ 为什么不能另开一行（踩过）：`dsh-llm-pi-ai` 的 `apply()` 会**无条件**
+         * 把 pi-ai 内置目录里的 41 个 provider 全部 `registerConfigurableProviders()`。
+         * 挂第二个实例时，第二批声明撞上第一批已经占用的路由，
+         * `commit()` 抛 `DUPLICATE_DIRECTORY`（`configurable provider "anthropic"
+         * is already declared`）⇒ 整个目录注册失败，模型列表空掉。
+         *
+         * ⚠️ 也不能用 `--patch` 去改这一行：overlay 在最顶层，会把用户在 GUI 里
+         * 新建的 provider 整块盖掉（就是本次要修的 bug）。
+         *
+         * 所以唯一正确的落点是**同一个 entry、profile 的用户配置层** —— 那正是
+         * GUI 自己写入的那份文件，我们只在缺 `agnes:` 时补一笔，绝不覆盖用户内容。
+         */
+        private const val KEY_POOL_NS = "llm-pi-ai"
 
         /**
          * 引擎配置里的匿名占位符。

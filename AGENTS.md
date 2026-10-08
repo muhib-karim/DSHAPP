@@ -1871,9 +1871,13 @@ resolveWebPort()?.let { port -> add("--port"); add(port.toString()) }
 （后两者都是生成物；头文件也**不入库**，因为混淆可逆、等价于明文）。
 
 `EngineManager` 侧：`ensureKeyInject()` 解到 `filesDir/libkeyinject.so`；
-`writeKeyInjectPatch()` 写 `$DSH_HOME/keyinject.patch.yml`；`start()` 里把该库
+`ensureKeyPoolProvider()` 把号池 provider **并入 profile 的用户配置层**
+（`$DSH_HOME/profiles/web/cordis.patch.yml`，只补缺、不覆盖）；`start()` 里把该库
 **追加**进 `LD_PRELOAD`（与 linkcompat 并存），并把 `AGNES_CREDENTIAL`
 环境变量设成**占位符**。
+
+⚠️ **不要把它写回 `$DSH_HOME/keyinject.patch.yml`** —— 那正是下一节要讲的
+`overridden by a home patch` 事故。`KEYINJECT_PATCH` 常量现在**只用于删除**老残留。
 
 #### 三个 hook 的分工
 
@@ -2017,6 +2021,56 @@ ALPN 列表、等 SNI 到达再决定是否降级。
 ⚠️ 加密端（PowerShell 的 `Get-Scramble`）与解密端（C 的 `derive_key`）**必须逐字节
 一致**，改一边必须同步改另一边。脚本里有往返自检，不一致会直接报错。
 
+#### ⚠️⚠️ 内置号池**绝不能**写成 `--patch` overlay —— 那会让用户加不了第三方 API
+
+**这是本方案踩过的最严重的一个坑**，症状是「更新完内置模型之后，用户一添加第三方
+API 就报错」，报错原文：
+
+```
+Configuration for "llm-pi-ai" is overridden by a home patch or command-line overlay
+```
+
+**根因**（`@deepseek-ai/dsh-config-editor/lib/index.js:122`）：GUI 的「创建提供商」
+走 `settings.mutate("llm-pi-ai", …)` → `ConfigEditor.edit()`，它在写盘前有一道
+**保护性校验** —— 把刚写下的值经**完整层序（含 `--patch` overlay）**重新
+`composeEntries()` 一遍，必须与写入值**深相等**，否则抛上面那句。
+
+而 patch 的语义是**整块替换该行的 `config`**（不是深合并，见 `dsh-base/cordis.patch.yml`
+头部注释），overlay 又排在**最顶层**。所以 `- id: llm-pi-ai` 的 overlay 一旦存在：
+
+| 层 | `llm-pi-ai` 的 `providers` |
+|---|---|
+| bundle | （空） |
+| **用户层**（GUI 写入 `agnes` + 用户新建的 `a`） | `agnes`, `a` |
+| **`--patch` overlay**（内置号池） | **`agnes`** ← 只剩这个 |
+
+compose 结果是 `{agnes}`，与写入的 `{agnes, a}` 不相等 ⇒ 校验失败 ⇒ **报错**。
+用户的 provider 一个都存不进去。
+
+**修法**：内置号池并入 **profile 的用户配置层**
+（`$DSH_HOME/profiles/web/cordis.patch.yml`）—— 那正是 GUI 自己读写的那份文件，
+格式与语义完全一致（同 [seedDefaultSettings] 的理由）。`EngineManager.ensureKeyPoolProvider()`
+只做**补缺**：已有 `agnes:` 时一个字节都不动，所以既能保证号池始终在，又不会覆盖
+用户自己加的 provider。
+
+⚠️ **老安装残留的 `keyinject.patch.yml` 必须无条件删除**（与号池资产在不在无关）：
+它本身就是那个 bug，留着它报错就还在。
+
+⚠️ **也不能给号池另开一行**（比如 `- insert: [{id: agnes-pool, name: '@deepseek-ai/dsh-llm-pi-ai'}]`）：
+`dsh-llm-pi-ai` 的 `apply()` 会**无条件**把 pi-ai 内置目录的 **41 个 provider**
+全部 `registerConfigurableProviders()`。挂第二个实例时第二批声明撞上第一批已占用的
+路由，抛 `DUPLICATE_DIRECTORY`（`configurable provider "anthropic" is already declared`）
+⇒ 整个目录注册失败、**模型列表空掉**。实测 `getBuiltinProviders()` 返回 41 项。
+
+⚠️ 改这一处时注意两个 YAML 细节（都踩过）：
+- 空模板是 `[]`，往里追加 entry 前**必须先摘掉它**，否则 `[]` 后面跟块序列是**非法 YAML**；
+- 行已存在但没写 `config:` 时，只补 `config` 子树，**不能再输出一遍 `name:`**（重复键非法）。
+
+**验收**（离线，用引擎自己的 `composeEntries` + `dsh-config-editor` 的判据）：
+四种起点（空模板 `[]` / 已有用户 provider / 已播种出厂默认项 / 行存在但无 config）
+补完后，模拟 GUI 新建 provider 再 compose，**必须深相等**；幂等（跑两次逐字节相同）；
+已有 `agnes:` 时**一个字节都不动**。
+
 #### 验收
 
 **离线实测（PC 上直接打两个站点，绕过引擎，验的是 combo 的分流原理）**：
@@ -2037,10 +2091,11 @@ ALPN 列表、等 SNI 到达再决定是否降级。
 | 项 | 结果 |
 |---|---|
 | `已解出号池注入库 libkeyinject.so (12576 字节)` | 注入库已落盘 |
-| `已写入内置号池 overlay: keyinject.patch.yml` | overlay 已生成 |
-| 设备上的 overlay 内容 | **单** provider `agnes`、`displayName: 'Agnes'`、baseURL 是 apihub、**只有 `agnes-3.0-flash` 一个模型** |
+| `已把内置号池并入 profile 用户配置: .../profiles/web/cordis.patch.yml` | 已并入用户层（**不是** overlay） |
+| `已删除旧的内置号池 overlay: keyinject.patch.yml` | 老安装的残留 overlay 已清掉（只出现一次） |
+| 用户层里的内置号池内容 | **单** provider `agnes`、`displayName: 'Agnes'`、baseURL 是 apihub、**只有 `agnes-3.0-flash` 一个模型** |
 | 引擎启动 | `引擎就绪` + `WebView 加载完成` |
-| `已安装移动端 UI 插件 dsh-android-mobile 1.0.0-38` | 已去掉「路由日志」分节的插件已解包 |
+| `已安装移动端 UI 插件 dsh-android-mobile <版本>` | 移动端插件已解包 |
 
 ⚠️ **下面这些要人工确认**（GUI 观感与真实对话，离线探针测不到）：
 
