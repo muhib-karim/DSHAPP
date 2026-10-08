@@ -55,3 +55,7 @@ agnes-keys-guide.md
 # 管线）、assets/（实机截图素材）、shots/（真机原始截图）、out/（成片）。
 video/tmp/
 video/clips/
+
+# 宣传片：同一套管线，忽略规则与介绍片一致
+video-promo/tmp/
+video-promo/clips/

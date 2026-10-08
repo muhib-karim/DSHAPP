@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<!--
+  DSH 安卓客户端 · 宣传片场景
+
+  渲染器只通过三个全局量驱动本文件：
+    window.__show(id)       切场景并重启该场景的 CSS 动画
+    window.__seek(id, t)    按精确时间设置「非 CSS」状态（点击响应、镜头推近、打字机）
+    window.__play(id, secs) 在真实浏览器里预览
+
+  设计约束（与 SKILL.md §2 一致，都是实测结论）：
+    - 只动 transform / opacity。绝不用 filter:blur()，绝不动 top/left/width/height。
+    - 全部素材是真机截图，没有一张是画出来的。
+    - 「模拟点击 → 真实响应」用两帧真实截图切换实现（20-bubble-home → 22-bubble-panel），
+      不是叠一个假的 UI。
+    - 每个场景都有持续的镜头推近，避免「幻灯片一页页翻」的观感。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   STYLE BLOCK — 纸墨杂志默认模板（暖白纸底 + 衬线标题 + 单一靛蓝强调色）
+   ══════════════════════════════════════════════════════════════════════════ */
+:root {
+  --bg:       #F7F5F2;
+  --ink:      #17161A;
+  --ink-2:    #3C3A42;
+  --dim:      #8B8791;
+  --accent:   #5A6BFF;
+  --accent-2: #8A7BFF;
+  --accent-soft: rgba(90,107,255,.09);
+  --panel:    #FFFFFF;
+  --line:     rgba(23,22,26,.10);
+  --line-2:   rgba(23,22,26,.06);
+
+  --glow-a: rgba(90,107,255,.11);
+  --glow-b: rgba(255,186,140,.13);
+
+  --serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
+  --sans:  "Noto Sans SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  --mono:  ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --h1-size: 9.8vh;
+  --h1-weight: 600;
+  --h2-size: 5.4vh;
+  --lead-size: 2.5vh;
+  --cap-size: 3.05vh;
+  --cap-color: #4E4B55;
+  --cap-shadow: 0 1px 0 rgba(255,255,255,.7);
+
+  --rise-dur: .82s;
+  --ease: cubic-bezier(.2,.72,.24,1);
+
+  /* 真机截图统一显示高度；下面所有点击坐标都由它换算而来 */
+  --cam-h: 88vh;
+}
+/* ══════════════════════ end STYLE BLOCK ══════════════════════════════════ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); }
+body { font-family: var(--sans); color: var(--ink); font-size: 2.2vh; }
+
+.stage { position: fixed; inset: 0; }
+
+/* ---- 页眉：品牌 + 页码，每个场景都在 ---- */
+.rail {
+  position: absolute; left: 8vw; right: 8vw; top: 6vh;
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 1.05vh; letter-spacing: .34em; text-transform: uppercase;
+  color: var(--dim); z-index: 4;
+}
+.rail .pager { font-family: var(--mono); letter-spacing: .18em; font-variant-numeric: tabular-nums; }
+
+/* ---- 一个场景 = 一个 <section> ---- */
+.scene {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; justify-content: center;
+  opacity: 0; pointer-events: none;
+  padding: 11vh 8vw 15vh;
+}
+.scene.on { opacity: 1; }
+.scene.center { align-items: center; text-align: center; }
+
+/* ---- 背景：纯渐变，零栅格化开销 ---- */
+.bg { position: absolute; inset: -22%; z-index: 0; pointer-events: none; }
+.bg::before {
+  content: ""; position: absolute; inset: 0;
+  background:
+    radial-gradient(44% 40% at 20% 24%, var(--glow-a), transparent 70%),
+    radial-gradient(38% 36% at 80% 76%, var(--glow-b), transparent 72%);
+}
+@keyframes drift {
+  from { transform: translate3d(-1.4%, -1.1%, 0) scale(1.02); }
+  to   { transform: translate3d(1.6%, 1.3%, 0) scale(1.07); }
+}
+.bg { animation: drift 30s ease-in-out infinite alternate; will-change: transform; }
+
+/* ---- 文字 ---- */
+h1 {
+  font-family: var(--serif); font-size: var(--h1-size);
+  font-weight: var(--h1-weight); letter-spacing: .01em; line-height: 1.22;
+}
+h1 .thin { font-weight: 300; color: var(--ink-2); }
+h2 { font-family: var(--serif); font-size: var(--h2-size); font-weight: var(--h1-weight); line-height: 1.3; }
+
+.eyebrow { font-size: 1.85vh; letter-spacing: .3em; text-transform: uppercase; color: var(--dim); }
+.num { font-family: var(--mono); font-size: 2.2vh; letter-spacing: .16em; color: var(--accent); }
+.lead { font-size: var(--lead-size); line-height: 1.75; color: var(--ink-2); font-weight: 300; }
+
+.rise { display: block; animation: rise var(--rise-dur) var(--ease) both; animation-delay: var(--d, 0s); }
+@keyframes rise {
+  from { opacity: 0; transform: translate3d(0, 28px, 0); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes pop { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: none; } }
+.pop { animation: pop .72s var(--ease) both; animation-delay: var(--d, 0s); }
+
+.hl { color: var(--accent); }
+.rule { height: 1px; background: var(--line); transform-origin: left center;
+        animation: sweep .95s var(--ease) both; animation-delay: var(--d, 0s); }
+@keyframes sweep { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 24px;
+  box-shadow: 0 2px 4px rgba(23,22,26,.03), 0 30px 60px -40px rgba(23,22,26,.35);
+}
+.divider { height: 1px; background: var(--line-2); }
+
+.split { display: grid; grid-template-columns: 40% 1fr; gap: 5vw; align-items: center; width: 100%; }
+
+/* ══════════════ 真机截图卡 ══════════════ */
+.shot { display: flex; align-items: center; justify-content: center; min-width: 0; }
+/* .cam 是镜头容器：overflow:hidden + 固定比例，JS 只对它做 scale 推近 */
+.cam {
+  position: relative; height: var(--cam-h); aspect-ratio: 9 / 20;
+  border-radius: 3.2vh; overflow: hidden;
+  background: var(--panel);
+  box-shadow: 0 2px 4px rgba(23,22,26,.05), 0 40px 80px -50px rgba(23,22,26,.55),
+              0 0 0 1px var(--line);
+  transform-origin: center center; will-change: transform;
+}
+.cam img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+.cam .layer { position: absolute; inset: 0; }
+.cam .layer img { width: 100%; height: 100%; }
+/* 截图顶部状态栏（时间/信号）对宣传片是噪音，用一层纸色渐变压掉 */
+.cam .veil {
+  position: absolute; left: 0; right: 0; top: 0; height: 7%;
+  background: linear-gradient(to bottom, var(--bg) 22%, rgba(247,245,242,0));
+}
+
+/* ══════════════ 模拟点击：触点 + 波纹 + 高亮框 ══════════════ */
+/* 全部用「相对 cam 的百分比」定位 —— 与 cam 的 vh 尺寸解耦，换比例也不会错位。
+   触点是 --tx/--ty（中心）；高亮框是 --bx/--by（中心）+ --bw/--bh，两者独立。 */
+.tap {
+  position: absolute; left: var(--tx); top: var(--ty);
+  width: 4.6vh; height: 4.6vh; margin: -2.3vh 0 0 -2.3vh;
+  border-radius: 50%; z-index: 3;
+  background: radial-gradient(circle, rgba(90,107,255,.96) 0 33%, rgba(90,107,255,.22) 34% 100%);
+  box-shadow: 0 0 0 .7vh rgba(90,107,255,.16), 0 .6vh 1.6vh rgba(23,22,26,.20);
+  animation: tapMove 1.05s var(--ease) both; animation-delay: var(--tapd, .55s);
+}
+/* 位移是「固定 7vh 自下而上」的纯相对量，不参与百分比换算，落点因此永远精确 */
+@keyframes tapMove {
+  from { opacity: 0; transform: translate3d(0, 7vh, 0) scale(1.5); }
+  35%  { opacity: 1; }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+.tap::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  border: .34vh solid var(--accent); opacity: 0;
+  animation: tapRing .9s var(--ease) both; animation-delay: calc(var(--tapd, .55s) + 1.05s);
+}
+@keyframes tapRing {
+  from { opacity: .9; transform: scale(.45); }
+  to   { opacity: 0; transform: scale(2.7); }
+}
+/* 高亮框：从中心长出来，把「点到了什么」圈住 */
+.hlbox {
+  position: absolute; left: var(--bx); top: var(--by);
+  width: var(--bw); height: var(--bh);
+  margin: calc(var(--bh) / -2) 0 0 calc(var(--bw) / -2);
+  z-index: 2; opacity: 0;
+  border: .3vh solid var(--accent); border-radius: 1.4vh;
+  background: var(--accent-soft); transform-origin: center center;
+  animation: hlbox .62s var(--ease) both; animation-delay: var(--hlbd, 1.72s);
+}
+@keyframes hlbox {
+  from { opacity: 0; transform: scale(.84, .5); }
+  to   { opacity: 1; transform: scale(1, 1); }
+}
+
+/* ══════════════ 规格条 / 徽章 ══════════════ */
+.specs { display: flex; flex-direction: column; gap: 0; }
+.spec { display: flex; align-items: baseline; justify-content: space-between; padding: 1.5vh 0; }
+.spec .k { font-size: 2.1vh; color: var(--dim); letter-spacing: .06em; }
+.spec .v { font-family: var(--mono); font-size: 2.35vh; color: var(--ink); font-variant-numeric: tabular-nums; }
+.spec .v.hl { color: var(--accent); }
+
+.points { display: flex; flex-direction: column; gap: 1.5vh; }
+.point {
+  display: flex; align-items: flex-start; gap: .9vw;
+  font-size: 2.35vh; line-height: 1.45; color: var(--ink);
+  animation: rise .6s var(--ease) both; animation-delay: var(--d, 0s);
+}
+.point .ico {
+  flex: 0 0 auto; width: 2.5vh; height: 2.5vh; margin-top: .3vh;
+  fill: none; stroke: var(--accent); stroke-width: 2.4;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+
+.badges { display: flex; flex-wrap: wrap; gap: 1.3vh; justify-content: center; }
+.badge {
+  font-size: 2vh; letter-spacing: .04em; color: var(--ink-2);
+  padding: .95vh 2vh; border-radius: 99px;
+  background: var(--panel); border: 1px solid var(--line);
+  box-shadow: 0 1px 2px rgba(23,22,26,.03);
+  animation: rise .6s var(--ease) both; animation-delay: var(--d, 0s);
+}
+
+/* 大数字（结尾用） */
+.figure {
+  font-family: var(--mono); font-size: 13vh; font-weight: 600; line-height: 1;
+  letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+}
+.figure .u { font-size: 4.6vh; font-weight: 400; color: var(--ink-2); margin-left: 1vh; }
+
+/* ---- 字幕，由 __LINES 驱动 ---- */
+.cap {
+  position: absolute; left: 0; right: 0; bottom: 6.4vh;
+  text-align: center; font-size: var(--cap-size); color: var(--cap-color);
+  text-shadow: var(--cap-shadow);
+  padding: 0 6vw; line-height: 1.4; z-index: 5;
+}
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <!-- 全片只有一个环境光元素 -->
+  <div class="bg"></div>
+
+  <div class="rail"><span data-brand>DSH · 安卓客户端</span><span class="pager" id="pager">01 / 08</span></div>
+
+  <!-- ══ s1 钩子：全片的核心叙事，居中两行衬线 ══ -->
+  <section class="scene center on" id="s1">
+    <div class="eyebrow rise">2026 · 端侧 Agent</div>
+    <h1 class="rise" style="--d:.16s;margin-top:2.8vh">别人的 AI</h1>
+    <h1 class="thin rise" style="--d:.34s">还在你手机里说话</h1>
+    <div class="rule" style="--d:.6s;width:26vw;margin:4.6vh 0"></div>
+    <p class="lead rise" style="--d:.72s">这个 AI，<span class="hl" style="font-weight:400">已经在你手机里干活了</span>。</p>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s2 系统级身份：特权权限页，触点落到「已开启」 ══ -->
+  <section class="scene" id="s2">
+    <div class="split">
+      <div>
+        <div class="num rise">01 — 系统级身份</div>
+        <h2 class="rise" style="--d:.14s;margin:1.5vh 0 2.4vh">它能做普通 App<br>做不到的事</h2>
+        <div class="points">
+          <div class="point" style="--d:.3s">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="12" cy="12" r="3.2"/></svg>
+            <span>截图，拿到的是一张<b>真图</b></span>
+          </div>
+          <div class="point" style="--d:.42s">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3v3M15 3v3"/><path d="M6 8h12l-1 12H7L6 8z"/></svg>
+            <span>模拟点击，<b>屏幕真的会动</b></span>
+          </div>
+          <div class="point" style="--d:.54s">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M8 7l1 13h6l1-13"/></svg>
+            <span>卸载应用、改系统设置</span>
+          </div>
+        </div>
+      </div>
+      <div class="shot pop">
+        <div class="cam">
+          <!-- 19-priv.png 是 1080x2268，比 cam 的 9:20 略宽，cover 会左右各裁一点；
+               百分比是相对裁切后的可见区算的（locate.py/preview.py 核过） -->
+          <div class="layer"><img src="assets/19-priv.png" alt="特权权限页"></div>
+          <div class="hlbox" style="--bx:50.0%;--by:27.4%;--bw:88.0%;--bh:15.0%;--hlbd:1.72s"></div>
+          <div class="tap" style="--tx:83.7%;--ty:27.5%;--tapd:.6s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s3 完整开发机：真机会话里 AI 在做真实环境分析 ══ -->
+  <section class="scene" id="s3">
+    <div class="split">
+      <div>
+        <div class="num rise">02 — 完整开发机</div>
+        <h2 class="rise" style="--d:.14s;margin:1.5vh 0 2.4vh">引擎就跑在<br>这台手机里</h2>
+        <div class="panel pop" style="--d:.3s;padding:1vh 2.4vh">
+          <div class="specs">
+            <div class="spec"><span class="k">运行时</span><span class="v">Node 26.4.0</span></div>
+            <div class="divider"></div>
+            <div class="spec"><span class="k">环境</span><span class="v">Termux · bash · pnpm</span></div>
+            <div class="divider"></div>
+            <div class="spec"><span class="k">连接方式</span><span class="v hl">全部本地</span></div>
+          </div>
+        </div>
+        <p class="lead rise" style="--d:.52s;margin-top:2.6vh">不用连电脑，不用服务器，也不用 root。</p>
+      </div>
+      <div class="shot pop">
+        <div class="cam">
+          <div class="layer"><img src="assets/10-chat.png" alt="真机会话"></div>
+          <div class="veil"></div>
+          <!-- 触点落在会话里的工具调用卡片上（AI 正在真实执行） -->
+          <div class="tap" style="--tx:23.0%;--ty:14.8%;--tapd:.62s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s4 悬浮气泡：点击圆点 → 真实展开面板（两张真机截图切换） ══ -->
+  <section class="scene" id="s4">
+    <div class="split">
+      <div>
+        <div class="num rise">03 — 退到桌面也不停</div>
+        <h2 class="rise" style="--d:.14s;margin:1.5vh 0 2.4vh">屏幕上留一个圆点</h2>
+        <div class="points">
+          <div class="point" style="--d:.3s">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8.4v4.2l2.6 1.6"/></svg>
+            <span>实时显示<b>正在做什么</b></span>
+          </div>
+          <div class="point" style="--d:.44s">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12H4z"/><path d="M7.5 10h9M7.5 13.5h5"/></svg>
+            <span>点开就是输入框，<b>直接发消息</b></span>
+          </div>
+          <div class="point" style="--d:.58s">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M5 8l7-5 7 5"/></svg>
+            <span>不用切回 App，不用重新加载</span>
+          </div>
+        </div>
+      </div>
+      <div class="shot pop">
+        <div class="cam">
+          <!-- 点击前：桌面上的气泡圆点 + 状态标签 -->
+          <div class="layer" id="s4-a"><img src="assets/20-bubble-home-blur.png" alt="桌面上的气泡"></div>
+          <!-- 点击后：真实展开的面板（真机截图，不是画出来的） -->
+          <div class="layer" id="s4-b" style="opacity:0"><img src="assets/22-bubble-panel-blur.png" alt="展开的气泡面板"></div>
+          <div class="veil"></div>
+          <!-- 框圈住展开后的整块面板（含输入框与发送按钮）—— 只在切换后出现 -->
+          <div class="hlbox" id="s4-box" style="--bx:49.1%;--by:50.5%;--bw:67.0%;--bh:34.0%;--hlbd:2.42s"></div>
+          <!-- 触点落在桌面上的气泡圆点（点击前那张图上），切换后隐藏 -->
+          <div class="tap" id="s4-tap" style="--tx:92.2%;--ty:41.0%;--tapd:.6s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s5 通知栏 ══ -->
+  <section class="scene" id="s5">
+    <div class="split">
+      <div>
+        <div class="num rise">04 — 进度看得见</div>
+        <h2 class="rise" style="--d:.14s;margin:1.5vh 0 2.4vh">通知栏<br>就是它的进度条</h2>
+        <p class="lead rise" style="--d:.32s">
+          不用打开 App，也不用解锁。<br>
+          正在执行什么、最后一段输出是什么，<br>
+          下拉通知栏全都在。
+        </p>
+        <p class="lead rise" style="--d:.5s;margin-top:2.6vh;font-size:2.2vh">
+          <span class="hl">前台服务 + 唤醒锁</span>，进程不会被系统回收。
+        </p>
+      </div>
+      <div class="shot pop">
+        <div class="cam">
+          <!-- 通知栏里除了 DSH 那张卡，其余都是第三方隐私（群名、新闻、昵称），
+               已在离线阶段做高斯模糊（redact.py），页面里零运行时开销 -->
+          <div class="layer"><img src="assets/17-notif-blur.png" alt="通知栏实时状态"></div>
+          <div class="hlbox" style="--bx:50.0%;--by:17.0%;--bw:94.0%;--bh:12.3%;--hlbd:1.72s"></div>
+          <div class="tap" style="--tx:50.0%;--ty:15.0%;--tapd:.6s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s6 内置免费号池 ══ -->
+  <section class="scene" id="s6">
+    <div class="split">
+      <div>
+        <div class="num rise">05 — 零配置</div>
+        <h2 class="rise" style="--d:.14s;margin:1.5vh 0 2.4vh">装完就能用<br>不用填 key</h2>
+        <p class="lead rise" style="--d:.32s">
+          内置免费号池，密钥在 TLS 层换上去，<br>
+          界面上永远是一串打码的占位符。
+        </p>
+        <div class="panel pop" style="--d:.5s;margin-top:2.8vh;padding:1vh 2.4vh">
+          <div class="specs">
+            <div class="spec"><span class="k">自定义号</span><span class="v">排在前面先试</span></div>
+            <div class="divider"></div>
+            <div class="spec"><span class="k">内置号池</span><span class="v hl">最后兜底 · 不可修改</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="shot pop">
+        <div class="cam">
+          <div class="layer"><img src="assets/13-pool.png" alt="多模态配置 · 内置号池"></div>
+          <div class="veil"></div>
+          <div class="hlbox" style="--bx:50.0%;--by:66.0%;--bw:86.0%;--bh:13.0%;--hlbd:1.72s"></div>
+          <div class="tap" style="--tx:50.0%;--ty:66.0%;--tapd:.6s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s7 跨会话记忆 + 人设 ══ -->
+  <section class="scene" id="s7">
+    <div class="split">
+      <div>
+        <div class="num rise">06 — 它认得你</div>
+        <h2 class="rise" style="--d:.14s;margin:1.5vh 0 2.4vh">跨会话记忆<br>常驻注入</h2>
+        <p class="lead rise" style="--d:.32s">
+          你上次说过什么、项目是什么、<br>
+          偏好怎么写——新会话里它全都记得。
+        </p>
+        <p class="lead rise" style="--d:.5s;margin-top:2.6vh;font-size:2.2vh">
+          回复风格还能随手切：<span class="hl">十一种人设</span>换着用。
+        </p>
+      </div>
+      <div class="shot pop">
+        <div class="cam">
+          <div class="layer"><img src="assets/14-persona.png" alt="AI 回复风格"></div>
+          <div class="veil"></div>
+          <div class="hlbox" style="--bx:50.0%;--by:36.4%;--bw:86.0%;--bh:7.4%;--hlbd:1.72s"></div>
+          <div class="tap" style="--tx:13.0%;--ty:36.4%;--tapd:.6s"></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap" data-cap></div>
+  </section>
+
+  <!-- ══ s8 结尾转化 ══ -->
+  <section class="scene center" id="s8">
+    <div class="eyebrow rise">现在就能装</div>
+    <div class="figure rise" style="--d:.16s;margin-top:3vh">127<span class="u">MB</span></div>
+    <h1 class="thin rise" style="--d:.34s;font-size:5.2vh;margin-top:2.4vh">无 root · 无电脑 · 免费号池开箱可用</h1>
+    <div class="rule" style="--d:.58s;width:24vw;margin:4.4vh 0"></div>
+    <div class="badges">
+      <span class="badge" style="--d:.7s">内置 Node 26</span>
+      <span class="badge" style="--d:.78s">内置 Agent 引擎</span>
+      <span class="badge" style="--d:.86s">系统级操作</span>
+      <span class="badge" style="--d:.94s">悬浮气泡</span>
+      <span class="badge" style="--d:1.02s">跨会话记忆</span>
+    </div>
+    <p class="lead rise" style="--d:1.16s;margin-top:4.2vh;font-size:2.7vh">
+      评论区置顶拿包 · <span class="hl">你的手机也能开始干活</span>
+    </p>
+    <div class="cap" data-cap></div>
+  </section>
+
+</div>
+
+<script>
+// ---- 字幕注入 ----
+// render.mjs 在 seek 之前设置 window.__LINES = { s1: "第一句", ... }
+function paintCap(id) {
+  const el = document.querySelector('#' + id + ' [data-cap]')
+  if (!el) return
+  const text = (window.__LINES || {})[id]
+  if (el.textContent !== (text || '')) el.textContent = text || ''
+}
+
+// 场景顺序驱动页码。必须与 <section> 的 id 以及 video.config.mjs 的 shots 顺序一致。
+const SCENES = ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']
+
+window.__show = function (id) {
+  for (const s of document.querySelectorAll('.scene')) s.classList.toggle('on', s.id === id)
+  const el = document.getElementById(id)
+  if (el) { void el.offsetWidth }   // reflow -> 重启 CSS 动画
+  paintCap(id)
+  // 复位非 CSS 状态（上一轮渲染可能留下了中间态）
+  const cam = document.querySelector('#' + id + ' .cam')
+  if (cam) cam.style.transform = ''
+  if (id === 's4') setPanel(false)
+  const pager = document.getElementById('pager')
+  if (pager) {
+    const n = SCENES.indexOf(id)
+    pager.textContent = String(n + 1).padStart(2, '0') + ' / ' + String(SCENES.length).padStart(2, '0')
+  }
+}
+
+// ---- s4 的「点击前 / 点击后」两张真机截图切换 ----
+// 切换前：桌面上的气泡圆点 + 触点；切换后：真实展开的面板 + 高亮框（框的 delay 已对齐）。
+// 触点在切换后直接 display:none —— 它属于「点击前」那一层，留着会穿帮。
+function setPanel(on) {
+  const a = document.getElementById('s4-a')
+  const b = document.getElementById('s4-b')
+  if (a) a.style.opacity = on ? '0' : '1'
+  if (b) b.style.opacity = on ? '1' : '0'
+  const tap = document.getElementById('s4-tap')
+  if (tap) tap.style.display = on ? 'none' : ''
+}
+
+// ---- 持续镜头推近：每帧由 JS 按精确时间设 scale ----
+// 时长与场景实际长度无关（6.0~7.8s），推到头就停住，避免依赖硬编码的动画时长。
+function cam(id, t) {
+  const el = document.querySelector('#' + id + ' .cam')
+  if (!el) return
+  const s = 1 + Math.min(t, 6.5) * 0.0052
+  el.style.transform = 'scale(' + s.toFixed(4) + ')'
+}
+
+const SEEKERS = {
+  s1(id, t) { paintCap(id) },
+  s2(id, t) { cam(id, t); paintCap(id) },
+  s3(id, t) { cam(id, t); paintCap(id) },
+  s4(id, t) {
+    cam(id, t)
+    // 触点落点是 1.7s，留 0.6s 的「响应时间」再换成展开后的真机截图
+    setPanel(t >= 2.3)
+    paintCap(id)
+  },
+  s5(id, t) { cam(id, t); paintCap(id) },
+  s6(id, t) { cam(id, t); paintCap(id) },
+  s7(id, t) { cam(id, t); paintCap(id) },
+  s8(id, t) { paintCap(id) },
+}
+
+window.__seek = function (id, t) {
+  const fn = SEEKERS[id]
+  if (fn) fn(id, t)
+  else paintCap(id)
+}
+
+// 在真实浏览器里预览：__play('s4', 8)
+window.__play = async function (id, seconds = 5) {
+  window.__show(id)
+  const t0 = performance.now()
+  const step = () => {
+    const t = (performance.now() - t0) / 1000
+    if (t > seconds) return
+    window.__seek(id, t)
+    requestAnimationFrame(step)
+  }
+  requestAnimationFrame(step)
+}
+</script>
+</body>
+</html>
