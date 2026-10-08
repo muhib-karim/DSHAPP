@@ -1343,6 +1343,10 @@ window.__ModuleLoader__.load({
 			// 钥匙孔代表拿得到特权。用描边风格（同 plugin/model 等），
 			// 与「通用设置/AI 回复风格」那两个实心官方图标区分开。
 			privileged: '<path d="M8 1.8l5.6 2.1v4.5c0 3.2-2.4 5.6-5.6 6.5-3.2-.9-5.6-3.3-5.6-6.5V3.9z"/><circle cx="8" cy="6.9" r="1.35"/><path d="M8 8.25V10.7"/>',
+			// 路由日志：自绘「分叉箭头」（一条入线分成两条出线）。
+			// 语义就是号池在做的事 —— 每个请求随机分到 14 把钥匙里的一把。
+			// 与 privileged 同样用描边风格。
+			route: '<circle cx="3.4" cy="8" r="1.5"/><circle cx="12.6" cy="3.6" r="1.5"/><circle cx="12.6" cy="12.4" r="1.5"/><path d="M4.9 8h2.3c1.2 0 1.6-.5 2.2-1.5l1.2-1.9"/><path d="M4.9 8h2.3c1.2 0 1.6.5 2.2 1.5l1.2 1.9"/>',
 		};
 		// 文本 → 图标键。先长后短匹配，避免「插件」抢走「插件市场」。
 		const MP_NAV_ICONS = [
@@ -1363,6 +1367,8 @@ window.__ModuleLoader__.load({
 			// 保持「长/具体优先」的既有约定。
 			["特权权限", "privileged"],
 			["Privileged access", "privileged"],
+			["路由日志", "route"],
+			["Routing log", "route"],
 		];
 		const mpIconKeyOf = (label) => {
 			const t = (label || "").trim();
@@ -1551,7 +1557,7 @@ window.__ModuleLoader__.load({
 						{ label: "通用", items: ["通用设置"] },
 						{ label: "模型", items: ["模型"] },
 						{ label: "插件", items: ["插件"] },
-						{ label: "高级", items: ["Agent 预设", "快照", "附件缓存", "特权权限"] },
+						{ label: "高级", items: ["Agent 预设", "快照", "附件缓存", "特权权限", "悬浮气泡", "路由日志"] },
 					];
 					for (const g of groups) {
 						const first = [...navList.querySelectorAll("button")].find((b) => g.items.includes((b.innerText || "").trim()));
@@ -4019,6 +4025,59 @@ window.__ModuleLoader__.load({
 			note3: "Messages sent from the bubble go through the same official composer and land in the current session, exactly as if you typed them in the app.",
 			noBridge: "No native bridge (DSHAndroid unavailable) in this environment — cannot control the bubble.",
 		};
+
+		// ══ 路由日志（内置号池的钥匙分配记录） ══════════════════════════
+		//
+		// 号池每个请求**随机抽一把**钥匙（见 app/src/main/jni/keyinject.c），
+		// 但抽到哪把从界面上完全看不出来 —— 用户没法确认轮换是否生效。
+		// 这个分节把它暴露出来：日志由 libkeyinject.so 写（每次换钥匙追加一行
+		// 「站点 + 第几把」），由原生桥读给这里显示。
+		//
+		// ⚠️ **日志里没有密钥**，只有站点与下标。这一点是刻意的：这个页面用户
+		// 能看到，把密钥写进去等于把整个方案的目的抹掉。
+		// ══════════════════════════════════════════════════════════════════
+		const MP_ROUTE_NS = "dsh-android-mobile.route-log";
+		const MP_ROUTE_ZH = {
+			nav: "路由日志",
+			title: "号池路由日志",
+			intro: "内置号池每个请求随机抽一把钥匙（14 把：国际站 7 + 国内站 7），抽到哪把从界面上看不出来。这里把每次实际的选择记下来，用来确认轮换生效。",
+			statusTitle: "当前记录",
+			empty: "还没有记录。发一条消息（或刷新一次模型列表）之后回来看。",
+			linesLabel: "记录行数",
+			linesNote: "最多显示最近 200 行",
+			refresh: "刷新",
+			clear: "清空",
+			noBridge: "当前环境没有原生桥（DSHAndroid 不可用），读不到日志。",
+			howTitle: "怎么看",
+			how1: "每行格式：时间 + 站点（INTL = 国际站 / CN = 国内站）+ idx = 是那一站的第几把（从 0 数）。",
+			how2: "随机抽取生效的话，连续几条的站点与 idx 都会变 —— 全是同一把说明没生效。",
+			how3: "出现 FAIL-401 / FAIL-429 说明那一次请求被拒了。引擎会自动重发，重发时会重新抽一把。",
+			notesTitle: "几点说明",
+			note1: "日志里只有站点与序号，**没有密钥** —— 密钥从来只在 TLS 加密前的一瞬间存在于内存里。",
+			note2: "日志超过 256 KB 就停止记录（不轮转、不截断，免得读到半个文件）。清空之后会重新开始记。",
+			note3: "调试完之后可以把这段关掉：把 EngineManager 里传 DSH_KEYINJECT_LOG 的那行删掉即可。",
+		};
+		const MP_ROUTE_EN = {
+			nav: "Routing log",
+			title: "Key-pool routing log",
+			intro: "The built-in key pool picks one of 14 keys at random for every request (7 international + 7 domestic). Which one it picked is invisible in the UI. This page records each actual choice so you can confirm rotation is working.",
+			statusTitle: "Current records",
+			empty: "No records yet. Send a message (or refresh the model list) and come back.",
+			linesLabel: "Lines",
+			linesNote: "showing the latest 200 at most",
+			refresh: "Refresh",
+			clear: "Clear",
+			noBridge: "No native bridge (DSHAndroid unavailable) in this environment — cannot read the log.",
+			howTitle: "How to read it",
+			how1: "Each line: time + site (INTL = international / CN = domestic) + idx = which key on that site (0-based).",
+			how2: "If random selection works, both the site and idx change from line to line — always the same key means it is not working.",
+			how3: "FAIL-401 / FAIL-429 means that request was rejected. The engine retries automatically, drawing a fresh key.",
+			notesTitle: "Notes",
+			note1: "The log holds only site and index — **never a key**. Keys exist in memory only for the instant before TLS encryption.",
+			note2: "Logging stops at 256 KB (no rotation or truncation, so readers never see a half-written file). Clearing it starts fresh.",
+			note3: "To turn this off after debugging, delete the line in EngineManager that passes DSH_KEYINJECT_LOG.",
+		};
+
 		const MP_PRIV_EN = {
 			nav: "Privileged access",
 			title: "Privileged access (uid 2000)",
@@ -4793,11 +4852,175 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/**
+		 * 「路由日志」分节组件。
+		 *
+		 * 布局沿用「特权权限 / 悬浮气泡」那套**结论优先**的结构：head 卡给行数 +
+		 * 刷新/清空，日志正文放在可滚动的等宽块里，说明折进 `<details>`。
+		 *
+		 * @param {object} props - 槽位注入面（只用 `t`）。
+		 * @returns {object} React 元素。
+		 */
+		function mpRouteLogSection(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_ROUTE_ZH[key] ?? key;
+			const [state, setState] = React.useState({ phase: "loading", text: "", lines: 0 });
+
+			/**
+			 * 从原生读一次日志。
+			 *
+			 * ⚠️ 桥**可能不存在**（非 App 环境），所以先查再调 —— 直接调会抛
+			 *   `TypeError: Cannot read properties of undefined`。
+			 */
+			const refresh = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.keyInjectLog !== "function") {
+					setState({ phase: "ready", text: "", lines: 0, noBridge: true });
+					return;
+				}
+				try {
+					// 桥返回 JSON 字符串（@JavascriptInterface 只支持基本类型与 String）。
+					const raw = bridge.keyInjectLog();
+					const o = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+					setState({ phase: "ready", text: String(o.text || ""), lines: Number(o.lines) || 0, noBridge: false });
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 读取路由日志失败:", e && e.message);
+					setState({ phase: "ready", text: "", lines: 0, noBridge: true });
+				}
+			}, []);
+
+			React.useEffect(() => { refresh(); }, [refresh]);
+
+			/**
+			 * 从别的界面回来后刷新 —— 用户多半是「发条消息 → 切回设置页看结果」，
+			 * 而本页拿不到任何回调，只能监听 `visibilitychange`。
+			 */
+			React.useEffect(() => {
+				const onVisible = () => { if (!document.hidden) refresh(); };
+				document.addEventListener("visibilitychange", onVisible);
+				window.addEventListener("focus", onVisible);
+				return () => {
+					document.removeEventListener("visibilitychange", onVisible);
+					window.removeEventListener("focus", onVisible);
+				};
+			}, [refresh]);
+
+			const clear = () => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.keyInjectLogClear !== "function") return;
+				try {
+					bridge.keyInjectLogClear();
+					refresh();
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 清空路由日志失败:", e && e.message);
+				}
+			};
+
+			const noBridge = state.noBridge;
+			const hasLog = !noBridge && state.lines > 0;
+			const tone = noBridge ? MP_PRIV_TONE.unknown : hasLog ? MP_PRIV_TONE.on : MP_PRIV_TONE.unknown;
+
+			// 日志正文：等宽 + 预格式 + 可滚。窄屏上横向滚动优于换行 ——
+			// 每行本来就不长，换行反而看不出「一行一条记录」。
+			const logBox = React.createElement("pre", {
+				style: {
+					margin: 0,
+					maxHeight: "320px",
+					overflow: "auto",
+					padding: "10px 12px",
+					borderRadius: "8px",
+					background: "var(--dsw-alias-interactive-bg-hover, #f2f2f2)",
+					fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+					fontSize: "12px",
+					lineHeight: "18px",
+					whiteSpace: "pre",
+				},
+			}, hasLog ? state.text : (noBridge ? t("noBridge") : t("empty")));
+
+			return React.createElement("div", { style: S.section },
+				React.createElement("h2", { style: S.heading }, t("title")),
+				React.createElement("p", { style: S.intro }, t("intro")),
+
+				React.createElement("div", { style: S.card },
+					React.createElement("div", { style: S.cardHead },
+						React.createElement("h3", { style: S.cardTitle }, t("statusTitle")),
+						React.createElement("span", {
+							style: { ...S.badge, color: tone.color, background: tone.bg },
+						}, hasLog ? `${t("linesLabel")} ${state.lines}` : t("empty")),
+					),
+					logBox,
+					React.createElement("div", { style: S.actions },
+						React.createElement("button", { style: S.btn, onClick: refresh }, t("refresh")),
+						React.createElement("button", { style: S.btnQuiet, onClick: clear }, t("clear")),
+					),
+				),
+
+				React.createElement("details", { style: S.fold },
+					React.createElement("summary", { style: S.foldHead }, t("howTitle")),
+					React.createElement("div", { style: S.foldBody },
+						React.createElement("ul", { style: S.notes },
+							[t("how1"), t("how2"), t("how3")].map((line, i) =>
+								React.createElement("li", { style: S.note, key: i }, line)),
+						),
+					),
+				),
+
+				React.createElement("details", { style: S.fold },
+					React.createElement("summary", { style: S.foldHead }, t("notesTitle")),
+					React.createElement("div", { style: S.foldBody },
+						React.createElement("ul", { style: S.notes },
+							[t("note1"), t("note2"), t("note3")].map((line, i) =>
+								React.createElement("li", { style: S.note, key: i }, line)),
+						),
+					),
+				),
+			);
+		}
+
+		/**
+		 * 把「路由日志」注册进设置页一级导航。
+		 *
+		 * 与另外两个分节同一套接缝（`settings.section`），所以不需要碰导航 DOM。
+		 *
+		 * @param {object} ctx - 浏览器插件上下文。
+		 */
+		function mpRegisterRouteLogSection(ctx) {
+			if (mpPrivReact === null) {
+				try { mpPrivReact = require("react"); } catch (e) {
+					console.warn("[dsh-android-mobile] require('react') 失败，跳过路由日志分节:", e && e.message);
+					mpPrivReact = null;
+				}
+			}
+			if (!mpPrivReact) return;
+			try {
+				ctx.inject(["slots", "locale"], (scope) => {
+					// ⚠️ 必须用 `scope` 上的服务（原因见 mpRegisterPrivilegedSection 的注释）。
+					const t = scope.locale.bind(MP_ROUTE_NS);
+					scope.effect(
+						() => scope.locale.register(MP_ROUTE_NS, { zh: MP_ROUTE_ZH, en: MP_ROUTE_EN }),
+						"dsh-android-mobile: 路由日志字典",
+					);
+					scope.slots.inject("settings.section", () => scope.slots.register({
+						name: "settings.section",
+						id: "dsh-android-route-log",
+						// 紧跟在「悬浮气泡」（26）之后。
+						order: 27,
+						label: () => t("nav"),
+						locale: MP_ROUTE_NS,
+					}, mpRouteLogSection));
+				});
+			} catch (e) {
+				console.warn("[dsh-android-mobile] 注册路由日志分节失败:", e && (e.stack || e.message || e));
+			}
+		}
+
 		function apply(ctx) {
 			mpCtx = ctx;
 			mpSessionsCache = ctx.get("sessions") ?? null;
 			mpRegisterPrivilegedSection(ctx);
 			mpRegisterBubbleSection(ctx);
+			mpRegisterRouteLogSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */
 			injectStyles();

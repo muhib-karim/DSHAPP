@@ -12,6 +12,7 @@ APK
  ├─ assets/node-addon-android-arm64.zip   自编译的原生插件（官方无 android 变体）
  ├─ assets/node-addon-system-android-arm64.zip  自编译的 flock 绑定（同上）
  ├─ assets/linkcompat.bin          link()/linkat() 语义转译层（LD_PRELOAD）
+ ├─ assets/keyinject.bin            内置号池注入层（LD_PRELOAD，密钥在 TLS 层换上，见 ⑮）
  ├─ assets/boosandbox.bin          LD_PRELOAD 写拦截器（沙箱的强制层）
  ├─ assets/boo-sandbox-run.bin     沙箱 runner：把 bwrap 方言翻译成拦截器配置
  ├─ assets/ripgrep-android-arm64.zip   官方 linux-arm64 静态 rg，补 @vscode/ripgrep 缺的 android 包
@@ -109,6 +110,69 @@ $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
 - ⚠️ debug 与 release **共用 `applicationId`**，同一台设备上只能存在一个；从 debug
   换装 release（或反之）会因签名不同而要求先卸载 ⇒ 数据全丢。自用机保持 debug 不动。
 
+#### 发布到夸克网盘
+
+发行包的对外分发走**夸克网盘**，目标是这个目录：
+
+```
+夸克网盘 / jiulingShare / DSH APP
+```
+
+里面已有的包用 `DSH<versionName>.apk` 命名（如 `DSH0.1.0.apk`）。**同名会冲突，
+所以每次发布都在版本号后面加个后缀**，例如 `DSH0.1.0-pool.apk`（内置号池版）、
+`DSH0.1.0-fixport.apk`。后缀随意，能区分就行。
+
+**必须走 Git 自带的 bash**（Windows 自带的 `bash.exe` 是 WSL，环境不对）：
+
+```powershell
+$bash = "C:\Program Files\Git\bin\bash.exe"
+$skill = "/c/Users/XIAOPAN/.claude/skills/quarkclouddrive"
+
+# 1) 先查目标目录的 FID（⚠️ 每次都要现查，见下）
+& $bash -lc "cd $skill && node scripts/quark-drive.cjs search --keyword 'DSH APP' --search-type dir 2>&1"
+
+# 2) 把包拷成要发布的名字（upload 用的是本地文件名，所以先改名再传）
+Copy-Item app\build\outputs\apk\release\app-release.apk "$env:TEMP\DSH0.1.0-pool.apk" -Force
+
+# 3) 上传（--parent-fid 填上一步查到的 FID）
+& $bash -lc "cd $skill && node scripts/quark-drive.cjs upload '/c/Users/XIAOPAN/AppData/Local/Temp/DSH0.1.0-pool.apk' --parent-fid '<FID>' 2>&1" |
+  Select-Object -Last 4
+```
+
+成功的收尾行长这样（`fullPath` 就是落地位置，**以此为准**）：
+
+```json
+{"code":0,"msg":"成功","data":{"fileNames":["DSH0.1.0-pool.apk"],"successCount":1,
+ "instantUpload":true,"fullPath":"夸克网盘/jiulingShare/DSH APP"},"action":"upload","type":"result"}
+```
+
+⚠️ **`--parent-fid` 不能省略，也不能硬编码。** 省略会直接失败：
+
+```
+{"code":14001,"msg":"参数错误: [upload dir blank]","action":"upload","type":"result"}
+```
+
+而 FID **每次查询都在变**（实测同一个「DSH APP」目录，三次拿到三种前缀，只有
+竖线后面的后缀 `|JkamYKaMIaE` 稳定）。所以**每次上传前重新 `search` 一次拿当前
+FID**，不要从上一次的输出里复制。
+
+⚠️ **`--parent-fid 0` 是根目录**（实测可用）。只有明确要传到根目录时才用它 ——
+发行包**不该**传根目录，那是放错位置。
+
+⚠️ **这个 CLI 没有删除命令**（`--help` 里 25 个命令逐个看过，没有 delete/rm/trash）。
+**传错位置只能去夸克 App 或网页端手动删**。所以上传前先确认 `--parent-fid` 是对的 ——
+这条踩过一次（包落到了根目录）。
+
+其他实测要点：
+
+- **进度是 NDJSON 刷屏**：一次上传打几百行 `{"msg":"进行中",...}`，必须
+  `| Select-Object -Last 4` 收尾，别把全量倒出来（132 MB 那次刷了 185 KB 日志）。
+- **秒传**：同内容文件已存在时 `instantUpload: true`，几秒就完（第二次传同一个包就是
+  这样），所以重复上传不浪费流量。
+- **账号**：昵称 `小强`，容量 20 TB 级。`get-user-info` 可验授权；它失败才说明授权
+  失效（需 `login --token <授权码>` 重新授权），单条命令失败不算。
+- ⚠️ **只能在 Windows 本机跑**（依赖 node）。Termux / Android 端没有 node，用不了。
+
 ```powershell
 # 安装 + 启动（adb 在 %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe）
 adb install -r app\build\outputs\apk\debug\app-debug.apk
@@ -141,6 +205,8 @@ adb logcat -d -s DSH:I
 | `已解出 link 兼容层 liblinkcompat.so (<N> 字节)` | link 转译层已落盘（并会被 LD_PRELOAD） |
 | `已还原目录选择器的起始目录（改由主目录下的入口链接提供）` | 老安装里「起点改 /sdcard」的补丁已撤回（见 ③.5） |
 | `已建工作区入口: 手机存储 → /sdcard` | HOME 下的入口链接已就位（只首次启动打印，见 ③.5） |
+| `Web 端口 3080 空闲，沿用引擎默认值` | 正常路径，端口与改动前一致（见 ⑭） |
+| `Web 端口 3080 已被占用（多半是上一次残留的引擎进程），改由内核分配空闲端口` | 撞上残留进程，已改传 `--port 0`（见 ⑭） |
 | `[engine] dsh web: http://127.0.0.1:3080/?token=...` | 引擎打印了带 token 的 URL |
 | `引擎就绪: http://...` | App 解析到 URL |
 | `WebView 加载完成: http://127.0.0.1:3080/` | 前端已加载 |
@@ -537,7 +603,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-36`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-37`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -547,6 +613,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `ripgrep-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `node-pty-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `linkcompat.bin` | 无需改（每次启动覆盖写） |
+| `keyinject.bin` | 无需改（每次启动覆盖写；换密钥池必须重新跑 `tools/build-keyinject.ps1`，见 ⑮） |
 | `boosandbox.bin` / `boo-sandbox-run.bin` | 无需改（每次启动覆盖写） |
 | `dsh-android-shell.mjs` | 无需改（每次启动覆盖写） |
 | `shell-tool.zip` | 无需改（每次启动解包覆盖写） |
@@ -1691,6 +1758,358 @@ if ((first === null || firstKey === own) && !ownIsPublic) return [normalizedFirs
 日志验收：`已写入插件源 overlay: plugin-manager.patch.yml`，且启动命令行里能看到
 `--patch .../plugin-manager.patch.yml`，同时**不应**出现 `name mismatch`、
 `entry not found`、`did not activate` / `pending`。
+
+### ⑭ Web 端口 3080 被占用 —— 默认沿用，撞车才让内核分配
+
+**症状**（粉丝反馈的真机截图）：启动页停在
+
+```
+引擎启动失败（引擎进程已退出）。最后输出:
+dsh: startup failed: 2 required plugins did not activate
+
+Failed plugins (1):
+webserver (required)
+Package: @deepseek-ai/dsh-host-webserver
+Error: listen EADDRINUSE: address already in use 127.0.0.1:3080
+...
+Plugins waiting for services (10):
+connection (required)  webRuntime
+open-in-app            webServer, connection
+...（10 行全是连锁反应）
+```
+
+**根因**：`3080` 是引擎自己的默认值（`dsh-web-app/cordis.patch.yml` 的
+`port: !!js ctx.webStartup.port ?? 3080`），而 App 原来**不传 `--port`**，
+于是每次启动都去抢 3080。而 `dsh-host-webserver` 的 `listen()` 失败是
+**直接 reject 插件激活**（`server.once("error", reject)`），它是 required 插件
+⇒ 整个引擎退出。**没有「端口被占就换一个」的退路。**
+
+⚠️ **那 10 行 `waiting for services` 是连锁反应，不是独立故障。** 根只有
+webserver 一个 —— 与 ④ 那条教训同构：**排查 `waiting for` 先看 `did not activate`。**
+
+**占用者是谁**（截图判断不了，但分支有限，按概率排）：
+
+1. **上一次残留的引擎进程**（最可能）。全工程**没有任何地方调用
+   `EngineManager.stop()`** —— 只有定义、没有调用者。`ProcessBuilder` 起的 node
+   是普通子进程，父进程被 LMK / 国产 ROM 清理时它**不会跟着死**（没设 PDEATHSIG），
+   被 reparent 到 init 后继续占着 3080。特征是**稳定复现**，重启手机才解。
+2. **应用分身 / 双开 / 工作资料**。`127.0.0.1` 是共享回环，两份实例抢同一个端口。
+   特征是「先开的那份永远正常，后开的必失败」。
+3. **引擎侧被手动跑过第二个 `dsh --profile web`**（本 App 带终端面板，见 ⑩）。
+4. 别的 App 占了 3080（>1024 任何 App 都能 bind），概率最低。
+
+**做法**（`EngineManager.resolveWebPort()` + `isLoopbackPortBusy()`）：
+启动前先探一次 `127.0.0.1:3080`，**空闲就照旧不传 `--port`**（行为与改动前逐字一致），
+**被占就传 `--port 0`** 让内核挑一个空闲端口。
+
+```kotlin
+// start() 的 buildList 里
+resolveWebPort()?.let { port -> add("--port"); add(port.toString()) }
+```
+
+⚠️⚠️ **`--port` 必须排在所有 `--patch` 之后，紧邻 `--no-open`。位置是硬性的。**
+
+`--port` 属于 **web app 的内层 flag**，而 `@deepseek-ai/dsh/lib/bin.js` 的 launcher
+**只解析自己的 `--profile` / `--patch`**，规则是「**第一个不认识的 token 就是内层参数的
+起点，其后原样转交**」（`bin.js` 顶部注释原文）。所以插到 `--patch` 前面时，
+后面的 `--patch` 全被当成内层参数：
+
+```
+[engine] error: unknown option '--patch'
+```
+
+引擎**直接起不来**，且报错指向 `--patch` 而完全看不出是 `--port` 的位置问题。
+真机实测踩过（第一次装上去就是这个症状）。改这一处时**先看 `bin.js` 的参数归属**
+再决定插入点，别按「越早传越保险」的直觉排。
+
+⚠️ **判据与 `AdbMdns.isPortInUse` 是反的**：那里「bind 失败 = adbd 在听」是**成功**，
+这里「bind 失败」就是**真被占用**。两处语义不同，别互相抄。
+
+⚠️ **不能一律传 `--port 0`**：那样每次启动端口都变，而移动端 UI 插件与用户的
+收藏/书签都可能记着 `127.0.0.1:3080`。只在真被占时才让出端口。
+
+⚠️ **`--port 0` 是官方支持的**（`dsh-web-app/lib/startup.js` 的
+`"--port <port>"` 帮助文本明写 "pass 0 to let the OS pick a free one"），
+`WebServer` 回填 `listenedPort = server.address().port`，打印的 URL 用的也是它 ——
+所以 App 侧**不用改任何解析逻辑**（`start()` 里的正则本来就是 `\d+`）。
+
+⚠️ **探测与真正 `listen` 之间天然有竞态**（探测完端口被抢走）。窗口只有毫秒级，
+且失败后果与改动前完全相同（引擎报错退出），所以**不为此加重试** ——
+真正的占用源是上一个残留进程，它不是并发抢端口。
+
+⚠️ **browser-trust fence 不受影响**：`dsh-client-connection` 的
+`isTrustedApiRequest()` 对 `isLoopbackHostname()` 的 Host **不比对端口**
+（`127.0.0.1:任意端口` 都算 loopback），所以换端口不会让 `/api` 403。
+
+日志验收：正常路径出现 `Web 端口 3080 空闲，沿用引擎默认值`；撞车时出现
+`Web 端口 3080 已被占用（多半是上一次残留的引擎进程），改由内核分配空闲端口`，
+随后 `[engine] dsh web: http://127.0.0.1:<非 3080 端口>/?token=...` 与
+`引擎就绪: http://...` 照常。
+
+### ⑮ 内置号池 —— 密钥在 TLS 层注入，粉丝挖不到
+
+**需求**：给粉丝免费用内置的 Agnes 号池（14 个密钥，国内站 7 + 国际站 7），
+但**不让他们把密钥挖出来**。
+
+**先说结论，别夸大**：本 App 给了 AI `bash` 与 `shell` 工具，粉丝**能对 AI 说话**。
+所以「密钥藏在设备上」这条路本身是死的 —— 只要密钥在磁盘/环境变量/JS 里出现过
+一次，问一句「打印所有环境变量」就出来了。**唯一彻底的解是把密钥放到服务器上做
+中转**（密钥永不落设备），那需要一台服务器。
+
+本方案是在「不引入服务器」前提下能做到的上限：**让密钥从来不进入 JS、文件、
+环境变量**，只在 TLS 加密前的最后一刻于 C 库内存里出现。
+
+#### 三个组件
+
+| 文件 | 作用 |
+|---|---|
+| `app/src/main/jni/keyinject.c` | `LD_PRELOAD` 注入库，hook 4 个 OpenSSL 符号（**手写源码，入库**） |
+| `tools/build-keyinject.ps1` | 读密钥清单 → 生成混淆头文件 → NDK 编译出 `assets/keyinject.bin`（**入库**） |
+| `agnes-keys.properties` | 明文密钥清单（**不入库**，`.gitignore` 已覆盖） |
+
+产物链路：`agnes-keys.properties` → `keyinject-keys.h` → `keyinject.bin`
+（后两者都是生成物；头文件也**不入库**，因为混淆可逆、等价于明文）。
+
+`EngineManager` 侧：`ensureKeyInject()` 解到 `filesDir/libkeyinject.so`；
+`writeKeyInjectPatch()` 写 `$DSH_HOME/keyinject.patch.yml`；`start()` 里把该库
+**追加**进 `LD_PRELOAD`（与 linkcompat 并存），并把 `AGNES_CREDENTIAL`
+环境变量设成**占位符**。
+
+#### 四个 hook 的分工
+
+| hook | 做什么 |
+|---|---|
+| `SSL_set_alpn_protos` | 把 ALPN 列表**扣住**，等知道域名之后再设 |
+| `SSL_ctrl`（SET_SNI） | 拿到域名 → 判断是不是目标域名，是才降级 `http/1.1` |
+| `SSL_write` | **每个请求随机抽一把**钥匙；**国内站的钥匙顺带改写 Host 头**（两处都等长）→ 写完**立刻还原** |
+| `SSL_read` | 看响应状态行，`401`/`429` 时往路由日志记一行（**只观测，不干预**） |
+
+#### combo：两个站点，一个供应商
+
+**需求**：模型列表里**只显示一个「Agnes」**，但 14 把钥匙分属两个站点，而两站
+钥匙**不通用**（实测互打 401，文档也写了不可混用）。
+
+一开始的实现是**两个 provider 路由**（`agnes` + `agnes-intl`），各指自己的
+`baseURL`。这样能用满 14 把钥匙，但代价是**模型选择器里出现两个 Agnes 分组**
+（「Agnes 国内站」「Agnes 国际站」），每个都列 11 个模型 —— 列表又长又乱。
+
+**现在的做法**：引擎侧只配**一个** provider，两站由 `keyinject.c` 在 TLS 层
+当小路由 —— **选中哪把钥匙，就把 Host 头改成那把钥匙所属站点的域名**。
+
+成立依据是三个实测事实：
+
+| 事实 | 实测值 |
+|---|---|
+| 两个域名解析到**同一个 IP** | `api.agnes-ai.cn` 与 `apihub.agnes-ai.cn` 都是 `119.0.68.30` |
+| 共用**同一张通配证书** | 都是 `CN=*.agnes-ai.cn`，SAN `*.agnes-ai.cn, agnes-ai.cn`，指纹一致 |
+| 服务器按 **Host 头**路由，**不是** SNI | 见下表 |
+
+路由依据的实测（同 IP 同证书，只换 SNI / Host，用「返回 11 还是 12 个模型」
+区分站点 —— 国际站多一个 `agnes-image-2.0-flash`）：
+
+| 请求 | 结果 | 实际站点 |
+|---|---|---|
+| INTL key + `Host: apihub.agnes-ai.cn` | 200 | 国际站 |
+| INTL key + `SNI=apihub` + `Host: api.agnes-ai.cn` | 401 | — |
+| **INTL key + `SNI=api` + `Host: apihub.agnes-ai.cn`** | **200** | **国际站** |
+| **CN key + `SNI=apihub` + `Host: api.agnes-ai.cn`** | **200** | **国内站** |
+
+⚠️ 后两行是**决定性证据**：SNI 与站点无关，**Host 头才是路由依据**。所以同一条
+TLS 连接上换 Host 就能换站点（实测同一连接先 CN 后 INTL，两条都 200）。
+
+⚠️ **Host 改写必须等长**：`apihub.agnes-ai.cn`（18 字符）比 `api.agnes-ai.cn`
+（15 字符）长，所以后者用 **3 个尾部空格**补齐到 18。HTTP 头值的尾部空格由服务器
+剥离（实测 `Host: api.agnes-ai.cn   ` 正确路由到国内站）。
+
+⚠️ **因此 `baseURL` 必须用较长的国际站域名** —— 等长改写只能从长的往短的改，
+反过来没有等长写法。这条决定了 `KEY_BASE_URL` 的取值，别随手改成国内站。
+
+⚠️ **Host 改写只在头部区域**（首个 `\r\n\r\n` 之前）进行，避免误改 body 里恰好
+出现的同一串域名（用户消息里粘了域名时，改 body 就是篡改用户内容）。
+
+#### ⚠️ 14 把钥匙一个池子，两站交错，每个请求随机抽一把
+
+池子按「国际站、国内站」**交错**排列：
+
+```
+intl.1, cn.1, intl.2, cn.2, … intl.7, cn.7
+```
+
+`keyref_at(slot, &site, &idx)` 就是这张映射表（偶数位国际、奇数位国内），
+用 `% count` 索引，所以两站数量不等也能跑（少的那个被循环复用）。
+
+**抽取策略是「每个请求独立随机抽」**（`arc4random_uniform(POOL_COUNT)`），
+不是轮转、也不是失败退避。理由：
+
+- 两站配额**同步消耗**，单把钥匙的速率摊薄到 1/14，429 概率显著下降；
+- **没有「当前钥匙」这个状态**，也就没有需要推进的游标 —— 一个请求一次抽取，
+  与上一个请求用了什么无关。
+
+⚠️ **为什么用 `arc4random_uniform` 而不是 `rand()`**：`rand()` 需要一个可靠的
+播种点，而本库是 `LD_PRELOAD` 进去的，没有合适的初始化时机（在构造函数里播种
+还会干扰宿主自己的随机数使用）。bionic 的 `arc4random` 自行维护熵池且线程安全，
+不需要播种。
+
+⚠️ **解出来的明文钥匙必须放在栈上，不能用全局缓存**（踩过）：`SSL_write` 会被
+node 的连接池**跨线程调用**，而随机化之后两个并发请求抽到的站点很可能不同。
+用全局缓存就会出现「A 线程刚解出国际站钥匙、B 线程立刻覆盖成国内站的」——
+于是 A 拿着国际站密钥去打国内站域名，**症状是稳定 401**，且只在并发时出现。
+栈上 52 字节，代价可忽略。
+
+⚠️ 早先还踩过更早的一版：按「表内下标」缓存，于是 `CN,idx=0` 与 `INTL,idx=0`
+被当成同一把，症状同样是稳定 401。
+
+**401 无法「就地重试」**：响应已经发完，字节改不了。引擎自己的 `retryPolicy`
+会重发失败请求，重发时自然重新抽一把。
+
+#### 路由日志（排查用，可随时关掉）
+
+「抽到哪把」从界面上完全看不出来，所以本库可以往一个文件里追加一行：
+
+```
+2026-10-08 08:26:11 INTL idx=3
+2026-10-08 08:26:12 CN idx=0
+2026-10-08 08:26:12 FAIL-401 idx=5
+```
+
+- 路径由环境变量 **`DSH_KEYINJECT_LOG`** 给出，由 `EngineManager.start()` 传
+  （`$DSH_HOME/keyinject-route.log`，App 私有目录、`0600`）。
+- **只记站点与下标，绝不记密钥本身** —— 这个文件在设置页「路由日志」分节里
+  用户直接能看到，写进密钥等于把整个方案的目的抹掉。
+- ⚠️ 环境变量名**不能含 `KEY`/`PASSWORD`/`SECRET`/`TOKEN`**：`dsh-subprocess`
+  的 `scrubbedParentEnv()` 会按这几个词剥变量。另外 `DSH_` 前缀的变量只会被
+  **引擎 spawn 的子进程**剥掉，而 TLS 发生在引擎主进程里，所以不受影响。
+- 写入用 `O_APPEND` + 单次 `write`（原子，多线程并发不会互相穿插）。
+- 上限 **256 KB**，到顶就停止记录（`log_disabled`）。**不轮转、不截断** ——
+  轮转要 `rename`、截断要重写，两者都可能让读的一方看到半个文件。
+- 任何失败（打不开、写不动）都置 `log_disabled`，**绝不让日志拖慢请求路径**。
+- ⚠️ 设置页的「清空」按钮走**截断**（`O_TRUNC`）而不是删文件：本库持有的是
+  `open()` 得到的 fd，删掉再新建的话它仍往那个已被 unlink 的 inode 里写，
+  用户会看到「清空了，但新日志再也不出现」。
+
+**关掉它**：删掉 `EngineManager.start()` 里 `put(KEYINJECT_LOG_ENV, …)` 那一行，
+并把 `MainActivity` 的 `keyInjectLog` / `keyInjectLogClear` 桥接口、
+`client.js` 的 `dsh-android-route-log` 分节一并移除。
+
+⚠️ 打开调试日志（`DSH_KEYINJECT_DEBUG=1`）打的是**同一份信息**（`use CN idx=0`），
+区别只在于它走 stderr、需要 `adb logcat` 才能看 —— 路由日志是为了让用户
+**在 App 里自己看**，不必接电脑。
+
+#### ⚠️ 必须降级 HTTP/1.1 —— 这是本方案最反直觉的一点
+
+**真机实测**：引擎的 undici 默认协商 **HTTP/2**（`SSL_write` 里看到的是
+`PRI * HTTP/2.0`），而 HTTP/2 的头部是 **HPACK 压缩**的 —— 看到的是一堆二进制，
+**没有明文 `Authorization` 头**，等长替换无从谈起。
+
+强制 ALPN 只留 `http/1.1` 之后，`SSL_write` 里就是标准明文 HTTP/1.1 报文，
+`Authorization: Bearer sk-ANON…` 清晰可见，替换才成立。
+
+⚠️ **降级只对目标域名生效，这是设计上最要紧的一条。** 全局降级会让引擎**所有**
+HTTPS 请求失去 HTTP/2（多路复用、头部压缩），是实打实的性能损失。实测调用顺序是
+`SSL_set_alpn_protos` **在前**、`SSL_ctrl(SET_SNI)` **在后**，所以本库先扣住
+ALPN 列表、等 SNI 到达再决定是否降级。
+
+⚠️ **`SSL_set_tlsext_host_name()` 是宏**，展开成 `SSL_ctrl()`，动态符号表里只有
+后者 —— hook 前者**永远不会被调用**（踩过，白白多花一轮真机验证）。域名必须从
+`SSL_ctrl(cmd=55 /* SSL_CTRL_SET_TLSEXT_HOSTNAME */, larg=0)` 的 `parg` 拿。
+
+#### ⚠️ 等长替换：唯一不可妥协的前提
+
+14 个密钥实测**全部恰好 51 字符**，占位符 `sk-ANON` + 44 个 `0` 也是 51 字符。
+所以替换是**等长原地覆盖**：`Content-Length` 不变、缓冲区布局不变。
+
+- 占位符长度写死在两处：C 侧的 `KI_PLACEHOLDER` 与 Kotlin 侧的 `KEY_PLACEHOLDER`，
+  **必须逐字一致**。`build-keyinject.ps1` 会读 Kotlin 文件校验两者长度相等，
+  不一致时**直接构建失败**（不静默放过）。
+- `keyinject.c` 里有 `_Static_assert(sizeof KI_PLACEHOLDER - 1 == KI_KEY_LEN, ...)`
+  兜底。C 侧的 `KI_KEY_LEN` 由生成的头文件给出，所以换密钥池时长度一变就编译不过。
+- **换密钥池时长度必须保持一致**，否则请求会因长度错乱失败。
+
+⚠️ **写完必须还原**：`SSL_write` 的缓冲区属于**调用方**（node 的 Buffer，可能被
+复用），留下真密钥会污染它。所以替换前先存下原 51 字节，`real_SSL_write()` 返回后
+立刻抹回占位符。
+
+#### 密钥怎么存（⚠️ 是混淆，不是加密）
+
+`build-keyinject.ps1` 对每个 key 逐字节 XOR 一个随机 mask，再叠一层位置相关的
+滚动常量（`i * 7 + 0x5A`）。所以 `strings keyinject.bin` 搜不到 `sk-` 开头的明文。
+
+⚠️ **这是混淆，不是加密。** mask 与滚动常量都在二进制里，有耐心的逆向者可以还原。
+它的作用只是把门槛从「会 `strings`」提到「会反汇编」，**别在任何地方说成
+「密钥被加密保护了」**。
+
+⚠️ 每次构建都换一把新 mask，所以**不可复现构建** —— 这是有意的（从某版本还原出
+明文也无法用同一套常量解开下一版），代价对本项目无影响（头文件与 `.bin` 都不入库）。
+
+⚠️ 加密端（PowerShell 的 `Get-Scramble`）与解密端（C 的 `derive_key`）**必须逐字节
+一致**，改一边必须同步改另一边。脚本里有往返自检，不一致会直接报错。
+
+#### 验收
+
+**离线实测（PC 上直接打两个站点，绕过引擎，验的是 combo 的分流原理）**：
+
+| 项 | 结果 |
+|---|---|
+| 两域名 IP | 都是 `119.0.68.30` |
+| 两域名证书 | 都是 `CN=*.agnes-ai.cn`，指纹一致 |
+| 路由依据 | **Host 头**（`SNI=api` + `Host: apihub` 照样进国际站） |
+| 同连接换 Host | 可行（先 CN 后 INTL，两条都 200） |
+| 14 把钥匙各自站点 | **14/14 全 200** |
+| `Host: api.agnes-ai.cn   `（3 空格补齐） | 200，且**路由到国内站**（用「有没有 `agnes-image-2.0-flash`」判定） |
+| 真实 `chat/completions` | 走 Host 改写后 **200** |
+| 二进制里搜明文密钥 | **0 命中**（`sk-` 只出现 1 次，就是占位符） |
+
+**真机实测（安装 debug 包后看日志）**：
+
+| 项 | 结果 |
+|---|---|
+| `已解出号池注入库 libkeyinject.so (12576 字节)` | 注入库已落盘 |
+| `已写入内置号池 overlay: keyinject.patch.yml` | overlay 已生成 |
+| 设备上的 overlay 内容 | **单** provider `agnes`、`displayName: 'Agnes'`、baseURL 是 apihub、**只有 `agnes-3.0-flash` 一个模型** |
+| 引擎启动 | `引擎就绪` + `WebView 加载完成` |
+| `已安装移动端 UI 插件 dsh-android-mobile 1.0.0-37` | 带「路由日志」分节的插件已解包 |
+
+⚠️ **下面这些要人工确认**（GUI 观感与真实对话，离线探针测不到）：
+
+1. 主界面模型选择器里**只有一个「Agnes」分组**，下面**只有 `agnes-3.0-flash`**。
+2. 选它发一条消息，能正常回复（证明 combo 在真机上把钥匙与 Host 配对了）。
+3. 设置 → 高级 → **「路由日志」**：发几条消息后回来点「刷新」，应看到多行
+   `<时间戳> INTL idx=N` / `<时间戳> CN idx=N`，且**站点与 idx 每行都在变**
+   （随机抽取生效）。看到 `FAIL-401`/`FAIL-429` 说明那一次被拒了，引擎会重发。
+
+体积代价：`keyinject.bin` 12,576 字节 —— 对 132.8 MB 的发行包约 0.01%，可忽略。
+真正的代价是维护面（一个原生组件、一条 `LD_PRELOAD`、一个启动顺序依赖，
+以及 combo 引入的「Host 改写必须等长」这条隐性约束）。
+
+#### ⚠️ 挡住了什么、挡不住什么（不要夸大）
+
+**挡住**：
+- AI 工具读文件 / 环境变量 / `/proc/<pid>/environ` —— 那些地方只有占位符（实测）
+- `strings` APK / 十六进制搜索 —— 二进制里没有明文 key（实测）
+- 装用户 CA 抓包 —— 抓到的是密文
+
+**挡不住**：
+- 有耐心的逆向者（反汇编本库、复现 XOR 与滚动算法）—— 是门槛，不是墙
+- 拿到 root 后用 Frida / ptrace 读进程内存 —— 但 release 包
+  `android:debuggable=false`，Frida 需要 root
+- hook 了 `SSL_write` 的抓包工具 —— 与本库同一层，看得到
+- ⚠️ **`android:usesCleartextTraffic="true"` 且没有 `networkSecurityConfig`**，
+  所以用户装的 CA 能解密 HTTPS。本库不防这个。
+
+⚠️ `/proc/<pid>/mem` 真机实测**被内核挡住**（`head: I/O error`），
+`/proc/sys/kernel/yama/ptrace_scope` 在本设备上不存在 —— 但这两条**都不构成防护**，
+ptrace/Frida 不受此限。
+
+⚠️ **调试开关**：`DSH_KEYINJECT_OFF=1` 关掉注入（用来区分「是本库引起的」还是
+「本来就这样」）；`DSH_KEYINJECT_DEBUG=1` 打开日志。两者都不参与保密 ——
+关掉后请求会带占位符发出去并被判 401，是个可观测的失败。
+
+#### ⚠️ 安全提醒（与代码无关，但比代码更要紧）
+
+密钥文档挂在 **`http://39.98.163.161:57647/`**（**明文 HTTP**，无 TLS）。
+若该主机对公网可达，那才是最大的暴露面 —— **比 APK 泄露严重得多**，
+因为它是 14 个密钥的完整清单、一次请求全部拿走。发版前建议确认它只在内网，
+或尽快改成 HTTPS / 加访问控制。
 
 ## 后台保活（任务切到后台不能断）
 

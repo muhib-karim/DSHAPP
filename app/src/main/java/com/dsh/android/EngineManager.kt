@@ -8,6 +8,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
@@ -1385,6 +1388,144 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出内置号池的注入库（`keyinject.bin` → `filesDir/libkeyinject.so`）。
+     *
+     * 这是「给粉丝免费用、又不让他们挖到密钥」的实现载体。它经 `LD_PRELOAD`
+     * 注入引擎进程，在 `SSL_write()` 加密前的最后一刻把配置里的**占位符**
+     * 换成真密钥，写完立刻还原。所以：
+     *
+     * - 磁盘上、环境变量里、JS 能碰到的任何地方，都**只有占位符**；
+     * - 粉丝对 AI 说「打印所有环境变量」或「读一下 .credentials.yaml」，
+     *   拿到的都是占位符；
+     * - `strings` APK 也搜不到明文密钥（资产里是混淆后的密文）。
+     *
+     * ⚠️ **这不是加密，是提高门槛。** 有耐心的逆向者（反汇编本库、复现 XOR）
+     * 仍能还原，拿到 root 用 Frida 读内存也能拿到。它把攻击成本从「会打字」
+     * 提到「会逆向」。完整的威胁模型见 `app/src/main/jni/keyinject.c` 头部。
+     *
+     * ⚠️ 资产不存在时**静默跳过**（返回 null，不挂 LD_PRELOAD、不写 provider
+     * 配置）：那是别人 clone 之后没跑 `tools/build-keyinject.ps1` 的正常状态，
+     * 此时引擎照常启动、只是没有内置号池，用户仍可自己配 provider。
+     */
+    private fun ensureKeyInject(): File? {
+        val dest = File(context.filesDir, KEYINJECT_FILE)
+        return try {
+            // 每次都覆盖写：库只有 11KB，且它随 APK 升级而变，比对哈希不值当
+            context.assets.open(KEYINJECT_ASSET).use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            }
+            dest.setReadable(true, false)
+            dest.setExecutable(true, false)
+            Log.i(TAG, "已解出号池注入库 $KEYINJECT_FILE (${dest.length()} 字节)")
+            dest
+        } catch (t: Throwable) {
+            // 没有资产 = 没跑生成脚本，属于正常状态，不是错误
+            Log.i(TAG, "未内置号池注入库（未运行 tools/build-keyinject.ps1），跳过")
+            null
+        }
+    }
+
+    /**
+     * 写入内置号池的 provider 配置 overlay（`$DSH_HOME/keyinject.patch.yml`）。
+     *
+     * **只有一个供应商**，但底下的 14 把钥匙分属两个站点。合并靠的是
+     * `keyinject.c` 在 TLS 层当小路由：选中哪把钥匙，就把 Host 头改成那把钥匙
+     * 所属站点的域名（两站同 IP、同一张通配证书，服务器按 Host 头路由）。
+     *
+     * 所以这里只要配**一个**路由，`baseURL` 取较长的国际站域名 —— 等长改写
+     * 只能从长的往短的改（见 [KEY_BASE_URL]）。
+     *
+     * ## 为什么 `apiKeyEnv` 指向的是**占位符**
+     *
+     * `apiKeyEnv` 是**凭据引用**（credential reference），不是密钥本身：引擎每次
+     * 请求都通过凭据 seam 把它解析成实际字符串，再放进 `Authorization` 头。所以
+     * 这里只写引用名，实际值由 [start] 注入成环境变量 —— 而那个值是占位符。
+     *
+     * 占位符随请求进入 TLS 缓冲区后，由 `libkeyinject.so` 在加密前换成真密钥。
+     * **整条链路上密钥只存在于 C 库的内存里**，这是本方案的全部要害。
+     *
+     * ## 为什么用 `--patch` 而不是让用户在设置页里配
+     *
+     * 这是 App 内置的能力，粉丝不该看到、也不该改（改了号池就废了）。patch 层
+     * 由 App 每次启动整体覆盖，用户层改不动它。与 [writeSandboxPatch] 同类。
+     */
+    private fun writeKeyInjectPatch(inject: File?): File? {
+        if (inject == null) return null
+        val file = File(dshHome, KEYINJECT_PATCH)
+        val yaml = buildString {
+            appendLine("# 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。")
+            appendLine("# 内置号池：一个供应商，密钥在 TLS 层由 libkeyinject.so 注入；")
+            appendLine("# 国内站/国际站两套密钥由它在 TLS 层改写 Host 头自动分流。")
+            appendLine("# 配置里只有占位符，真密钥不落盘、不进 JS、不进环境变量。")
+            appendLine("# 详见 app/src/main/jni/keyinject.c。")
+            appendLine("- id: llm-pi-ai")
+            appendLine("  name: '@deepseek-ai/dsh-llm-pi-ai'")
+            appendLine("  config:")
+            appendLine("    providers:")
+            appendLine("      $KEY_PROVIDER:")
+            appendLine("        displayName: '$KEY_PROVIDER_NAME'")
+            appendLine("        api: openai-completions")
+            appendLine("        baseURL: '$KEY_BASE_URL'")
+            appendLine("        apiKeyEnv: $KEY_ENV")
+            appendLine("        models:")
+            for (m in KEY_MODELS) {
+                appendLine("          - id: $m")
+            }
+        }
+        return try {
+            if (!file.isFile || file.readText() != yaml) {
+                file.writeText(yaml)
+                Log.i(TAG, "已写入内置号池 overlay: ${file.name}")
+            }
+            file
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入内置号池 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 读路由日志（最近 [maxLines] 行，最新的在最后）。
+     *
+     * 给设置页的「路由日志」分节用 —— 它是唯一能回答「每次请求到底用了哪把钥匙」
+     * 的地方。文件不存在（还没发过请求 / 没内置号池）时返回空串，不是错误。
+     *
+     * ⚠️ 日志里**没有密钥**，只有站点与下标（见 `keyinject.c` 的 `route_log`）。
+     *
+     * 只读尾部：文件上限 256 KB，全读进内存没必要。
+     */
+    fun readKeyInjectLog(maxLines: Int = 200): String {
+        val f = File(dshHome, KEYINJECT_LOG_FILE)
+        if (!f.isFile) return ""
+        return try {
+            val lines = f.readLines()
+            val tail = if (lines.size <= maxLines) lines else lines.subList(lines.size - maxLines, lines.size)
+            tail.joinToString("\n")
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取路由日志失败: ${t.message}")
+            ""
+        }
+    }
+
+    /**
+     * 清空路由日志（设置页的「清空」按钮）。
+     *
+     * ⚠️ 用**截断**而不是删除：`keyinject.c` 持有的是 `open()` 得到的 fd，
+     * 删掉文件再新建的话，注入库仍然往那个已被 unlink 的 inode 里写 ——
+     * 用户会看到「清空了，但新日志再也不出现」。截断（`O_TRUNC`）保留 inode，
+     * fd 继续有效。
+     */
+    fun clearKeyInjectLog() {
+        val f = File(dshHome, KEYINJECT_LOG_FILE)
+        try {
+            if (f.isFile) f.writeText("")
+            Log.i(TAG, "已清空路由日志")
+        } catch (t: Throwable) {
+            Log.w(TAG, "清空路由日志失败: ${t.message}")
+        }
+    }
+
+    /**
      * 解出 uid 2000 执行通道（`dsh-android-shell.mjs`，每次启动覆盖写）。
      *
      * 该脚本直连本机 adbd（`127.0.0.1:5555`）走 ADB 协议认证，从而以 shell
@@ -1713,6 +1854,69 @@ class EngineManager private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * 决定引擎 Web GUI 的监听端口。
+     *
+     * 返回 `null` 表示**不传 `--port`**，让引擎落到它自己的默认值
+     * （`@deepseek-ai/dsh-web-app/cordis.patch.yml` 的 `port ?? 3080`）。
+     * 返回 `0` 表示让内核挑一个空闲端口。
+     *
+     * ## 为什么需要它
+     *
+     * `dsh-host-webserver` 的 `listen()` 失败会**直接 reject 插件激活**
+     * （`lib/index.js` 的 `server.once("error", reject)`），而它是 required 插件，
+     * 于是整个引擎以
+     * `dsh: startup failed: N required plugins did not activate` 退出，
+     * 界面上就是「引擎启动失败（引擎进程已退出）」+ 一串
+     * `waiting for webServer / webRuntime / connection` 的连锁行。
+     *
+     * 真机反馈的场景：App 上一次的 node 进程没跟着进程一起死（`ProcessBuilder`
+     * 起的子进程不会随父进程退出），仍占着 3080，之后每次冷启动都撞 EADDRINUSE ——
+     * 用户只能重启手机。
+     *
+     * ## 为什么「探测空闲就照旧传默认值」而不是一律 `--port 0`
+     *
+     * 一律 `--port 0` 会让每次启动的端口都变，而移动端 UI 插件与用户的收藏/
+     * 书签都可能记着 `127.0.0.1:3080`。只有真被占时才让出端口，正常路径的
+     * 行为与改动前**逐字一致**。
+     *
+     * ⚠️ 探测与真正 `listen` 之间天然存在竞态（探测完端口被别人抢走）。
+     * 这个窗口只有毫秒级，且失败后果与改动前完全相同（引擎报错退出），
+     * 所以不为此引入重试 —— 真正的占用源是上一个残留进程，它不是并发抢端口。
+     */
+    private fun resolveWebPort(): Int? {
+        if (!isLoopbackPortBusy(DEFAULT_WEB_PORT)) {
+            Log.i(TAG, "Web 端口 $DEFAULT_WEB_PORT 空闲，沿用引擎默认值")
+            return null
+        }
+        Log.w(
+            TAG,
+            "Web 端口 $DEFAULT_WEB_PORT 已被占用（多半是上一次残留的引擎进程），" +
+                "改由内核分配空闲端口",
+        )
+        return 0
+    }
+
+    /**
+     * `127.0.0.1` 上的 [port] 是否已被占用。
+     *
+     * ⚠️ 判据与 `AdbMdns.isPortInUse` 相反：那里「bind 失败 = adbd 在听」是**成功**，
+     * 这里「bind 失败」就是**真被占用**。两处语义不同，别互相抄。
+     *
+     * 只探测回环地址，与引擎的 `host: '127.0.0.1'` 对齐 —— 别的进程若绑在
+     * `0.0.0.0:3080`，对 `127.0.0.1:3080` 的 bind 同样会失败，判据成立。
+     */
+    private fun isLoopbackPortBusy(port: Int): Boolean = try {
+        ServerSocket().use {
+            // 不设 SO_REUSEADDR：Android 上它只影响 TIME_WAIT 复用，不影响
+            // 「有人在 listen」的判定，默认行为更贴近引擎自己的 bind。
+            it.bind(InetSocketAddress("127.0.0.1", port), 1)
+        }
+        false
+    } catch (_: IOException) {
+        true
+    }
+
     /** 启动引擎，等待其打印带 token 的 URL。 */
     suspend fun start() = withContext(Dispatchers.IO) {        if (process?.isAlive == true) {
             Log.i(TAG, "引擎已在运行")
@@ -1760,6 +1964,10 @@ class EngineManager private constructor(private val context: Context) {
         val pluginManagerPatch = writePluginManagerPatch()
         // link 兼容层：SELinux 不给 app_data_file 的 link 权限，需在 libc 边界转译
         val linkCompat = ensureLinkCompat()
+        // 内置号池：密钥在 TLS 层注入，配置与磁盘上只有占位符。
+        // 资产缺失（没跑生成脚本）时返回 null，引擎照常启动、只是没有内置号池。
+        val keyInject = ensureKeyInject()
+        val keyInjectPatch = writeKeyInjectPatch(keyInject)
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
         val privRunner = ensurePrivilegedShell()
@@ -1822,6 +2030,23 @@ class EngineManager private constructor(private val context: Context) {
             if (privPatch != null) {
                 add("--patch"); add(privPatch.absolutePath)
             }
+            // 内置号池：provider 路由 + 占位符引用（真密钥由 LD_PRELOAD 的库注入）
+            if (keyInjectPatch != null) {
+                add("--patch"); add(keyInjectPatch.absolutePath)
+            }
+            // 端口：默认沿用引擎内置的 3080；被占用时改让内核分配空闲端口。
+            // 不这么做的话 webserver（required）会以 EADDRINUSE 激活失败 →
+            // `dsh: startup failed: 2 required plugins did not activate` → 引擎退出。
+            // 详见 [resolveWebPort]。
+            //
+            // ⚠️ 位置是硬性的：`--port` 属于 **web app 的内层 flag**，而 launcher
+            // （`@deepseek-ai/dsh/lib/bin.js`）只解析自己的 `--profile` / `--patch`，
+            // 「第一个不认识的 token 就是内层参数的起点，其后原样转交」。
+            // 插到 `--patch` 前面会让它们全被当成内层参数，引擎直接
+            // `error: unknown option '--patch'` 起不来（真机实测踩过）。
+            resolveWebPort()?.let { port ->
+                add("--port"); add(port.toString())
+            }
             add("--no-open")
         }
 
@@ -1866,11 +2091,25 @@ class EngineManager private constructor(private val context: Context) {
             // link()/linkat() 语义转译：SELinux 不允许 untrusted_app 对 app_data_file
             // 做硬链接，而 DSH 上游用硬链接做独占原子发布。见 [ensureLinkCompat]。
             //
+            // 号池注入库同在这条链上，所以**必须用列表拼接而不是覆盖** ——
+            // 两个库都要生效。见 [ensureKeyInject]。
+            //
             // ⚠️ 只加在本进程：LD_PRELOAD 会一并继承给 node spawn 的子进程（如 shell
-            // 工具）。对本库无害（只 hook link/linkat，且先试原生、失败才转译），
-            // 但若将来要往 LD_PRELOAD 里追加别的库，务必确认不会破坏系统二进制。
-            if (linkCompat != null) {
-                put("LD_PRELOAD", linkCompat.absolutePath)
+            // 工具）。对这两个库都无害（linkcompat 只 hook link/linkat 且先试原生；
+            // keyinject 只 hook SSL_*，没有 TLS 的子进程根本不会碰到），但若将来要
+            // 往 LD_PRELOAD 里追加别的库，务必确认不会破坏系统二进制。
+            val preloads = listOfNotNull(linkCompat, keyInject).map { it.absolutePath }
+            if (preloads.isNotEmpty()) {
+                // 空格分隔，与 boo-sandbox-run.c 里追加 LD_PRELOAD 的写法一致
+                put("LD_PRELOAD", preloads.joinToString(" "))
+            }
+            // 内置号池的凭据引用指向**占位符**，不是真密钥：真密钥在 TLS 层由
+            // libkeyinject.so 换上。所以这里泄露出去也无所谓 —— 这正是设计意图。
+            if (keyInject != null) {
+                put(KEY_ENV, KEY_PLACEHOLDER)
+                // 路由日志：每次换钥匙追加一行「站点 + 第几把」。
+                // 路径给绝对路径（注入库在 node 进程里跑，工作目录不固定）。
+                put(KEYINJECT_LOG_ENV, File(dshHome, KEYINJECT_LOG_FILE).absolutePath)
             }
             // 沙箱 runner 靠它定位 LD_PRELOAD 拦截器。runner 会把它追加到子进程
             // 的 LD_PRELOAD 里（保留这里已有的 link 兼容层，两个库都生效）。
@@ -2068,6 +2307,16 @@ class EngineManager private constructor(private val context: Context) {
         private const val READY_TIMEOUT_MS = 120_000L
         private const val MAX_LOG_LINES = 400
 
+        /**
+         * 引擎 Web GUI 的默认监听端口。
+         *
+         * 出处：`@deepseek-ai/dsh-web-app/cordis.patch.yml` 的
+         * `port: !!js ctx.webStartup.port ?? 3080` —— App 不传 `--port` 时落到的就是它。
+         *
+         * 被占用时改传 `--port 0` 让内核挑一个空闲端口，见 [isLoopbackPortBusy]。
+         */
+        private const val DEFAULT_WEB_PORT = 3080
+
         /** WebView 兼容补丁：资产名与注入到 index.html 里的标签。 */
         private const val POLYFILL_FILE = "webview-polyfill.js"
         private const val POLYFILL_TAG = """<script src="./$POLYFILL_FILE"></script>"""
@@ -2153,6 +2402,94 @@ class EngineManager private constructor(private val context: Context) {
         private const val LINKCOMPAT_ASSET = "linkcompat.bin"
         private const val LINKCOMPAT_FILE = "liblinkcompat.so"
 
+        /** 内置号池的注入库（见 `ensureKeyInject()` 与 `app/src/main/jni/keyinject.c`）。 */
+        private const val KEYINJECT_ASSET = "keyinject.bin"
+        private const val KEYINJECT_FILE = "libkeyinject.so"
+        private const val KEYINJECT_PATCH = "keyinject.patch.yml"
+
+        /**
+         * 路由日志文件名（落在 `$DSH_HOME` 下）。
+         *
+         * `keyinject.c` 每次换钥匙都往它追加一行「站点 + 第几把」，用来回答
+         * 「轮换到底有没有生效」—— 光看界面看不出来。设置页里有个入口能看。
+         *
+         * ⚠️ **日志里没有密钥**，只有站点与下标。这一点是刻意的：这个文件用户
+         * 能看到，写进密钥等于把整个方案的目的抹掉。
+         */
+        private const val KEYINJECT_LOG_FILE = "keyinject-route.log"
+
+        /**
+         * 传给注入库的日志路径环境变量名。
+         *
+         * ⚠️ 名字不能带 `KEY`/`TOKEN`/`SECRET` 这类词：`dsh-subprocess` 的
+         * `scrubbedParentEnv()` 会把匹配 `/KEY|PASSWORD|SECRET|TOKEN/i` 的变量
+         * 连同所有 `DSH_*` 一起剥掉（本库要读它的正是被 spawn 的子进程）。
+         * `DSH_KEYINJECT_LOG` 两个条件都不满足 —— `DSH_` 前缀是给**我们自己**
+         * 的库读的，剥掉它的只有引擎自己 spawn 的子进程，而 TLS 只发生在引擎
+         * 主进程里，不受影响。见 `keyinject.c` 的 `init_once()`。
+         */
+        private const val KEYINJECT_LOG_ENV = "DSH_KEYINJECT_LOG"
+
+        /**
+         * 引擎配置里的匿名占位符。
+         *
+         * ⚠️ **必须与 `keyinject.c` 的 `KI_PLACEHOLDER` 逐字一致**，长度也必须等于
+         * 密钥长度（51）。等长替换是「不用重算 Content-Length」的前提，长度不等
+         * 会让请求错位失败。`tools/build-keyinject.ps1` 会读这个文件校验两者一致，
+         * 不一致时直接构建失败 —— 所以改这里必须同步改 C 侧。
+         *
+         * 占位符**不是秘密**：被粉丝读到也无所谓，它只是一把会被换掉的假钥匙。
+         */
+        private const val KEY_PLACEHOLDER = "sk-ANON00000000000000000000000000000000000000000000"
+
+        /**
+         * 内置号池的 provider 路由名。
+         *
+         * **只有一个**：两个站点由 `keyinject.c` 在 TLS 层按钥匙所属站点改写
+         * Host 头来区分（combo），所以引擎侧看到的就是一个普通供应商，用户
+         * 在主界面选模型时也只看到一个「Agnes」。
+         *
+         * 依据是三个实测事实：两个域名**同一个 IP**、共用**同一张**
+         * `*.agnes-ai.cn` 通配证书、服务器按 **Host 头**路由（不是 SNI）。
+         */
+        private const val KEY_PROVIDER = "agnes"
+
+        /** 供应商显示名 —— 主界面模型列表里分组用的就是它。 */
+        private const val KEY_PROVIDER_NAME = "Agnes"
+
+        /**
+         * baseURL **必须**用较长的国际站域名。
+         *
+         * combo 靠等长改写 Host 头区分站点：`apihub.agnes-ai.cn`（18 字符）可以
+         * 缩成 `api.agnes-ai.cn` + 4 个尾部空格（同为 18），反过来则没有等长写法。
+         * 所以基准域名只能是国际站 —— 国内站的钥匙由 `keyinject.c` 把 Host 改短。
+         */
+        private const val KEY_BASE_URL = "https://apihub.agnes-ai.cn/v1"
+
+        /**
+         * `apiKeyEnv` 引用的环境变量名。
+         *
+         * 名字里**刻意不带 KEY/SECRET/TOKEN**：`dsh-subprocess` 的
+         * `scrubbedParentEnv()` 会剥掉所有匹配 `SENSITIVE_ENV_PATTERN`
+         * （`/KEY|PASSWORD|SECRET|TOKEN/i`）的变量，带这些字样的名字会让子进程
+         * 拿不到它。虽然这里装的是占位符、泄露也无所谓，但保持它能被子进程读到
+         * 更省事（引擎若在子进程里做模型发现，缺了它会报 `MISSING_CREDENTIAL`）。
+         */
+        private const val KEY_ENV = "AGNES_CREDENTIAL"
+
+        /**
+         * 内置号池对外提供的模型清单。
+         *
+         * ⚠️ 必须显式列出：pi-ai 对手工声明的路由要求 `models` 非空，否则
+         * 整个 profile 会被拒绝（"A route pi-ai does not ship needs `api`,
+         * `baseURL`, and a non-empty `models` list"）。
+         *
+         * 只留 `agnes-3.0-flash`：号池是给粉丝免费体验用的，列一长串
+         * （图像、视频、各种 pro 变体）只会让模型选择器变乱，而实际额度也不支持
+         * 那些模型。要放开时在这里加一行即可。
+         */
+        private val KEY_MODELS = listOf("agnes-3.0-flash")
+
         /** ripgrep：官方 `@vscode/ripgrep` 没有 android 平台包，这里补一个。 */
         private const val RIPGREP_ASSET = "ripgrep-android-arm64.zip"
         private const val RIPGREP_PACKAGE = "@vscode/ripgrep-android-arm64"
@@ -2218,7 +2555,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-36"
+        private const val MOBILE_UI_VERSION = "1.0.0-37"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

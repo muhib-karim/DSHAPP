@@ -26,10 +26,25 @@ keystore.properties
 # 例外：手写源码，必须入库。
 #   webview-polyfill.js    —— 旧 WebView 内核兼容垫片
 #   dsh-android-shell.mjs  —— uid 2000 执行通道（含 ADB 协议与密钥信任逻辑）
+#
+# 例外：内置号池的注入库（手写源码 + 生成脚本），必须入库。
+#   详见 app/src/main/jni/keyinject.c 头部与 tools/build-keyinject.ps1。
 app/src/main/assets/*
 !app/src/main/assets/webview-polyfill.js
 !app/src/main/assets/dsh-android-shell.mjs
 COMMIT_MSG.tmp
+
+# ── 内置号池的密钥：绝不入库 ─────────────────────────────
+#
+# agnes-keys.properties 是**明文密钥清单**，keyinject-keys.h 是它的混淆产物
+# （混淆可逆，等价于明文）。两者都必须留在本机。
+# 入库的只有手写源码 app/src/main/jni/keyinject.c 与生成脚本 tools/build-keyinject.ps1；
+# 别人 clone 后拿不到密钥，跑一次生成脚本才能得到可用的 keyinject.bin。
+agnes-keys.properties
+app/src/main/jni/keyinject-keys.h
+# agnes-keys-guide.md 是密钥服务商发的原始文档（14 个明文密钥 + 配对邮箱），
+# 从公网 http://39.98.163.161:57647/ 抓下来留档，同样绝不入库。
+agnes-keys-guide.md
 
 # ── 介绍片：中间产物不入库，源文件与成片入库 ─────────────
 #
