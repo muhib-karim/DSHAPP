@@ -759,6 +759,36 @@ window.__ModuleLoader__.load({
 .mp-plugin-group-open .mp-plugin-group-chevron {
   transform: rotate(180deg);
 }
+
+/* ══ 修复 66：全局面板页（插件 / 定时任务）顶部文字被汉堡压住 ════════════
+   现象（2026-10-04 啾灵真机反馈）：
+     侧栏点「插件」后主区切到插件页，页面最上方的「插件」大标题与它下面
+     的说明文字，和左上角那枚汉堡按钮**叠在一起**（截图实测汉堡 y 145..215、
+     标题 y 150..215，重叠约 65px）。
+
+   根因（官方布局 + 本插件的挂载策略共同导致，不是单方面的锅）：
+     ① 「.wSkVaW_header」（含 ⋯ 那一行顶栏）属于 **conversation 插件**，
+        切到 main panel 时 conversation 整体卸载 → 顶栏连同一整行都没了；
+     ② 本插件的汉堡由 mpAnchorBurger() 挂载：有顶栏时进 header（absolute），
+        **没有顶栏时回落到 document.body（fixed 左上角浮层）** —— 这一步本身
+        是对的（否则插件页就没有入口回不去侧栏了）；
+     ③ 而插件页自己的「.X_2TxG_pageHead」只有 padding-top:28px，那是官方给
+        **桌面端** --dsh-frame-top-clearance 预留的量（该变量只在
+        darwin / windows-titlebar 下定义，Android 上恒为 0）→ 页面从视口顶部
+        开始排，正好撞进汉堡的浮层范围。
+
+   修法：**不给插件页写死像素，也不去硬编码它的 hash 类名**。
+     汉堡是浮层时，把它真实的 bottom（+ 呼吸位）写成 CSS 变量
+     --mp-float-nav-h，由「.pI_x6G_centerCol」（官方 layout 的稳定类名）
+     吃成 padding-top；汉堡回到顶栏里时该变量清零，conversation 页逐像素不变。
+     这样任何面板页、任何屏幕、任何系统栏高度都自动对齐，且官方换 hash 类名
+     也不会失效（我们不依赖 X_2TxG_page 这个构建期哈希）。
+
+   ⚠️ 只动 centerCol 的**上内边距**：它是 flex 列容器、内部只有 main slot
+      一个子项，加内边距 = 子项整体下移，不改变子项自身的布局语义。 */
+[data-mobile] .pI_x6G_centerCol {
+  padding-top: var(--mp-float-nav-h, 0px) !important;
+}
 `;
 
 		function injectStyles() {
@@ -960,6 +990,32 @@ window.__ModuleLoader__.load({
 			const row = e.target.closest('.YDXeBa_sessionRow');
 			if (!row) return;
 			if (e.target.closest('.YDXeBa_rowActions')) return;
+			closeDrawerAfterClick();
+		}
+		// ── 6b. 侧栏点「全局面板」条目（插件 / 定时任务）后同样自动收回抽屉 ──
+		//
+		// 修复 66（2026-10-04 啾灵真机反馈）：
+		//   现象：侧栏点「插件」后主区**已经**切到插件页，但侧栏抽屉还开在原地，
+		//         要用户再点一次遮罩才收起来。
+		//   根因：上面两个监听器只覆盖「新会话」与「会话条」，而全局面板条目是
+		//         sidebar.panellist 槽位注册的**另一类**按钮（PanelRow），
+		//         它的 onClick 只调 selectPanel(id)，从不经过 closeDrawerAfterClick()
+		//         → 主区切了、抽屉没人收。
+		//
+		//   ⚠️ 判据用官方 PanelRow 的构建期哈希类名 `hHd-Xa_panelRow`，
+		//      与本项目既有做法一致（.hHd-Xa_toggle / .hHd-Xa_root 同理）；
+		//      再补一条结构性兜底 `hHd-Xa_panelList button`（容器内的按钮），
+		//      这样即便官方升级把 panelRow 这个类名换掉，只要槽位容器还在就仍能命中。
+		//      两条都不会误伤会话条 / 新建按钮 —— 它们在别的容器里。
+		//
+		//   ⚠️ 用 closest 而不是 e.target.matches：点击通常落在条目内的图标
+		//      span / 文字 span 上，只有向上找到那个 button 才是可点实体。
+		//      PanelRow 渲染出来的就是 <button class="hHd-Xa_panelRow">，
+		//      所以两条选择器最终命中的是同一个元素。
+		function onPanelRowClick(e) {
+			if (!mpIsMobile()) return; // 修复 40：收抽屉仅移动端有意义
+			const t = e.target.closest('.hHd-Xa_panelRow, .hHd-Xa_panelList button');
+			if (!t) return;
 			closeDrawerAfterClick();
 		}
 
@@ -2527,7 +2583,50 @@ window.__ModuleLoader__.load({
 					// 修复 61：高度自校准与居中留白共用这一帧（共用节流，不额外增加重排次数）
 					try { mpSyncHeaderHeight(); } catch (e) { /* 静默：纯外观，绝不影响功能 */ }
 					try { mpSyncHeaderCenter(); } catch (e) { /* 静默：纯外观，绝不影响功能 */ }
+					// 修复 66：与上面两件事共用同一帧（零额外重排）
+					try { mpSyncFloatNavGap(); } catch (e) { /* 静默：纯外观，绝不影响功能 */ }
 				});
+			}
+
+			/* ══ 修复 66：汉堡浮层时给主区让出顶部空间（配合 CSS 的
+			   [data-mobile] .pI_x6G_centerCol { padding-top: var(--mp-float-nav-h) }）══
+
+			   背景见 CSS 那条注释：切到全局面板（插件 / 定时任务）后官方顶栏随
+			   conversation 一起卸载，汉堡由 mpAnchorBurger() 回落到 body 的
+			   fixed 浮层，而面板页自己的顶部留白是给桌面端预留的（Android 恒为 0）
+			   → 面板标题撞进汉堡。
+
+			   ⚠️ **量汉堡的真实 rect，不写死像素**：
+			     汉堡 top = calc(var(--dsh-android-system-top, 0px) + 6px)，而该变量
+			     在本 App 里从未被任何代码写入（恒 0）；真正把汉堡推下去的是 WebView
+			     自身对系统栏的避让。写死 46px 在别的机型/系统栏高度上就会偏，
+			     所以直接读 getBoundingClientRect().bottom —— 它是 fixed 元素，
+			     页面滚动不影响，读数恒定，也不需要知道系统栏多高。
+
+			   ⚠️ 判据用 `mp-in-header` 类而不是"header 在不在"：这个类正是
+			     mpAnchorBurger() 挂载时打的标记（进 header 加、回落 body 摘），
+			     与汉堡的实际归属永远一致，不会出现"类与位置打架"的中间态。
+
+			   非移动端 / 汉堡不在浮层 → 变量归 0px，conversation 页逐像素不变。 */
+			const MP_FLOAT_NAV_GAP = 8; // 呼吸位：标题不要贴着汉堡下沿
+			var mpFloatNavH = "";
+			function mpSyncFloatNavGap() {
+				const root = document.documentElement;
+				if (!root.hasAttribute("data-mobile")) {
+					if (root.style.getPropertyValue("--mp-float-nav-h")) root.style.removeProperty("--mp-float-nav-h");
+					mpFloatNavH = "";
+					return;
+				}
+				const btn = mpNavBtnEl;
+				const floating = !!(btn && btn.isConnected && !btn.classList.contains("mp-in-header"));
+				let next = "0px";
+				if (floating) {
+					const r = btn.getBoundingClientRect();
+					if (r.height > 0) next = Math.round(r.bottom + MP_FLOAT_NAV_GAP) + "px";
+				}
+				if (next === mpFloatNavH) return; // 无变化 ⇒ 不写 DOM ⇒ 不触发 observer
+				mpFloatNavH = next;
+				root.style.setProperty("--mp-float-nav-h", next);
 			}
 
 			function mpAnchorBurger() {
@@ -4815,6 +4914,7 @@ window.__ModuleLoader__.load({
 			document.querySelectorAll('[role="dialog"][aria-modal="true"]').forEach(setupSettingsDialog);
 			document.addEventListener("click", onNewSessionClick, true);
 			document.addEventListener("click", onSessionRowClick, true);
+			document.addEventListener("click", onPanelRowClick, true);   /* 修复 66 */
 			const disposePressFeedback = setupPressFeedback();
 			const disposeStatusBridge = mpInstallStatusBridge();
 			const disposeImePrejudge = setupImePrejudge();   /* 修复 65 */
@@ -4855,6 +4955,7 @@ window.__ModuleLoader__.load({
 				disposeKeyboardGuard();
 				disposeTriggerMenuDismiss();
 				disposeKeepFocusGuard();
+				document.removeEventListener("click", onPanelRowClick, true);   /* 修复 66 */
 			};
 		}
 
