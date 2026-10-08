@@ -1725,6 +1725,92 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 把跨会话持久记忆插件 dsh-core-memory 解到 `$DSH_HOME/core-memory/dsh-core-memory/`（幂等）。
+     *
+     * 与 [ensureMobileUi] / [ensureAgnesMultimodal] 同一套做法、同一套理由：包解到
+     * `$DSH_HOME` 下而不是 profile 的 `node_modules`（那里归 pnpm 管，本包不在 profile
+     * 的 `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`，
+     * overlay 里的包名随即解析失败）。
+     *
+     * ⚠️ **`lib/persona.js` 必须一起解出来**：`lib/index.js` 用相对路径
+     * `from './persona.js'` 导入它（宿主半的回复风格逻辑全在那里）。少这一个文件，
+     * 插件在 `import` 阶段就 `ERR_MODULE_NOT_FOUND`，宿主半整个不激活 —— 而且报错
+     * 只在引擎启动日志里出现一次，界面上表现为「记忆功能完全不存在」。
+     *
+     * 幂等判据是版本戳而不是「文件在不在」：插件随 APK 升级而变，只看文件存在
+     * 会让老设备永远停在旧版。
+     */
+    private fun ensureCoreMemory() {
+        val target = File(dshHome, "$CORE_MEMORY_DIR/$CORE_MEMORY_PACKAGE")
+        val clientJs = File(target, "lib/client.js")
+        val stamp = File(target, CORE_MEMORY_STAMP)
+
+        if (clientJs.isFile && clientJs.length() > 0 &&
+            stamp.isFile && stamp.readText().trim() == CORE_MEMORY_VERSION
+        ) {
+            return
+        }
+
+        try {
+            target.deleteRecursively()
+            java.util.zip.ZipInputStream(context.assets.open(CORE_MEMORY_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(target, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            stamp.writeText(CORE_MEMORY_VERSION)
+            Log.i(TAG, "已安装跨会话记忆插件 $CORE_MEMORY_PACKAGE $CORE_MEMORY_VERSION (${clientJs.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上不阻断启动：只是少了记忆能力
+            Log.w(TAG, "安装跨会话记忆插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载 dsh-core-memory 的 overlay，返回其路径；不可用时返回 null。
+     *
+     * 与 [writeAgnesMultimodalPatch] 同构：`--patch` 在 profile 层**之后**应用，优先级
+     * 更高，且完全由本 App 拥有，升级时整体覆盖即可。`name` 用 `file://` 绝对
+     * URL，因为包在 pnpm 管辖之外、按裸包名解析不到。
+     *
+     * ⚠️ 浏览器半（「AI 回复风格」设置页）由 `dsh-client-modules` 通过 package.json 的
+     * `dsh.client` 声明 + `exports["./client"]` 自动编入，**不需要**在这里声明。
+     */
+    private fun writeCoreMemoryPatch(): File? {
+        val patch = File(dshHome, CORE_MEMORY_PATCH)
+        val entry = File(dshHome, "$CORE_MEMORY_DIR/$CORE_MEMORY_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "跨会话记忆插件入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载跨会话持久记忆插件；插件包随 APK 分发，已解到 .dsh/${CORE_MEMORY_DIR}。
+                # 用 file:// 绝对路径挂载：包刻意放在 profile 的 node_modules 之外，
+                # 否则用户每次用插件管理器装东西都会被 pnpm 挪进 .ignored/。
+                - insert:
+                    - id: $CORE_MEMORY_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入跨会话记忆 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 把 link()/linkat() 的语义转译层解到真实文件路径（幂等），返回其路径。
      *
      * 为什么需要：SELinux 的 `untrusted_app(_27)` 域对 `app_data_file` **没有
@@ -2318,6 +2404,10 @@ class EngineManager private constructor(private val context: Context) {
         // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
         ensurePresetRazor()
         val presetRazorPatch = writePresetRazorPatch()
+        // 跨会话持久记忆插件：核心记忆常驻注入 + 归档记忆检索 + 回复风格设置页。
+        // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
+        ensureCoreMemory()
+        val coreMemoryPatch = writeCoreMemoryPatch()
         // 沙箱：Android 无内核级后端，用自带 runner 保住 workspace-write 的写边界
         val sandboxPatch = writeSandboxPatch(ensureSandbox())
         // 默认工作区：Android 落不进引擎的平台分支，必须显式给 documentsDirectory
@@ -2383,6 +2473,10 @@ class EngineManager private constructor(private val context: Context) {
             // 内置预设 dsh-preset-razor：声明行 + registry 默认位，同样是 overlay
             if (presetRazorPatch != null) {
                 add("--patch"); add(presetRazorPatch.absolutePath)
+            }
+            // 跨会话持久记忆插件：同样是 overlay
+            if (coreMemoryPatch != null) {
+                add("--patch"); add(coreMemoryPatch.absolutePath)
             }
             // 沙箱 runner：同样是 overlay（--patch 可重复，按顺序应用）
             if (sandboxPatch != null) {
@@ -2815,6 +2909,18 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 预设标识符，必须与 razor 的 `cordis.patch.yml` 里 `config.id` 一致。 */
         private const val PRESET_RAZOR_ID = "razor"
+
+        /** 跨会话持久记忆插件（dsh-core-memory）：资产名、包名、overlay 文件名。 */
+        private const val CORE_MEMORY_ASSET = "core-memory.zip"
+        private const val CORE_MEMORY_PACKAGE = "dsh-core-memory"
+        private const val CORE_MEMORY_PATCH = "core-memory.patch.yml"
+
+        /** 解包目录，相对 `$DSH_HOME`；与 [MOBILE_UI_DIR] 同理，刻意在 pnpm 管辖之外。 */
+        private const val CORE_MEMORY_DIR = "core-memory"
+
+        /** 内容版本戳：改了 `core-memory.zip` 里任何东西都必须改这里。 */
+        private const val CORE_MEMORY_VERSION = "1.0.0-1"
+        private const val CORE_MEMORY_STAMP = ".core_memory_version"
 
         /**
          * link()/linkat() 语义转译层（LD_PRELOAD）。
