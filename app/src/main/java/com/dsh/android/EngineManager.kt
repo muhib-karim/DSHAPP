@@ -640,6 +640,113 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 把 `terminal-bash` 硬编码的 `/bin/bash` 换成 Termux 的 bash（幂等）。
+     *
+     * ## 症状
+     *
+     * `bash` 工具**每一条命令**都失败，报：
+     *
+     * ```
+     * Error: PTY shell exited during startup
+     * ```
+     *
+     * 而**侧栏终端却能正常打开** —— 「一个坏一个好」这个分裂现象是本节的要害，
+     * 它排除了「PTY 不可用」这个直觉上最像的解释。
+     *
+     * ## 根因：`/bin/bash` 在 Android 上根本不存在
+     *
+     * 抛出点是 `dsh-terminal-bash/lib/index.js` 的 `initialize()`：
+     *
+     * ```js
+     * if (result.waitReason === "session_exit") throw new Error("PTY shell exited during startup");
+     * ```
+     *
+     * `session_exit` = shell 进程**起来后立刻退出**。而它 spawn 的是什么，
+     * 由同文件的 `resolveConfig()` 决定：
+     *
+     * ```js
+     * const DEFAULT_BASH_SHELL = "/bin/bash";
+     * shellPath: config.shellPath?.length > 0 ? config.shellPath : DEFAULT_BASH_SHELL,
+     * ```
+     *
+     * ⚠️ **引擎没有任何一层配置写过 `shellPath`**（全 engine + `$DSH_HOME` 搜过，
+     * 只有类型定义和 GUI 侧栏终端的同名字段），于是必然落到这个硬编码值。
+     *
+     * 真机实测（uid 2000 与 app 域都测了，排除权限干扰）：
+     *
+     * | 命令 | 结果 |
+     * |---|---|
+     * | `ls -l /system/bin/bash` | `No such file or directory` |
+     * | `/bin/bash -c "echo OK"` | rc=**127** `inaccessible or not found` |
+     * | `/bin/sh -c "echo SH_OK"` | `SH_OK`，rc=0 |
+     * | `$PREFIX/bin/bash -c ...` | `5.3.9(1)-release`，rc=0 |
+     *
+     * `/bin` 在 Android 上是 `-> /system/bin`，那里只有 `sh`（mksh），**没有 bash**。
+     * 这与权限无关 —— 把「特殊权限」全开也变不出这个文件来。
+     *
+     * ⚠️ **`terminal-bash` 不做 PATH 查找**：`spawn()` 直接用 `argv[0]`，
+     * 不调 `resolveExecutable`。所以哪怕引擎的 `PATH` 第一项就是 `$PREFIX/bin`
+     * （真机确认），它也找不到 bash。这是「为什么不靠 PATH 修」的答案。
+     *
+     * ## 为什么侧栏终端不受影响
+     *
+     * 它走的是**另一条路径**（`dsh-api-terminal-controller` 的 `resolveShell()`）：
+     *
+     * ```js
+     * shell = profile(environment.defaultShell ?? (platform === "windows" ? "cmd.exe" : "/bin/sh"));
+     * ```
+     *
+     * 回落的是 `/bin/sh` —— 那个**真实存在**（引擎环境里没有 `SHELL` 变量，
+     * 真机确认，所以走的就是这个兜底值）。同一个 App 里两条路径一个默认
+     * `/bin/sh`、一个默认 `/bin/bash`，后者在 Android 上必挂。
+     *
+     * ## 做法
+     *
+     * 换成 `$PREFIX/bin/bash`（Termux 的 bash 5.3.9）。选它而不是 `/bin/sh`：
+     * `terminal-bash` 整个包是按 bash 语义写的（`--noprofile --norc -i`、
+     * `stty -echo`、提示符契约），而 `--noprofile` 这种长选项 mksh 不认。
+     *
+     * ⚠️ 已用真机 PTY 实测（同一份 node-pty 绑定、同款参数、带 link 转译层）：
+     * 启动即出提示符 `bash-5.3$`，写入 `echo READY_$((6*7))` 回显 `READY_42`，
+     * 进程存活（`exited=null`）。不是推测。
+     *
+     * 用 `process.env.PREFIX` 而不是硬编码绝对路径：`PREFIX` 由 [start] 显式传给
+     * 引擎（真机确认 `PREFIX=/data/user/0/com.dsh.android/files/termux/usr`），
+     * 这样不依赖包名或目录布局。取不到时回落 `/bin/sh`（一定存在）—— 虽然会失去
+     * bash 语义，也好过必定 rc=127 的 `/bin/bash`。
+     *
+     * ⚠️ 全 engine 只有**这一处**硬编码 `"/bin/bash"`（全盘搜过），所以改这一处
+     * 就覆盖了所有 preset —— 包括用户当前在用的 `minimal`（只有它的
+     * `persistent-shell` group 挂 `terminal-bash`）。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败，届时日志里有提示）。
+     */
+    private fun patchTerminalShell() {
+        val entry = File(engineDir, "node_modules/@deepseek-ai/dsh-terminal-bash/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到 terminal-bash，跳过默认 shell 补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            // ⚠️ 必须先判「已打过补丁」再判「原文在不在」：打完之后原文就不存在了，
+            //    顺序反了会把已完成的状态误报成「未找到」。
+            if (source.contains(TERMINAL_SHELL_ANCHOR)) {
+                return
+            }
+            if (!source.contains(TERMINAL_SHELL_GUARD)) {
+                Log.w(TAG, "terminal-bash 的默认 shell 结构与预期不符，跳过补丁")
+                return
+            }
+            entry.writeText(source.replace(TERMINAL_SHELL_GUARD, TERMINAL_SHELL_ANCHOR))
+            Log.i(TAG, "已把 terminal-bash 的默认 shell 换成 ${'$'}PREFIX/bin/bash: ${entry.name}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "修正 terminal-bash 的默认 shell 失败: ${t.message}")
+        }
+    }
+
+    /**
      * 撤回「把选择工作区对话框的起始目录改成 `/sdcard`」那次改动（幂等）。
      *
      * **症状**：点「选择工作区」后，对话框停在 `files/home`（app 私有目录），
@@ -1903,6 +2010,9 @@ class EngineManager private constructor(private val context: Context) {
         ensureNodePty()
         // 终端后端的进程检查器只认 linux/darwin/win32，android 要显式放行
         patchProcessInspector()
+        // terminal-bash 硬编码 /bin/bash，而 Android 上只有 /bin/sh（没有 bash）→
+        // bash 工具每条命令都报「PTY shell exited during startup」，改用 $PREFIX/bin/bash
+        patchTerminalShell()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
         // 目录选择器：撤回「起点改 /sdcard」的旧补丁，改由 HOME 下的入口链接提供
@@ -2294,6 +2404,23 @@ class EngineManager private constructor(private val context: Context) {
             "if (platform !== 'linux' && platform !== 'darwin') {"
         private const val FLOCK_ANDROID_ANCHOR =
             "if (platform !== 'linux' && platform !== 'darwin' && platform !== 'android') {"
+
+        /**
+         * `dsh-terminal-bash/lib/index.js` 里 `DEFAULT_BASH_SHELL` 的原样文本，
+         * 以及换成 Termux bash 之后的文本。见 [patchTerminalShell]。
+         *
+         * ⚠️ `/bin/bash` 在 Android 上不存在（`/bin -> /system/bin` 里只有 mksh），
+         * 不改这里 `bash` 工具每条命令都会以 `PTY shell exited during startup` 失败。
+         * 两者都必须与官方发布件逐字一致；引擎升级后若此处不再匹配，
+         * [patchTerminalShell] 会跳过并在日志里提示，不会让启动失败。
+         *
+         * 替换值用 `process.env.PREFIX` 拼，不写死绝对路径：`PREFIX` 由 [start]
+         * 传给引擎，这样不依赖包名或目录布局；取不到时回落 `/bin/sh`（一定存在）。
+         */
+        private const val TERMINAL_SHELL_GUARD =
+            "const DEFAULT_BASH_SHELL = \"/bin/bash\";"
+        private const val TERMINAL_SHELL_ANCHOR =
+            "const DEFAULT_BASH_SHELL = process.env.PREFIX ? process.env.PREFIX + \"/bin/bash\" : \"/bin/sh\";"
 
         /**
          * `dsh-attachment-local/lib/index.js` 里 `syncDirectory()` 的原样文本，
