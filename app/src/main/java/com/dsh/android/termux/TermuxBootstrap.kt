@@ -68,8 +68,17 @@ class TermuxBootstrap(private val context: Context) {
      *   failed, the loop skipped the package silently, and every package with a
      *   maintainer script died at `dpkg returned an error code (1)`. v6 uses
      *   `dpkg-deb`, which ships inside `dpkg` and is therefore always present.
+     * - `_v6` → `_v7`: v6's post-unpack sweep skipped binaries on purpose
+     *   (`grep -I`), which leaves the official prefix inside every freshly
+     *   installed **ELF**. `git` bakes it into 12 strings — the
+     *   `share/git-core/templates` path, `etc/gitconfig`, the default `sh`/
+     *   `bash`/`login` for hooks, and `RUNPATH` — so every `git init` printed
+     *   `warning: templates not found in /data/data/com.termux/...` and the
+     *   linker was pointed at com.termux's private directory. v7 adds an
+     *   equal-length ELF rewrite (27 → 27 bytes, pure overwrite) to the same
+     *   hook, so it applies to packages installed from now on.
      */
-    private val rewriteMarker get() = File(prefixDir, ".paths_rewritten_v6")
+    private val rewriteMarker get() = File(prefixDir, ".paths_rewritten_v7")
 
     /**
      * 内置 Node 运行时的安装标记。
@@ -646,6 +655,15 @@ DPkg::options { "--instdir=$instdir"; };
      * would be useless on exactly the installs that need it.
      */
     private fun installDebFixHook() {
+        // The sweep rewrites the official prefix inside ELF binaries, which is
+        // only safe because the two strings are the same length (pure
+        // overwrite — no offsets shift). The sweep interpolates ELF_ROOT_REPLACEMENT
+        // into itself, so assert the invariant here: refuse to write a hook that
+        // would silently corrupt every binary it touched.
+        check(OLD_TERMUX_ROOT.length == ELF_ROOT_REPLACEMENT.length) {
+            "Termux path rewrite must be equal length: " +
+                "${OLD_TERMUX_ROOT.length} != ${ELF_ROOT_REPLACEMENT.length}"
+        }
         try {
             val hookDir = File(prefixDir, "etc/apt/hooks")
             val confDir = File(prefixDir, "etc/apt/apt.conf.d")
@@ -766,6 +784,41 @@ DPkg::options { "--instdir=$instdir"; };
           esac
           sed -i "s|${'$'}OLD|${'$'}PREFIX|g" "${'$'}f" 2>/dev/null && echo "text ${'$'}f" >> "${'$'}LOG"
           ch=1
+        done
+
+        # 4. ELF binaries, equal-length rewrite only. A fresh .deb payload carries
+        #    the official prefix inside its executables too — `git` bakes it into
+        #    12 strings (its templates dir, `etc/gitconfig`, the sh/bash/login it
+        #    hands to hooks, and RUNPATH). Unpatched, every `git init` prints
+        #    "warning: templates not found in" the com.termux path and the
+        #    compiled-in RUNPATH sends the linker into com.termux's private dir.
+        #
+        #    The substitution MUST be byte-for-byte equal length (27 -> 27): that
+        #    is what makes a plain `sed` safe on an ELF — nothing shifts, no
+        #    `.dynstr` index moves, no neighbouring string gets clipped. This is
+        #    the same rule [patchElfInPlace] applies at bootstrap; the difference
+        #    is that it runs only once, at unpack time, so packages installed
+        #    *later* never got it. Verified on device: 3613096 bytes before and
+        #    after, 0 residual hits, `git --version` still answers 2.56.0.
+        #
+        #    ⚠️ ELF_OLD is assembled from T for the same reason the hooks above
+        #    are: [rewriteTermuxPaths] walks this very file and rewrites every
+        #    literal occurrence of the official root, so spelling it out in full
+        #    would make the rewriter substitute the longer real prefix, the
+        #    lengths would stop matching, and every binary this loop touched
+        #    would be silently corrupted.
+        #    ⚠️ ELF_NEW is interpolated from ELF_ROOT_REPLACEMENT so there is a
+        #    single source of truth for the 27-byte spelling;
+        #    [installDebFixHook] refuses to write this script at all unless that
+        #    constant matches OLD_TERMUX_ROOT in length.
+        ELF_OLD=/data/data/${'$'}T/files
+        ELF_NEW=$ELF_ROOT_REPLACEMENT
+        for d in bin libexec lib; do
+          [ -d "${'$'}PREFIX/${'$'}d" ] || continue
+          for f in ${'$'}(grep -rl -a "${'$'}ELF_OLD" "${'$'}PREFIX/${'$'}d" 2>/dev/null); do
+            sed -i "s|${'$'}ELF_OLD|${'$'}ELF_NEW|g" "${'$'}f" 2>/dev/null && echo "elf ${'$'}f" >> "${'$'}LOG"
+            ch=1
+          done
         done
 
         # Python bytecode caches the string constants it was compiled from, so a
