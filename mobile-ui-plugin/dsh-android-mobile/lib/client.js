@@ -2675,8 +2675,12 @@ window.__ModuleLoader__.load({
 			//   ③ 官方其它模态弹窗（兜底：点遮罩 / 派 Escape）
 			//   ④ composer 的触发菜单（「/」指令、@ 引用等）
 			//   ⑤ 侧栏抽屉
-			//   ⑥ 官方主面板（插件管理器 / 日程 / 快照…）→ 回对话
+			//   ⑥ 官方右侧栏（「工作区文件 / 新建终端」那一栏）
+			//   ⑦ 官方主面板（插件管理器 / 日程 / 快照…）→ 回对话
 			//   都没有 ⇒ false，交原生退出
+			//
+			// ⚠️ ⑥ 与 ⑦ 的先后：右栏在**对话界面之内**（它是会话的停靠面），而主面板
+			//   是替换掉整个对话区。所以先退右栏、再退主面板，与视觉层次一致。
 			//
 			// ⚠️ 判据一律用**可见性**，不能用 DOM 存在性：官方弹窗关掉后节点往往
 			//   仍留在 DOM 里（只改 display），按存在性判会永远认为"有东西可关"，
@@ -2717,6 +2721,31 @@ window.__ModuleLoader__.load({
 			function mpLayout() {
 				if (!mpCtx) return null;
 				try { return mpCtx.get("layout") ?? null; } catch (e) { return null; }
+			}
+
+			/**
+			 * 官方 `ctx.sidebarRight` 服务 —— 右上角那一栏（工作区文件 / 新建终端）。
+			 *
+			 * ⚠️ **不要用 `layout.closeRightbar()` 关它**，那是个陷阱：该方法在
+			 *   `ILayout` 上的语义是「**报告**右栏为隐藏」（`dsh-client-ui-layout` 的
+			 *   注释原文 "Report the right panel as hidden"），它是给占用方
+			 *   （`dsh-client-ui-sidebar-right`）上报呈现状态用的。而右栏自己的
+			 *   `expanded` 状态住在 sidebar-right 的 store 里，由它反过来调
+			 *   `openRightbar`/`closeRightbar` 同步给 layout（见其 client.js 的
+			 *   `syncPresentation`）。直接调 layout 只会改 grid 轨道，**右栏的
+			 *   `expanded` 仍是 true**，于是面板被滑到屏幕外却还认为自己开着，
+			 *   用户再点右上角按钮时行为就错乱了。
+			 *
+			 * 正确的接缝是 `ctx.sidebarRight`（`provide("sidebarRight", controller)`）：
+			 *   · `isExpanded()` —— 「这一层开着吗」，判据与官方自己一致；
+			 *   · `toggleExpanded()` —— 收起/展开，内部走 store action，会正常
+			 *     同步 layout 轨道与面板滑出动画。
+			 *
+			 * @returns {object|null} 服务实例；拿不到（未装该插件）返回 null。
+			 */
+			function mpSidebarRight() {
+				if (!mpCtx) return null;
+				try { return mpCtx.get("sidebarRight") ?? null; } catch (e) { return null; }
 			}
 
 			/**
@@ -2761,7 +2790,18 @@ window.__ModuleLoader__.load({
 				const col = mpSidebarCol();
 				if (col && col.classList.contains("mp-drawer-open")) { mpCloseDrawer(); return true; }
 
-				// ⑥ 官方主面板 → 回对话
+				// ⑥ 官方右侧栏（右上角那个按钮开出来的「工作区文件 / 新建终端」栏）。
+				//    判据用服务自己的 `isExpanded()`，不猜 DOM —— 右栏收起时面板只是被
+				//    平移到屏幕外（`transform`，节点仍在 DOM 里且尺寸非零），用
+				//    `mpVisible()` 那套可见性判据会**永远为真**，返回键就再也退不出去了。
+				const sidebarRight = mpSidebarRight();
+				if (sidebarRight && typeof sidebarRight.isExpanded === "function") {
+					try {
+						if (sidebarRight.isExpanded()) { sidebarRight.toggleExpanded(); return true; }
+					} catch (e) { /* 静默：服务异常不该让返回键卡住 */ }
+				}
+
+				// ⑦ 官方主面板 → 回对话
 				const layout = mpLayout();
 				if (layout) {
 					try {
