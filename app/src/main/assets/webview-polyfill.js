@@ -292,6 +292,134 @@
     };
   }
 
+  // Chromium 120：**非特殊 scheme** 的 host 解析（`foo://host/path` 里的那个 host）
+  //
+  // ⚠️ **这是真机踩到的缺口**（CDY-TN90 / Android 10 / WebView 114）：
+  //    右栏「工作区文件」点开任何一个文件，正文永远只有一句「文件资源服务不可用」，
+  //    不报错、不发请求，像是这个功能整个不存在。
+  //
+  // 根因在前端的地址解析（`@deepseek-ai/dsh-client-resources/lib/client.js`）：
+  //
+  //     parsed = new URL(address);                       // dsh-resource://file/session/<id>/<path>
+  //     if (parsed.protocol !== 'dsh-resource:') return undefined;
+  //     return parsed.hostname === '' ? undefined : parsed.hostname.toLowerCase();
+  //
+  // 而 Chromium 直到 **120** 才实现**非特殊 scheme**（不是 http/https/ws/wss/file/ftp
+  // 那几个）的 authority 解析。旧内核上实测：
+  //
+  //     new URL('foo://bar/baz')
+  //       旧内核 → hostname ''  pathname '//bar/baz'   ← `//bar` 被整段当成路径
+  //       规范   → hostname 'bar' pathname '/baz'
+  //
+  // 于是 `protocolOf()` 恒为 undefined → registry 认为「该协议没有 provider」→
+  // 快照停在 `status: 'none'` → 前端渲染成「文件资源服务不可用」。
+  // ⚠️ 受害的不止 file 一个协议：`plan`、`subagentchat` 同样挂着 `dsh-resource:`，
+  //    凡是走 ResourceRegistry 的地址解析**都**受影响。
+  //
+  // ⚠️ 别把它当成后端问题：右栏的文件**列表**走得通（那是普通 RPC），
+  //    列表里点文件没反应才是这里 —— 两者只差在这一个 `new URL()` 上。
+  //
+  // 修法：只补内核确实算不出来的那三样 —— `host` / `hostname` / `port`。
+  // 判据是「原生 hostname 为空 **且** href 里确实写着 `scheme://authority`」，
+  // 两者同时成立才接手，因此：
+  //   - 内核已支持（新版 WebView）时下面的探测直接不成立，一个字节都不改；
+  //   - 特殊 scheme、以及 `foo:/path`、`foo:path`、`blob:http://…` 这些**本就没有**
+  //     authority 的形态，原生结果与规范一致，也走不到补丁分支。
+  //
+  // ⚠️ 只接管 getter，**setter 原样转发给原生**：赋值语义（及其触发的 href 重写）
+  //    仍由内核负责，垫片不重建 URL 序列化。
+  (function () {
+    var PROBE = 'dsh-webview-scheme-probe://probe-host/probe-path';
+
+    function probeHostname() {
+      try {
+        return new URL(PROBE).hostname;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // 已支持 → 不动；行为既不是 '' 也不是 'probe-host'（比如解析直接抛错）→ 不敢动
+    if (probeHostname() !== '') return;
+
+    var dHost = Object.getOwnPropertyDescriptor(URL.prototype, 'host');
+    var dName = Object.getOwnPropertyDescriptor(URL.prototype, 'hostname');
+    var dPort = Object.getOwnPropertyDescriptor(URL.prototype, 'port');
+    if (!dHost || !dName || !dPort || !dHost.get || !dName.get || !dPort.get) return;
+
+    var nativeHost = dHost.get;
+    var nativeName = dName.get;
+    var nativePort = dPort.get;
+
+    // `scheme://authority…`：只认 href 里字面写着的 authority
+    var AUTHORITY_RE = /^([A-Za-z][A-Za-z0-9+.-]*:)\/\/([^/?#]*)/;
+
+    function authorityOf(self) {
+      var m = AUTHORITY_RE.exec(String(self.href));
+      if (!m) return null;
+      var authority = m[2];
+      if (authority === '') return null;
+      var at = authority.lastIndexOf('@');
+      if (at >= 0) authority = authority.slice(at + 1); // 丢掉 userinfo
+      return authority === '' ? null : authority;
+    }
+
+    // `[::1]:8080` 与 `host:8080` 两种形态（规范里 IPv6 字面量带方括号）
+    function splitAuthority(authority) {
+      if (authority.charAt(0) === '[') {
+        var end = authority.indexOf(']');
+        if (end < 0) return { host: authority, port: '' };
+        var rest = authority.slice(end + 1);
+        return {
+          host: authority.slice(0, end + 1),
+          port: rest.charAt(0) === ':' ? rest.slice(1) : '',
+        };
+      }
+      var colon = authority.lastIndexOf(':');
+      if (colon < 0) return { host: authority, port: '' };
+      return { host: authority.slice(0, colon), port: authority.slice(colon + 1) };
+    }
+
+    Object.defineProperty(URL.prototype, 'hostname', {
+      get: function () {
+        var native = nativeName.call(this);
+        if (native !== '') return native;
+        var authority = authorityOf(this);
+        return authority === null ? native : splitAuthority(authority).host.toLowerCase();
+      },
+      set: dName.set,
+      configurable: true,
+      enumerable: true,
+    });
+
+    Object.defineProperty(URL.prototype, 'host', {
+      get: function () {
+        var native = nativeHost.call(this);
+        if (native !== '') return native;
+        var authority = authorityOf(this);
+        if (authority === null) return native;
+        var parts = splitAuthority(authority);
+        var host = parts.host.toLowerCase();
+        return parts.port === '' ? host : host + ':' + parts.port;
+      },
+      set: dHost.set,
+      configurable: true,
+      enumerable: true,
+    });
+
+    Object.defineProperty(URL.prototype, 'port', {
+      get: function () {
+        var native = nativePort.call(this);
+        if (native !== '') return native;
+        var authority = authorityOf(this);
+        return authority === null ? native : splitAuthority(authority).port;
+      },
+      set: dPort.set,
+      configurable: true,
+      enumerable: true,
+    });
+  })();
+
   // Chromium 120：URL.canParse
   if (typeof URL.canParse !== 'function') {
     URL.canParse = function (url, base) {
