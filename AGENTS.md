@@ -575,6 +575,45 @@ llvm-readelf --dyn-syms app\src\main\assets\pnpm-android-arm64.bin | Select-Stri
 
 所以是编译期判定，**没有任何配置项能绕过去**。
 
+⚠️ **上面这一整段是 12.8.1 的实测结论，12.10.1 已经不成立**（2026-10-10 复测，
+CDY-TN90 / Android 10）。上游在这两个版本之间把锁换成了 flock 可用的实现：
+
+| 判据 | 12.8.1（原文实测） | 12.10.1（复测） |
+|---|---|---|
+| 动态符号表里的 `flock` | **没有**（只有 `fcntl`） | **有**（`grep -c -a flock` 命中 1） |
+| `pnpm add` 写操作 | `ERR_PNPM_STORE_DIR_ACQUIRE_OPERATION_LOCK` | **成功**，RC=0 |
+
+复测证据（`@pnpm/exe.android-arm64@12.10.1`，位于
+`$HOME/.local/share/pnpm/store/v11/links/@/pnpm/12.10.1/<hash>/node_modules/pnpm/pnpm`）：
+
+```
+$P add is-number   → RC=0，590ms，node_modules/is-number 落盘
+$P add is-even     → RC=0，820ms，+5 包
+pnpm add is-odd    → RC=0，793ms，+2 包（经 pnpm 11 自动切换后）
+```
+
+三次都没出现 `ERR_PNPM_STORE_DIR_ACQUIRE_OPERATION_LOCK`。store 仍写成 v11 格式。
+
+⚠️ **这不改变本 App 的做法**：插件管理仍固定走 pnpm 11.28.3，理由是**确定性**
+（11 是纯 JS，行为已在本项目逐条验过），不是因为 12 不能用。
+⚠️ **也别据此就把 12 升上来** —— 上面的对比只覆盖「能不能写」，没覆盖
+`nodeLinker`、`node_modules/.ignored` 驱逐行为、本地 `link:` 包这些本项目真正依赖的
+语义。要升就按 ⑥ 的老办法重新逐项实测。
+
+⚠️ **pnpm 12 会在特定目录里被自动下载并接管**，这一点值得知道：`pnpm init`（12.x 写的
+package.json）会带上
+
+```json
+"devEngines": { "packageManager": { "name": "pnpm", "version": "12.10.1", "onFail": "download" } },
+"packageManager": "pnpm@12.10.1"
+```
+
+之后在该目录跑**任何** pnpm 命令都会自动下载 12.10.1 并切过去（实测就是这样从
+11.28.3 切走的），产物落在 `$HOME/.local/share/pnpm/store/`。用户在自己工作目录里
+`pnpm init` 后就会遇到，**这是预期行为不是 bug**。
+而 `$DSH_HOME/profiles/web/package.json` **没有这两个字段**（只有
+`name`/`private`/`dependencies`/`dsh`，已实测确认），所以**插件安装永远走 11.28.3**。
+
 #### 为什么 pnpm 11 可以
 
 11.x 是最后一条**纯 JS** 主线：`dist/pnpm.mjs` 是 15.7 MB 的单文件 bundle，
