@@ -789,6 +789,22 @@ window.__ModuleLoader__.load({
 [data-mobile] .pI_x6G_centerCol {
   padding-top: var(--mp-float-nav-h, 0px) !important;
 }
+
+/* 修复 68：被改写成 text 的凭据输入框，靠这条规则把外观保持成圆点。
+ *
+ * type="password" 被摘掉之后，浏览器不再自动遮挡字符；而官方那两个输入框
+ * **没有**「显示/隐藏」的切换按钮，所以必须由这里补上遮挡，否则 API key 会
+ * 明文显示在屏幕上（截屏、录屏、旁人可见都成了新的泄露面）。
+ *
+ * ⚠️ -webkit-text-security 是 WebKit 私有属性，Chromium / Android WebView
+ *    支持它（Chrome 长期保留）。是**非标准**属性，所以只作为外观增强：即使
+ *    某天失效，退化结果也只是「字符明文可见」，不影响输入与剪贴板 —— 而这
+ *    正是本修复要解决的问题本身，属可接受的退化方向。
+ * ⚠️ 选择器只认 data-mp-key：那是本插件亲手标记过的元素（且只在移动端标记），
+ *    不会误伤页面里其它输入框，也不需要作用域前缀。 */
+input[data-mp-key="1"] {
+  -webkit-text-security: disc !important;
+}
 `;
 
 		function injectStyles() {
@@ -5362,6 +5378,104 @@ window.__ModuleLoader__.load({
 			};
 		}
 
+		/* ══ 修复 68：凭据输入框改用普通键盘（移动端）══
+
+		   背景：官方把「API key / 凭据」输入框渲染成 `<input type="password">`：
+
+		     · `dsh-client-ui-settings-models/lib/client.js` L1380 与 L1692
+		       （模型配置页的两个变体：内置 provider 与自定义 provider）
+		     · `dsh-web-frontend/dist` 里的通用凭据字段组件（`type:"password"`）
+
+		   这是**桌面语义**：桌面上 `type=password` 只意味着「遮挡字符」，键盘还是
+		   物理键盘，`Ctrl+V` 照常可用。但在 Android 上它有一个额外且不明显的后果 ——
+		   **输入法会据此切换到「安全键盘」**（华为/小米/OPPO 的密码输入法），而
+		   安全键盘**按设计屏蔽剪贴板**：既没有粘贴入口，长按也不出粘贴菜单。
+
+		   而 API key 是一串 51 字符的 `sk-...`，**手抄不现实**，用户唯一的现实
+		   做法就是从别处复制粘贴。于是「安全键盘」在这里不是安全增强，而是**把
+		   这个功能变不可用**。这是纯移动端才有的一类缺口（同修复 67）。
+
+		   做法：把 `type="password"` 改写成 `type="text"`，同时打上 `data-mp-key`
+		   标记，由 CSS（`-webkit-text-security: disc`）继续遮挡字符。这样
+		   输入法看到的是普通文本框 ⇒ 普通键盘 ⇒ 剪贴板可用；而屏幕上仍然是圆点，
+		   不新增泄露面。
+
+		   ⚠️ **必须全局扫描，不能只认某个选择器**：这些输入框**没有稳定的
+		     class / data 属性**可锚（class 是 CSS Modules 的哈希名，随构建变），
+		     且分布在**两个独立编译的包**里。唯一稳定的判据就是 `type="password"`
+		     这个属性本身 —— 它也正是输入法所用的判据。
+		   ⚠️ **用 MutationObserver 兜住懒挂载与重渲染**：设置页是按需打开的
+		     对话框，`apply()` 执行时它还不存在。同时观察 `type` 属性变化，
+		     万一 React 把它设回去也能立刻改回来。
+		   ⚠️ **只改 type，不动 value / onChange**：官方那两个框是**受控组件**
+		     （`value={keyDraft}`），字符本身由 React 状态持有。改 type 不碰状态，
+		     React 下次渲染时该属性与虚拟 DOM 一致（React 侧一直是 "password"、
+		     未变化 ⇒ 不会重设），因此不会打架。
+		   ⚠️ **不改 autoComplete**：`new-password` 只影响浏览器的密码管理器提示，
+		     与输入法（安全键盘）无关，动了反而可能引入自动填充弹窗。
+		   ⚠️ 只在移动端生效（修复 40 的惯例）：桌面端 `type=password` 完全正常，
+		     没有「安全键盘屏蔽剪贴板」这个问题，不该被改。 */
+		const MP_KEY_ATTR = "data-mp-key";
+
+		function setupPlainKeyboardForCredentials() {
+			if (!mpIsMobile()) return () => {}; // 修复 40：仅移动端（桌面无安全键盘）
+
+			/** 把一处密码输入框降级成普通文本框 + 打标记。返回是否真的改了。 */
+			function soften(el) {
+				if (!el || el.nodeType !== 1 || el.tagName !== "INPUT") return false;
+				// ⚠️ **先看现在是不是密码框，不是就一个字节都不动。** 这一条同时管两件事：
+				//   ① 安全：CSS 靠 `data-mp-key` 补圆点遮挡，若无条件打标记，页面里
+				//      普通的 `input[type=email]`（登录页之类）会被一起变成圆点。
+				//   ② 幂等：改成 text 之后再调用会走到这里直接返回，不产生任何写入 ⇒
+				//      MutationObserver 不会自激。
+				//   代价：React 若在 type 已是 text 的情况下单独把 autocomplete 加回来，
+				//   我们不再处理它。但官方这两处的 type 与 autocomplete 写在**同一个
+				//   JSX 对象**里，只会一起回来 —— 那时 type 又是 password，会走完下面
+				//   全部三步。所以没有真实漏口。
+				if ((el.getAttribute("type") || "").toLowerCase() !== "password") return false;
+				try {
+					el.setAttribute(MP_KEY_ATTR, "1");
+					// 主触发点：`type=password` ⇒ WebView 的 inputType 变成
+					// TYPE_TEXT_VARIATION_PASSWORD ⇒ 输入法切安全键盘。
+					el.setAttribute("type", "text");
+					// 次要触发点：`autocomplete="new-password"` 是 Chromium 的 autofill
+					// 提示（AutofillManager 会把它作为 hint 交给输入法），部分国产输入法
+					// 据此也判成密码字段。**整个移除属性**而不是改成 "off" —— 后者会让
+					// Chromium 置上 `IME_FLAG_NO_PERSONALIZED_LEARNING`，又是一条「敏感
+					// 字段」信号，等于换一个可能触发安全键盘的理由。
+					if (el.hasAttribute("autocomplete")) el.removeAttribute("autocomplete");
+					return true;
+				} catch (err) { return false; } // 静默：绝不打断设置页
+			}
+
+			function scan(root) {
+				if (!root || typeof root.querySelectorAll !== "function") return;
+				try {
+					soften(root); // root 自身可能就是那个输入框（addedNodes 分支）
+					root.querySelectorAll("input[type='password']").forEach(soften);
+				} catch (err) { /* 静默 */ }
+			}
+
+			scan(document);
+
+			const obs = new MutationObserver((records) => {
+				for (const r of records) {
+					// attributes 分支：React 把 type / autocomplete 设回去时立刻改回来。
+					// soften 自身幂等（已标记且已降级时不产生任何写入）⇒ 不会自激循环。
+					if (r.type === "attributes") { soften(r.target); continue; }
+					for (const n of r.addedNodes) scan(n);
+				}
+			});
+			// subtree + childList 抓懒挂载（设置页是按需打开的对话框）；
+			// attributes 抓 React 回写。
+			obs.observe(document.documentElement || document.body, {
+				childList: true, subtree: true,
+				attributes: true, attributeFilter: ["type", "autocomplete"],
+			});
+
+			return () => { try { obs.disconnect(); } catch (err) { /* 静默 */ } };
+		}
+
 		/** 最近一次组字结束的时间戳（0 = 从未）。见 setupEnterAsNewline。 */
 		let mpLastCompositionEnd = 0;
 
@@ -5377,6 +5491,7 @@ window.__ModuleLoader__.load({
 			const disposeTriggerMenuDismiss = setupTriggerMenuAutoDismiss();
 			const disposeKeepFocusGuard = setupKeepFocusGuard();
 			const disposeEnterAsNewline = setupEnterAsNewline();   /* 修复 67 */
+			const disposePlainKey = setupPlainKeyboardForCredentials();   /* 修复 68 */
 			// 初始一轮
 			document.querySelectorAll(".xzv4MW_timeEnd").forEach(trimMeta);
 			processStatsLine();
@@ -5429,6 +5544,7 @@ window.__ModuleLoader__.load({
 				disposeTriggerMenuDismiss();
 				disposeKeepFocusGuard();
 				disposeEnterAsNewline();   /* 修复 67 */
+				disposePlainKey();   /* 修复 68 */
 				document.removeEventListener("click", onPanelRowClick, true);   /* 修复 66 */
 			};
 		}
