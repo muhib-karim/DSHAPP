@@ -556,8 +556,14 @@ class MainActivity : AppCompatActivity() {
     //   history —— 实测从头到尾 `canGoBack()` 恒为 false，用它判等于没做。
     //
     // ⚠️ **回调是异步的**（`evaluateJavascript` 走 WebView 的 JS 线程），所以
-    //   不能直接在回调里调 `finish()` 之外的 Activity 操作；这里只在"页面说
-    //   没得关"时才收尾，动作单一，安全。
+    //   不能直接在回调里调 Activity 的复杂操作；这里只在"页面说没得关"时才
+    //   收尾，动作单一，安全。
+    //
+    // ⚠️ **收尾动作是「退到后台」，不是 `finish()`**（0.2.0 起）。本 App 的核心
+    //   状态全在 Node 引擎里：`finish()` 会走到 `onDestroy` → 停掉引擎，用户切回来
+    //   要重新等引擎启动。而返回键在手机上的语义本来就是「离开这个界面」而不是
+    //   「关掉这个应用」—— 启动器、微信、浏览器都是退到后台保留现场；真要退出
+    //   可以用最近任务列表划掉。引擎不随 Activity 退后台而停（跑在 EngineService 里）。
 
     /** 是否有一次"问页面"的往返正在进行中（防止连按返回键叠加调用）。 */
     private var backQueryPending = false
@@ -594,11 +600,11 @@ class MainActivity : AppCompatActivity() {
         backQueryPending = true
         wv.evaluateJavascript(BACK_PROBE_JS) { result ->
             backQueryPending = false
-            // 页面回 "true" ⇒ 已消费；其余（"false" / "null" / 异常）一律退出。
+            // 页面回 "true" ⇒ 已消费；其余（"false" / "null" / 异常）一律退到后台。
             val consumed = result != null && result.trim('"') == "true"
             if (!consumed) {
-                Log.i(DshApplication.TAG, "返回键：页面已无可退层级，退出 App")
-                finish()
+                Log.i(DshApplication.TAG, "返回键：页面已无可退层级，退到后台（不结束进程）")
+                moveTaskToBack(true)
             }
         }
     }

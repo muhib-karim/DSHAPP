@@ -5275,6 +5275,96 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/* ══ 修复 67：回车 = 换行（移动端）══
+
+		   背景：官方 composer 的键盘映射（`dsh-client-ui-conversation/lib/client.js` 的
+		   `registerComposerKeymap`）是**桌面语义**：
+
+		     | 按键            | 官方行为 | 出处 |
+		     |-----------------|----------|------|
+		     | `Enter`         | **发送** | L16704-16716 `handlers.submit(...)` |
+		     | `Shift+Enter`   | 换行     | L16706 `if (event?.shiftKey === true) return false;`（放行给编辑器默认行为） |
+		     | `Ctrl/Cmd+Enter`| 发送     | L16715 `submit(event.ctrlKey === true \|\| event.metaKey === true)` |
+
+		   桌面上有 Shift 键，所以「Enter 发送、Shift+Enter 换行」是合理默认。但**手机
+		   软键盘没有 Shift**（中文输入法更不会给），于是用户想在多行里换行时**做不到**：
+		   一按回车就发出去了，长 prompt 只能挤成一行。这是纯移动端才有的一类缺口。
+
+		   做法：在**捕获阶段**拦下编辑器上的 Enter，把它改写成 `Shift+Enter` 派发回去。
+		   这样官方那条 `shiftKey === true → return false` 的分支就命中了，编辑器执行
+		   默认行为（插入换行），而**不需要**去改引擎源码、也不依赖任何私有 API。
+
+		   ⚠️ **必须拦在 composer 编辑区上，不能拦 document**：官方把键盘映射注册在
+		     编辑器实例上（`editor.registerCommand`），拦到别处既无效、又会误伤设置页
+		     等其它输入框（那些地方回车该是「确认」）。
+		   ⚠️ **必须检查 `isComposing` / `keyCode === 229`**：中文输入法的候选框确认也
+		     发 Enter。不排除的话，**选词会被当成换行**，用户根本没法打中文。官方
+		     `isComposingEvent()` 用的就是这两个判据（外加 composition 结束 10ms 内的宽限）。
+		   ⚠️ **要用真实焦点上的元素派发**，且 `cancelable: true`、`composed: true`：
+		     官方这条命令是挂在该编辑器实例的 root 上的。
+		   ⚠️ **不要试图 preventDefault 后手工插 `\n`**：编辑器是 Lexical（`editor.update()`
+		     那套），直接改 DOM 会被它的模型覆盖掉。走「改写成 Shift+Enter」这条路，
+		     等于让官方自己执行它本来就有的换行分支。 */
+		const MP_ENTER_SEL = "[data-composer-input]";
+
+		function setupEnterAsNewline() {
+			if (!mpIsMobile()) return () => {}; // 修复 40：仅移动端（必须返回空清理函数）
+
+			/** 中文/日文输入法正在组字时，回车属于「上屏」而不是「换行」。 */
+			function mpIsComposing(e) {
+				if (!e) return false;
+				if (e.isComposing === true || e.keyCode === 229) return true;
+				// 输入法上屏后紧跟的那次回车，浏览器可能已经把 isComposing 置回 false。
+				// 用「最近一次 compositionend 的时间」兜一下（官方宽限 10ms，这里给 80ms：
+				// 手机上输入法的时序比桌面慢，实测偶有超出 10ms 的情况）。
+				return mpLastCompositionEnd > 0 && (Date.now() - mpLastCompositionEnd) < 80;
+			}
+
+			const onKeyDown = (e) => {
+				try {
+					if (e.key !== "Enter") return;
+					// 已经是「换行」或「发送」的变体（用户外接键盘按了 Shift/Ctrl/Cmd）：
+					// 一律放行给官方，保持外接键盘上的桌面习惯不变。
+					if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+					if (mpIsComposing(e)) return;
+					const ed = e.target && e.target.closest ? e.target.closest(MP_ENTER_SEL) : null;
+					if (!ed) return;
+
+					// 吃掉这一次 Enter，再补一次带 shiftKey 的 —— 官方把它当换行。
+					e.preventDefault();
+					e.stopPropagation();
+					// ⚠️ 派发目标优先用**真实焦点元素**：官方那条命令注册在编辑器实例的
+					//   root 上，而 `[data-composer-input]` 未必就是那个 root（可能只是
+					//   它的祖先）。`dispatchEvent` 只向上冒泡、**不进入子元素**，若从祖先
+					//   派发而监听在子元素上就永远收不到。焦点元素必然在编辑区内部，
+					//   且 `bubbles: true` 会一路冒泡经过 root ⇒ 两种情形都覆盖到。
+					let target = ed;
+					try {
+						const a = document.activeElement;
+						if (a && a !== document.body && ed.contains(a)) target = a;
+					} catch (err2) { /* 静默：拿不到焦点就用编辑区本体 */ }
+					const synth = new KeyboardEvent("keydown", {
+						key: "Enter", code: "Enter", keyCode: 13, which: 13,
+						shiftKey: true, bubbles: true, cancelable: true, composed: true,
+					});
+					target.dispatchEvent(synth);
+				} catch (err) { /* 静默：绝不打断输入 */ }
+			};
+
+			// 组字状态由编辑器自己维护，这里只需要知道「刚刚结束过一次组字」。
+			const onCompositionEnd = () => { mpLastCompositionEnd = Date.now(); };
+
+			document.addEventListener("keydown", onKeyDown, true);
+			document.addEventListener("compositionend", onCompositionEnd, true);
+			return () => {
+				document.removeEventListener("keydown", onKeyDown, true);
+				document.removeEventListener("compositionend", onCompositionEnd, true);
+			};
+		}
+
+		/** 最近一次组字结束的时间戳（0 = 从未）。见 setupEnterAsNewline。 */
+		let mpLastCompositionEnd = 0;
+
 		function apply(ctx) {
 			mpCtx = ctx;
 			mpSessionsCache = ctx.get("sessions") ?? null;
@@ -5286,6 +5376,7 @@ window.__ModuleLoader__.load({
 			const disposeKeyboardGuard = setupComposerKeyboardGuard();
 			const disposeTriggerMenuDismiss = setupTriggerMenuAutoDismiss();
 			const disposeKeepFocusGuard = setupKeepFocusGuard();
+			const disposeEnterAsNewline = setupEnterAsNewline();   /* 修复 67 */
 			// 初始一轮
 			document.querySelectorAll(".xzv4MW_timeEnd").forEach(trimMeta);
 			processStatsLine();
@@ -5337,6 +5428,7 @@ window.__ModuleLoader__.load({
 				disposeKeyboardGuard();
 				disposeTriggerMenuDismiss();
 				disposeKeepFocusGuard();
+				disposeEnterAsNewline();   /* 修复 67 */
 				document.removeEventListener("click", onPanelRowClick, true);   /* 修复 66 */
 			};
 		}

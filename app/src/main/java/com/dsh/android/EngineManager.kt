@@ -2226,6 +2226,74 @@ class EngineManager private constructor(private val context: Context) {
         return lines.joinToString("\n")
     }
 
+    /**
+     * 确保 profile 的用户配置层里写着「默认模型 = 内置 Agnes」（老安装补缺用）。
+     *
+     * [DEFAULT_SETTINGS_PATCH] 里虽然已经带了这一项，但那份只在「用户从未动过设置」
+     * 时播种一次 —— 而 [ensureKeyPoolProvider] 会往同一个文件里补内置号池，于是
+     * **任何装过一次的机器**都不再是空模板，播种被跳过、永远拿不到这个默认值。
+     * 已发出去的 0.1.x / 0.2.0 全是这种状态，所以这一支是**必须**的。
+     *
+     * 判据与 [ensureKeyPoolProvider] 一致：**只补缺，不覆盖**。行已存在就一个字节
+     * 都不动 —— 那意味着用户在设置页里选过模型，属于用户意图。
+     */
+    private fun ensureDefaultModel() {
+        val patch = File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME")
+        val existing = try {
+            if (patch.isFile) patch.readText() else ""
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取 profile 用户配置失败: ${t.message}")
+            return
+        }
+        val updated = mergeDefaultModel(existing)
+        if (updated == existing) {
+            Log.i(TAG, "默认模型已在 profile 用户配置里（或用户已自选）: ${patch.absolutePath}")
+            return
+        }
+        try {
+            patch.parentFile?.mkdirs()
+            patch.writeText(updated)
+            Log.i(TAG, "已把默认模型设为内置 $KEY_PROVIDER: ${patch.absolutePath}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入默认模型失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 把「默认模型」那一行并进 profile 用户配置文本（纯函数，便于离线验证）。
+     *
+     * ⚠️ 判据比 [mergeKeyPoolProvider] 简单得多：**只看那一行在不在**。
+     *   因为 profile 的用户 patch 层里本来就没有这一行（引擎的出厂值在 bundle 层，
+     *   不在这个文件里），所以「行存在」⇔「用户或本 App 写过它」。
+     *   行在就原样保留 —— 用户改过的模型选择必须留住。
+     */
+    private fun mergeDefaultModel(body: String): String {
+        val lines = body.lines().toMutableList()
+        if (lines.any { isEntryIdLine(it, DEFAULT_MODEL_NS) }) return body
+
+        // 与 mergeKeyPoolProvider 同一处理：先摘掉空模板的顶层 `[]`，否则会变成
+        // `[]` 后面又跟一个 entry —— **非法 YAML**（一个文档不能既是流式空数组
+        // 又是块序列）。注释原样保留，YAML 允许注释出现在数组之前。
+        lines.indexOfFirst { it.isNotBlank() && it.indexOfFirst { c -> c != ' ' } == 0 && it.trim() == "[]" }
+            .takeIf { it >= 0 }?.let { lines.removeAt(it) }
+        while (lines.isNotEmpty() && lines.last().isBlank()) lines.removeAt(lines.size - 1)
+        if (lines.isNotEmpty()) lines.add("")
+        lines.addAll(defaultModelEntryYaml(0).trimEnd('\n').lines())
+        return lines.joinToString("\n") + "\n"
+    }
+
+    /** 默认模型那一行的 YAML，[indent] 为整行基准缩进。 */
+    private fun defaultModelEntryYaml(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            appendLine("${pad}- id: $DEFAULT_MODEL_NS")
+            appendLine("$pad  name: '$DEFAULT_MODEL_PACKAGE'")
+            appendLine("$pad  config:")
+            appendLine("$pad    provider: $KEY_PROVIDER")
+            appendLine("$pad    model: ${KEY_MODELS.first()}")
+        }
+    }
+
     /** [mergeKeyPoolProvider] 的判据：这一行是不是 `- id: <ns>`。 */
     private fun isEntryIdLine(line: String, ns: String): Boolean {
         val trimmed = line.trimStart()
@@ -2899,6 +2967,9 @@ class EngineManager private constructor(private val context: Context) {
         // command-line overlay` —— 用户表现为「一添加第三方 API 就报错」。
         // 所以改为把内置号池**补进 profile 的用户配置层**（见 [ensureKeyPoolProvider]）。
         ensureKeyPoolProvider(keyInject)
+        // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
+        // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
+        ensureDefaultModel()
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
         val privRunner = ensurePrivilegedShell()
@@ -3704,7 +3775,7 @@ class EngineManager private constructor(private val context: Context) {
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-43"
+        private const val MOBILE_UI_VERSION = "1.0.0-44"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -3719,6 +3790,18 @@ class EngineManager private constructor(private val context: Context) {
         private const val PROFILE_PATCH_FILENAME = "cordis.patch.yml"
 
         /**
+         * 默认模型那一行的 entry id。
+         *
+         * 出处是 bundle 层 `@deepseek-ai/dsh-base/cordis.patch.yml`（`- id: agent-default-model`）。
+         * 我们要覆盖的是它的 `config.provider`/`config.model`，所以 **id 必须逐字一致**
+         * 才能命中同一行。
+         */
+        private const val DEFAULT_MODEL_NS = "agent-default-model"
+
+        /** 该 entry 的 `name`（= 引擎里提供 `agentDefaultModel` 服务的包名）。 */
+        private const val DEFAULT_MODEL_PACKAGE = "@deepseek-ai/dsh-agent-default-model"
+
+        /**
          * 出厂默认设置。格式与 GUI 设置页写出的完全一致（`id` + `name` + `config`），
          * 所以用户在设置页里改任何一项，都只是往同一份文件里追加/覆盖对应的 `config`。
          *
@@ -3730,6 +3813,29 @@ class EngineManager private constructor(private val context: Context) {
          * | 字号大小 = 15 | `ui-theme` | `fontSize: 15` | 引擎默认 14 在手机上偏小 |
          * | 工作步骤展示 = 标准 | `ui-chat` | `transcriptView: standard` | 引擎默认 `detailed`，手机上太占屏 |
          * | 繁忙时的发送行为 = 插话发送 | `ui-conversation` | `busyEnter: steer` | 引擎默认 `queue`（排队），插话更符合"打断纠正"的直觉 |
+         * | 默认模型 = 内置 Agnes | `agent-default-model` | `provider: agnes` | 见下 |
+         *
+         * ## 为什么默认模型必须显式播种
+         *
+         * 引擎的出厂默认写在 bundle 层（`@deepseek-ai/dsh-base/cordis.patch.yml`）：
+         *
+         * ```yaml
+         * - id: agent-default-model
+         *   name: '@deepseek-ai/dsh-agent-default-model'
+         *   config:
+         *     provider: deepseek-official
+         *     model: deepseek-flash
+         * ```
+         *
+         * 也就是**官方模型**。而本 App 的用户大多是冲着内置号池来的 —— 他们没配过
+         * 任何第三方 API，`deepseek-official` 对他们来说是个**必然失败**的路由
+         * （没有凭据）。表现就是「第一次打开就报错，得自己去模型选择器里换一个」。
+         *
+         * ⚠️ **不能靠改 bundle 层**：那是引擎的包内文件，引擎升级就被覆盖。
+         * ⚠️ **也不能只写进 [DEFAULT_SETTINGS_PATCH]**：那份只在「用户从未动过设置」
+         *   时播种一次。而 `ensureKeyPoolProvider()` 会往同一个文件里补内置号池，
+         *   于是**任何已装过的设备**都不再是空模板 ⇒ 播种被跳过 ⇒ 老用户永远
+         *   拿不到这个默认值。所以老安装要由 [ensureDefaultModel] 单独补缺。
          *
          * ⚠️ `permission` 这项 GUI 会连同 `presets` 整块一起写出（实测），
          * 这里照抄同一形态，保证"用户之后在设置页改这一项"时 diff 最小。
@@ -3765,6 +3871,11 @@ class EngineManager private constructor(private val context: Context) {
               name: "@deepseek-ai/dsh-client-ui-conversation"
               config:
                 busyEnter: steer
+            - id: agent-default-model
+              name: "@deepseek-ai/dsh-agent-default-model"
+              config:
+                provider: $KEY_PROVIDER
+                model: ${KEY_MODELS.first()}
         """.trimIndent() + "\n"
 
         // ── uid 2000 特权通道 ────────────────────────────────────────
