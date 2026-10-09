@@ -819,6 +819,76 @@ Android 上**本来就不可达**，这不是取舍是平台事实。
 它们只 fsync **直接父目录**，都在 `$DSH_HOME` 以内，**安全**。
 **只有 `dsh-attachment-local` 会一路走到 `/`。**
 
+### ⑨.5 API 错误中断后会话**永久发不出去** —— assistant 的 `tool_use` 块顺序
+
+**症状（严重，会话级永久损坏）**：某一轮因为 **API 错误**结束时（实测是第三方路由的
+`429 RATE_LIMIT`），**该会话此后的每一条消息都失败**，连「只回复两个字：通了」
+这种最简消息也一样：
+
+```
+本轮运行失败 messages.7.1: `tool_use` ids were found without `tool_result`
+blocks immediately after: call_f0dd74e854fd4cb1a0a6ee0a. (INVALID_REQUEST)
+```
+
+**新建会话不受影响** —— 所以这是**历史消息**的问题，不是当前请求的问题。
+UI 上表现为「处理失败」，`INVALID_REQUEST` 是错误码。
+
+⚠️ **触发它的不是用户点「停止生成」**（实测那条路径完全正常，中断后会话照常可用），
+而是 **API 侧的错误中断**：那一轮的 assistant 消息已经带上了 `tool_use` 块，
+但永远等不到对应的 `tool_result`，历史就此定形。
+
+**根因**：`dsh-llm-deepseek/lib/index.js` 的 `serialize()` 把 assistant 消息的
+content 块**原样保序**映射成 `tool_use` / `text` / `thinking`，而持久化历史里
+assistant 的实际形状是**交错的**（模型先说一句、再调工具、再说一句、再调工具）：
+
+```
+["tool_use:call_e6d1…", "text(3)", "tool_use:call_a47f…", "tool_use:call_2399…"]
+```
+
+而 DeepSeek Messages API 要求 assistant 的 `tool_use` 块**必须连续**，且紧后必须
+是携带全部 `tool_result` 的 user 消息。夹在中间的 `text` 直接违约。
+
+⚠️ **引擎自己的自检抓不到它**：`serialize()` 末尾那个 `pending` 循环**只查 id 配对、
+不查块顺序**，所以这种历史在本地自检里是「合法」的，只有真发给 API 才炸。
+
+⚠️ **引擎其实已经对 user 消息做了同样的重排**（`[...results, ...其余]`，就是修
+「tool_result 必须在前」的那一行），**只是漏了 assistant 这一侧**。这个补丁补的就是
+那处遗漏。
+
+**做法**：`EngineManager.patchLlmDeepseekToolOrder()` 把 `assistant()` 的
+`return message.content.map(...)` 拆成先赋给 `const mapped`，再补一次稳定重排 ——
+**把 `tool_use` 收敛到末尾**，其余块保持原有相对顺序。锚点 `TOOL_ORDER_GUARD_HEAD` /
+`TOOL_ORDER_GUARD_TAIL`（首尾两行，不是整段照抄，免得无关空白变化就失配）。
+
+⚠️ **方向是「置尾」而不是「置首」**：assistant 的 content 首块常是 `reasoning`
+（映射成 `thinking`），而 Messages API 要求 thinking 排在 assistant content 的**最前**。
+把 `tool_use` 提到最前会让 thinking 落到它后面，可能触发签名校验失败。收敛到末尾
+得到的 `[thinking, text, tool_use…]` 才是规范形状。
+
+⚠️ **重排必须发生在 `map` 之后**：`readReplay()` 返回的签名数组是**按下标**与
+`message.content` 对齐的，`assistant()` 在 `map` 里用 `replay[index]` 取签名。
+若在 `map` 之前重排 `message.content`，签名会串位。补丁插在 `map` 的外层正是这个位置。
+
+⚠️ **只改 wire 请求体，不改持久化历史**：`assistant()` 返回的是新数组，
+`message.content` 本身不被改写，会话日志与 UI 显示都不受影响。真机实测修复后
+日志里 assistant 仍是交错的 37 个 `tool-call`，证明没有回写。
+
+**真机验收**（同一个已卡死的会话 `session-c470b9d5`，21 轮历史，其中两条
+`INVALID_REQUEST`）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 「只回复两个字：通了」 | `INVALID_REQUEST` | `已完成，用时 15秒` → 回复「通了」 |
+| 多工具任务（3 步 bash） | — | `turn/end kind=completed`，产物 `e2e-multi/x.txt` = `MULTI_OK` |
+
+日志：`已修正 DeepSeek Messages 的 tool_use 块顺序: dsh-llm-deepseek`。
+幂等：第二次启动不再打印该行（`contains(TOOL_ORDER_ANCHOR_HEAD)` 命中即返回），
+补丁文本仍只有 1 处。
+
+⚠️ 离线复刻验证（把会话日志按 `serialize()` 的逻辑重建 wire messages）：
+现状 **24 处违例**（`messages.1/7/13/21/…`，报错里的 `messages.7.1` 正是其中之一），
+重排后 **0 处**。
+
 ### ⑩ 侧栏终端打不开 —— node-pty 缺 android 绑定 + 进程检查器只认三平台
 
 **症状**：终端面板显示

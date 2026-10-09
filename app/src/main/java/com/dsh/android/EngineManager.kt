@@ -1121,6 +1121,84 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 让 DeepSeek Messages 适配器把 assistant 的 `tool_use` 块**前置**（幂等）。
+     *
+     * **症状（严重，会话级永久损坏）**：某一轮因为 API 错误结束（实测是第三方
+     * 路由的 `429 RATE_LIMIT`）之后，**该会话此后的每一条消息都失败**，连
+     * 「只回复两个字：通了」这种最简消息也一样：
+     *
+     * ```
+     * 本轮运行失败 messages.7.1: `tool_use` ids were found without
+     * `tool_result` blocks immediately after: call_f0dd74e854fd4cb1a0a6ee0a.
+     * (INVALID_REQUEST)
+     * ```
+     *
+     * 新建会话不受影响，说明是**历史消息**的问题，不是当前请求的问题。
+     *
+     * **根因**：`serialize()` 把 assistant 消息的 content 块**原样保序**映射成
+     * `tool_use` / `text` / `thinking`，而持久化历史里 assistant 的实际形状是
+     * **交错的**（模型先说话、再调工具、再说一句、再调工具）：
+     *
+     * ```
+     * ["tool_use:call_e6d1…", "text(3)", "tool_use:call_a47f…", "tool_use:call_2399…"]
+     * ```
+     *
+     * 而 DeepSeek Messages API 要求 assistant 的 `tool_use` 块**必须连续**，
+     * 且紧后必须是携带全部 `tool_result` 的 user 消息。夹在中间的 `text`
+     * 直接违约 → 整段历史从此再也发不出去。
+     *
+     * ⚠️ 引擎自己的自检（`serialize()` 末尾的 `pending` 循环）**只查 id 配对、
+     * 不查块顺序**，所以这个历史在本地自检里是「合法」的，只有真发给 API 才炸。
+     *
+     * ⚠️ 触发它的**不是**用户主动点「停止生成」（实测那条路径正常），而是
+     * **API 侧的错误中断** —— 那一轮 assistant 消息已经带上了 `tool_use`，
+     * 但永远等不到 `tool_result`，历史就此定形。
+     *
+     * **做法**：只在 `assistant()` 的 `map` 之后补一次稳定排序 —— 把
+     * `tool_use` 抽到最前、其余（`text` / `thinking`）保持原有相对顺序跟在后面。
+     *
+     * ⚠️ **只动 wire 请求体，不动持久化历史**：`assistant()` 返回的是新数组，
+     * `message.content` 本身不被改写，会话日志与 UI 显示都不受影响。
+     *
+     * ⚠️ **`replay` 的 index 对齐不能破坏**：`readReplay()` 返回的签名数组是
+     * **按下标**与 `message.content` 对齐的，而 `assistant()` 在 `map` 里用
+     * `replay[index]` 取签名。所以重排必须发生在**映射之后**（对已经带上
+     * `signature` 的 wire 块重排），不能在 `map` 之前重排 `message.content`，
+     * 否则签名会串位。本补丁插在 `return ... .map(...)` 的外层，正是这个位置。
+     *
+     * ⚠️ 引擎自己**已经**对 user 消息做了同样的重排（`[...results, ...其余]`），
+     * 只是漏了 assistant 这一侧 —— 这个补丁补的就是那处遗漏。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败，届时日志里有提示）。
+     */
+    private fun patchLlmDeepseekToolOrder() {
+        val entry = File(engineDir, "node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到 DeepSeek Messages 适配器，跳过 tool_use 顺序补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(TOOL_ORDER_ANCHOR_HEAD)) {
+                return
+            }
+            if (!source.contains(TOOL_ORDER_GUARD_HEAD) || !source.contains(TOOL_ORDER_GUARD_TAIL)) {
+                Log.w(TAG, "DeepSeek Messages 适配器的 assistant 映射结构与预期不符，跳过 tool_use 顺序补丁")
+                return
+            }
+            entry.writeText(
+                source
+                    .replace(TOOL_ORDER_GUARD_HEAD, TOOL_ORDER_ANCHOR_HEAD)
+                    .replace(TOOL_ORDER_GUARD_TAIL, TOOL_ORDER_ANCHOR_TAIL),
+            )
+            Log.i(TAG, "已修正 DeepSeek Messages 的 tool_use 块顺序: dsh-llm-deepseek")
+        } catch (t: Throwable) {
+            Log.w(TAG, "修正 DeepSeek Messages 的 tool_use 块顺序失败: ${t.message}")
+        }
+    }
+
+    /**
      * 安装 pnpm 到 `$PREFIX/bin`（幂等）。
      *
      * `plugin_manager` 的 `install_bundle` 通过 spawn `pnpm add` 装插件，而
@@ -3031,6 +3109,9 @@ class EngineManager private constructor(private val context: Context) {
         patchTerminalShell()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
+        // DeepSeek Messages 要求 assistant 的 tool_use 块连续且紧后跟 tool_result，
+        // 而持久化历史里 text 会夹在多个 tool_use 之间 → 该会话从此永久发不出去
+        patchLlmDeepseekToolOrder()
         // 目录选择器：撤回「起点改 /sdcard」的旧补丁，改由 HOME 下的入口链接提供
         restoreDirectoryPickerStart()
         // 手机存储与 app 私有目录在 Android 上互不可达，靠 HOME 下两个链接做入口
@@ -3548,6 +3629,48 @@ class EngineManager private constructor(private val context: Context) {
                 "\t\tif (err && (err.code === \"EACCES\" || err.code === \"EPERM\")) return;\n" +
                 "\t\tthrow err;\n" +
                 "\t}"
+
+        /**
+         * `dsh-llm-deepseek/lib/index.js` 里 `assistant()` 映射的**首尾两行原文**，
+         * 以及把 `tool_use` 块收敛到末尾之后的文本。见 [patchLlmDeepseekToolOrder]。
+         *
+         * 分首尾两处替换（而不是整段替换）：中间是一个完整的 `switch`，整段照抄
+         * 容易在引擎升级时因为无关的空白/注释变化而失配，只锚定首尾两行更稳。
+         *
+         * ⚠️ **重排方向是「置尾」而不是「置首」**：assistant 的 content 里可能有
+         * 带签名的 `thinking` 块，而 Messages API 要求 thinking 排在 assistant
+         * content 的**最前**。把 `tool_use` 提到最前会让 thinking 落到它后面，
+         * 可能触发签名校验失败。收敛到末尾得到的 `[thinking, text, tool_use…]`
+         * 才是规范形状。
+         *
+         * ⚠️ 缩进是**制表符**（首行 1 个、尾行 3/2/1/0 个），与官方发布件逐字一致；
+         * 引擎升级后若不再匹配，补丁会跳过并在日志里提示，不会让启动失败。
+         */
+        private const val TOOL_ORDER_GUARD_HEAD =
+            "\treturn message.content.map((block, index) => {"
+        private const val TOOL_ORDER_ANCHOR_HEAD =
+            "\tconst mapped = message.content.map((block, index) => {"
+
+        private const val TOOL_ORDER_GUARD_TAIL =
+            "\t\t\tdefault: return unsupported(`assistant content \${block.type}`);\n" +
+                "\t\t}\n" +
+                "\t});\n" +
+                "}"
+        private const val TOOL_ORDER_ANCHOR_TAIL =
+            "\t\t\tdefault: return unsupported(`assistant content \${block.type}`);\n" +
+                "\t\t}\n" +
+                "\t});\n" +
+                "\t/* Android: DeepSeek Messages 要求 assistant 的 tool_use 块连续，且紧后\n" +
+                "\t   必须携带全部 tool_result。持久化历史里 assistant 的块是交错的\n" +
+                "\t   （text 夹在多个 tool_use 之间），原样发出会被 API 以\n" +
+                "\t   \"tool_use ids were found without tool_result blocks\" 拒绝，\n" +
+                "\t   且该历史从此永久发不出去。这里把 tool_use 收敛到末尾，\n" +
+                "\t   其余块保持原有相对顺序（thinking 必须留在最前）。\n" +
+                "\t   只改本次请求体，不改持久化历史，replay 签名已在映射时贴好。 */\n" +
+                "\tconst calls = mapped.filter((block) => block.type === \"tool_use\");\n" +
+                "\tif (calls.length === 0) return mapped;\n" +
+                "\treturn [...mapped.filter((block) => block.type !== \"tool_use\"), ...calls];\n" +
+                "}"
 
         /**
          * `dsh-host-directory-picker-browse/lib/index.js` 里 `list()` 决定默认起点
