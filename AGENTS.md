@@ -23,7 +23,8 @@ APK
  ├─ assets/adb-wireless-arm64.zip  Termux 官方 adb（无线调试配对要 TLS-PSK，Node 的 tls 不支持）
  ├─ assets/dsh-android-shell.mjs   uid 2000 执行通道（直连 adbd）
  ├─ assets/shell-tool.zip          uid 2000 特权工具插件（注册 `shell` 工具）
- └─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片
+ ├─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片（补**运行时 API**）
+ └─ assets/webview-compat.zip      按 chrome74 降级编译的前端 bundle（补**语法**，见 ⑯）
 
 运行期（filesDir 下）
  ├─ usr/            $PREFIX —— Termux 环境（含 bin/pnpm）
@@ -618,6 +619,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `dsh-android-shell.mjs` | 无需改（每次启动覆盖写） |
 | `shell-tool.zip` | 无需改（每次启动解包覆盖写） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
+| `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
 
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
 这三个都是踩过的坑。
@@ -2136,6 +2138,117 @@ ptrace/Frida 不受此限。
 若该主机对公网可达，那才是最大的暴露面 —— **比 APK 泄露严重得多**，
 因为它是 14 个密钥的完整清单、一次请求全部拿走。发版前建议确认它只在内网，
 或尽快改成 HTTPS / 加访问控制。
+
+### ⑯ 旧 WebView 内核白屏 —— 前端 bundle 降级编译（**不是** polyfill）
+
+**症状**（用户反馈的 45 秒录屏，vivo Y52s / V2057A / Android 10 / Funtouch OS 10.5）：
+启动层走完「正在启动引擎…」→「正在准备界面…」，然后**一片纯白**，永远不出来。
+
+**这一处的要害：白屏与「缺 API」是两回事。** 必须先分清，否则会一直在补 API：
+
+| | 缺**运行时 API** | 缺**语法** |
+|---|---|---|
+| 例子 | `Object.hasOwn`、`.at()`、`Promise.withResolvers` | `static {}`、`??=`、`#m()` |
+| 失败时机 | 执行到那一行才抛 TypeError | **解析整份 chunk 时就失败** |
+| 后果 | 前面的代码已经跑过 | **整份 chunk 一行都不执行** |
+| 能否用 polyfill 补 | **能** | **不能**（垫片自己也在那份 chunk 里/依赖它） |
+
+官方前端 bundle 用的是新语法，所以命中右边一列 —— `webview-polyfill.js` 那种
+运行时垫片**完全无能为力**。这就是为什么 0.1.4 只加日志、界面照样白。
+
+**真机定位过程（可复现）**：
+
+1. 逐帧量状态栏像素：全程停在主题色 `#0F1115`（RGB 15,16,20），内容区 `255,255,255`。
+   状态栏颜色由页面的 `onStatus` 上报驱动 ⇒ **页面 JS 一行都没执行**。
+   而 HTML/CSS 明显已加载（白底来自官方前端的 CSS）⇒ 排除网络与资源 404。
+2. 读内核版本：`WebView.getCurrentWebViewPackage()` → **83**。
+3. 扫 bundle 找 83 解析不了的语法，得到下面这张表。
+
+**实测缺口（engine.bin 里的官方 bundle）**：
+
+| 语法 | 最低内核 | index | vendor |
+|---|---|---|---|
+| `class static block`（`static {}`） | **94** | 2 | — |
+| 逻辑赋值 `\|\|=` `&&=` `??=` | **85** | 25 | 7 |
+| class 私有方法（`#m(){}`） | **84** | — | 1 |
+| 可选链 `?.` | 80 | 231 | 96 |
+| 空值合并 `??` | 80 | 156 | 29 |
+
+内核 83 同时踩中 94 / 85 / 84 三道 ⇒ 与白屏完全吻合。
+
+**做法**：`tools/build-webview-compat.ps1` 用 esbuild 把 dist 降到
+`--target=chrome74`，只把**真有语法缺口**的文件打成 `assets/webview-compat.zip`
+（实测只有 **3 个**：`index-5SrrfWpU.js`、`vendor-CCJJTK99.js`、`index-BPHePDI_.css`，
+**438 KB**）。App 侧 `EngineManager.ensureWebViewCompat()` 解到 dist 覆盖。
+
+⚠️ **判据不能是「输入 hash ≠ 输出 hash」**：esbuild 即使不降级也会重新格式化，
+那样 61 个文件全被判为「变了」，资产从 0.44 MB 涨到 0.84 MB。
+判据取「同一输入，`--target=esnext` 与 `--target=$Target` 的输出是否相同」——
+输出相同 ⇔ 该文件没有缺口。
+
+⚠️ **判据也不能是正则扫 `??=`**：正则字面量里就有这些字符。实测
+`langs/make-CHLpvVh8.js` 里那处 `??=` 位于 `([+:?]??=)?` 之内，是正则文本不是运算符。
+交给 esbuild 自己判，它认语法不认字符串。
+
+**验收用的是独立解析器，不是 esbuild 自己**（用 esbuild 验 esbuild 是循环论证）：
+`tools/check-frontend-syntax.mjs` 用 acorn 建 AST，**遍历节点**按「特性 → 最低 Chrome 版本」
+表判定。
+
+⚠️ **不能直接看 `ecmaVersion`**：`acorn.parse({ecmaVersion:2019})` 会拒绝 class 私有字段
+（标准里属 ES2022），但 **Chrome 74 早就实现了它**。
+**ECMAScript 版本号 ≠ Chrome 版本号** —— 实测降级产物在 ES2019 下报「需要 ES2022」，
+真因只是私有字段，会把人误导回「降级失败」。
+同理，`top-level await` 的标注必须**遇到函数边界就停**（函数体内的 await 是 async 的一部分，
+从 ES2017 就合法），否则误报 44 处；`numeric separator` 只看数值字面量，
+字符串的 `raw` 含引号内容，`"a1_2"` 会被误判。
+
+**对照结果**（这才是证据）：
+
+```
+原始 index-5SrrfWpU.js  → FAIL: static block ×2(94)、||= ×25(85)、?? ×156、?. ×231
+原始 vendor-CCJJTK99.js → FAIL: #m() ×1(84)、||= ×7(85)、?? ×29、?. ×96
+降级后两个文件          → OK: 无任何 chrome74 以上语法
+webview-polyfill.js 自身 → OK
+检测器自检（--target 94）→ 原始 bundle 放行（证明不是无脑报错）
+```
+
+**门槛不再写死 94**：`MainActivity.effectiveMinWebViewMajor` 按
+`EngineManager.webViewCompatApplied` 动态取值 —— 降级生效 → 74，没生效 → 退回 94。
+⚠️ 判定放在 `observeEngine` 的 `Ready` 分支而不是 `detectWebViewVersion()`：
+后者在 `onCreate` 跑，那时引擎还没启动、降级还没落盘，会把门槛误报成 94。
+
+**polyfill 同步补齐降级后仍缺的 API**（esbuild 只降语法、不管 API）：
+`.at()`（92，index ×14 + vendor ×12）、`Object.hasOwn`（93，×7）、
+`replaceAll`（85，×5）、`reportError`（95，×2）、`AggregateError`（85，×1）、
+`WeakRef`（84，×1）。
+
+⚠️ **`WeakRef` 只能近似**：真弱引用语义在旧内核上无法用 JS 复刻，这里用强引用顶替
+（`.deref()` 恒返回原对象），代价是该对象不被回收。比 `new WeakRef()` 直接抛
+ReferenceError 让整个 chunk 挂掉好。
+⚠️ **`replaceAll` 的字符串分支不能写成 `split/join`** —— 那样 `$&`、`$$` 就不按标准展开。
+转义成字面量正则后交给原生 `replace`（core-js 同做法）。
+⚠️ **polyfill 自己是普通 `<script>`，不经过 esbuild**，所以它自身的语法也必须能被 74 解析
+（实测 OK：没用 `?.` / `??`，只用 `async` / `for await`）。
+
+**CSS 只降掉一半，这是已知边界**：esbuild 与 lightningcss 都只把 `inset:` 从 18 处降下来，
+`:is()` 88 / `:where()` 88 / `:has()` 105 / `color-mix()` 111 / `dvh` 108 / flex `gap` 84
+**一处没动**。这些在 chrome74 上是**未知语法 ⇒ 整条规则被丢弃**（不是解析失败），
+所以**不会白屏，但布局/配色会错乱**（实测 33 条规则受影响，其中 9 条涉及布局，
+`_markdown_*` 排版占多数）。lightningcss 也解决不了，**不要再引入它**（已试过并删除）。
+真机复测时若发现「能打开但界面乱」，根因在这里。
+
+**验收日志**（真机实测，CDY-TN90 上跑 0.1.5 debug）：
+
+```
+WebView 内核: com.huawei.webview 114.0.5.302（官方 bundle 门槛 94，降级后 74）
+已应用 WebView 降级前端: 3 个文件（chrome74-1）        ← 首次
+WebView 降级前端已就位，跳过（chrome74-1）             ← 之后每次
+```
+
+⚠️ 幂等戳写在 **dist 里**（`.webview-compat-stamp`）而不是别处：引擎升级会重新解包 dist，
+戳跟着一起没 ⇒ 自动重打，正是想要的。实测删掉戳后下次启动会重新应用。
+⚠️ 文件名带内容 hash（`index-5SrrfWpU.js`），**换 `engine.bin` 后必然对不上，必须重跑脚本**。
+⚠️ 降级资产**打不上时不能放行**：门槛会退回 94，宁可提示用户升级内核，也不要放进一片白屏。
 
 ## 后台保活（任务切到后台不能断）
 

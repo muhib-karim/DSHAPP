@@ -107,9 +107,28 @@ class MainActivity : AppCompatActivity() {
     /** 启动层超时的 handler 与 runnable（见 [armOverlayTimeout]）。 */
     private val overlayHandler = Handler(Looper.getMainLooper())
     private val overlayTimeoutRunnable = Runnable {
-        if (!overlayDismissed) {
-            Log.w(DshApplication.TAG, "界面就绪回调超时，强制收起启动动画")
-            hideOverlay()
+        if (overlayDismissed) return@Runnable
+        // ⚠️ 这里**不再静默收起**。原做法是「到点无条件收起」，理由是
+        //   「启动层永久盖住界面是最糟的失败方式」—— 但在旧 WebView 内核上，
+        //   收起之后露出来的是**一片白屏**（前端 bundle 解析失败、React 没挂载），
+        //   用户看到的就是反馈里那个「卡在空白页」，连原因都看不到。
+        //   所以改成把原因摆出来，并留一个点击出口（见 onCreate 里的
+        //   `overlay.setOnClickListener`）：既说清问题，又不会被永久挡住。
+        Log.w(
+            DshApplication.TAG,
+            "界面就绪回调超时（WebView 内核 $webViewMajor，页面错误: " +
+                "${webError.ifEmpty { "无" }}）",
+        )
+        // 优先显示页面自己报出来的原因（最准确）；没有就退到「内核可能过旧」的推断。
+        if (webError.isNotEmpty()) {
+            showOverlay("界面加载失败", hint = "$webError（点一下这里可继续）", isError = true)
+        } else {
+            showOverlay(
+                "界面没有加载出来",
+                hint = "可能是系统 WebView 内核过旧（当前 $webViewMajor，需要 $MIN_WEBVIEW_MAJOR+）。" +
+                    "请更新后重开 App；点一下这里可继续",
+                isError = true,
+            )
         }
     }
 
@@ -120,6 +139,42 @@ class MainActivity : AppCompatActivity() {
      *   重新盖住用户正在用的界面。
      */
     private var overlayDismissed = false
+
+    /** 当前 WebView 内核的主版本号；0 = 读不到（此时不做版本拦截）。 */
+    private var webViewMajor = 0
+
+    /**
+     * 内核低于**当前实际生效的门槛** —— 前端 bundle 的语法它解析不了。
+     *
+     * 门槛不是固定的：`EngineManager.ensureWebViewCompat()` 会把官方 bundle 换成
+     * 按 `chrome74` 降级编译的版本，换成功之后 83 这种旧内核也能解析。
+     * 所以这里按「降级到底生效了没有」动态判定，见 [effectiveMinWebViewMajor]。
+     *
+     * 为 true 时不再 `loadUrl`（那只会在 12 秒后露出一片白屏），
+     * 改成在启动层上直接说明原因（见 `observeEngine` 的 `Ready` 分支）。
+     */
+    private var webViewTooOld = false
+
+    /**
+     * 当前生效的内核门槛。
+     *
+     * - 降级前端已就位 → [MIN_WEBVIEW_MAJOR_COMPAT]（chrome74，实测 83 也跑得动）
+     * - 降级没打上（资产缺失/解包失败）→ [MIN_WEBVIEW_MAJOR]（官方 bundle 的 94）
+     *
+     * ⚠️ 降级**失败**时必须退到 94：那时跑的就是官方 bundle，语法缺口原样存在。
+     *   宁可提示用户升级内核，也不要放进一片白屏。
+     */
+    private val effectiveMinWebViewMajor: Int
+        get() = if (engine.webViewCompatApplied) MIN_WEBVIEW_MAJOR_COMPAT else MIN_WEBVIEW_MAJOR
+
+    /**
+     * 页面侧上报的第一条脚本错误（见 `webview-polyfill.js` 的错误上报）。
+     *
+     * ⚠️ 由 `StatusBridge`（WebView 的 JS 线程）写、主线程读，必须 `@Volatile`。
+     * 空串 = 页面没报过错。
+     */
+    @Volatile
+    private var webError = ""
 
     /** WebView 是否已经提交过至少一帧（见 [awaitWebViewPainted]）。 */
     private var webViewPainted = false
@@ -267,6 +322,7 @@ class MainActivity : AppCompatActivity() {
         loadImeHeight()   // 修复 65：把上次学到的键盘高度取回来（跨冷启动有效）
 
         setupWebView()
+        detectWebViewVersion()
         setupBackNavigation()
         installBubbleBridge()
         observeEngine()
@@ -357,6 +413,34 @@ class MainActivity : AppCompatActivity() {
         } catch (t: Throwable) {
             Log.w(DshApplication.TAG, "无法请求电池优化白名单: ${t.message}")
         }
+    }
+
+    /**
+     * 读当前 WebView 内核版本，判断它跑不跑得动前端 bundle。
+     *
+     * **为什么需要这一步**：官方前端 bundle 用了 Chromium 94 才有的语法
+     * （class static block），旧内核在**解析阶段**就失败 —— 不是缺某个 API，
+     * 而是整份 chunk 一行都不执行。这种失败在页面上完全无声：HTML 和 CSS 都正常，
+     * `#root` 却永远是空的，用户只看到白屏，连线索都没有。
+     *
+     * 这里只负责「读版本 + 记日志 + 置标志」，怎么呈现交给 `observeEngine`。
+     *
+     * ⚠️ **不能在这里定 `webViewTooOld`**：此刻引擎还没启动，降级 bundle 也就
+     *   还没落盘，[effectiveMinWebViewMajor] 会误报成 94。判定挪到
+     *   `observeEngine` 的 `Ready` 分支（引擎就绪 = 降级已经打过了）。
+     *
+     * ⚠️ 读不到版本时**不做拦截**（`webViewMajor = 0`）：宁可维持原行为，
+     *   也不能因为一次读取失败就把本来能用的设备挡在门外。
+     */
+    private fun detectWebViewVersion() {
+        val pkg = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()
+        val version = pkg?.versionName.orEmpty()
+        webViewMajor = version.substringBefore('.').toIntOrNull() ?: 0
+        Log.i(
+            DshApplication.TAG,
+            "WebView 内核: ${pkg?.packageName} $version" +
+                "（官方 bundle 门槛 $MIN_WEBVIEW_MAJOR，降级后 $MIN_WEBVIEW_MAJOR_COMPAT）",
+        )
     }
 
     private fun setupWebView() = with(binding.webView) {
@@ -586,6 +670,23 @@ class MainActivity : AppCompatActivity() {
         fun onUiReady() {
             Log.i(DshApplication.TAG, "插件已激活（onUiReady）")
             engine.notifyUiReady()
+        }
+
+        /**
+         * 页面侧脚本错误上报（见 `webview-polyfill.js`）。
+         *
+         * 这类失败原本在设备上完全无声：页面起不来，但宿主收不到任何回调，
+         * 只能靠 12 秒兜底超时收掉启动层，露给用户一片白屏。
+         * 有了它，启动层就能把**真实原因**摆出来（见 `overlayTimeoutRunnable`）。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程，只写一个 volatile 字段，不碰 View。
+         * ⚠️ 只记第一条：启动失败时后续错误多半是连锁反应。
+         */
+        @android.webkit.JavascriptInterface
+        fun reportWebError(message: String) {
+            if (webError.isNotEmpty()) return
+            webError = message
+            Log.w(DshApplication.TAG, "页面脚本错误: $message")
         }
 
         /**
@@ -846,6 +947,32 @@ class MainActivity : AppCompatActivity() {
                         showOverlay("正在启动引擎…", hint = "加载 Node 运行时与本地服务")
                     }
                     is EngineManager.State.Ready -> {
+                        // 门槛在这里才定：引擎就绪 ⇒ ensureWebViewCompat() 已经跑过，
+                        // 降级到底生效了没有此时才准（见 effectiveMinWebViewMajor）。
+                        val minMajor = effectiveMinWebViewMajor
+                        webViewTooOld = webViewMajor in 1 until minMajor
+                        if (webViewTooOld) {
+                            Log.w(
+                                DshApplication.TAG,
+                                "WebView 内核 $webViewMajor < 门槛 $minMajor" +
+                                    "（降级前端${if (engine.webViewCompatApplied) "已" else "未"}生效），" +
+                                    "前端无法解析，跳过加载",
+                            )
+                            showOverlay(
+                                "系统 WebView 内核过旧",
+                                hint = "当前内核 $webViewMajor，需要 $minMajor+；" +
+                                    "请在应用商店更新「Android System WebView」后重开 App",
+                                isError = true,
+                            )
+                            return@collect
+                        }
+                        if (webViewMajor in 1 until MIN_WEBVIEW_MAJOR) {
+                            Log.i(
+                                DshApplication.TAG,
+                                "WebView 内核 $webViewMajor 低于官方门槛 $MIN_WEBVIEW_MAJOR，" +
+                                    "但降级前端已生效，继续加载",
+                            )
+                        }
                         // ⚠️ 这里**不能**收起 overlay：引擎就绪只代表 HTTP 服务起来了，
                         //   页面还没加载、插件更没激活。实测后面还有约 3.8 秒。
                         showOverlay("正在加载界面…", hint = "渲染 Web GUI")
@@ -984,6 +1111,10 @@ class MainActivity : AppCompatActivity() {
             binding.overlay.visibility = View.VISIBLE
         }
         binding.overlayText.text = text
+        // 只有**错误态**才给点击出口：正常启动期不给 —— 那时界面还没渲染好，
+        // 让用户误点一下就把启动层收掉，只会提前露出白屏。
+        // 错误态下界面已经确认起不来，点一下至少能让人自己看看（或按返回退出）。
+        binding.overlay.setOnClickListener(if (isError) View.OnClickListener { hideOverlay() } else null)
         binding.overlayText.setTextColor(
             if (isError) Color.parseColor("#FF8A8A") else Color.parseColor("#8FA3C0")
         )
@@ -1199,6 +1330,42 @@ class MainActivity : AppCompatActivity() {
          * 目的是避免启动层永久盖住界面。
          */
         const val UI_READY_TIMEOUT_MS = 12000L
+
+        /**
+         * WebView 内核的最低主版本号。
+         *
+         * DSH 官方前端的入口 bundle 里用了 **class static block**（`static { … }`），
+         * 那是 **Chromium 94** 才支持的**语法**。语法补不了 ——
+         * `webview-polyfill.js` 只能补运行时 API（缺函数时挂一个），
+         * 补不了解析期语法：整份 chunk 在解析阶段直接失败，一行都不执行。
+         *
+         * 真机现象正是如此（用户反馈的 45 秒录屏，vivo Y52s / Android 10）：
+         * HTML 到了（`onPageFinished` 触发，启动层走到「正在准备界面…」）、
+         * CSS 也生效了（页面是官方前端的白底），但 `onUiReady` 永不到达
+         * —— React 根本没挂载。12 秒后 [UI_READY_TIMEOUT_MS] 兜底收起启动层，
+         * 露出来的就是一片白屏。
+         *
+         * 所以把门槛显式化：低于它就不再静默白屏，而是把原因摆到启动层上。
+         * 取 94（static block 的引入版本）而不是更高：内核 94 上还缺的
+         * `reportError`（95）是 API，由 polyfill 补（见 `webview-polyfill.js`）。
+         */
+        const val MIN_WEBVIEW_MAJOR = 94
+
+        /**
+         * 降级前端生效后的实际门槛。
+         *
+         * `EngineManager.ensureWebViewCompat()` 会把官方 bundle 换成按
+         * **chrome74** 降级编译的版本（class static block 被展开、逻辑赋值被改写），
+         * 于是门槛降到 74。取 74 而不是 83（反馈设备那个版本）是留一档余量：
+         * esbuild 的 `chrome74` 目标保证不生成 74 之后才有的语法。
+         *
+         * ⚠️ 74 之后引入的 **API**（`Object.hasOwn` 93、`.at()` 92、
+         *   `reportError` 95 …）由 `webview-polyfill.js` 兜底，两者配合才完整。
+         *
+         * ⚠️ 降级**没打上**时不能放行：那时跑的是官方 bundle，
+         *   门槛必须退回 [MIN_WEBVIEW_MAJOR]（见 `effectiveMinWebViewMajor`）。
+         */
+        const val MIN_WEBVIEW_MAJOR_COMPAT = 74
 
         /**
          * 等待 WebView 提交首帧的兜底超时（ms）。

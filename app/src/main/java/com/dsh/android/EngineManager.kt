@@ -99,6 +99,18 @@ class EngineManager private constructor(private val context: Context) {
     private var process: Process? = null
     private val logLines = ArrayDeque<String>()
 
+    /**
+     * 降级前端是否已就位（见 [ensureWebViewCompat]）。
+     *
+     * 供 [MainActivity] 决定要不要因内核过旧而拦截加载：降级生效后门槛就降到
+     * `chrome74`，不再一律卡 94。
+     *
+     * ⚠️ 由 IO 线程写、主线程读（`observeEngine` 的 `Ready` 分支），必须 `@Volatile`。
+     */
+    @Volatile
+    var webViewCompatApplied = false
+        private set
+
     /** Termux 环境：提供 node 可执行文件与 $PREFIX。 */
     private val bootstrap by lazy { com.dsh.android.termux.TermuxBootstrap(context) }
 
@@ -281,6 +293,96 @@ class EngineManager private constructor(private val context: Context) {
         } catch (t: Throwable) {
             // 补丁失败不阻断启动：新版 WebView 本来就不需要它
             Log.w(TAG, "注入 WebView 兼容补丁失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 把前端 bundle 换成按旧内核降级编译的版本（幂等）。
+     *
+     * **为什么 polyfill 不够**：[ensureWebCompat] 那种运行时垫片只能补**缺失的 API**，
+     * 而官方前端还用了**新语法** —— 最典型的是 class static block（`static { ... }`，
+     * Chromium 94+）。语法缺口发生在**解析阶段**，整份 chunk 一行都不执行，
+     * 垫片根本没机会跑。表现是 HTML/CSS 都正常、`#root` 永远为空，
+     * 页面侧连个错误都报不出来。
+     *
+     * 真机实测（用户反馈的 vivo Y52s / Android 10，**WebView 内核 83**）：
+     *   index  : class static block ×2（需 94）、逻辑赋值 ??= ×25（需 85）
+     *   vendor : private method ×3（需 84）、逻辑赋值 ×7（需 85）
+     *   CSS    : inset ×18（需 87）
+     *
+     * **做法**：`tools/build-webview-compat.ps1` 用 esbuild 把 dist 降到
+     * `--target=chrome74`，只把**真有语法缺口**的 3 个文件打进
+     * [WEBVIEW_COMPAT_ASSET]，这里解出来覆盖 dist。
+     *
+     * ⚠️ **必须放在 [ensureWebCompat] 里一起调用**，且要在注入 polyfill 标签**之前** ——
+     *    `index.html` 本身不在资产里（它没有语法缺口），但顺序上先换 bundle 更清楚。
+     *
+     * ⚠️ 幂等靠 `dist/.webview-compat-stamp` 与 zip 内 `.compat-stamp` 比对。
+     *    **戳文件写在 dist 里而不是别处**：引擎升级会重新解包 dist，戳跟着一起没，
+     *    于是自动重打 —— 正是想要的。文件名带内容 hash（`index-5SrrfWpU.js`），
+     *    引擎升级后旧资产必然对不上，必须重跑脚本重新生成。
+     */
+    private fun ensureWebViewCompat() {
+        val dist = File(engineDir, "node_modules/@deepseek-ai/dsh-web-frontend/dist")
+        if (!dist.isDirectory) {
+            Log.w(TAG, "引擎尚未解包，跳过 WebView 降级资产")
+            return
+        }
+
+        try {
+            // 先读 zip 里的戳（在流开头之后才能知道），再决定要不要落盘
+            var stampInZip = ""
+            val entries = LinkedHashMap<String, ByteArray>()
+            java.util.zip.ZipInputStream(context.assets.open(WEBVIEW_COMPAT_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        if (entry.name == WEBVIEW_COMPAT_STAMP_ENTRY) {
+                            stampInZip = zis.readBytes().toString(Charsets.UTF_8).trim()
+                        } else {
+                            entries[entry.name] = zis.readBytes()
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+
+            if (entries.isEmpty()) {
+                Log.w(TAG, "WebView 降级资产是空的，跳过")
+                return
+            }
+
+            val stampFile = File(dist, WEBVIEW_COMPAT_STAMP)
+            if (stampFile.isFile && stampFile.readText().trim() == stampInZip) {
+                webViewCompatApplied = true
+                // 幂等跳过也要打日志：否则「降级到底在不在」只能靠翻文件系统确认，
+                // 而真机上排查白屏时这条信息恰恰最关键（见 MainActivity 的门槛判定）。
+                Log.i(TAG, "WebView 降级前端已就位，跳过（$stampInZip）")
+                return
+            }
+
+            var written = 0
+            for ((name, bytes) in entries) {
+                val out = File(dist, name)
+                // 防目录穿越：资产是我们自己打的，但解包路径仍按约定校验
+                if (!out.canonicalPath.startsWith(dist.canonicalPath + File.separator)) {
+                    Log.w(TAG, "跳过越界的资产条目: $name")
+                    continue
+                }
+                out.parentFile?.mkdirs()
+                out.writeBytes(bytes)
+                written++
+            }
+            stampFile.writeText(stampInZip)
+            webViewCompatApplied = true
+            Log.i(
+                TAG,
+                "已应用 WebView 降级前端: $written 个文件（$stampInZip）",
+            )
+        } catch (t: Throwable) {
+            // 打不上就维持原样：新内核本来就不需要它，旧内核也只是回到白屏
+            Log.w(TAG, "应用 WebView 降级前端失败: ${t.message}")
         }
     }
 
@@ -2653,6 +2755,8 @@ class EngineManager private constructor(private val context: Context) {
 
         // 前端补丁要在 WebView 首次加载前落盘，所以放在启动引擎这一步里
         ensureWebCompat()
+        // 降级 bundle 必须紧跟其后：polyfill 只补 API，语法缺口得靠换 bundle
+        ensureWebViewCompat()
         // 原生插件是引擎启动的前提（DSH 的 profile 解析依赖它），必须早于进程启动
         ensureNativeAddon()
         // system 插件（会话写入锁）：缺了它每轮回复都会以「本轮运行失败」告终
@@ -3095,6 +3199,18 @@ class EngineManager private constructor(private val context: Context) {
         /** WebView 兼容补丁：资产名与注入到 index.html 里的标签。 */
         private const val POLYFILL_FILE = "webview-polyfill.js"
         private const val POLYFILL_TAG = """<script src="./$POLYFILL_FILE"></script>"""
+
+        /**
+         * 按旧内核降级编译的前端 bundle（见 [ensureWebViewCompat]）。
+         *
+         * 由 `tools/build-webview-compat.ps1` 生成，只含真有语法缺口的文件
+         * （实测 3 个，438 KB）。**换了 engine.bin 必须重跑脚本**。
+         */
+        private const val WEBVIEW_COMPAT_ASSET = "webview-compat.zip"
+
+        /** 降级资产在 dist 里留下的戳，以及 zip 内对应的条目名。 */
+        private const val WEBVIEW_COMPAT_STAMP = ".webview-compat-stamp"
+        private const val WEBVIEW_COMPAT_STAMP_ENTRY = ".compat-stamp"
 
         /** 自编译的 android-arm64 原生插件（官方无此变体）。 */
         private const val ADDON_ASSET = "node-addon-android-arm64.zip"
