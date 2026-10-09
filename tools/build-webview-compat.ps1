@@ -1,4 +1,4 @@
-﻿# 生成 WebView 兼容资产（webview-compat.zip）
+# 生成 WebView 兼容资产（webview-compat.zip）
 #
 # ── 为什么需要它 ──────────────────────────────────────────────────────
 #
@@ -22,10 +22,36 @@
 # **只把内容真的变了的文件**打进 zip（实测只有 4 个 js + 1 个 css）。
 # App 侧 `EngineManager.ensureWebViewCompatAssets()` 把它解到 dist 上覆盖。
 #
+# ── ⚠️ 为什么还降级「插件的 client bundle」（v2 起的重点）──────────────
+#
+# 只降 dist 是**不够的**，这是线上真实踩到的坑（用户反馈
+# `groups.toSorted is not a function`，模型选择器整块打不开；同一份缺口的
+# `dsh-client-ui-settings-models` 则让「模型」设置页**空白**）。
+#
+# 前端分两部分下发，各自独立编译：
+#   dist/                     官方 shell（v1 已覆盖）
+#   node_modules/@deepseek-ai/*/lib/client.js   71 个插件的客户端 bundle
+#                              ← v1 完全没管，实测 68/85 个在 chrome74 下有语法缺口
+# 外加 App 自己注入的 mobile-ui 插件（在 `$DSH_HOME`，不在 engine.bin 里）。
+#
+# 只补运行时 API（`webview-polyfill.js`）补不了**语法**：语法不达标时整份 chunk
+# 在**解析阶段**就死，`window.__ModuleLoader__.load()` 永远不执行，表现为
+# 「某个插件静默不生效」或「某块 UI 永远空白」，比白屏更难查。
+#
+# zip 里的条目带前缀标记要落到哪棵树，App 侧按前缀分派：
+#   dist/<rel>                    → engine/node_modules/@deepseek-ai/dsh-web-frontend/dist/
+#   engine/<pkg>/lib/<file>       → engine/node_modules/@deepseek-ai/<pkg>/lib/
+#   mobileui/<rel>                → $DSH_HOME/mobile-ui/dsh-android-mobile/
+#
 # ⚠️ **换了 engine.bin 必须重跑本脚本**，并把产物一起提交。
 #    文件名带内容 hash（`index-5SrrfWpU.js`），引擎升级后必然对不上。
 #
 # ⚠️ esbuild 只是**构建期工具**，不进 APK、设备上也不需要它。
+#
+# ⚠️ 降级产物必须**语法复检**（本脚本第 5 步会做，用
+#    `tools/check-frontend-syntax.mjs`）。「esbuild exit=0」不代表产物在目标内核下
+#    能解析 —— 实测它连 pdf.js 的 RegExp `v` 标志（chrome112）都能降干净，
+#    但这是**实测结论**而不是保证，换个引擎版本就可能变，所以复检不能省。
 #
 # 用法：
 #   .\tools\build-webview-compat.ps1
@@ -38,7 +64,13 @@ param(
     [string]$Target = "chrome74",
 
     # 兼容资产版本号。改了降级逻辑/目标就 +1 —— App 侧靠它判断要不要重新覆盖。
-    [string]$CompatVersion = "1",
+    # v2：降级范围从「只 dist」扩到「dist + 71 个插件 client bundle + mobile-ui 插件」。
+    #     ⚠️ 必须 bump：v1 的戳已经落在老设备的 dist 里，不 bump 会命中
+    #     「戳一致 → 跳过」，插件那部分**永远不生效**（静默，最难查的那种）。
+    # v3：加了第 3.6 步运行时 API 审计门禁（从产物反向扫 API，不再靠人工名单）。
+    #     降级产物本身与 v2 相同（多补的是 polyfill，那份每次启动都覆盖写、不吃戳），
+    #     但 bump 一下无害且更清晰：将来审计查出新缺口、要重新生成 zip 时不会漏。
+    [string]$CompatVersion = "3",
 
     [string]$EngineBin,
     [string]$OutZip
@@ -67,19 +99,33 @@ if (-not (Test-Path $esbuild)) {
     if ($LASTEXITCODE -ne 0) { throw "esbuild 安装失败" }
 }
 
-# ── 2. 从 engine.bin 解出前端 dist ──────────────────────────────────────
+# ── 2. 从 engine.bin 解出「前端 dist」与「插件的 client bundle」──────────
 $extract = Join-Path $work "extract"
 New-Item -ItemType Directory -Path $extract -Force | Out-Null
 $tgz = Join-Path $work "engine.tar.gz"
 Copy-Item $EngineBin $tgz -Force
 
-Write-Host "解出前端 dist…"
+Write-Host "解出前端 dist 与插件 client bundle…"
 Push-Location $extract
-& tar -xzf $tgz "node_modules/@deepseek-ai/dsh-web-frontend/dist"
+# 两处通配符解包走**同一次调用**（bsdtar 原生支持 `*`，不需要 --wildcards，
+# 加了反而报「Option --wildcards is not supported」）。
+# `client*.js` 覆盖 client.js 与三个 lazy chunk（client.pdf/excel/terminal.js）。
+& tar -xzf $tgz "node_modules/@deepseek-ai/dsh-web-frontend/dist" "node_modules/@deepseek-ai/*/lib/client*.js"
+if ($LASTEXITCODE -ne 0) { throw "从 engine.bin 解包失败" }
 Pop-Location
 
 $dist = Join-Path $extract "node_modules\@deepseek-ai\dsh-web-frontend\dist"
 if (-not (Test-Path $dist)) { throw "engine.bin 里没找到前端 dist" }
+
+# 插件的客户端 bundle（不含 dsh-web-frontend —— 那个是 shell，走 dist 那条路）
+$pluginRoot = Join-Path $extract "node_modules\@deepseek-ai"
+$pluginFiles = @(
+    Get-ChildItem $pluginRoot -Directory |
+        Where-Object { $_.Name -ne "dsh-web-frontend" } |
+        ForEach-Object { Get-ChildItem (Join-Path $_.FullName "lib") -File -Filter "client*.js" -ErrorAction SilentlyContinue }
+)
+if ($pluginFiles.Count -eq 0) { throw "engine.bin 里没解出任何插件 client bundle，解包通配符可能失效了" }
+Write-Host "  → 插件 client bundle $($pluginFiles.Count) 个"
 
 # ── 3. 逐个降级，只留真有语法缺口的 ────────────────────────────────────
 #
@@ -94,32 +140,62 @@ if (-not (Test-Path $dist)) { throw "engine.bin 里没找到前端 dist" }
 #    实测 `langs/make-CHLpvVh8.js` 里那处 `??=` 位于 `([+:?]??=)?` 之内，是
 #    正则的文本而不是运算符 —— 用正则判会把 59 个 langs 全误收进来。
 #    交给 esbuild 自己判，它认语法、不认字符串。
+
+# 待降级清单。Entry 是 zip 内部路径，前缀决定 App 侧解到哪棵树：
+#   dist/      → engine/node_modules/@deepseek-ai/dsh-web-frontend/dist/
+#   engine/    → engine/node_modules/@deepseek-ai/
+#   mobileui/  → $DSH_HOME/mobile-ui/dsh-android-mobile/
+$targets = @()
+
+foreach ($f in (Get-ChildItem $dist -Recurse -File -Include *.js, *.css)) {
+    $rel = $f.FullName.Substring($dist.Length + 1) -replace '\\', '/'
+    $targets += @{ Src = $f.FullName; Entry = "dist/$rel"; Label = "dist" }
+}
+
+foreach ($f in $pluginFiles) {
+    # <pkg>/lib/client*.js —— pkg 是 lib 的父目录名
+    $pkg = $f.Directory.Parent.Name
+    $targets += @{ Src = $f.FullName; Entry = "engine/$pkg/lib/$($f.Name)"; Label = $pkg }
+}
+
+# App 自己注入的移动端 UI 插件。它**不在 engine.bin 里**（源码在仓库里、
+# 由 mobile-ui.zip 下发），但它同样是浏览器要解析的 bundle，实测在 chrome74 下
+# 有 ×10 optional chaining + ×6 nullish —— 一并降级，否则老内核上会静默退回桌面布局。
+$mobileUiSrc = Join-Path $repoRoot "mobile-ui-plugin\dsh-android-mobile"
+if (Test-Path $mobileUiSrc) {
+    foreach ($f in (Get-ChildItem $mobileUiSrc -Recurse -File -Filter "client*.js")) {
+        $rel = $f.FullName.Substring($mobileUiSrc.Length + 1) -replace '\\', '/'
+        $targets += @{ Src = $f.FullName; Entry = "mobileui/$rel"; Label = "mobile-ui" }
+    }
+} else {
+    Write-Warning "找不到 $mobileUiSrc，跳过移动端 UI 插件的降级"
+}
+
 $out = Join-Path $work "out"
 New-Item -ItemType Directory -Path $out | Out-Null
 $probe = Join-Path $work "probe"
 New-Item -ItemType Directory -Path $probe -Force | Out-Null
 
 $changed = @()
-$sources = Get-ChildItem $dist -Recurse -File -Include *.js, *.css
-Write-Host "扫描 $($sources.Count) 个 js/css（目标 $Target）…"
+Write-Host "扫描 $($targets.Count) 个 js/css（目标 $Target）…"
 
-foreach ($f in $sources) {
-    $rel = $f.FullName.Substring($dist.Length + 1)
-    $dst = Join-Path $out $rel
+foreach ($t in $targets) {
+    # 产物按 zip 条目路径摆放，打 zip 时可直接用
+    $dst = Join-Path $out ($t.Entry -replace '/', '\')
     New-Item -ItemType Directory -Path (Split-Path $dst -Parent) -Force | Out-Null
 
     # 基准：不降级，只做同样的格式化
     $baseline = Join-Path $probe "baseline"
-    & $esbuild $f.FullName --target=esnext "--outfile=$baseline" --log-level=error 2>&1 |
+    & $esbuild $t.Src --target=esnext "--outfile=$baseline" --log-level=error 2>&1 |
         ForEach-Object { if ("$_".Trim()) { Write-Warning "esbuild: $_" } }
-    if ($LASTEXITCODE -ne 0) { throw "esbuild 基准转换失败: $rel" }
+    if ($LASTEXITCODE -ne 0) { throw "esbuild 基准转换失败: $($t.Entry)" }
 
-    & $esbuild $f.FullName "--target=$Target" "--outfile=$dst" --log-level=error 2>&1 |
+    & $esbuild $t.Src "--target=$Target" "--outfile=$dst" --log-level=error 2>&1 |
         ForEach-Object { if ("$_".Trim()) { Write-Warning "esbuild: $_" } }
-    if ($LASTEXITCODE -ne 0) { throw "esbuild 降级失败: $rel" }
+    if ($LASTEXITCODE -ne 0) { throw "esbuild 降级失败: $($t.Entry)" }
 
     if ((Get-FileHash $baseline).Hash -ne (Get-FileHash $dst).Hash) {
-        $changed += $rel
+        $changed += $t
     } else {
         Remove-Item $dst -Force
     }
@@ -129,23 +205,113 @@ if ($changed.Count -eq 0) {
     Write-Warning "没有任何文件需要降级 —— 前端可能已按低版本编译，或 $Target 给高了"
 }
 
+# 按树分组打印，便于一眼看出「哪棵树完全没被覆盖」（那正是 v1 的病）
 Write-Host "需要降级的文件（$($changed.Count) 个）:"
-$changed | ForEach-Object { Write-Host "  $_" }
+foreach ($g in ($changed | Group-Object { $_.Entry.Split('/')[0] })) {
+    Write-Host "  [$($g.Name)] $($g.Count) 个"
+    $g.Group | ForEach-Object { Write-Host "      $($_.Entry)" }
+}
 
-# ── 4. 打 zip（条目为相对路径，无顶层目录 —— 与其它资产同一约定）──────
+# ── 3.5 语法复检：esbuild 说"降完了"不等于产物真能在目标内核下解析 ───────
+#
+# ⚠️ 这一步不能省。「esbuild exit=0」只说明它没报错，而解析门槛是**产物**的属性。
+#    实测它能连 pdf.js 的 RegExp `v` 标志（chrome112）一起降干净，但那是实测结论、
+#    不是 API 保证 —— 换个 esbuild/引擎版本就可能变。
+#
+# 复用 `tools/check-frontend-syntax.mjs`（acorn 遍历 AST 按特性查 Chrome 版本）。
+$checker = Join-Path $repoRoot "tools\check-frontend-syntax.mjs"
+$targetMajor = [int]($Target -replace '\D', '')
+if ((Test-Path $checker) -and $changed.Count -gt 0) {
+    Write-Host "语法复检（目标 chrome$targetMajor）…"
+    $bad = @()
+    $toolBroke = $null
+    $checked = 0
+    foreach ($t in $changed) {
+        # ⚠️ **只复检 .js。** `check-frontend-syntax.mjs` 是 acorn（JS 解析器），
+        #    喂 .css 进去必然报 `Unexpected character '@'` —— 那是解析器不适用，
+        #    不是 CSS 有问题。降级产物里那个 css（`index-*.css`，inset 属性）由
+        #    esbuild 的 `--target` 负责，它的门槛与 JS 不同，这里不重复判定。
+        if ($t.Entry -notlike "*.js") { continue }
+        $checked++
+        $dst = Join-Path $out ($t.Entry -replace '/', '\')
+        # ⚠️ 必须看退出码：1 = 真有语法缺口，2 = 校验工具自己跑不起来（如 acorn 装不上）。
+        #    早先只判 `-ne 0` 就把「acorn 找不到」也当成语法不合格，于是 72 个产物
+        #    全被报成失败、真因一个都没有 —— 环境问题绝不能伪装成语法问题。
+        $verdict = & node $checker --target $targetMajor $dst 2>&1
+        $rc = $LASTEXITCODE
+        if ($rc -eq 2) {
+            $toolBroke = ($verdict | Select-Object -Last 2) -join "`n"
+            break
+        }
+        if ($rc -ne 0) { $bad += "$($t.Entry)`n$($verdict -join "`n")" }
+    }
+    if ($toolBroke) {
+        Write-Warning "语法复检未能执行（校验工具本身的问题，不代表产物有问题）：`n$toolBroke"
+        Write-Warning "请手工确认产物，或修好 tools/check-frontend-syntax.mjs 后重跑"
+    } elseif ($bad.Count -gt 0) {
+        Write-Host ($bad -join "`n")
+        throw "降级产物仍有 chrome$targetMajor 以上语法，见上方清单 —— 换更高的 -Target 或升级 esbuild"
+    } else {
+        Write-Host "  → $checked 个 js 产物全部通过"
+    }
+}
+
+# ── 3.6 运行时 API 审计：语法过关 ≠ 能跑 ────────────────────────────────
+#
+# ⚠️ **这一步是「完整修复」的地基，别删。**
+#
+# 语法复检（3.5）只能证明产物在目标内核下**能解析**，证明不了它**能跑**：
+# `toSorted`（Chrome 110）与 `AbortSignal.prototype.throwIfAborted`（100）
+# 都是**合法语法**，esbuild 也降不了（它们是运行时 API、不是语法），
+# 但在老内核上就是 `xxx is not a function`，整块 UI 直接打不开。
+#
+# 这两次线上事故的共同根因是**同一个**：polyfill 该补哪些 API 是**人工列**的，
+# 而人工名单必然会漏 —— 第一次漏了实例方法（只收了 `AbortSignal.any`，
+# 没收 `throwIfAborted`），第二次漏了一整个家族（只扫了 dist，没扫插件）。
+#
+# 所以改成**从产物反向扫描**：把三棵树的 js 都过一遍 AST，抽出真正用到的
+# 标准库成员，再和 polyfill 做差集，有缺口就**构建失败**。
+# 新增的 API 只会让这一步报错，不会再静默漏到用户手上。
+$auditor = Join-Path $repoRoot "tools\audit-runtime-apis.mjs"
+$polyfill = Join-Path $repoRoot "app\src\main\assets\webview-polyfill.js"
+if (Test-Path $auditor) {
+    Write-Host "运行时 API 审计（对照 $([System.IO.Path]::GetFileName($polyfill))）…"
+    # ⚠️ **三棵树都要扫**，少一棵就会有盲区：
+    #    $dist       官方 shell（dist 里的 js/css 同样是浏览器要解析的）
+    #    $pluginRoot 71+ 个插件的 client bundle
+    #    $mobileUiSrc App 自己注入的插件（不在 engine.bin 里）
+    #    ⚠️ 曾经只扫 dist —— 那正是 `toSorted` 漏掉的原因（dist 恰好一处都没用到）。
+    #    审计**源文件**而不是 $out 里的降级产物：$out 只含「有语法缺口」的文件，
+    #    而「语法本来就 OK、但用了新 API」的文件不在里面 —— 它们照样会被加载，
+    #    漏扫它们等于留一个盲区。
+    $auditOut = & node $auditor --polyfill $polyfill --target "chrome$targetMajor" $dist $pluginRoot $mobileUiSrc 2>&1
+    $auditRc = $LASTEXITCODE
+    # 只打印结论段，完整清单太长
+    $auditOut | Select-Object -Last 22 | ForEach-Object { Write-Host "  $_" }
+    if ($auditRc -eq 2) {
+        Write-Warning "运行时 API 审计未能执行（工具自身问题，不代表产物有问题）"
+    } elseif ($auditRc -ne 0) {
+        throw "存在未被 polyfill 覆盖的运行时 API（见上方 ❌ 清单）—— 在 webview-polyfill.js 里补齐后重跑"
+    } else {
+        Write-Host "  → 无缺口"
+    }
+} else {
+    Write-Warning "找不到 $auditor，跳过运行时 API 审计（缺口将静默漏到用户手上）"
+}
+
+# ── 4. 打 zip（条目为相对路径带树前缀 —— App 侧按前缀分派目的一棵树）──
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 if (Test-Path $OutZip) { Remove-Item $OutZip -Force }
 $zip = [System.IO.Compression.ZipFile]::Open($OutZip, 'Create')
 try {
-    foreach ($rel in $changed) {
-        $src = Join-Path $out $rel
-        # zip 内部一律用 / 分隔
+    foreach ($t in $changed) {
+        $src = Join-Path $out ($t.Entry -replace '/', '\')
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-            $zip, $src, ($rel -replace '\\', '/')) | Out-Null
+            $zip, $src, $t.Entry) | Out-Null
     }
     # 版本戳：App 侧读它决定要不要重新覆盖
     $stampTmp = Join-Path $work "stamp.txt"
-    Set-Content -Path $stampTmp -Value "$Target-$CompatVersion" -NoNewline -Encoding ascii
+    Set-Content -Path $stampTmp -Value "$Target-v$CompatVersion" -NoNewline -Encoding ascii
     [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $stampTmp, ".compat-stamp") | Out-Null
 } finally {
     $zip.Dispose()
@@ -156,4 +322,5 @@ Write-Host ""
 Write-Host "已生成: $OutZip"
 Write-Host ("  条目 {0} 个，{1:N0} 字节（{2:N2} MB）" -f ($changed.Count + 1), $size, ($size / 1MB))
 Write-Host ""
-Write-Host "⚠️ 记得同步 EngineManager.WEBVIEW_COMPAT_VERSION = `"$Target-$CompatVersion`""
+Write-Host "⚠️ 戳是 $Target-v$CompatVersion（App 侧从 zip 里读，无需改 Kotlin 常量）"
+Write-Host "⚠️ 确认 MainActivity.MIN_WEBVIEW_MAJOR_COMPAT = $targetMajor 与本次 -Target 一致"

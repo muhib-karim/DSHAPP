@@ -71,6 +71,23 @@
     });
   })();
 
+  // ── 小工具：造一个 AbortError / TimeoutError 风格的 DOMException ────────
+  //
+  // 规范里 abort 的默认 reason 是 `DOMException(name='AbortError')`。
+  // 老内核可能没有 DOMException 构造器（或它不可 new），退化成带 name 的 Error ——
+  // 关键是 `err.name`，上层普遍按 name 判定，而不是 instanceof。
+  function abortError(name, message) {
+    var n = name || 'AbortError';
+    var m = message || 'This operation was aborted';
+    try {
+      return new DOMException(m, n);
+    } catch (e) {
+      var err = new Error(m);
+      err.name = n;
+      return err;
+    }
+  }
+
   // Chromium 119：Promise.withResolvers
   if (typeof Promise.withResolvers !== 'function') {
     Promise.withResolvers = function () {
@@ -80,6 +97,38 @@
         reject = rej;
       });
       return { promise: promise, resolve: resolve, reject: reject };
+    };
+  }
+
+  // Chromium 100：AbortSignal.prototype.throwIfAborted
+  //
+  // ⚠️ **这是线上真实踩到的缺口**（粉丝截图：点「选择工作区目录」弹
+  //    `client api: directoryPicker/list failed: signal.throwIfAborted is not a function`）。
+  //    12 个插件 bundle 在用，其中就有目录选择器的客户端。
+  //
+  // ⚠️ 它当初被漏掉的原因值得记一笔：`AbortSignal.any`（116）被人工收进了清单，
+  //    而同一个接口的实例方法 `throwIfAborted` 没被收 —— 人工名单按「接口名」列，
+  //    漏的就是「同一个接口的不同成员」。所以现在改成从产物反向扫描
+  //    （tools/audit-runtime-apis.mjs），不再靠人脑枚举。
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.prototype.throwIfAborted !== 'function') {
+    AbortSignal.prototype.throwIfAborted = function () {
+      if (this.aborted) {
+        // 规范：aborted 为真时抛出 reason（缺省是一个 DOMException AbortError）
+        throw this.reason !== undefined ? this.reason : abortError();
+      }
+    };
+  }
+
+  // Chromium 103：AbortSignal.timeout
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout !== 'function') {
+    AbortSignal.timeout = function (ms) {
+      var controller = new AbortController();
+      var timer = setTimeout(function () {
+        controller.abort(abortError('TimeoutError', 'The operation timed out.'));
+      }, ms);
+      // 别让这个定时器拖住事件循环（浏览器里无 unref，做了也无害）
+      if (timer && typeof timer.unref === 'function') timer.unref();
+      return controller.signal;
     };
   }
 
@@ -108,6 +157,15 @@
         list[k].addEventListener('abort', onAbort);
       }
       return signal;
+    };
+  }
+
+  // Chromium 93：AbortSignal.abort（静态）
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.abort !== 'function') {
+    AbortSignal.abort = function (reason) {
+      var controller = new AbortController();
+      controller.abort(reason !== undefined ? reason : abortError());
+      return controller.signal;
     };
   }
 
@@ -268,6 +326,107 @@
     });
   }
 
+  // Chromium 130：Uint8Array.prototype.toHex / Uint8Array.fromHex
+  //
+  // ⚠️ 实测 11 个插件 bundle 在用 `toHex`（含 dsh-client-connection）。
+  //    它与 toBase64 是同一批提案，当初也只补了 base64 那一半。
+  if (typeof Uint8Array.fromHex !== 'function') {
+    Uint8Array.fromHex = function (hex) {
+      var s = String(hex);
+      if (s.length % 2 !== 0) throw new SyntaxError('Invalid hex string');
+      var out = new Uint8Array(s.length / 2);
+      for (var i = 0; i < out.length; i++) {
+        var byte = parseInt(s.substr(i * 2, 2), 16);
+        if (byte !== byte) throw new SyntaxError('Invalid hex string');
+        out[i] = byte;
+      }
+      return out;
+    };
+  }
+  if (typeof Uint8Array.prototype.toHex !== 'function') {
+    Object.defineProperty(Uint8Array.prototype, 'toHex', {
+      value: function () {
+        var out = '';
+        for (var i = 0; i < this.length; i++) {
+          out += (this[i] < 16 ? '0' : '') + this[i].toString(16);
+        }
+        return out;
+      },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
+  // Chromium 126：URL.parse（静态，失败返回 null 而不是抛错）
+  if (typeof URL.parse !== 'function') {
+    URL.parse = function (url, base) {
+      try {
+        return new URL(url, base);
+      } catch (e) {
+        return null;
+      }
+    };
+  }
+
+  // Chromium 114：ArrayBuffer.prototype.transfer / transferToFixedLength
+  //
+  // ⚠️ 语义要点：transfer 之后**原 buffer 被 detach**（byteLength 变 0），
+  //    所有权转到新 buffer。这里用「复制 + 把原 buffer 的字节长度清零」模拟。
+  //    真正的 detach 无法在 JS 里做到（那是引擎内部状态），实测调用方
+  //    （pdf.js 里的 wasm 内存搬运）只关心「拿到等长的新内容」，
+  //    不依赖原 buffer 抛错 —— 已核对 client.pdf.js 的用法。
+  if (typeof ArrayBuffer.prototype.transfer !== 'function') {
+    Object.defineProperty(ArrayBuffer.prototype, 'transfer', {
+      value: function (newLength) {
+        var len = newLength === undefined ? this.byteLength : newLength;
+        var out = new ArrayBuffer(len);
+        var copyLen = Math.min(this.byteLength, len);
+        new Uint8Array(out).set(new Uint8Array(this, 0, copyLen));
+        try {
+          // 尽力而为的 detach 近似：多数引擎里 byteLength 是只读的，失败就算了
+          Object.defineProperty(this, 'byteLength', { value: 0, configurable: true });
+        } catch (e) {
+          /* 忽略：拿不到真 detach 不影响调用方用法 */
+        }
+        return out;
+      },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  if (typeof ArrayBuffer.prototype.transferToFixedLength !== 'function') {
+    Object.defineProperty(ArrayBuffer.prototype, 'transferToFixedLength', {
+      value: function (newLength) {
+        return ArrayBuffer.prototype.transfer.call(this, newLength);
+      },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
+  // Chromium 92：crypto.randomUUID
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID !== 'function') {
+    crypto.randomUUID = function () {
+      var bytes = new Uint8Array(16);
+      if (typeof crypto.getRandomValues === 'function') {
+        crypto.getRandomValues(bytes);
+      } else {
+        for (var i = 0; i < 16; i++) bytes[i] = (Math.random() * 256) | 0;
+      }
+      // 版本 4（随机）+ 变体 10xx，与规范一致
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      var hex = [];
+      for (var j = 0; j < 16; j++) hex.push((bytes[j] < 16 ? '0' : '') + bytes[j].toString(16));
+      var s = hex.join('');
+      return s.slice(0, 8) + '-' + s.slice(8, 12) + '-' + s.slice(12, 16) + '-' +
+        s.slice(16, 20) + '-' + s.slice(20);
+    };
+  }
+
   // Chromium 133：Map.prototype.getOrInsert / getOrInsertComputed
   if (typeof Map.prototype.getOrInsert !== 'function') {
     Object.defineProperty(Map.prototype, 'getOrInsert', {
@@ -373,6 +532,291 @@
       }
     }
   })();
+
+  // Chromium 97：Array.prototype.findLast / findLastIndex
+  // Chromium 110：Array.prototype.toSorted / toReversed
+  //
+  // ⚠️ 这一族的调用点在**插件的 client bundle** 里，而**不在** `dsh-web-frontend/dist`
+  //    —— 上面那段是按 dist 一个个数出来的，而 dist（官方前端壳）恰好一处都没用到它们，
+  //    于是整族被漏掉。这族是「降级 bundle 里仍在调用」的又一批，性质与上面完全相同。
+  //
+  //    真机症状（粉丝反馈，小米 13 / MIUI 14）：
+  //      · composer 里点模型选择器 → 红字 `groups.toSorted is not a function`，
+  //        点「重试」无效（每次重算 provider 顺序都会再抛一次）；
+  //      · 设置页的「模型」标签页**整页空白** —— 同一个坑的另一处（`rows.toSorted`）。
+  //
+  //    调用方（扫过全部 WebView 侧 bundle）：
+  //      toSorted     : dsh-client-ui-model-selection（`orderModelProviders`）、
+  //                     -settings-models、-schedule
+  //      toReversed   : -sidebar-documentpreview 的 client.pdf.js
+  //      findLast     : -chat ×5、-conversation ×2、-sidebar-documentpreview
+  //      findLastIndex: -trajectory、-sidebar-documentpreview
+  //
+  // ⚠️ **只覆盖 `Array.prototype`，不覆盖 TypedArray。** 这一族的 TypedArray 版本
+  //    标准要求返回**同类型**的新 TypedArray，拿上面 `.at()` 那种「一个函数套所有原型」
+  //    的写法顶替会静默改变返回类型。而扫遍全部 WebView 侧 bundle，
+  //    TypedArray 上并没有它们的调用点 —— 不能拿 `.at()` 的覆盖范围直接类比。
+  (function () {
+    var methods = {
+      findLast: function (predicate, thisArg) {
+        if (typeof predicate !== 'function') {
+          throw new TypeError('predicate must be a function');
+        }
+        for (var i = this.length - 1; i >= 0; i--) {
+          if (predicate.call(thisArg, this[i], i, this)) return this[i];
+        }
+        return undefined;
+      },
+      findLastIndex: function (predicate, thisArg) {
+        if (typeof predicate !== 'function') {
+          throw new TypeError('predicate must be a function');
+        }
+        for (var i = this.length - 1; i >= 0; i--) {
+          if (predicate.call(thisArg, this[i], i, this)) return i;
+        }
+        return -1;
+      },
+      // 与 `sort()` 的唯一差别是**返回副本、不动原数组**（调用方依赖这一点：
+      // `state.groups` 是 store 里的快照，就地排序会污染它）。
+      // compareFn 的类型校验交给原生 `sort`，语义（含 undefined ⇒ 字典序）完全一致。
+      toSorted: function (compareFn) {
+        var copy = [];
+        for (var i = 0; i < this.length; i++) copy.push(this[i]);
+        return copy.sort(compareFn);
+      },
+      toReversed: function () {
+        var copy = [];
+        for (var i = this.length - 1; i >= 0; i--) copy.push(this[i]);
+        return copy;
+      },
+    };
+    for (var name in methods) {
+      if (typeof Array.prototype[name] !== 'function') {
+        Object.defineProperty(Array.prototype, name, {
+          value: methods[name],
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+    }
+  })();
+
+  // Chromium 98：structuredClone
+  //
+  // ⚠️ 这一族和上面那段是**同一个病根**：旧的清单只扫了 `dsh-web-frontend/dist`
+  //    （官方 shell），而调用点其实在**插件的 client bundle** 里，于是整族被漏掉。
+  //    现在降级与盘点都覆盖到了插件（见 `tools/build-webview-compat.ps1` 的 v2 说明）。
+  //
+  //    三个包在用，且都在**用户主路径**上：
+  //      · dsh-client-ui-settings          —— `mutate()` 克隆 ops 后再写配置
+  //      · dsh-client-ui-settings-models   —— `structuredClone(subtree)` 读模型配置
+  //        （缺了它，「模型」设置页整页空白）
+  //      · -sidebar-documentpreview/client.pdf.js —— pdf.js 内部 4 处
+  //
+  //    实现在这里刻意用「优先原生 → 再退到带类型的深拷贝」：原生存在时（新旧内核
+  //    都有）直接用，只有真缺才补 —— 与文件里其它段落一样保持幂等。
+  //
+  // ⚠️ **兜底实现只覆盖 JSON 能表达的数据**（普通对象/数组/字符串/数字/布尔/null），
+  //    另外单独处理 Date / Map / Set / RegExp / ArrayBuffer / TypedArray。
+  //    **注意：pdf.js 那 4 处调用带了 `{ transfer }` 第二参，而这里的兜底实现
+  //    忽略 transfer**（不做 ArrayBuffer 所有权转移，改为复制）——语义上更安全
+  //    （源 buffer 仍可用），代价是多一次内存拷贝。
+  //    pdf.js 的 worker 消息克隆拿到的是副本，不影响正确性。
+  if (typeof structuredClone !== 'function') {
+    (function () {
+      function cloneValue(value, seen) {
+        if (value === null || typeof value !== 'object') return value;
+        // 环引用保护：结构化克隆支持环，朴素的递归会栈溢出
+        var hit = seen.get(value);
+        if (hit) return hit;
+
+        var proto = Object.getPrototypeOf(value);
+        var out;
+
+        if (value instanceof Date) return new Date(value.getTime());
+        if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+        if (value instanceof ArrayBuffer) return value.slice(0);
+        if (ArrayBuffer.isView(value)) {
+          // TypedArray / DataView：复制底层 buffer 并保持视图窗口
+          var buf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+          return value instanceof DataView
+            ? new DataView(buf)
+            : new value.constructor(buf);
+        }
+        if (value instanceof Map) {
+          out = new Map();
+          seen.set(value, out);
+          value.forEach(function (v, k) {
+            out.set(cloneValue(k, seen), cloneValue(v, seen));
+          });
+          return out;
+        }
+        if (value instanceof Set) {
+          out = new Set();
+          seen.set(value, out);
+          value.forEach(function (v) {
+            out.add(cloneValue(v, seen));
+          });
+          return out;
+        }
+        if (Array.isArray(value)) {
+          out = [];
+          seen.set(value, out);
+          for (var i = 0; i < value.length; i++) out[i] = cloneValue(value[i], seen);
+          return out;
+        }
+        // 普通对象（含 null 原型）。只复制可枚举的自有属性 —— 与结构化克隆一致
+        // （它不搬原型链，结果一律是普通对象）。
+        out = proto === null ? Object.create(null) : {};
+        seen.set(value, out);
+        var keys = Object.keys(value);
+        for (var j = 0; j < keys.length; j++) {
+          out[keys[j]] = cloneValue(value[keys[j]], seen);
+        }
+        return out;
+      }
+      var shim = function (value /* , options */) {
+        return cloneValue(value, new WeakMap());
+      };
+      try {
+        Object.defineProperty(self, 'structuredClone', {
+          value: shim,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      } catch (e) {
+        self.structuredClone = shim;
+      }
+    })();
+  }
+
+  // Chromium 87：Intl.Segmenter
+  //
+  // ⚠️ **这个比上面那个更急**：`dsh-client-ui-chat` 是在**模块顶层**构造它的
+  //    （`const LIVE_TOOL_DETAIL_SEGMENTER = new Intl.Segmenter(...)`），
+  //    缺了会在**加载插件那一刻**就抛，整个 chat 插件的 client bundle 注册失败。
+  //    `client.pdf.js` 里另有两处（`granularity: "grapheme" / "word"`）。
+  //
+  // ⚠️ 兜底实现的**切分粒度不如原生**，这是有意的取舍：
+  //    · grapheme：用 `\p{Extended_Pictographic}` + 组合记号近似，能挡住最常见的
+  //      「emoji / 变音符号被从中间截断」；但不等价于完整的 UAX #29。
+  //    · word：按 `Intl.Segmenter` 的词边界近似（拉丁词 + CJK 逐字）。
+  //    调用场景是**给 UI 显示细节做截断**（chat 的 tool detail 限 160 字符）和
+  //    pdf 里的词边界判断，截断点略偏不会造成错误结果，只会略有出入。
+  //    真要有原生就用原生的（新内核走不到这里）。
+  //
+  //    `containing()` 是 pdf.js 用到的关键方法（L24756/24760），必须实现。
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter !== 'function') {
+    (function () {
+      // ⚠️ **正则必须用 `new RegExp` 在运行时构造，绝不能写成字面量。**
+      //    正则字面量在**解析阶段**就被编译：万一某个老内核不认
+      //    `\p{Extended_Pictographic}`（Unicode 属性转义里的这个值比 `/u` 本身更晚
+      //    落地），抛的是 SyntaxError —— 那会让**整个 polyfill 文件**解析失败，
+      //    连带上面所有补丁一起失效。这是本项目最不能接受的一种失败。
+      //    退一步只让 grapheme 粒度退化成「按码元切」，比整体炸掉好得多。
+      //
+      // 近似 grapheme 切分：组合记号、变体选择符、零宽连接符、区域指示符都吸附到前一个
+      var GRAPHEME_RE = null;
+      try {
+        GRAPHEME_RE = new RegExp(
+          '(?:\\p{Extended_Pictographic}(?:\\uFE0F|\\u200D\\p{Extended_Pictographic})*|\\P{M}\\p{M}*|[\\s\\S])',
+          'gu'
+        );
+      } catch (e) {
+        GRAPHEME_RE = null;
+      }
+      var WORD_RE = null;
+      try {
+        WORD_RE = new RegExp("[\\p{L}\\p{N}_'’]+|\\s+|[^\\s\\p{L}\\p{N}_]", 'gu');
+      } catch (e) {
+        WORD_RE = null;
+      }
+
+      // 兜底切分（零依赖）：逐码元推进，遇到代理对合并成一个整体。
+      // 粒度只到「码元/码点」，不处理组合记号 —— 好过完全不切。
+      function fallbackSplit(source) {
+        var out = [];
+        for (var i = 0; i < source.length; i++) {
+          var code = source.charCodeAt(i);
+          if (code >= 0xd800 && code <= 0xdbff && i + 1 < source.length) {
+            out.push(source.slice(i, i + 2));
+            i++;
+          } else {
+            out.push(source[i]);
+          }
+        }
+        return out;
+      }
+
+      function makeSegments(source, parts) {
+        var list = [];
+        var index = 0;
+        for (var i = 0; i < parts.length; i++) {
+          var seg = parts[i];
+          if (seg === '') continue;
+          list.push({ segment: seg, index: index, input: source, isWordLike: /\S/.test(seg) });
+          index += seg.length;
+        }
+        return list;
+      }
+
+      function Segmenter(locales, options) {
+        if (!(this instanceof Segmenter)) return new Segmenter(locales, options);
+        this._granularity = (options && options.granularity) || 'grapheme';
+        this.resolvedOptions = function () {
+          return { locale: 'und', granularity: this._granularity };
+        };
+      }
+      Segmenter.prototype.segment = function (input) {
+        var source = input === undefined || input === null ? '' : String(input);
+        var parts;
+        if (this._granularity === 'word') {
+          parts = WORD_RE ? source.match(WORD_RE) : source.split(/(\s+)/);
+        } else {
+          parts = GRAPHEME_RE ? source.match(GRAPHEME_RE) : fallbackSplit(source);
+        }
+        var list = makeSegments(source, parts || []);
+
+        // 迭代器协议：segments 可 for..of，也要能展开成数组。
+        // ⚠️ 每次取 `[Symbol.iterator]()` 都必须返回**新的**迭代器 —— 返回同一个
+        //    会在第二次遍历时拿到已耗尽的那个（`[...segments]` 变空数组）。
+        //    原生就是这么定的，chat 那边用 `Array.from(segmenter.segment(x), ...)` 取值。
+        var segments = {
+          containing: function (index) {
+            for (var i = 0; i < list.length; i++) {
+              if (index >= list[i].index && index < list[i].index + list[i].segment.length) {
+                return list[i];
+              }
+            }
+            return undefined;
+          },
+          [Symbol.iterator]: function () {
+            var i = 0;
+            return {
+              next: function () {
+                return i < list.length
+                  ? { value: list[i++], done: false }
+                  : { value: undefined, done: true };
+              },
+            };
+          },
+        };
+        return segments;
+      };
+      try {
+        Object.defineProperty(Intl, 'Segmenter', {
+          value: Segmenter,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      } catch (e) {
+        Intl.Segmenter = Segmenter;
+      }
+    })();
+  }
 
   // Chromium 93：Object.hasOwn
   // 与 `hasOwnProperty` 的差别是**不查原型链、对 null 原型对象也安全**。

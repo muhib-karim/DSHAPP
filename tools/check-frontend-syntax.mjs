@@ -21,13 +21,62 @@
  * ⚠️ 只覆盖**语法**。`Object.hasOwn` / `.at()` / `WeakRef` 这类是**运行时 API**，
  *   解析器看不见，由 `webview-polyfill.js` 负责（见该文件对应段落）。
  *
+ * ── 调用方 ──────────────────────────────────────────────────────────
+ *
+ * `tools/build-webview-compat.ps1` 的复检环节会**无人值守**地调它，所以：
+ *   · `acorn` 缺失时**自己装一份**到临时目录（不要要求调用方先 npm install）；
+ *   · 退出码要能区分「真有语法缺口(1)」与「工具本身跑不起来(2)」——
+ *     否则环境问题会被误报成「降级失败」，排查方向直接跑偏。
+ *
  * 用法：node tools/check-frontend-syntax.mjs [--target 74] <文件...>
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const require = createRequire(import.meta.url);
-const acorn = require('acorn');
+
+/**
+ * 取 acorn：先本仓库，再全局，最后**自己装一份**。
+ *
+ * ⚠️ 本仓库**没有** `package.json` / `node_modules`（这是个 Android 工程，
+ *    JS 只在 `tools/` 下当构建期脚本用），所以「找不到 acorn」是**常态**而非异常。
+ *    早先没这段兜底时，`Cannot find module 'acorn'` 会被上层当成语法不合格，
+ *    于是每个文件都「失败」—— 实测报出 72 个「降级失败」，真因其实一个都没有。
+ */
+async function loadAcorn() {
+  try {
+    return require('acorn');
+  } catch {
+    /* 落到下面自装 */
+  }
+  const dir = join(tmpdir(), 'dsh-syntax-check');
+  const marker = join(dir, 'node_modules', 'acorn', 'package.json');
+  if (!existsSync(marker)) {
+    process.stderr.write('安装 acorn（构建期工具，不进仓库）…\n');
+    const env = { ...process.env };
+    // 与 build-webview-compat.ps1 同一个代理：本机直连 npm 会超时
+    if (!env.HTTPS_PROXY) env.HTTPS_PROXY = 'http://127.0.0.1:7897';
+    if (!env.HTTP_PROXY) env.HTTP_PROXY = 'http://127.0.0.1:7897';
+    execFileSync(
+      process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      ['install', 'acorn@8', '--prefix', dir, '--no-audit', '--no-fund', '--loglevel=error'],
+      { stdio: 'inherit', env, shell: process.platform === 'win32' }
+    );
+  }
+  return createRequire(join(dir, 'index.cjs'))('acorn');
+}
+
+let acorn;
+try {
+  acorn = await loadAcorn();
+} catch (e) {
+  // 退出码 2：工具跑不起来 ≠ 产物有语法缺口。调用方必须能把这两者分开。
+  console.error(`无法加载 acorn，校验未能执行（不是语法问题）: ${e.message}`);
+  process.exit(2);
+}
 
 const argv = process.argv.slice(2);
 let target = 74;

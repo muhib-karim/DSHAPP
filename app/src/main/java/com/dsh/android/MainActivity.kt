@@ -1354,13 +1354,21 @@ class MainActivity : AppCompatActivity() {
         /**
          * 降级前端生效后的实际门槛。
          *
-         * `EngineManager.ensureWebViewCompat()` 会把官方 bundle 换成按
-         * **chrome74** 降级编译的版本（class static block 被展开、逻辑赋值被改写），
-         * 于是门槛降到 74。取 74 而不是 83（反馈设备那个版本）是留一档余量：
-         * esbuild 的 `chrome74` 目标保证不生成 74 之后才有的语法。
+         * `EngineManager.ensureWebViewCompat()` 会把 bundle 换成按 **chrome74** 降级
+         * 编译的版本（class static block 被展开、逻辑赋值被改写），于是门槛降到 74。
+         * 取 74 而不是 83（反馈设备那个版本）是留一档余量：esbuild 的 `chrome74`
+         * 目标保证不生成 74 之后才有的语法。
+         *
+         * ⚠️ **降级范围是「dist + 全部插件的 client bundle」**（v2 起）。只降 dist
+         *   是不够的 —— 实测 71 个插件 bundle 里 68 个在 chrome74 下有语法缺口，
+         *   而它们与 dist 是**各自独立编译**的。只覆盖 dist 时症状不是白屏，而是
+         *   「某个插件静默不生效 / 某块 UI 永远空白」（线上真实反馈：
+         *   `groups.toSorted is not a function` 打不开模型选择器、
+         *   「模型」设置页整页空白）。
          *
          * ⚠️ 74 之后引入的 **API**（`Object.hasOwn` 93、`.at()` 92、
-         *   `reportError` 95 …）由 `webview-polyfill.js` 兜底，两者配合才完整。
+         *   `reportError` 95、`structuredClone` 98、`Intl.Segmenter` 87 …）
+         *   由 `webview-polyfill.js` 兜底，两者配合才完整。
          *
          * ⚠️ 降级**没打上**时不能放行：那时跑的是官方 bundle，
          *   门槛必须退回 [MIN_WEBVIEW_MAJOR]（见 `effectiveMinWebViewMajor`）。

@@ -310,17 +310,31 @@ class EngineManager private constructor(private val context: Context) {
      *   vendor : private method ×3（需 84）、逻辑赋值 ×7（需 85）
      *   CSS    : inset ×18（需 87）
      *
-     * **做法**：`tools/build-webview-compat.ps1` 用 esbuild 把 dist 降到
-     * `--target=chrome74`，只把**真有语法缺口**的 3 个文件打进
-     * [WEBVIEW_COMPAT_ASSET]，这里解出来覆盖 dist。
+     * **降级范围是「三棵树」，不是只有 dist**（v2 起）。前端分两部分下发，
+     * 各自独立编译，只降 dist 会漏掉全部插件：
      *
-     * ⚠️ **必须放在 [ensureWebCompat] 里一起调用**，且要在注入 polyfill 标签**之前** ——
-     *    `index.html` 本身不在资产里（它没有语法缺口），但顺序上先换 bundle 更清楚。
+     * | zip 条目前缀 | 落到哪 | 为什么 |
+     * |---|---|---|
+     * | `dist/`     | `engine/…/dsh-web-frontend/dist/` | 官方 shell |
+     * | `engine/`   | `engine/node_modules/@deepseek-ai/` | 71 个插件的 client bundle |
+     * | `mobileui/` | `$DSH_HOME/mobile-ui/dsh-android-mobile/` | App 自己注入的插件 |
+     *
+     * ⚠️ **这是线上真实踩到的坑**（用户反馈 `groups.toSorted is not a function`，
+     *    模型选择器整块打不开；同一类缺口的 `dsh-client-ui-settings-models`
+     *    则让「模型」设置页**完全空白**）。v1 只降了 dist，实测 71 个插件 bundle 里
+     *    有 68 个在 chrome74 下有语法缺口 —— 覆盖率不到 5%。
+     *
+     * ⚠️ **`mobileui/` 必须晚于 [ensureMobileUi] 执行**：[ensureMobileUi] 里
+     *    版本戳不一致时会 `target.deleteRecursively()` 整个重解包，**会把降级产物抹掉**。
+     *    所以在 [start] 里的调用顺序是 `ensureMobileUi()` → `ensureWebViewCompat()`
+     *    （而 `dist`/`engine` 两棵树没有这个问题，谁先谁后都行）。
      *
      * ⚠️ 幂等靠 `dist/.webview-compat-stamp` 与 zip 内 `.compat-stamp` 比对。
      *    **戳文件写在 dist 里而不是别处**：引擎升级会重新解包 dist，戳跟着一起没，
      *    于是自动重打 —— 正是想要的。文件名带内容 hash（`index-5SrrfWpU.js`），
      *    引擎升级后旧资产必然对不上，必须重跑脚本重新生成。
+     *    ⚠️ 换降级范围/目标必须 bump `-CompatVersion`，否则老设备命中「戳一致 → 跳过」，
+     *    新纳入的那部分**永远不生效**（静默，最难查的那种）。
      */
     private fun ensureWebViewCompat() {
         val dist = File(engineDir, "node_modules/@deepseek-ai/dsh-web-frontend/dist")
@@ -353,8 +367,23 @@ class EngineManager private constructor(private val context: Context) {
                 return
             }
 
-            val stampFile = File(dist, WEBVIEW_COMPAT_STAMP)
-            if (stampFile.isFile && stampFile.readText().trim() == stampInZip) {
+            val engineModules = File(engineDir, "node_modules/@deepseek-ai")
+            val mobileUiRoot = File(dshHome, "$MOBILE_UI_DIR/$MOBILE_UI_PACKAGE")
+
+            // ⚠️ **两棵树各判各的戳，不能只看 dist 那一个。**
+            // [ensureMobileUi] 在版本戳不一致时会 `deleteRecursively()` 整个重解包
+            // mobile-ui 目录 —— 降级产物连同它自己的戳一起被抹掉。若这里仍按 dist 的戳
+            // 判定「已就位」就整体跳过，结果就是**新装的 mobile-ui 是没降级的原版**，
+            // 在老内核上静默退回桌面布局。两戳分开后，重解包会自动触发重降级。
+            val distUpToDate = File(dist, WEBVIEW_COMPAT_STAMP).let {
+                it.isFile && it.readText().trim() == stampInZip
+            }
+            val wantsMobile = entries.keys.any { it.startsWith("$COMPAT_PREFIX_MOBILEUI/") }
+            val mobileStamp = File(mobileUiRoot, WEBVIEW_COMPAT_STAMP)
+            val mobileUpToDate = !wantsMobile ||
+                (mobileStamp.isFile && mobileStamp.readText().trim() == stampInZip)
+
+            if (distUpToDate && mobileUpToDate) {
                 webViewCompatApplied = true
                 // 幂等跳过也要打日志：否则「降级到底在不在」只能靠翻文件系统确认，
                 // 而真机上排查白屏时这条信息恰恰最关键（见 MainActivity 的门槛判定）。
@@ -362,23 +391,73 @@ class EngineManager private constructor(private val context: Context) {
                 return
             }
 
-            var written = 0
+            val counts = LinkedHashMap<String, Int>()
+            var distWrote = false
+            var mobileWrote = false
+
             for ((name, bytes) in entries) {
-                val out = File(dist, name)
+                // 条目前缀决定落到哪棵树。前缀本身就是防目录穿越的第一道闸：
+                // 认不出的前缀直接丢弃，绝不按 zip 里的路径原样拼。
+                val prefix = name.substringBefore('/')
+                val root: File
+                val rel: String
+                when (prefix) {
+                    COMPAT_PREFIX_DIST -> {
+                        if (distUpToDate) continue
+                        root = dist
+                        rel = name.removePrefix("$COMPAT_PREFIX_DIST/")
+                        distWrote = true
+                    }
+                    COMPAT_PREFIX_ENGINE -> {
+                        if (distUpToDate) continue
+                        root = engineModules
+                        rel = name.removePrefix("$COMPAT_PREFIX_ENGINE/")
+                        distWrote = true
+                    }
+                    COMPAT_PREFIX_MOBILEUI -> {
+                        if (mobileUpToDate) continue
+                        root = mobileUiRoot
+                        rel = name.removePrefix("$COMPAT_PREFIX_MOBILEUI/")
+                        mobileWrote = true
+                    }
+                    else -> {
+                        Log.w(TAG, "跳过前缀无法识别的降级条目: $name")
+                        continue
+                    }
+                }
+
+                val out = File(root, rel)
                 // 防目录穿越：资产是我们自己打的，但解包路径仍按约定校验
-                if (!out.canonicalPath.startsWith(dist.canonicalPath + File.separator)) {
+                if (!out.canonicalPath.startsWith(root.canonicalPath + File.separator)) {
                     Log.w(TAG, "跳过越界的资产条目: $name")
+                    continue
+                }
+                // mobile-ui 那棵树要等 [ensureMobileUi] 先解包出目录才能写。
+                // 真缺了就跳过（下次启动会重试，因为戳没写），不要把整趟降级带崩 ——
+                // dist/engine 两棵树跟它无关，照常生效。
+                if (prefix == COMPAT_PREFIX_MOBILEUI && !mobileUiRoot.isDirectory) {
+                    mobileWrote = false
                     continue
                 }
                 out.parentFile?.mkdirs()
                 out.writeBytes(bytes)
-                written++
+                counts[prefix] = (counts[prefix] ?: 0) + 1
             }
-            stampFile.writeText(stampInZip)
+
+            // 戳只在对应树真的写了之后才落盘，否则会把「没写成功」记成「已完成」
+            if (distWrote || distUpToDate) {
+                File(dist, WEBVIEW_COMPAT_STAMP).writeText(stampInZip)
+            }
+            if (mobileWrote) {
+                File(mobileUiRoot, WEBVIEW_COMPAT_STAMP).writeText(stampInZip)
+            } else if (wantsMobile && !mobileUpToDate) {
+                Log.w(TAG, "移动端 UI 插件尚未就位，其降级条目顺延到下次启动")
+            }
+
             webViewCompatApplied = true
             Log.i(
                 TAG,
-                "已应用 WebView 降级前端: $written 个文件（$stampInZip）",
+                "已应用 WebView 降级前端: ${counts.entries.joinToString(", ") { "${it.key}=${it.value}" }} 个文件（$stampInZip）",
             )
         } catch (t: Throwable) {
             // 打不上就维持原样：新内核本来就不需要它，旧内核也只是回到白屏
@@ -2755,8 +2834,6 @@ class EngineManager private constructor(private val context: Context) {
 
         // 前端补丁要在 WebView 首次加载前落盘，所以放在启动引擎这一步里
         ensureWebCompat()
-        // 降级 bundle 必须紧跟其后：polyfill 只补 API，语法缺口得靠换 bundle
-        ensureWebViewCompat()
         // 原生插件是引擎启动的前提（DSH 的 profile 解析依赖它），必须早于进程启动
         ensureNativeAddon()
         // system 插件（会话写入锁）：缺了它每轮回复都会以「本轮运行失败」告终
@@ -2780,6 +2857,11 @@ class EngineManager private constructor(private val context: Context) {
         ensurePickerRoots()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
         ensureMobileUi()
+        // 降级 bundle：polyfill 只补 API，语法缺口得靠换 bundle 覆盖 dist 与各插件。
+        // ⚠️ **必须在 ensureMobileUi() 之后**：那一支在版本戳不一致时会
+        // `deleteRecursively()` 重解包 mobile-ui 目录，先降级会被它整个抹掉。
+        // （dist / engine 两棵树与该顺序无关，只是顺手放在一起。）
+        ensureWebViewCompat()
         // 出厂默认设置：只写 profile 的用户 patch 层，且只在它不存在时写一次。
         // 必须早于引擎启动 —— 引擎的 initProfile() 会给缺失的 patch 文件补一份空模板。
         seedDefaultSettings()
@@ -3203,14 +3285,25 @@ class EngineManager private constructor(private val context: Context) {
         /**
          * 按旧内核降级编译的前端 bundle（见 [ensureWebViewCompat]）。
          *
-         * 由 `tools/build-webview-compat.ps1` 生成，只含真有语法缺口的文件
-         * （实测 3 个，438 KB）。**换了 engine.bin 必须重跑脚本**。
+         * 由 `tools/build-webview-compat.ps1` 生成，含 dist 与**各插件的 client bundle**
+         * 两部分的降级产物（老版本只含 dist，实测漏了 71 个插件里 68 个的语法缺口）。
+         * **换了 engine.bin 必须重跑脚本**。
          */
         private const val WEBVIEW_COMPAT_ASSET = "webview-compat.zip"
 
         /** 降级资产在 dist 里留下的戳，以及 zip 内对应的条目名。 */
         private const val WEBVIEW_COMPAT_STAMP = ".webview-compat-stamp"
         private const val WEBVIEW_COMPAT_STAMP_ENTRY = ".compat-stamp"
+
+        /**
+         * 降级 zip 的条目树前缀 —— 决定每个条目解到哪棵树上（见 [ensureWebViewCompat]）。
+         *
+         * ⚠️ 这三个字符串必须与 `tools/build-webview-compat.ps1` 里写死的一致：
+         *    对不上时条目会被当「前缀无法识别」丢掉，症状是降级**静默不生效**。
+         */
+        private const val COMPAT_PREFIX_DIST = "dist"
+        private const val COMPAT_PREFIX_ENGINE = "engine"
+        private const val COMPAT_PREFIX_MOBILEUI = "mobileui"
 
         /** 自编译的 android-arm64 原生插件（官方无此变体）。 */
         private const val ADDON_ASSET = "node-addon-android-arm64.zip"

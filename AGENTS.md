@@ -2141,6 +2141,9 @@ ptrace/Frida 不受此限。
 
 ### ⑯ 旧 WebView 内核白屏 —— 前端 bundle 降级编译（**不是** polyfill）
 
+> ⚠️ **降级范围是「三棵树」，不是只有 dist**（v2 起，`-CompatVersion 2`）。
+> 只降 dist 是**不够的**，这是线上真实踩到的坑，见本节末尾的「v2：插件 bundle」。
+
 **症状**（用户反馈的 45 秒录屏，vivo Y52s / V2057A / Android 10 / Funtouch OS 10.5）：
 启动层走完「正在启动引擎…」→「正在准备界面…」，然后**一片纯白**，永远不出来。
 
@@ -2249,6 +2252,95 @@ WebView 降级前端已就位，跳过（chrome74-1）             ← 之后每
 戳跟着一起没 ⇒ 自动重打，正是想要的。实测删掉戳后下次启动会重新应用。
 ⚠️ 文件名带内容 hash（`index-5SrrfWpU.js`），**换 `engine.bin` 后必然对不上，必须重跑脚本**。
 ⚠️ 降级资产**打不上时不能放行**：门槛会退回 94，宁可提示用户升级内核，也不要放进一片白屏。
+
+#### v2：只降 `dist` 是不够的 —— 插件 bundle 也要降（**线上真实踩到**）
+
+**症状**（粉丝反馈，小米 13 / MIUI 14，内核版本未知但 < 110）：
+composer 里点模型选择器弹红字 `groups.toSorted is not a function`，点「重试」无效；
+设置页的「模型」标签页**整页空白**。
+
+**根因**：`dsh-client-ui-model-selection/lib/client.js:475` 的
+`orderModelProviders(groups)` 直接调 `groups.toSorted(...)`（**Chrome 110+**），
+`dsh-client-ui-settings-models/lib/client.js:929` 是 `rows.toSorted(...)`（同一个坑）。
+`toSorted` 是**运行时 API** 而不是语法，所以 esbuild 降级**碰不到它**
+（`--target` 只管语法）—— 必须由 polyfill 补。而 v1 的 polyfill 清单是
+**只扫 `dsh-web-frontend/dist` 数出来的**，`toSorted` 那一族在 dist 里**一次都没出现**，
+于是整族被漏掉。
+
+**要害：前端是分两部分下发的，各自独立编译。** 只降 dist ≈ 覆盖率不到 5%：
+
+| 部分 | 位置 | v1 覆盖 |
+|---|---|---|
+| 官方 shell | `node_modules/@deepseek-ai/dsh-web-frontend/dist/` | ✅ |
+| **71 个插件**的客户端 bundle | `node_modules/@deepseek-ai/*/lib/client.js` | ❌ |
+| App 自己注入的移动端 UI 插件 | `$DSH_HOME/mobile-ui/dsh-android-mobile/` | ❌ |
+
+实测在 `--target=chrome74` 下扫描：**dist 61 个文件里 2 个**有缺口，
+而**插件 85 个 `client*.js` 里 68 个**有缺口（`dsh-api-remotes` 一个包就有 ×340 逻辑赋值）。
+
+⚠️ **插件缺语法时的症状比白屏更隐蔽**：dist 挂掉是整页白屏（一眼可见），
+而插件挂掉是**「这一个插件静默不生效」或「这一块 UI 永远空白」** ——
+`window.__ModuleLoader__.load()` 根本没执行，宿主与页面都收不到完整报错。
+本次的 `toSorted` 只是其中一类（API 类），语法类症状与它同构。
+
+**做法（v2）**：脚本的降级范围扩到三棵，zip 条目**带树前缀**，App 侧按前缀分派：
+
+| zip 条目前缀 | 解到哪棵树 |
+|---|---|
+| `dist/` | `engine/node_modules/@deepseek-ai/dsh-web-frontend/dist/` |
+| `engine/` | `engine/node_modules/@deepseek-ai/` |
+| `mobileui/` | `$DSH_HOME/mobile-ui/dsh-android-mobile/` |
+
+实测产物：**72 个文件**（dist 3 + engine 68 + mobileui 1），**9.95 MB**。
+
+⚠️ **`-CompatVersion` 必须 bump 到 2**：v1 的戳（`chrome74-1`）已经落在老设备的
+dist 里，不 bump 会命中「戳一致 → 跳过」，于是**新纳入的插件部分永远不生效** ——
+静默，且症状与没修一模一样。现在戳是 `chrome74-v2`（`$Target-v$CompatVersion`）。
+
+⚠️ **mobile-ui 那棵树必须晚于 `ensureMobileUi()`**：那一支在版本戳不一致时会
+`target.deleteRecursively()` 整个重解包 mobile-ui 目录，**会把降级产物连同它的戳一起抹掉**。
+所以 `start()` 里的顺序是 `ensureMobileUi()` → `ensureWebViewCompat()`
+（dist / engine 两棵树与顺序无关）。
+
+⚠️ **两棵树各判各的戳**：只按 dist 的戳判定「已就位」整体跳过的话，上面那次重解包
+之后的 mobile-ui 就是**没降级的原版**，老内核上静默退回桌面布局。
+
+⚠️ **写 `client*.js` 到磁盘对运行时真的生效**（已核实，不是推测）：
+`dsh-client-modules` 的 `/plugins` 路由是 `readFileSync(record.meta.clientPath)`
+（`lib/index.js` 的 613/815/946 行），**每次请求都读盘**；
+浏览器缓存也不会成为障碍 —— 缓存键里的 `rev` 来自
+`artifactRevision(baseline) = framedHash("plugin-artifact", [mtimeMs, ctimeMs, size])`，
+覆盖文件后 `rev` 自动变化。另外 `initialBundleSnapshot()` 在**激活时**读，
+所以必须在**引擎 spawn 之前**覆盖好 —— 当前调用顺序满足。
+
+⚠️ **验收要独立解析器，不能用 esbuild 自己验自己**：脚本第 3.5 步对**每个降级 js 产物**
+调 `tools/check-frontend-syntax.mjs` 复检。实测 71 个 js 全部通过。
+
+⚠️ **复检的两个坑（都踩过）**：
+- **不能把 `.css` 喂给 acorn** —— 它必然报 `Unexpected character '@'`，
+  那是解析器不适用而不是 CSS 有问题。只复检 `*.js`。
+- **必须区分退出码**：`1` = 真有语法缺口，`2` = 校验工具自己跑不起来
+  （本仓库没有 `package.json`，`acorn` 常缺 —— 脚本会自己装一份到临时目录）。
+  早先只判 `-ne 0`，于是 `Cannot find module 'acorn'` 被当成「72 个产物全部降级失败」，
+  真因一个都没有。
+
+**polyfill 同步补齐 v2 新暴露的缺口**（都在用户主路径上）：
+
+| API | 最低内核 | 调用方 |
+|---|---|---|
+| `structuredClone` | **98** | `-ui-settings`（`mutate()`）、`-ui-settings-models`（读模型配置）、`client.pdf.js` ×4 |
+| `Intl.Segmenter` | **87** | `-ui-chat`（**模块顶层**构造！）、`client.pdf.js` ×2 |
+
+⚠️ **`Intl.Segmenter` 比 `structuredClone` 更急**：`-ui-chat` 在**模块顶层**
+`const LIVE_TOOL_DETAIL_SEGMENTER = new Intl.Segmenter(...)`，缺了会在**加载插件那一刻**
+就抛 ⇒ **整个 chat 插件的 client bundle 注册失败**。而 chat 是主界面。
+pdf.js 用到 `segments.containing(index)`，必须实现这个方法。
+⚠️ 它的兜底切分粒度不如原生（UAX #29 完整实现不现实），但调用场景是
+「给 UI 详情做 160 字符截断」和 pdf 里的词边界判断，**截断点略偏不会造成错误结果**。
+⚠️ 该段的正则**必须用 `new RegExp` 运行时构造、不能写成字面量**：
+`\p{Extended_Pictographic}` 若不被某老内核认识，抛的是 **SyntaxError**，
+那会让**整个 polyfill 文件**解析失败、连带上面所有补丁一起失效。
+用 try/catch 包住并退化成「按码点切」。
 
 ## 后台保活（任务切到后台不能断）
 
