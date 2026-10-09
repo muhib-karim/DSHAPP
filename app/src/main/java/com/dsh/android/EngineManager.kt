@@ -1841,9 +1841,50 @@ class EngineManager private constructor(private val context: Context) {
     /**
      * 写出挂载内置预设的 overlay，返回其路径；不可用时返回 null。
      *
-     * 生成的内容 = 「把 registry 的出厂默认预设改成 razor」+「razor 的预设声明行原文」。
-     * 两件事合在**一份**文件里，因为它们本就是同一个功能（内置该预设并默认使用它），
-     * 拆成两份只会多一次 `--patch`。
+     * 生成的内容 = razor 的**预设声明行原文**（来自解包出来的 `cordis.patch.yml`），
+     * 一行都不多。
+     *
+     * ## ⚠️ 为什么这里**不能**再写 `agent-preset-registry` 那一行（踩过，就是本次要修的 bug）
+     *
+     * 老写法把「把 registry 的出厂默认位改成 razor」也塞进这份 overlay：
+     *
+     * ```yaml
+     * - id: agent-preset-registry
+     *   name: '@deepseek-ai/dsh-agent-preset-registry'
+     *   config:
+     *     default: razor
+     * ```
+     *
+     * `readProfilePatches()`（`dsh-app-boot/lib/index.js`）把 `--patch` overlay 追加在
+     * 层序**最顶层**，而 patch 语义是**整块替换 config 而不是深合并**：
+     *
+     * ```js
+     * const patches = structuredClone([
+     *   ...profile.layers.flatMap((layer) => layer.patches),
+     *   ...loadOptionalPatches(binName, context.patchPath) ?? [],
+     *   ...loadOptionalPatches(binName, join(context.home, "cordis.patch.yml")) ?? [],
+     *   ...context.overlays          // ← 本 App 的 --patch 在这里，最后应用
+     * ]);
+     * ```
+     *
+     * 于是 GUI 里点任何一张预设卡片（发 `settings/update {ns:"agent-preset-registry",
+     * patch:{selectedDefault:"ptc"}}`）都会失败：`dsh-settings` 算出 next 后交给
+     * `config-editor.edit()`，后者写完要用**含 overlay 的完整层序**重新 compose 一遍
+     * 再比对（`lib/index.js:122`）：
+     *
+     * ```js
+     * if (!isDeepStrictEqual(flatten(composeEntries([patches])).find((row) => row.id === entry.options.id)?.config ?? {}, next))
+     *   throw new Error(`Configuration for "${entry.options.id}" is overridden by a home patch or command-line overlay`);
+     * ```
+     *
+     * overlay 把 config 盖回 `{default: "razor"}` ⇒ 恒不等于 next ⇒ 抛错。
+     * 用户看到的就是预设页顶部一行红字，**默认预设根本改不了**。
+     *
+     * 这与 AGENTS.md ⑮ 记录的 `llm-pi-ai` 号池老 bug **完全同构**，修法也一致：
+     * 出厂默认位必须落在**用户层**（`profiles/web/cordis.patch.yml`，即 GUI 自己写的
+     * 那份文件），见 [ensurePresetDefault]。这份 overlay 只留 `- insert:` 声明行 ——
+     * `insert` 行不参与 config 覆盖（`inherited()` 对 `patch.insert !== void 0` 直接
+     * 原样返回），所以不影响 GUI 写入校验。
      *
      * ## 为什么是改 `default` 而不是 `selectedDefault`
      *
@@ -1857,16 +1898,10 @@ class EngineManager private constructor(private val context: Context) {
      * ```
      *
      * `selectedDefault` 是 **volatile** 字段 —— 它由用户在 GUI 里选默认预设时写入，
-     * 且**不由任何 patch 提供**。所以这里只改 `default`（出厂默认位）：用户没选过时
+     * 且**不由任何 patch 提供**。所以只改 `default`（出厂默认位）：用户没选过时
      * 新会话用 razor；用户选过之后 `selectedDefault` 优先，**用户在 GUI 里的选择依然
      * 生效**。反过来若去写 `selectedDefault`，就变成 App 每次启动都把用户的默认设置
      * 按回 razor —— 那是把「默认用它」做成了「锁死它」。
-     *
-     * ## 为什么可以整块替换 registry 的 config
-     *
-     * patch 语义是**整块替换 config 而不是深合并**（见 AGENTS.md 里同名警告）。
-     * 官方那行（`dsh-web-app/cordis.patch.yml`）的 config 只有 `default: standard`
-     * 一个字段，没有别的会被这里抹掉，所以替换是安全的。
      *
      * ## ⚠️ 与用户自己装同名插件会撞车
      *
@@ -1886,15 +1921,14 @@ class EngineManager private constructor(private val context: Context) {
             patch.writeText(
                 """
                 # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
-                # 内置预设 dsh-preset-razor（「快准狠模式（通用）」）并默认使用它。
+                # 内置预设 dsh-preset-razor（「快准狠模式（通用）」）的声明行原文，
+                # 来自 .dsh/$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE/cordis.patch.yml。
                 #
-                # 下面第一行是 registry 的出厂默认预设位；用户若在 GUI 里另选了默认，
-                # selectedDefault（volatile，不来自 patch）优先，用户的选择依然生效。
-                # 之后是预设声明行原文，来自 .dsh/$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE/cordis.patch.yml。
-                - id: agent-preset-registry
-                  name: '@deepseek-ai/dsh-agent-preset-registry'
-                  config:
-                    default: $PRESET_RAZOR_ID
+                # ⚠️ 「默认使用它」那一位**刻意不在这里** —— overlay 在最顶层且 patch 是
+                # 整块替换 config，写进来会让 GUI 的预设页一改默认就报
+                # `Configuration for "agent-preset-registry" is overridden by a home
+                # patch or command-line overlay`。那一位落在 profile 的用户层，见
+                # EngineManager.ensurePresetDefault()。
 
                 """.trimIndent() + "\n" + body + "\n"
             )
@@ -1902,6 +1936,84 @@ class EngineManager private constructor(private val context: Context) {
         } catch (t: Throwable) {
             Log.w(TAG, "写入内置预设 overlay 失败: ${t.message}")
             null
+        }
+    }
+
+    /**
+     * 确保 registry 的出厂默认预设位是 razor（写进 profile 的**用户层**）。
+     *
+     * 落点、理由与判据与 [ensureKeyPoolProvider] 完全一致：`--patch` overlay 在最顶层
+     * 且 patch 整块替换 config，写进 overlay 会让 GUI 预设页一改默认就报
+     * `Configuration for "agent-preset-registry" is overridden by a home patch or
+     * command-line overlay`（详见 [writePresetRazorPatch] 的注释）。用户层正是 GUI 自己
+     * 写的那份文件，格式一致、语义一致，且 `dsh-settings` 写入时会**整块重述**这一行。
+     *
+     * ## ⚠️ 为什么用「补缺」而不是「每次重述」
+     *
+     * GUI 保存 `selectedDefault` 时，`dsh-settings` 写出的 next 是
+     * `mergeLayers(strip(raw, form), next)` —— `raw` 里本来就有我们写下的
+     * `default: razor`，所以它会被一并写回，不会丢。
+     *
+     * 但我们仍**只补缺**：行存在就一个字节都不动。理由是用户可能在 GUI 里把默认改成
+     * 别的预设（那会重写这一行的 `default`）—— 那是用户意图，必须留住。
+     * 这与 [ensureDefaultModel] 同一取舍。
+     *
+     * 老版本把这一位写在 overlay 里。那份 overlay 每次启动都被 [writePresetRazorPatch]
+     * **整体覆盖**，所以残留行会自动消失，不需要额外清理 —— 但**新写的 overlay 里
+     * 绝不能再出现这一行**，否则 bug 原样复活。
+     */
+    private fun ensurePresetDefault() {
+        val patch = File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME")
+        val existing = try {
+            if (patch.isFile) patch.readText() else ""
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取 profile 用户配置失败: ${t.message}")
+            return
+        }
+        val updated = mergePresetDefault(existing)
+        if (updated == existing) {
+            Log.i(TAG, "内置预设默认位已在 profile 用户配置里（或用户已自选）: ${patch.absolutePath}")
+            return
+        }
+        try {
+            patch.parentFile?.mkdirs()
+            patch.writeText(updated)
+            Log.i(TAG, "已把内置预设默认位写入 profile 用户配置: ${patch.absolutePath}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入内置预设默认位失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 把 registry 的默认预设位并进 profile 用户配置文本（纯函数，便于离线验证）。
+     *
+     * 判据与 [mergeDefaultModel] 同：**只看那一行在不在** —— 用户层里本来就没有
+     * `agent-preset-registry` 这一行（出厂值在 `dsh-web-app/cordis.patch.yml`），
+     * 所以「行存在」⇔「用户或本 App 写过它」。行在就原样保留，用户自选的默认必须留住。
+     */
+    private fun mergePresetDefault(body: String): String {
+        val lines = body.lines().toMutableList()
+        if (lines.any { isEntryIdLine(it, PRESET_REGISTRY_NS) }) return body
+
+        // 与 mergeKeyPoolProvider 同一处理：先摘掉空模板的顶层 `[]`，否则会变成
+        // `[]` 后面又跟一个 entry —— **非法 YAML**（一个文档不能既是流式空数组
+        // 又是块序列）。注释原样保留，YAML 允许注释出现在数组之前。
+        lines.indexOfFirst { it.isNotBlank() && it.indexOfFirst { c -> c != ' ' } == 0 && it.trim() == "[]" }
+            .takeIf { it >= 0 }?.let { lines.removeAt(it) }
+        while (lines.isNotEmpty() && lines.last().isBlank()) lines.removeAt(lines.size - 1)
+        if (lines.isNotEmpty()) lines.add("")
+        lines.addAll(presetDefaultEntryYaml(0).trimEnd('\n').lines())
+        return lines.joinToString("\n") + "\n"
+    }
+
+    /** registry 默认预设那一行的 YAML，[indent] 为整行基准缩进。 */
+    private fun presetDefaultEntryYaml(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            appendLine("${pad}- id: $PRESET_REGISTRY_NS")
+            appendLine("$pad  name: '$PRESET_REGISTRY_PACKAGE'")
+            appendLine("$pad  config:")
+            appendLine("$pad    default: $PRESET_RAZOR_ID")
         }
     }
 
@@ -2945,6 +3057,12 @@ class EngineManager private constructor(private val context: Context) {
         // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
         ensurePresetRazor()
         val presetRazorPatch = writePresetRazorPatch()
+        // ⚠️ **不能**走 `--patch` overlay：overlay 在最顶层整块替换 `agent-preset-registry`
+        // 那一行的 config，GUI 预设页一改默认就报
+        // `Configuration for "agent-preset-registry" is overridden by a home patch or
+        // command-line overlay` —— 用户表现为「默认预设根本改不了」。
+        // 所以默认位改为补进 profile 的用户配置层（见 [ensurePresetDefault]）。
+        ensurePresetDefault()
         // 跨会话持久记忆插件：核心记忆常驻注入 + 归档记忆检索 + 回复风格设置页。
         // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
         ensureCoreMemory()
@@ -3503,6 +3621,15 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 预设标识符，必须与 razor 的 `cordis.patch.yml` 里 `config.id` 一致。 */
         private const val PRESET_RAZOR_ID = "razor"
+
+        /**
+         * registry 的 entry id 与包名。默认预设位（`config.default`）写在这一行上，
+         * 落点是 profile 的**用户层**而不是 `--patch` overlay —— 见 [ensurePresetDefault]。
+         *
+         * ⚠️ `id` 必须与 `dsh-web-app/cordis.patch.yml` 里那一行**逐字一致**才能命中同一行。
+         */
+        private const val PRESET_REGISTRY_NS = "agent-preset-registry"
+        private const val PRESET_REGISTRY_PACKAGE = "@deepseek-ai/dsh-agent-preset-registry"
 
         /** 跨会话持久记忆插件（dsh-core-memory）：资产名、包名、overlay 文件名。 */
         private const val CORE_MEMORY_ASSET = "core-memory.zip"
