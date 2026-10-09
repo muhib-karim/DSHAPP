@@ -12,6 +12,7 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
@@ -20,6 +21,8 @@ import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -35,8 +38,13 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.dsh.android.databinding.ActivityMainBinding
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
  * 主界面：启动内置引擎，然后把 DSH 自带的 Web GUI 加载进 WebView。
@@ -535,6 +543,106 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        /**
+         * 下载接管。
+         *
+         * ⚠️ **必须实现**：与 `onShowFileChooser` 同一类缺口 —— WebView 自己不会下载，
+         * 默认实现直接丢弃，页面侧完全无感。症状是「下载 Session 日志」弹窗显示
+         * 「浏览器正在下载 Session ZIP 文件」，但文件根本没落地。
+         *
+         * 页面侧触发方式（`dsh-session-log-export` 的 `downloadUrl()`）是
+         * `document.createElement("a")` + `anchor.download` + `anchor.click()`，
+         * 最终落到 WebView 的下载回调，所以这里就是唯一的接缝。
+         */
+        setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            handleDownload(url, userAgent, contentDisposition, mimeType)
+        }
+    }
+
+    /**
+     * 下载引擎导出的文件到本机。
+     *
+     * ⚠️ **不能用系统 `DownloadManager`**：会话导出接口用 **HttpOnly cookie** 鉴权
+     * （`dsh-auth-*`，真机实测带 cookie 200 / 不带 401），而 `DownloadManager` 跑在
+     * 系统进程里，既**不共享** WebView 的 cookie jar，也**不允许**应用自己设
+     * `Cookie` 请求头（API 28 起系统会剥掉）。两条路都堵死，结果就是下载项静默失败。
+     *
+     * 所以这里在**本进程内**取字节：`CookieManager` 拿得到 HttpOnly cookie
+     * （它本来就是给宿主用的），自家的 `HttpURLConnection` 也没有那个 header 限制。
+     */
+    private fun handleDownload(
+        url: String,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+    ) {
+        // 只接管本地引擎的下载；外链仍交给系统浏览器（与 shouldOverrideUrlLoading 一致）。
+        if (!url.startsWith("http://127.0.0.1")) {
+            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                .onFailure { Log.w(DshApplication.TAG, "无法打开外部下载链接: $url", it) }
+            return
+        }
+
+        // 优先用 Content-Disposition 里的文件名（引擎给的是 dsh-session-<id>.zip）。
+        val filename = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val cookie = CookieManager.getInstance().getCookie(url).orEmpty()
+        val target = downloadTargetDir()
+        Toast.makeText(this, "开始下载 $filename", Toast.LENGTH_SHORT).show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15_000
+                    readTimeout = 60_000
+                    if (cookie.isNotEmpty()) setRequestProperty("Cookie", cookie)
+                    userAgent?.takeIf { it.isNotEmpty() }?.let { setRequestProperty("User-Agent", it) }
+                    setRequestProperty("Referer", "http://127.0.0.1:3080/")
+                }
+                try {
+                    val code = conn.responseCode
+                    if (code != HttpURLConnection.HTTP_OK) {
+                        error("HTTP $code")
+                    }
+                    val file = File(target, filename)
+                    conn.inputStream.use { input -> file.outputStream().use { input.copyTo(it) } }
+                    file
+                } finally {
+                    conn.disconnect()
+                }
+            }
+            withContext(Dispatchers.Main) {
+                result
+                    .onSuccess { file ->
+                        Log.i(DshApplication.TAG, "Session 日志已保存: ${file.absolutePath} (${file.length()} 字节)")
+                        Toast.makeText(this@MainActivity, "已保存到 ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                    }
+                    .onFailure { e ->
+                        Log.w(DshApplication.TAG, "下载失败: $url", e)
+                        Toast.makeText(this@MainActivity, "下载失败：${e.message}", Toast.LENGTH_LONG).show()
+                    }
+            }
+        }
+    }
+
+    /**
+     * 下载落地目录。
+     *
+     * 有存储权限时写公共「下载」目录（用户能在文件管理器里直接找到）；
+     * 用户拒绝权限时退回 app 自己的外部目录 —— 那条路**不需要任何权限**，
+     * 功能不至于整个不可用（与 `ensureStorageAccess()` 的取舍一致）。
+     */
+    private fun downloadTargetDir(): File {
+        val granted = checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            @Suppress("DEPRECATION")
+            val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (publicDir != null && (publicDir.isDirectory || publicDir.mkdirs())) return publicDir
+            Log.w(DshApplication.TAG, "公共下载目录不可用，改用 app 外部目录")
+        }
+        return getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
     }
 
     /** 当前挂起的文件选择回调；null 表示没有等待中的选择。 */
