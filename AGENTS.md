@@ -174,6 +174,42 @@ FID**，不要从上一次的输出里复制。
   失效（需 `login --token <授权码>` 重新授权），单条命令失败不算。
 - ⚠️ **只能在 Windows 本机跑**（依赖 node）。Termux / Android 端没有 node，用不了。
 
+#### ⚠️ 发布完必须整理目录：旧版挪进「历史版本」
+
+`DSH APP` 根目录**只留最新一个包**，被它取代的旧包一律移进子目录
+`DSH APP/历史版本/`。目录里那个 `保存此文件夹持续更新中.txt` 是分享说明，
+不是包，别动。
+
+**这一步是发布的一部分，不是可选收尾。** 漏做的后果是根目录堆着一串版本、
+分享链接的访客分不清该下哪个。
+
+```powershell
+# 1) 列出根目录，拿到「旧包」与「历史版本」两个 FID
+#    ⚠️ 每次都要现查：FID 前缀每次都变，只有竖线后的后缀稳定
+& $bash -lc "cd $skill && node scripts/quark-drive.cjs browse --parent-fid '<DSH APP 的 FID>' --all 2>&1"
+
+# 2) 移动（fids 是位置参数，目标目录用 --target-fid）
+& $bash -lc "cd $skill && node scripts/quark-drive.cjs move '<旧包的 FID>' --target-fid '<历史版本的 FID>' 2>&1"
+```
+
+成功时 `move_path` 会回显落地位置，**以此为准**：
+
+```json
+{"code":0,"msg":"成功","data":{"fids":["~1E2xIos…|Z7KnYr6cf84"],
+ "targetFid":"~1gZvlvk…|H_y2_NbMY0Q",
+ "move_path":"夸克网盘/jiulingShare/DSH APP/历史版本"},"action":"move","type":"result"}
+```
+
+**什么算「旧包」**：同一次发布里如果因为返工传了第二个包（如 `DSH0.2.3.apk`
+→ `DSH0.2.3-icons.apk`），根目录留**最后上传的那个**，先前那个进历史版本 ——
+即使两者 `versionName` 相同。
+
+⚠️ `move` 是**移动**不是复制，根目录里那一条会消失；移动完回查两个目录确认
+（根目录少一个、历史版本多一个）。
+
+⚠️ 实测 `历史版本` 目录的 FID 后缀是 `|H_y2_NbMY0Q`、`DSH APP` 是
+`|JkamYKaMIaE`，但**前缀每次查询都变，所以仍然必须现查**，不能拿后缀凑 FID。
+
 ```powershell
 # 安装 + 启动（adb 在 %LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe）
 adb install -r app\build\outputs\apk\debug\app-debug.apk
