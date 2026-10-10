@@ -70,7 +70,11 @@ param(
     # v3：加了第 3.6 步运行时 API 审计门禁（从产物反向扫 API，不再靠人工名单）。
     #     降级产物本身与 v2 相同（多补的是 polyfill，那份每次启动都覆盖写、不吃戳），
     #     但 bump 一下无害且更清晰：将来审计查出新缺口、要重新生成 zip 时不会漏。
-    [string]$CompatVersion = "3",
+    # v4：mobile-ui 插件改了设置页图标（悬浮气泡/交流群的自定义 SVG），
+    #     `mobileui/lib/client.js` 的降级产物随之变化。**必须 bump** ——
+    #     否则已装 v3 的设备会命中「两戳都一致 → 整体跳过」，
+    #     mobile-ui 那棵树继续用**旧**的降级产物覆盖源文件，图标改动静默失效。
+    [string]$CompatVersion = "4",
 
     [string]$EngineBin,
     [string]$OutZip
@@ -85,18 +89,29 @@ if (-not $EngineBin) { $EngineBin = Join-Path $repoRoot "app\src\main\assets\eng
 if (-not $OutZip) { $OutZip = Join-Path $repoRoot "app\src\main\assets\webview-compat.zip" }
 
 # ── 1. 准备 esbuild（临时目录，不进仓库）────────────────────────────────
+#
+# ⚠️ esbuild 装在**独立的持久目录**里，不能放进下面每次都要清空的 `$work`。
+# 经代理装一次 esbuild 实测要 **3 分 26 秒**（206 s，2 个包），而它只是构建期
+# 工具、与本次要降级的文件无关。原来 `$work` 每次运行都 `Remove-Item -Recurse`
+# 再重装，等于每跑一次白等三分半 —— 这也是「这个脚本怎么这么慢」的主因。
+$esbuildTool = Join-Path $env:TEMP "dsh-esbuild-tool"
+
+# `$work` 仍然每次清空：extract 出来的 dist 必须干净，免得旧文件混进产物。
 $work = Join-Path $env:TEMP "dsh-webview-compat"
 if (Test-Path $work) { Remove-Item -Recurse -Force $work }
 New-Item -ItemType Directory -Path $work | Out-Null
 
-$esbuild = Join-Path $work "node_modules\.bin\esbuild.cmd"
+$esbuild = Join-Path $esbuildTool "node_modules\.bin\esbuild.cmd"
 if (-not (Test-Path $esbuild)) {
-    Write-Host "安装 esbuild（构建期工具，不进 APK）…"
+    Write-Host "安装 esbuild（构建期工具，不进 APK；仅首次需要，约 3 分钟）…"
+    New-Item -ItemType Directory -Path $esbuildTool -Force | Out-Null
     # 走代理：本机直连 npm 会超时（与 gradle.properties 里同一个代理）
     $env:HTTPS_PROXY = "http://127.0.0.1:7897"
     $env:HTTP_PROXY = "http://127.0.0.1:7897"
-    & "npm.cmd" install esbuild@0.25.0 --prefix $work --no-audit --no-fund --loglevel=error
+    & "npm.cmd" install esbuild@0.25.0 --prefix $esbuildTool --no-audit --no-fund --loglevel=error
     if ($LASTEXITCODE -ne 0) { throw "esbuild 安装失败" }
+} else {
+    Write-Host "复用已装的 esbuild: $esbuildTool"
 }
 
 # ── 2. 从 engine.bin 解出「前端 dist」与「插件的 client bundle」──────────
