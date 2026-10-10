@@ -1199,6 +1199,123 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 修正 pi-ai 适配器在**第三方路由不返回 tool_call id** 时写出的空 tool-call id（幂等）。
+     *
+     * **症状（会话级永久损坏，比 ⑨.5 更狠）**：某一轮结束后，该会话从列表里消失，
+     * `/export` 报 HTTP 500，**新建会话也跟着失败**：
+     *
+     * ```
+     * format v4 tool/result at seq 19 requires toolCallId matching its tool source
+     * tool call id requires a nonempty string
+     * 新建会话失败: gateway/internal: failed to create session "session-7d4ab1ab-…":
+     *   SessionQueryError: stored session … is corrupt:
+     *   SessionFormatError: tool call id requires a nonempty string
+     * ```
+     *
+     * **根因**：`toolcall_end` 分支拿 provider 给的 id 造 tool-call 块，**没有任何校验**：
+     *
+     * ```js
+     * id: brandString(event.toolCall.id),   // brandString 是纯类型断言，return value，零校验
+     * ```
+     *
+     * 对比 DeepSeek 官方适配器，那里有防线
+     * （`if (!content.id || !content.name) return malformed("empty tool identity")`），
+     * **pi-ai 这条路径漏了**。第三方路由（实测设备上的 `agnes` / `q`）在流式响应里
+     * 不给 `toolCall.id` 时，`id` 就是 `""` 或 `undefined`。
+     *
+     * ⚠️ **`dsh-llm` 的收口兜不住它**（[patchLlmToolCallIdFallback] 是第二道防线）：
+     * `assemble()` 里 `id: partial.toolCallId ?? brandString(...)` 的 `??`
+     * **只兜 `null`/`undefined`，兜不住空串**；而且 pi-ai 会经 `block-end` 直接把
+     * 整个 block 塞进 `partial.block`，`assemble()` 第一行
+     * `if (partial.block) return partial.block;` 会**直接返回**，`??` 那行根本不执行。
+     *
+     * ⚠️ **为什么这会造成整个会话不可读**：`tool/result` 行落盘后，读取侧
+     * `dsh-session-format-v3-to-v4` 的 `assertV4ToolResultMessage()` 要求
+     * `toolCallId` 是非空字符串且等于 `source.callId`；而
+     * `dsh-session-persistence-jsonl` 的 `consumeEventLine()` 对格式错误
+     * **只重抛、不恢复**（只有 JSON 解析失败才走 `issue` 恢复路径），
+     * `finish()` 还会再跑一遍 `assertReleasedV4Relationships()`。
+     * 所以**一行坏数据就让整个会话加载失败** → 从列表消失 → 导出 500 → 新建会话被拖累。
+     *
+     * ⚠️ 空 id 能一路落盘是因为 `snapshotJsonValue()` 只校验「可无损 JSON 序列化」，
+     * 空串是合法 JSON；`undefined` 则会被 JSON 往返整个丢掉字段，两种都逃得过写入侧。
+     *
+     * ⚠️ 只改**流式事件的 id 兜底**，不改持久化历史、不改正常路径：
+     * provider 给了真实 id 时行为完全不变。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败，届时日志里有提示）。
+     */
+    private fun patchLlmPiAiToolCallId() {
+        val entry = File(engineDir, "node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到 pi-ai 适配器，跳过空 tool-call id 补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(PI_AI_TOOLID_ANCHOR_START)) {
+                return
+            }
+            if (!source.contains(PI_AI_TOOLID_GUARD_START) || !source.contains(PI_AI_TOOLID_GUARD_END)) {
+                Log.w(TAG, "pi-ai 适配器的 toolcall 事件结构与预期不符，跳过空 tool-call id 补丁")
+                return
+            }
+            entry.writeText(
+                source
+                    .replace(PI_AI_TOOLID_GUARD_START, PI_AI_TOOLID_ANCHOR_START)
+                    .replace(PI_AI_TOOLID_GUARD_END, PI_AI_TOOLID_ANCHOR_END),
+            )
+            Log.i(TAG, "已修正 pi-ai 的空 tool-call id: dsh-llm-pi-ai")
+        } catch (t: Throwable) {
+            Log.w(TAG, "修正 pi-ai 的空 tool-call id 失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 修正 `dsh-llm` 组装 tool-call 块时**兜不住空串**的 id 兜底（幂等）。
+     *
+     * 这是 [patchLlmPiAiToolCallId] 的**第二道防线**，覆盖 pi-ai 之外的 provider：
+     * 任何走「只有 delta、没有 block-end」协议的适配器，其空 id 都会从这里出去。
+     *
+     * ```js
+     * id: partial.toolCallId ?? brandString(`call-${index}`),
+     * //                      ^^ 只兜 null/undefined，空串照样透出去
+     * ```
+     *
+     * ⚠️ 这是**所有 LLM 适配器共用的收口**（`BlockAssembler`），所以只修 pi-ai
+     * 不够 —— 别的 provider 出现同样形状时，坏行会从同一个地方产生。
+     *
+     * ⚠️ 走 `block-end` 的协议（pi-ai 就是）**不会**执行到这一行：
+     * `assemble()` 第一行 `if (partial.block) return partial.block;` 直接返回了
+     * block-end 带来的块。所以这两处补丁各管一段路径，都要在。
+     *
+     * 找不到锚点就跳过。
+     */
+    private fun patchLlmToolCallIdFallback() {
+        val entry = File(engineDir, "node_modules/@deepseek-ai/dsh-llm/lib/index.js")
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到 dsh-llm 组装器，跳过 tool-call id 兜底补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(LLM_TOOLID_ANCHOR)) {
+                return
+            }
+            if (!source.contains(LLM_TOOLID_GUARD)) {
+                Log.w(TAG, "dsh-llm 组装器的 tool-call 组装结构与预期不符，跳过 tool-call id 兜底补丁")
+                return
+            }
+            entry.writeText(source.replace(LLM_TOOLID_GUARD, LLM_TOOLID_ANCHOR))
+            Log.i(TAG, "已修正 dsh-llm 组装器的空 tool-call id 兜底: dsh-llm")
+        } catch (t: Throwable) {
+            Log.w(TAG, "修正 dsh-llm 组装器的空 tool-call id 兜底失败: ${t.message}")
+        }
+    }
+
+    /**
      * 安装 pnpm 到 `$PREFIX/bin`（幂等）。
      *
      * `plugin_manager` 的 `install_bundle` 通过 spawn `pnpm add` 装插件，而
@@ -3112,6 +3229,10 @@ class EngineManager private constructor(private val context: Context) {
         // DeepSeek Messages 要求 assistant 的 tool_use 块连续且紧后跟 tool_result，
         // 而持久化历史里 text 会夹在多个 tool_use 之间 → 该会话从此永久发不出去
         patchLlmDeepseekToolOrder()
+        // pi-ai：第三方路由不给 tool_call id 时，原样透出空 id → 落盘后会话永久不可读。
+        // 两处都要改（delta 与 end 各一条路径），见各自的 KDoc。
+        patchLlmPiAiToolCallId()
+        patchLlmToolCallIdFallback()
         // 目录选择器：撤回「起点改 /sdcard」的旧补丁，改由 HOME 下的入口链接提供
         restoreDirectoryPickerStart()
         // 手机存储与 app 私有目录在 Android 上互不可达，靠 HOME 下两个链接做入口
@@ -3671,6 +3792,54 @@ class EngineManager private constructor(private val context: Context) {
                 "\tif (calls.length === 0) return mapped;\n" +
                 "\treturn [...mapped.filter((block) => block.type !== \"tool_use\"), ...calls];\n" +
                 "}"
+
+        /**
+         * `dsh-llm-pi-ai/lib/index.js` 里 tool-call 事件的**首尾两处原文**，
+         * 以及给空 id 兜底之后的文本。见 [patchLlmPiAiToolCallId]。
+         *
+         * ⚠️ 两处都要改，缺一不可：
+         * - `toolcall_delta` 显式造空串（`known?.id ?? ""`），它经 `partial.toolCallId`
+         *   进入组装器；
+         * - `toolcall_end` 直接造整个 block（`id: brandString(event.toolCall.id)`），
+         *   经 `partial.block` 短路返回，**绕过组装器的 `??` 兜底**。
+         *
+         * 兜底值用 `call-<index>` 形状（与 `dsh-llm` 组装器原生的兜底命名一致），
+         * 保证 provider 不给 id 时仍有稳定的、非空的调用标识。
+         *
+         * ⚠️ 缩进是**制表符**，与官方发布件逐字一致；引擎升级后若不再匹配，
+         * 补丁会跳过并在日志里提示，不会让启动失败。
+         */
+        private const val PI_AI_TOOLID_GUARD_START =
+            "\t\t\t\tid: brandString(known?.id ?? \"\"),\n"
+        private const val PI_AI_TOOLID_ANCHOR_START =
+            "\t\t\t\t/* Android: 第三方路由（实测 agnes/q）在流式响应里可能不给 tool_call id，\n" +
+                "\t\t\t\t   原样透出会让 tool-call 块拿到空 id，落盘后该会话永久不可读。\n" +
+                "\t\t\t\t   这里补一个稳定的非空兜底。 */\n" +
+                "\t\t\t\tid: brandString(known?.id || `call-\${event.contentIndex}`),\n"
+
+        private const val PI_AI_TOOLID_GUARD_END =
+            "\t\t\t\t\tid: brandString(event.toolCall.id),\n"
+        private const val PI_AI_TOOLID_ANCHOR_END =
+            "\t\t\t\t\t/* Android: 同 toolcall_delta —— provider 不给 id 时兜底，\n" +
+                "\t\t\t\t\t   否则这个 block 会短路返回、绕过组装器的 ?? 兜底。 */\n" +
+                "\t\t\t\t\tid: brandString(event.toolCall.id || `call-\${event.contentIndex}`),\n"
+
+        /**
+         * `dsh-llm/lib/index.js` 里 `assemble()` 组装 tool-call 块的那一行原文，
+         * 以及空串也能兜住的文本。见 [patchLlmToolCallIdFallback]。
+         *
+         * ⚠️ 原文用 `??`，**只兜 `null`/`undefined`**；而 pi-ai 的 delta 路径
+         * 显式产生空串 `""`，`??` 放行 → 空 id 落盘 → 会话永久不可读。
+         * 改成 `||` 让空串也走兜底。
+         *
+         * ⚠️ 缩进是**四个制表符**，与官方发布件逐字一致。
+         */
+        private const val LLM_TOOLID_GUARD =
+            "\t\t\t\tid: partial.toolCallId ?? brandString(`call-\${index}`),\n"
+        private const val LLM_TOOLID_ANCHOR =
+            "\t\t\t\t/* Android: `??` 兜不住空串，而 pi-ai 的 delta 路径会产生 \"\"，\n" +
+                "\t\t\t\t   空 id 落盘后整个会话都读不出来。改用 `||` 连空串一起兜。 */\n" +
+                "\t\t\t\tid: partial.toolCallId || brandString(`call-\${index}`),\n"
 
         /**
          * `dsh-host-directory-picker-browse/lib/index.js` 里 `list()` 决定默认起点
