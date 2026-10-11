@@ -100,6 +100,14 @@ class EngineManager private constructor(private val context: Context) {
     private val logLines = ArrayDeque<String>()
 
     /**
+     * 最近一次 [ensureExtracted] 收到的版本戳。
+     *
+     * 体检（见 [preflight]）发现 `engine/` 目录被改坏时，要拿它强制重解包 ——
+     * 版本戳是调用方（MainActivity）传进来的，引擎这一层不能自己编一个。
+     */
+    private var lastAssetStamp: String? = null
+
+    /**
      * 降级前端是否已就位（见 [ensureWebViewCompat]）。
      *
      * 供 [MainActivity] 决定要不要因内核过旧而拦截加载：降级生效后门槛就降到
@@ -135,6 +143,7 @@ class EngineManager private constructor(private val context: Context) {
      * @param versionStamp 资产版本标识；与已解包版本一致时直接跳过。
      */
     suspend fun ensureExtracted(versionStamp: String) = withContext(Dispatchers.IO) {
+        lastAssetStamp = versionStamp
         if (stampFile.isFile && stampFile.readText().trim() == versionStamp) {
             Log.i(TAG, "引擎资产已是最新（$versionStamp），跳过解包")
             return@withContext
@@ -3132,6 +3141,440 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 启动前体检：跑一次 `--dump-config`，把「坏到起不来」的 profile 先修好。
+     *
+     * ## 为什么需要它
+     *
+     * profile 的 bundle 清单与 patch 层都落在 `$DSH_HOME` 下，而那是**模型可写**
+     * 的目录（AI 能直接编辑 `profiles/web/` 与 `engine/`）。一旦改坏，引擎在
+     * `loadProfile()` 阶段就抛错并以 `process.exit(1)` 退出，App 只会在启动页上
+     * 显示「引擎启动失败」——**没有任何自救路径**，用户只能卸载重装，而卸载会清掉
+     * 整个 `filesDir`（Termux 环境、会话、凭据、工作区全没）。
+     *
+     * ## 为什么用 `--dump-config` 当体检手段
+     *
+     * 引擎自带这条免 boot 的命令：它走的是**和启动完全同一套** `loadProfile()` +
+     * patch 解析（`dump-config-BEDI-dNY.js` 的 `prepareProfile()`），但只解析、
+     * 不求值 `!!js`、不起服务。于是：
+     * - 判据来自引擎自己的解析器，不会随引擎升级而漂（**不要**用 Kotlin 重写 YAML 校验）；
+     * - 真机实测耗时约 **0.7~0.8 秒**（3 次：703 / 780 / 800 ms），相对引擎自身
+     *   7~10 秒的启动时间可忽略。
+     *
+     * ## 三种坏法，判据**不一样**（真机逐条实测，别合并成一条）
+     *
+     * | 坏在哪 | `dump-config` | 判据 |
+     * |---|---|---|
+     * | `profiles/web/package.json` 非法 JSON | RC=1 | 退出码 |
+     * | `profiles/web/cordis.patch.yml` 语法坏 | RC=1 | 退出码 |
+     * | 第三方 bundle 的 patch 坏 | **RC=0** | stderr 的 `skipping profile bundle` |
+     * | 核心 bundle（`dsh-web-app`）的 patch 坏 | **RC=0** | **required 条目缺失** |
+     *
+     * ⚠️ **只看退出码会漏掉后两种**，而第四种正是「AI 改坏 `engine/` 目录」的形态：
+     * 真机实测该状态下 `dump-config` 返回 **RC=0**，但真正 boot 会**挂死**
+     * （45 秒超时被杀，EXIT=124，日志里 `webserver` 等服务永远 pending）。
+     * 所以必须再补一道「required 条目在不在」的检查 —— 那 4 个 id 与
+     * `dsh-app-boot` 的 `requiredStartupEntryIds` 同源，缺一个引擎就起不来。
+     *
+     * ## 隔离方式：改名不删
+     *
+     * 一律改成 `<原名>.bak-<时间戳>`。模型改坏的东西可能还带着用户想要的内容，
+     * 而本方法只负责让 App 能打开，不该替用户销毁数据。
+     *
+     * @return true = 做过修复（调用方据此提示用户）；false = profile 本来就是好的。
+     */
+    private suspend fun preflight(): Boolean {
+        val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
+        if (!profileDir.isDirectory) {
+            // 还没有 profile：引擎首次启动会自己按模板初始化，没什么可体检的
+            return false
+        }
+
+        val first = runDumpConfig()
+        if (first == null) {
+            // 跑不起来（node 缺失等）：体检本身失效，放行让引擎报它自己的错
+            Log.w(TAG, "启动前体检无法执行，跳过（不影响启动）")
+            return false
+        }
+
+        val suspects = LinkedHashSet<File>()
+        if (first.exitCode != 0) {
+            // 坏法①②：stderr 里有绝对路径，引擎自己指认了是哪个文件
+            suspects += parseBlamedFiles(first.stderr)
+            if (suspects.isEmpty()) {
+                // 指认不出来（比如 package.json 的报错只有 JSON 位置、没有路径）：
+                // 退到隔离 profile 自己的两个文件，这是唯一可能抛在这两处的来源
+                suspects += File(profileDir, "package.json")
+                suspects += File(profileDir, PROFILE_PATCH_FILENAME)
+            }
+        } else {
+            // 坏法④：核心 bundle 被 skip 时 required 条目会消失
+            val missing = missingRequiredEntries(first.stdout)
+            if (missing.isNotEmpty()) {
+                Log.w(TAG, "启动前体检：核心条目缺失 ${missing.joinToString(", ")}")
+                // 核心 bundle 来自 engine/，用户配置层动不了它 —— 只能整棵重解包
+                return rebuildEngine(missing)
+            }
+            // 坏法③：退出码是 0，只能看 stderr 的跳过行
+            suspects += parseSkippedBundles(first.stderr)
+        }
+
+        // 落在 engine/ 下的坏文件隔离没有意义（下次解包就覆盖了，而 `.stamp` 短路
+        // 意味着没有"下次"）—— 直接整棵重解包
+        val engineSide = suspects.filter { it.absolutePath.startsWith(engineDir.absolutePath) }
+        if (engineSide.isNotEmpty()) {
+            Log.w(TAG, "启动前体检：engine/ 内的 bundle 损坏 ${engineSide.joinToString(", ")}")
+            return rebuildEngine(emptyList())
+        }
+
+        if (suspects.isEmpty()) return false
+
+        var quarantined = 0
+        for (file in suspects) {
+            if (quarantine(file, "启动前体检")) quarantined++
+        }
+        if (quarantined == 0) return false
+
+        // 复检：隔离完再跑一次，确认真的修好了
+        val second = runDumpConfig()
+        if (second != null && second.exitCode == 0 && missingRequiredEntries(second.stdout).isEmpty()) {
+            Log.i(TAG, "启动前体检：已隔离 $quarantined 个损坏的 profile 文件，复检通过")
+            return true
+        }
+
+        // 隔离了还不够：坏的不止那几个文件，退到整棵重解包
+        Log.w(TAG, "启动前体检：隔离后复检仍未通过，改走整棵重解包")
+        return rebuildEngine(emptyList())
+    }
+
+    /**
+     * 安全模式：把「模型能改坏的一切」一次性推开，让 App 必定能开起来。
+     *
+     * ## 它和 [preflight] 的分工
+     *
+     * [preflight] 是**自动**的，只在能精确指认坏文件时动手（体检判据 + 复检通过），
+     * 拿不准就不碰 —— 免得把好配置误伤。但体检覆盖不到的情况真实存在：
+     * 坏法超出上面四类、体检超时、或者坏在体检看不见的地方（比如 profile 的
+     * `dependencies` 被改得指向一个不存在的包）。那时 App 依然打不开，而用户
+     * 手上没有任何出路 —— 只能卸载重装，那会清掉全部会话与凭据。
+     *
+     * 本方法就是那个出路：**用户在失败浮层上点一下**，然后 App 一定开得起来。
+     * 它是破坏性的、由人显式触发的，所以不需要"拿不准就别动"的克制。
+     *
+     * ## 推开哪三样（都不碰用户数据）
+     *
+     * | 推开什么 | 为什么 |
+     * |---|---|
+     * | profile 用户 patch 层 | 模型最爱改的就是它，且改坏会让引擎 exit 1 |
+     * | 第三方 bundle（保留核心的 deepseek-ai 前缀那些） | 插件装坏 / 版本对不上是常见死因 |
+     * | `engine/.stamp` | 强制重解包，把 `engine/` 里的改动全部还原 |
+     *
+     * ⚠️ 上面那条里**不能**写 `@deepseek-ai` 加斜杠星号：Kotlin 的块注释支持嵌套，
+     * 那两字符会开始一层嵌套注释，把下面整段代码吞进注释里（编译报
+     * `Missing '}'` + `Unclosed comment`，且报错行号指向完全无关的地方）。
+     *
+     * ⚠️ **会话、凭据、工作区都在 `$DSH_HOME` 与 `workspace/`，不在这三样里**，
+     * 所以安全模式不会丢用户数据。代价只是重解包那约 15 秒。
+     *
+     * ⚠️ 三样都是**改名不删**（见 [quarantine]）：安全模式只负责让 App 能打开，
+     * 不该替用户销毁配置 —— 用户想找回改坏前的内容，`.bak-<时间戳>` 还在那儿。
+     *
+     * @return true = 至少改动了一样（调用方据此提示用户）；false = 三样本来就都干净。
+     */
+    suspend fun enterSafeMode(): Boolean = withContext(Dispatchers.IO) {
+        stop()
+
+        val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
+        var changed = false
+
+        // ① 用户配置层：模型改坏它的形态最多（语法坏、patch 目标已消失）
+        if (quarantine(File(profileDir, PROFILE_PATCH_FILENAME), "安全模式")) changed = true
+
+        // ② 第三方 bundle：只留 @deepseek-ai/* 的核心 bundle。
+        //    改的是 profile 的清单，不是插件包本身 —— 包还在 node_modules 里，
+        //    想装回来只要重新勾一次。
+        if (stripThirdPartyBundles(profileDir)) changed = true
+
+        // ③ 引擎目录：删戳 = 下次启动重解包，把 engine/ 下的改动全部还原
+        if (stampFile.isFile && stampFile.delete()) {
+            Log.w(TAG, "安全模式：已删除引擎版本戳，将重新解包 engine/")
+            changed = true
+        }
+
+        Log.w(TAG, "安全模式：已推开损坏的配置（改动=$changed），准备重启引擎")
+        changed
+    }
+
+    /**
+     * 把 profile 清单里的**第三方** bundle 摘掉，只留 deepseek-ai 前缀的核心 bundle（幂等）。
+     *
+     * ⚠️ 用 `JSONObject` 解析再回写，不搞正则替换：profile 清单是 JSON，
+     * 而"注释/尾逗号"这类东西在 JSON 里本来就不合法，引擎自己也读不了。
+     * 解析失败（清单已经坏了）时**直接隔离整份清单** —— 引擎发现清单缺失会
+     * 按模板重建一份核心的，这正是安全模式想要的结果。
+     *
+     * ⚠️ 回写前先备份原文件（[quarantine]），用户想恢复第三方插件时有据可依。
+     *
+     * @return true = 确实摘掉了东西。
+     */
+    private fun stripThirdPartyBundles(profileDir: File): Boolean {
+        val manifest = File(profileDir, "package.json")
+        if (!manifest.isFile) return false
+        val json = try {
+            JSONObject(manifest.readText())
+        } catch (t: Throwable) {
+            Log.w(TAG, "安全模式：profile 清单已损坏（${t.message}），整份隔离")
+            return quarantine(manifest, "安全模式")
+        }
+
+        val dsh = json.optJSONObject("dsh") ?: return false
+        val profile = dsh.optJSONObject("profile") ?: return false
+        val bundles = profile.optJSONArray("bundles") ?: return false
+
+        val kept = ArrayList<String>(bundles.length())
+        var dropped = 0
+        for (i in 0 until bundles.length()) {
+            val name = bundles.optString(i, "")
+            // 核心 bundle 一律保留：它们来自 engine/，重解包就会还原成好的
+            if (name.startsWith("@deepseek-ai/")) kept += name else dropped++
+        }
+        if (dropped == 0) return false
+
+        // 先备份再写：摘掉的是用户装的插件，配置本身有价值。
+        // ⚠️ 备份失败就**不要写** —— 否则会把唯一一份原始清单覆盖掉。
+        if (!quarantine(manifest, "安全模式")) {
+            Log.w(TAG, "安全模式：备份 profile 清单失败，放弃摘除第三方 bundle")
+            return false
+        }
+
+        profile.put("bundles", JSONArray(kept))
+        dsh.put("profile", profile)
+        json.put("dsh", dsh)
+        return try {
+            // ⚠️ `JSONObject.toString()` 会把 `/` 转义成 `\/`（org.json 防 `</script>`
+            // 的历史行为）。那在 JSON 里**完全合法**（引擎实测读得进去），但这份文件
+            // 用户和模型都会看，`@deepseek-ai\/dsh-base` 长得就像文件已经坏了 ——
+            // 而"配置看起来坏了"正是本方法要消灭的状态。还原回去。
+            //
+            // 安全性：`\/` 与 `/` 在 JSON 里语义完全相同，还原不会产生歧义 ——
+            // 反斜杠本身在 org.json 的输出里是 `\\`，所以 `\\\/`（原串为 `\` + `/`）
+            // 还原成 `\\/` 后仍解析为 `\` + `/`，与还原前一致。
+            manifest.writeText(json.toString(2).replace("\\/", "/"))
+            Log.w(TAG, "安全模式：已摘掉 $dropped 个第三方 bundle，保留 ${kept.joinToString(", ")}")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "安全模式：回写 profile 清单失败: ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 体检输出里缺了哪些 required 条目（见 [REQUIRED_ENTRY_IDS]）。
+     *
+     * ⚠️ 匹配要**行级**：`dump-config` 的输出里每行都是 `- id: xxx`，用
+     * `contains("- id: webserver")` 会误命中 `webserver-xxx` 之类的前缀相同项。
+     */
+    private fun missingRequiredEntries(dumpOutput: String): List<String> {
+        val ids = dumpOutput.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("- id: ") }
+            .map { it.removePrefix("- id: ").trim() }
+            .toHashSet()
+        return REQUIRED_ENTRY_IDS.filterNot { it in ids }
+    }
+
+    /**
+     * 强制重解包 `engine/`：删掉版本戳，然后**当场**重解包一次。
+     *
+     * ⚠️ **这是唯一能修「`engine/` 目录被改坏」的手段**：`ensureExtracted()` 有
+     * `.stamp` 短路（见该方法），AI 改了 `engine/` 下的文件之后**永远不会被还原**。
+     * 删掉戳之后必须**立刻**重解包，不能等下次启动 —— 本方法在 `start()` 里跑，
+     * 而 `MainActivity` 的 `ensureExtracted()` 调用已经过去了，光删戳这一轮仍会用
+     * 坏掉的引擎目录起来（真机实测就是这么踩的）。
+     *
+     * ⚠️ 会话、凭据、工作区都在 `$DSH_HOME` 与 `workspace/`，**不在 `engine/`**，
+     * 所以这一下不会丢用户数据；代价只是重新解包那约 15 秒。
+     *
+     * ⚠️ 调用点在 `start()` 的最前段（早于所有往 `engine/` 写东西的 ensureXxx），
+     * 否则重解包会把那些补丁抹掉。见 `start()` 里的顺序注释。
+     *
+     * @param missing 体检发现缺失的 required 条目 id（仅用于日志）。
+     */
+    private suspend fun rebuildEngine(missing: List<String>): Boolean {
+        // 用户配置层也可能是共犯（比如它 patch 的目标行已随 bundle 一起消失）
+        quarantine(File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME"), "启动前体检")
+
+        val stamp = lastAssetStamp
+        if (stamp == null) {
+            // 没拿到版本戳（ensureExtracted 还没被调用过）：只能删戳，让下次启动重解包
+            if (stampFile.delete()) Log.w(TAG, "启动前体检：已删除引擎版本戳，下次启动将重新解包")
+            return true
+        }
+
+        Log.w(
+            TAG,
+            "启动前体检：核心 bundle 损坏（缺 ${missing.joinToString(", ").ifEmpty { "未指认" }}），" +
+                "正在重新解包 engine/（约 15 秒）",
+        )
+        if (stampFile.isFile) stampFile.delete()
+        return try {
+            ensureExtracted(stamp)
+            val check = runDumpConfig()
+            val stillMissing = check?.let { missingRequiredEntries(it.stdout) }.orEmpty()
+            if (check != null && check.exitCode == 0 && stillMissing.isEmpty()) {
+                Log.i(TAG, "启动前体检：重解包完成，复检通过")
+                true
+            } else {
+                // 重解包都修不好 ⇒ 不是 engine/ 的问题（多半是设备环境），如实报出来
+                Log.e(TAG, "启动前体检：重解包后仍未通过（缺 ${stillMissing.joinToString(", ")}）")
+                true
+            }
+        } catch (t: Throwable) {
+            // ensureExtracted 自己会把 State 置成 Failed 并抛出；这里不再吞掉它，
+            // 让 start() 的调用方看到真实的解包失败原因
+            Log.e(TAG, "启动前体检：重新解包失败", t)
+            throw t
+        }
+    }
+
+    /**
+     * 把 [file] 改名成 `<原名>.bak-<时间戳>`（不删）。
+     *
+     * 时间戳冲突时补一个序号 —— 同一毫秒内隔离两个文件是可能的。
+     *
+     * ⚠️ [reason] 是**日志前缀**，不是给人看的备注：两条路径共用本方法
+     * （[preflight] 自动修 / [enterSafeMode] 用户显式触发），日志里必须能分清
+     * 是哪一条动的 —— 否则排查时会把用户主动进安全模式误读成"体检又修了一次"。
+     *
+     * @return true = 确实隔离了；false = 文件本来就不存在或改名失败。
+     */
+    private fun quarantine(file: File, reason: String): Boolean {
+        if (!file.isFile) return false
+        val base = "${file.name}.bak-${System.currentTimeMillis()}"
+        var target = File(file.parentFile, base)
+        var ordinal = 0
+        while (target.exists()) target = File(file.parentFile, "$base-${++ordinal}")
+        return try {
+            if (file.renameTo(target)) {
+                Log.w(TAG, "$reason：已隔离损坏的文件 ${file.name} → ${target.name}")
+                true
+            } else {
+                Log.w(TAG, "$reason：隔离 ${file.name} 失败（改名返回 false）")
+                false
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "$reason：隔离 ${file.name} 失败: ${t.message}")
+            false
+        }
+    }
+
+    /** [runDumpConfig] 的结果。 */
+    private class DumpResult(val exitCode: Int, val stdout: String, val stderr: String)
+
+    /**
+     * 跑一次 `--dump-config` 并收集输出。
+     *
+     * 与真正启动用**同一套**环境变量与 node 二进制（见 [start] 的 `pb.environment()`），
+     * 否则体检结论对不上真实启动。区别只有：这里不传 `--patch`，因为本 App 自己写的
+     * 那几份 overlay 是每次启动整体覆盖的、不可能是坏的，带上反而多一层噪声。
+     *
+     * @return null = 压根跑不起来（node 缺失等），调用方应放行而不是误判成 profile 坏了。
+     */
+    private fun runDumpConfig(): DumpResult? {
+        val nodeBin = bootstrap.nodeBinary
+        val binJs = File(engineDir, "node_modules/@deepseek-ai/dsh/lib/bin.js")
+        if (!nodeBin.isFile || !binJs.isFile) return null
+        return try {
+            val prefix = bootstrap.prefixDir.absolutePath
+            val pb = ProcessBuilder(
+                nodeBin.absolutePath, binJs.absolutePath,
+                "--profile", PROFILE_NAME, "--dump-config",
+            )
+                .directory(workspaceDir)
+            pb.environment().apply {
+                put("PREFIX", prefix)
+                put("DSH_HOME", dshHome.absolutePath)
+                put("HOME", homeDir.absolutePath)
+                put("TMPDIR", context.cacheDir.absolutePath)
+                put("PATH", "$prefix/bin:$prefix/bin/applets:/system/bin:/system/xbin")
+                put("SSL_CERT_FILE", "$prefix/etc/tls/cert.pem")
+                put("CURL_CA_BUNDLE", "$prefix/etc/tls/cert.pem")
+                put("NODE_OPTIONS", "--max-old-space-size=1024")
+            }
+            val proc = pb.start()
+            // ⚠️ 必须**并发**读走两个流：dump 的输出有 1500+ 行（真机实测），
+            // 单线程先 readText() 一个流会让另一个流的 64KB 管道缓冲写满，
+            // 引擎卡在 write 上永远不退出 —— 体检就成了新的挂死点。
+            val out = StringBuilder()
+            val err = StringBuilder()
+            val outThread = Thread { proc.inputStream.bufferedReader().forEachLine { out.appendLine(it) } }
+                .apply { isDaemon = true; start() }
+            val errThread = Thread { proc.errorStream.bufferedReader().forEachLine { err.appendLine(it) } }
+                .apply { isDaemon = true; start() }
+            if (!proc.waitFor(PREFLIGHT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                proc.destroyForcibly()
+                outThread.join(1000)
+                errThread.join(1000)
+                Log.w(TAG, "启动前体检超时（${PREFLIGHT_TIMEOUT_MS} ms），跳过")
+                return null
+            }
+            outThread.join(2000)
+            errThread.join(2000)
+            DumpResult(proc.exitValue(), out.toString(), err.toString())
+        } catch (t: Throwable) {
+            Log.w(TAG, "启动前体检执行失败，跳过: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 从 stderr 里解析引擎自己指认的坏文件路径。
+     *
+     * 引擎的报错长这样（真机原文，`--dump-config` 下）：
+     * ```
+     * Error: dsh: failed to parse overlay /data/.../profiles/web/cordis.patch.yml: YAMLException: ...
+     * Error: dsh: failed to read profile manifest /data/.../profiles/web/package.json: ...
+     * ```
+     * 只接受**落在 `$DSH_HOME` 或 `engine/` 以内**的路径 —— 别的一律不动。
+     */
+    private fun parseBlamedFiles(stderr: String): List<File> {
+        val out = ArrayList<File>()
+        for (line in stderr.lineSequence()) {
+            val match = BLAMED_PATH.find(line) ?: continue
+            val file = File(match.groupValues[1])
+            if (isWithinManagedRoots(file)) out += file
+        }
+        return out
+    }
+
+    /**
+     * 从 stderr 的 `skipping profile bundle "x": ...` 行里，反查出该 bundle 的目录。
+     *
+     * 真机原文：`dsh: skipping profile bundle "dsh-ppt-master": Error: ... failed to parse
+     * overlay /data/.../node_modules/dsh-ppt-master/cordis.patch.yml: ...`。
+     * 报错行里带的那个 overlay 路径就是坏文件，直接隔离它 —— 比按包名去猜目录可靠。
+     *
+     * ⚠️ 返回值里可能含**落在 `engine/` 下**的路径（核心 bundle 被 skip 时）——
+     * 那类文件隔离没有意义（会被重解包覆盖），由调用方据此改走整棵重解包。
+     */
+    private fun parseSkippedBundles(stderr: String): List<File> {
+        val out = ArrayList<File>()
+        for (line in stderr.lineSequence()) {
+            if (!line.contains("skipping profile bundle")) continue
+            Log.w(TAG, "启动前体检：${line.trim()}")
+            val match = BLAMED_PATH.find(line) ?: continue
+            val file = File(match.groupValues[1])
+            if (isWithinManagedRoots(file)) out += file
+        }
+        return out
+    }
+
+    /** [file] 是否落在本 App 管得着的两棵树里（`$DSH_HOME` 与 `engine/`）。 */
+    private fun isWithinManagedRoots(file: File): Boolean {
+        val path = file.absolutePath
+        return path.startsWith(dshHome.absolutePath) || path.startsWith(engineDir.absolutePath)
+    }
+
+    /**
      * 决定引擎 Web GUI 的监听端口。
      *
      * 返回 `null` 表示**不传 `--port`**，让引擎落到它自己的默认值
@@ -3206,6 +3649,32 @@ class EngineManager private constructor(private val context: Context) {
         homeDir.mkdirs()
         dshHome.mkdirs()
         workspaceDir.mkdirs()
+
+        // ⚠️ Termux 环境与启动前体检**必须排在最前面**，早于下面所有往 engine/ 写东西
+        // 的 ensureXxx。理由是体检在发现核心 bundle 被改坏时会触发**整棵 engine/
+        // 重解包**，而那会把已经打好的补丁与已解出的原生插件全部抹掉 —— 那些
+        // ensureXxx 都是幂等的，重解包之后再跑一遍才是正确顺序。
+        // 真机实测：正常态体检耗时 0.7~0.8 秒，对 7~10 秒的启动时间可忽略。
+        if (!bootstrap.installNodeRuntime()) {
+            _state.value = State.Failed(
+                "Termux 环境未就绪，无法启动引擎。\n" +
+                    "prefix=${bootstrap.prefixDir.absolutePath}\n" +
+                    "node=${bootstrap.nodeBinary.absolutePath}"
+            )
+            return@withContext
+        }
+
+        val nodeBin = bootstrap.nodeBinary
+        if (!nodeBin.isFile) {
+            _state.value = State.Failed("找不到 Node 可执行文件: ${nodeBin.absolutePath}")
+            return@withContext
+        }
+
+        // 启动前体检：profile 与 patch 层都是模型可写的，改坏会让引擎直接 exit 1，
+        // 而 App 没有任何自救路径（用户只能卸载重装，那会清掉全部会话与凭据）。
+        if (preflight()) {
+            Log.i(TAG, "启动前体检已修复损坏的插件配置，继续启动")
+        }
 
         // 前端补丁要在 WebView 首次加载前落盘，所以放在启动引擎这一步里
         ensureWebCompat()
@@ -3318,22 +3787,6 @@ class EngineManager private constructor(private val context: Context) {
         }
         // 让模型知道「这台设备有没有 root」，否则它会去猜、去反复试
         ensureRootPrompt(rootPatch != null)
-
-        // Termux 环境必须先就位：node 从 $PREFIX/bin 来，缺失时下面的检查会给出明确报错。
-        if (!bootstrap.installNodeRuntime()) {
-            _state.value = State.Failed(
-                "Termux 环境未就绪，无法启动引擎。\n" +
-                    "prefix=${bootstrap.prefixDir.absolutePath}\n" +
-                    "node=${bootstrap.nodeBinary.absolutePath}"
-            )
-            return@withContext
-        }
-
-        val nodeBin = bootstrap.nodeBinary
-        if (!nodeBin.isFile) {
-            _state.value = State.Failed("找不到 Node 可执行文件: ${nodeBin.absolutePath}")
-            return@withContext
-        }
 
         // pnpm 要落到 $PREFIX/bin，必须等 Termux 环境就位之后再装
         ensurePnpm()
@@ -3677,6 +4130,41 @@ class EngineManager private constructor(private val context: Context) {
         private const val ASSET_NAME = "engine.bin"
         private const val READY_TIMEOUT_MS = 120_000L
         private const val MAX_LOG_LINES = 400
+
+        /**
+         * 启动前体检（[preflight]）的超时。
+         *
+         * 真机实测正常态耗时 0.7~0.8 秒；给到 30 秒是为了容忍慢卡（体检只是
+         * 保险，超时即跳过、不影响启动，所以宁可给宽一点）。
+         */
+        private const val PREFLIGHT_TIMEOUT_MS = 30_000L
+
+        /**
+         * `requiredStartupEntryIds` 的副本 —— 与 `dsh-app-boot/lib/index.js` 里的
+         * 那个 Set **同源**，少一个引擎就起不来（`auditStartupEntries` 会抛
+         * `StartupError` 并以 exit 1 结束）。
+         *
+         * ⚠️ 这几个 id 不是「重要插件」的意思，而是「缺了整个树就废了」：
+         * 真机实测删掉 `dsh-web-app` 的 `cordis.patch.yml` 后，`webserver` /
+         * `modules` / `connection` 三个条目全部消失，引擎 boot 时挂死（45 秒超时）。
+         * 引擎升级若增删了这个列表，本副本要跟着改 —— 漏改只会让体检**少报**，
+         * 不会误伤（体检判据是「缺了才隔离」）。
+         */
+        private val REQUIRED_ENTRY_IDS = listOf("agent-loop", "webserver", "modules", "connection")
+
+        /**
+         * 从引擎报错行里抠出被指认的文件绝对路径。
+         *
+         * 覆盖三种官方措辞（真机原文）：
+         * - `failed to parse overlay <path>:`
+         * - `failed to read overlay <path>:`
+         * - `failed to read profile manifest <path>:`
+         *
+         * 路径一定在 `/` 开头（本 App 的 `$DSH_HOME` 与 `engine/` 都是绝对路径），
+         * 所以用 `(/\S+)` 而不是更宽松的匹配 —— 报错行后面还跟着 YAML 片段。
+         */
+        private val BLAMED_PATH =
+            Regex("""failed to (?:parse|read) (?:overlay|profile manifest) (/\S+?):""")
 
         /**
          * 引擎 Web GUI 的默认监听端口。

@@ -2986,6 +2986,103 @@ adb shell am force-stop com.dsh.android   # 重启才会重新加载
 ⚠️ **探针用完必须删干净**：`run-as rm -rf` 掉整个插件目录（让它从 APK 重新解包），
 并清 `/sdcard` 上的临时文件。否则下次构建的资产版本戳虽然会覆盖它，但中途容易被自己误导。
 
+## 插件改坏导致 App 打不开 —— 启动前体检 + 安全模式
+
+**症状**：用户让 App 里的 AI 改插件，AI 把 profile 或 `engine/` 改坏，之后 App
+**永久打不开**，且用户手上没有任何出路 —— 只能卸载重装，而那会清掉全部会话与凭据。
+
+**根因是两条叠加**：
+
+1. profile 与 patch 层都是**模型可写**的，改坏会让引擎 `exit 1`（或 boot 挂死）。
+2. `ensureExtracted()` 有 `.stamp` 短路 —— 改坏的是 `engine/` 下的文件时，
+   **永远不会被还原**，因为版本戳没变。
+
+### 判据：用引擎自己的 `--dump-config`，不要在 Kotlin 里重写 YAML 校验
+
+引擎自带免 boot 的 `dsh --profile web --dump-config`，走的是**和启动完全同一套**
+`loadProfile()` + patch 解析，但只解析、不求值 `!!js`、不起服务。所以判据来自引擎
+自己的解析器，不会随引擎升级而漂。
+
+真机实测耗时 **0.7~0.8 秒**（3 次：703 / 780 / 800 ms），相对引擎自身 7~10 秒的启动
+时间可忽略。
+
+**四种坏法的判据不一样，别合并成一条**（真机逐条实测）：
+
+| 坏在哪 | `dump-config` | 判据 |
+|---|---|---|
+| `profiles/web/package.json` 非法 JSON | RC=1 | 退出码（但 stderr 里**没有文件路径**，只有 JSON 位置） |
+| `profiles/web/cordis.patch.yml` 语法坏 | RC=1 | 退出码 + stderr 里的绝对路径 |
+| 第三方 bundle 的 patch 坏 | **RC=0** | stderr 的 `skipping profile bundle` |
+| 核心 bundle（`dsh-web-app`）的 patch 坏 | **RC=0** | **required 条目缺失** |
+
+⚠️ **只看退出码会漏掉后两种**。第四种尤其要紧：真机实测该状态下 `dump-config`
+返回 **RC=0**，但真正 boot 会**挂死**（45 秒超时被杀，`EXIT=124`）。所以必须再补一道
+「required 条目在不在」的检查。
+
+### 自动修：`EngineManager.preflight()`（A）
+
+在 `start()` 的**最前段**跑（早于所有往 `engine/` 写东西的 `ensureXxx`），
+发现坏文件就**改名隔离**（`<原名>.bak-<时间戳>`），再复检一次确认修好了。
+
+⚠️ **顺序是硬性的**：体检在发现核心 bundle 坏时会触发**整棵 `engine/` 重解包**，
+那会把已经打好的补丁与解出的原生插件全部抹掉。放在 `ensureWebCompat()` 之后会让
+重解包抹掉刚打的补丁。
+
+⚠️ **改名不删**：AI 改坏的东西可能还带着用户想要的内容，体检只负责让 App 能打开。
+
+### 兜底：安全模式（B）
+
+体检只用能精确指认的判据，拿不准就不碰 —— 免得误伤好配置。但覆盖不到的情况真实
+存在（坏法超出那四类、体检超时、坏在体检看不见的地方）。所以失败浮层上给一个
+**用户显式触发**的按钮（`overlaySafeMode`，只在 `isError` 时可见）。
+
+`EngineManager.enterSafeMode()` 推开三样，都不碰用户数据：
+
+| 推开什么 | 为什么 |
+|---|---|
+| profile 用户 patch 层 | 模型最爱改的就是它，改坏会让引擎 exit 1 |
+| 第三方 bundle（保留 deepseek-ai 前缀那些） | 插件装坏 / 版本对不上是常见死因 |
+| `engine/.stamp` | 强制重解包，把 `engine/` 里的改动全部还原 |
+
+⚠️ **会话、凭据、工作区都在 `$DSH_HOME` 与 `workspace/`，不在这三样里** ——
+真机验收时逐项确认过（`sessions/`、`storages/`、`workspace/` 全部完好）。
+
+⚠️ 三样都是改名不删。`stripThirdPartyBundles()` 改的是 profile **清单**而不是插件包
+（包还在 `node_modules` 里，想装回来重新勾一次即可），且**备份失败就不写** ——
+否则会把唯一一份原始清单覆盖掉。
+
+### 真机验收（2026-10-11，CDY-TN90 / Android 10）
+
+| 场景 | 结果 |
+|---|---|
+| 正常态（配置完好） | 体检**静默通过**，无任何日志，启动 11 秒，行为零变化 |
+| 坏法① `package.json` = `{ x` | 体检识别 + 隔离 + 复检通过，14 秒起好 |
+| 坏法② `cordis.patch.yml` 引号未闭合 | 体检 1 秒识别 + 隔离 + 复检通过，14 秒起好 |
+| 坏法④ 删核心 bundle 的 patch | 识别出缺 `webserver, modules, connection` → 重解包 18.5 秒 → 复检通过 → 起好 |
+| 体检修不了的失败态（删 `bin.js`） | 失败浮层出现，按钮可见可点 |
+| 点安全模式（清单含第三方 bundle） | 隔离 2 个文件 + 摘掉 1 个第三方 bundle + 重解包 → 起好，会话/凭据/工作区全在 |
+
+### 写这套东西踩到的坑
+
+⚠️ **Kotlin 的块注释支持嵌套**：KDoc 里写 `@deepseek-ai` 紧跟 `/*`（即包名通配那种
+写法）会**开始一层嵌套注释**，把下面整段代码吞进注释里。报错是 `Missing '}'` +
+`Unclosed comment`，**行号指向完全无关的地方**。文档里写这种通配要拆开写。
+
+⚠️ **主题是 `Theme.Material3.*`，它会顶掉 `Button` 的 `android:background`** ——
+设了描边背景却渲染成一大块实心紫。气泡里那几个按钮同样是 `TextView`，照抄既有写法
+（`TextView` + `clickable="true"` + `@drawable/xxx_bg`）。
+
+⚠️ **`org.json` 的 `JSONObject.toString()` 会把 `/` 转义成 `\/`**（防 `</script>`
+的历史行为）。在 JSON 里完全合法、引擎也读得进去，但这份清单用户和模型都会看，
+`@deepseek-ai\/dsh-base` 长得就像文件已经坏了 —— 而"配置看起来坏了"正是要消灭的
+状态。回写时 `.replace("\\/", "/")` 还原。
+
+⚠️ **`quarantine()` 是两条路径共用的**（体检自动修 / 安全模式），日志前缀必须区分
+来源 —— 否则排查时会把用户主动进安全模式误读成"体检又修了一次"。
+
+⚠️ **测试期隔离出来的 `.bak-<时间戳>` 会累积**：真机上跑一轮完整验证会留下五六个。
+测完记得 `rm -f files/home/.dsh/profiles/web/*.bak-*`，并把 profile 恢复成测前的样子。
+
 ## 已知边界
 
 - **终端/PTY 执行**：已接入（见 ⑩）。侧栏终端可用，但**沙箱不隔离 PID 命名空间**

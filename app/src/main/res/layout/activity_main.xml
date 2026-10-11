@@ -78,6 +78,39 @@
                 android:textColor="#5A6B85"
                 android:textSize="11.5sp"
                 android:visibility="gone" />
+
+            <!--
+              安全模式入口：**只在失败态**显示（见 MainActivity.showOverlay）。
+
+              为什么需要它：启动前体检（EngineManager.preflight）能自动修掉四类
+              可指认的坏法，但覆盖不到的情况真实存在（坏法超出那四类、体检超时、
+              或者坏在体检看不见的地方）。那时 App 依然打不开，而用户手上没有任何
+              出路 —— 只能卸载重装，那会清掉全部会话与凭据。
+
+              文案刻意写清楚"不会丢会话"，因为这一步是破坏性的：用户需要知道
+              代价是什么才敢点。
+
+              ⚠️ 用 TextView 而不是 Button：主题是 `Theme.Material3.*`，它会给
+              Button 套一层自己的实心紫底，把 android:background 顶掉（真机实测
+              显示成一大块实心紫）。气泡里那几个按钮同样是 TextView，照抄既有写法。
+            -->
+            <TextView
+                android:id="@+id/overlaySafeMode"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="22dp"
+                android:background="@drawable/overlay_button_bg"
+                android:clickable="true"
+                android:focusable="true"
+                android:letterSpacing="0.06"
+                android:paddingStart="20dp"
+                android:paddingTop="10dp"
+                android:paddingEnd="20dp"
+                android:paddingBottom="10dp"
+                android:text="@string/safe_mode_entry"
+                android:textColor="#DCE6F5"
+                android:textSize="13sp"
+                android:visibility="gone" />
         </LinearLayout>
     </FrameLayout>
 </FrameLayout>

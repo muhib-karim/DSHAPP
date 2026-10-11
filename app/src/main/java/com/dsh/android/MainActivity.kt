@@ -329,6 +329,10 @@ class MainActivity : AppCompatActivity() {
         engine = EngineManager.get(this)
         loadImeHeight()   // 修复 65：把上次学到的键盘高度取回来（跨冷启动有效）
 
+        // 失败浮层上的唯一出路。⚠️ Button 是 clickable 的子 View，点击不会冒泡到
+        // overlay 自己的监听器（那个只负责"点一下收起浮层"），两者不冲突。
+        binding.overlaySafeMode.setOnClickListener { enterSafeMode() }
+
         setupWebView()
         detectWebViewVersion()
         setupBackNavigation()
@@ -1234,7 +1238,42 @@ class MainActivity : AppCompatActivity() {
         )
         binding.overlayHint.text = hint.orEmpty()
         binding.overlayHint.visibility = if (hint.isNullOrBlank()) View.GONE else View.VISIBLE
+        // 安全模式入口只在失败态给：正常启动期界面马上就出来了，多一个按钮只会
+        // 诱人误点（而它的代价是重解包 15 秒 + 推开插件配置）。
+        binding.overlaySafeMode.visibility = if (isError) View.VISIBLE else View.GONE
         binding.bootAnim.setProgress(if (isError) -1f else (progress ?: -1f))
+    }
+
+    /**
+     * 用户点了失败浮层上的「安全模式」：推开模型改坏的配置，然后重启引擎。
+     *
+     * 这是**唯一**不靠卸载重装的出路 —— 见 [EngineManager.enterSafeMode] 的 KDoc。
+     * 按钮要先禁掉：重解包要 15 秒，这期间用户再点几下会叠起多次重启。
+     */
+    private fun enterSafeMode() {
+        binding.overlaySafeMode.isEnabled = false
+        // ⚠️ 顺序：先清掉"已收起"标记再 showOverlay —— 后者在 overlayDismissed
+        //   为真时会直接返回（那是防动画闪回的守卫），提示文案就贴不上去了。
+        overlayDismissed = false
+        showOverlay(
+            "正在进入安全模式…",
+            hint = "推开损坏的插件配置并重新解包引擎（约 15 秒）",
+        )
+        lifecycleScope.launch {
+            try {
+                val changed = engine.enterSafeMode()
+                Log.i(DshApplication.TAG, "安全模式：改动=$changed，重启引擎")
+                // ⚠️ 必须重新解包：enterSafeMode 删掉了版本戳，而这次 start() 之前的
+                //   ensureExtracted 已经跑过去了（在 bootEngine 里），不补一次的话
+                //   引擎还是用旧的坏目录起来。
+                engine.ensureExtracted(assetStamp)
+                engine.start()
+            } catch (t: Throwable) {
+                Log.e(DshApplication.TAG, "安全模式启动失败", t)
+                binding.overlaySafeMode.isEnabled = true
+                showOverlay("安全模式启动失败", hint = t.message, isError = true)
+            }
+        }
     }
 
     /**
