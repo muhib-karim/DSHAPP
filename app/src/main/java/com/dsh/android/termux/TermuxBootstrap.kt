@@ -8,10 +8,14 @@ import com.dsh.android.termux.util.AppLogger
 import com.dsh.android.termux.util.AtomicTextFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 
 /**
@@ -81,7 +85,7 @@ class TermuxBootstrap(private val context: Context) {
     private val rewriteMarker get() = File(prefixDir, ".paths_rewritten_v7")
 
     /**
-     * 内置 Node 运行时的安装标记。
+     * 安装标记，`.node_runtime_<版本>`。
      *
      * ⚠️ 与 [rewriteMarker] **分开**是必需的：那个标记只覆盖 bootstrap 自己解出来的文件，
      * 而 Node 运行时是随后单独铺进去的一批文件。若共用标记，升级安装时新增或更新的
@@ -103,80 +107,90 @@ class TermuxBootstrap(private val context: Context) {
         if (isReady) return
         AppLogger.i("TERMUX", "install start arch=$termuxArch")
         withContext(Dispatchers.IO) {
-            Log.i(TAG, "Extracting Termux bootstrap from assets")
-            rootDir.mkdirs()
-            homeDir.mkdirs()
-            prefixDir.deleteRecursively()
-            prefixDir.mkdirs()
+          // 与 installNodeRuntime / rewriteTermuxPaths 共用同一把锁：三者都会
+          // 往 prefix 里写文件，而 install() 开头就有 deleteRecursively()。
+          prefixLock.withLock {
+            installLocked()
+          }
+        }
+    }
 
-            val zipName = "bootstrap-${termuxArch}.zip"
-            context.assets.open(zipName).use { input ->
-                ZipInputStream(input.buffered()).use { zis ->
-                    var entry = zis.nextEntry
-                    while (entry != null) {
-                        val name = entry.name
-                        if (name == "SYMLINKS.txt") {
-                            File(prefixDir, name).outputStream().use { zis.copyTo(it) }
+    /** [install] 的实现体，必须已持有 [prefixLock]。 */
+    private fun installLocked() {
+        if (isReady) return
+        Log.i(TAG, "Extracting Termux bootstrap from assets")
+        rootDir.mkdirs()
+        homeDir.mkdirs()
+        prefixDir.deleteRecursively()
+        prefixDir.mkdirs()
+
+        val zipName = "bootstrap-${termuxArch}.zip"
+        context.assets.open(zipName).use { input ->
+            ZipInputStream(input.buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    val name = entry.name
+                    if (name == "SYMLINKS.txt") {
+                        File(prefixDir, name).outputStream().use { zis.copyTo(it) }
+                    } else {
+                        val outFile = File(prefixDir, name)
+                        if (entry.isDirectory) {
+                            outFile.mkdirs()
                         } else {
-                            val outFile = File(prefixDir, name)
-                            if (entry.isDirectory) {
-                                outFile.mkdirs()
-                            } else {
-                                outFile.parentFile?.mkdirs()
-                                FileOutputStream(outFile).use { zis.copyTo(it) }
-                                if (name.startsWith("bin/") || name.startsWith("libexec/") ||
-                                    name.startsWith("lib/apt/methods/")) {
-                                    outFile.setExecutable(true, false)
-                                }
+                            outFile.parentFile?.mkdirs()
+                            FileOutputStream(outFile).use { zis.copyTo(it) }
+                            if (name.startsWith("bin/") || name.startsWith("libexec/") ||
+                                name.startsWith("lib/apt/methods/")) {
+                                outFile.setExecutable(true, false)
                             }
                         }
-                        zis.closeEntry()
-                        entry = zis.nextEntry
                     }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
                 }
             }
-
-            val symlinksFile = File(prefixDir, "SYMLINKS.txt")
-            if (symlinksFile.exists()) {
-                processSymlinks(symlinksFile, prefixDir)
-                symlinksFile.delete()
-            }
-
-            // Point every baked-in /data/data/com.termux path at this install.
-            // Order matters: the alias symlinks come first because the paths
-            // rewritten inside ELF binaries resolve *through* them.
-            // See rewriteTermuxPaths for why binaries need a different rule.
-            createPrefixAliases()
-            ensureDpkgDirs()
-            ensureAptInstdirRoot()
-            rewriteTermuxPaths(prefixDir)
-
-            // Install GPG keyrings so apt can verify repository signatures.
-            // The bootstrap zip ships keys in share/termux-keyring/*.gpg
-            // but etc/apt/trusted.gpg.d/ is empty. Normally the second-stage
-            // bootstrap (dpkg --configure termux-keyring) does this, but
-            // we skip second-stage since its scripts also have broken paths.
-            installGpgKeys(prefixDir)
-
-            // Ensure TMPDIR exists — the shell environment references it.
-            File(prefixDir, "tmp").mkdirs()
-
-            // Pre-create apt directories. The bootstrap zip doesn't ship
-            // var/cache/apt/ or var/lib/apt/ — apt creates them lazily, but
-            // pre-creating avoids any edge case with directory creation on
-            // read-only / restrictive Android filesystem paths.
-            File(prefixDir, "var/cache/apt/archives/partial").mkdirs()
-            File(prefixDir, "var/lib/apt/lists/partial").mkdirs()
-
-            writeSourcesList()
-            writeAptConfig()
-            // 首次安装就把国内快源写进 pip/npm/go/cargo 配置。用候选表默认值（实测各生态
-            // 最快的一个），**不做同步测速** —— 启动路径绝不为了挑源多等 8 秒。
-            applyMirrorConfigs(loadMirrors())
-            marker.writeText("ok")
-            rewriteMarker.writeText("ok")
-            Log.i(TAG, "Termux bootstrap installed ($prefixDir)")
         }
+
+        val symlinksFile = File(prefixDir, "SYMLINKS.txt")
+        if (symlinksFile.exists()) {
+            processSymlinks(symlinksFile, prefixDir)
+            symlinksFile.delete()
+        }
+
+        // Point every baked-in /data/data/com.termux path at this install.
+        // Order matters: the alias symlinks come first because the paths
+        // rewritten inside ELF binaries resolve *through* them.
+        // See rewriteTermuxPaths for why binaries need a different rule.
+        createPrefixAliases()
+        ensureDpkgDirs()
+        ensureAptInstdirRoot()
+        rewriteTermuxPathsLocked(prefixDir)
+
+        // Install GPG keyrings so apt can verify repository signatures.
+        // The bootstrap zip ships keys in share/termux-keyring/*.gpg
+        // but etc/apt/trusted.gpg.d/ is empty. Normally the second-stage
+        // bootstrap (dpkg --configure termux-keyring) does this, but
+        // we skip second-stage since its scripts also have broken paths.
+        installGpgKeys(prefixDir)
+
+        // Ensure TMPDIR exists — the shell environment references it.
+        File(prefixDir, "tmp").mkdirs()
+
+        // Pre-create apt directories. The bootstrap zip doesn't ship
+        // var/cache/apt/ or var/lib/apt/ — apt creates them lazily, but
+        // pre-creating avoids any edge case with directory creation on
+        // read-only / restrictive Android filesystem paths.
+        File(prefixDir, "var/cache/apt/archives/partial").mkdirs()
+        File(prefixDir, "var/lib/apt/lists/partial").mkdirs()
+
+        writeSourcesList()
+        writeAptConfig()
+        // 首次安装就把国内快源写进 pip/npm/go/cargo 配置。用候选表默认值（实测各生态
+        // 最快的一个），**不做同步测速** —— 启动路径绝不为了挑源多等 8 秒。
+        applyMirrorConfigs(loadMirrors())
+        marker.writeText("ok")
+        rewriteMarker.writeText("ok")
+        Log.i(TAG, "Termux bootstrap installed ($prefixDir)")
     }
 
     /**
@@ -221,15 +235,33 @@ class TermuxBootstrap(private val context: Context) {
      * @return true 表示运行时已就位（含本就已安装的情况）。
      */
     suspend fun installNodeRuntime(): Boolean = withContext(Dispatchers.IO) {
+        prefixLock.withLock { installNodeRuntimeLocked() }
+    }
+
+    /** [installNodeRuntime] 的实现体，必须已持有 [prefixLock]。 */
+    private fun installNodeRuntimeLocked(): Boolean {
         if (!prefixDir.exists()) {
             AppLogger.w("TERMUX", "installNodeRuntime: prefix 不存在，跳过")
-            return@withContext false
+            return false
         }
         if (nodeMarker.exists() && nodeBinary.isFile) {
-            return@withContext true
+            // 标记只证明「曾经装过」，不证明「现在还能用」。node 是 47 MB 的
+            // 可执行文件，任何把它写坏的原因（写入中途被杀、两个入口并发写、
+            // 磁盘错误）都会留下一个「大小对、ELF 头也在、但内容已坏」的文件，
+            // 而这里原本只看文件在不在 ⇒ 直接放行 ⇒ 引擎再也起不来。
+            //
+            // 真机实测那种坏法：node 起动时在 V8 反序列化内嵌启动快照处
+            // `Check failed: magic_number_ == SerializedData::kMagicNumber`，
+            // 报错发生在**任何一行 JS 之前**，所以插件/profile 层面的所有自救
+            // 路径（含「进入安全模式」）都够不着它 —— 用户只能卸载重装，而那会
+            // 清掉整个 $DSH_HOME。见 [nodeIsUsable]。
+            if (nodeIsUsable()) return true
+            AppLogger.w("TERMUX", "内置 Node 运行时已损坏，重新解包: ${nodeBinary.absolutePath}")
+            nodeMarker.delete()
+            nodeBinary.delete()
         }
 
-        try {
+        return try {
             AppLogger.i("TERMUX", "安装内置 Node 运行时 $NODE_VERSION")
             val links = mutableListOf<Pair<String, String>>()
 
@@ -257,12 +289,22 @@ class TermuxBootstrap(private val context: Context) {
                                 // 先写临时文件再改名：中途被杀不会留下半截的可执行文件，
                                 // 而半截的 node 会在 exec 时报 "Exec format error"，
                                 // 症状离根因很远。
-                                val tmp = File(out.parentFile, "${out.name}.part")
-                                FileOutputStream(tmp).use { zis.copyTo(it) }
-                                if (tmp.renameTo(out)) {
+                                //
+                                // ⚠️ 临时名必须**唯一**（`createTempFile` 而不是固定的
+                                // `<名字>.part`）：.part 是固定名，两个入口同时装就会开
+                                // 同一个文件写、内容交错 —— 产出的正是上面那种「大小对、
+                                // 内容已坏」的二进制。锁已经挡住了本类的并发，这里再防一层
+                                // 别的进程/残留进程。
+                                val tmp = File.createTempFile(".${out.name}.", ".part", out.parentFile)
+                                try {
+                                    FileOutputStream(tmp).use { zis.copyTo(it) }
+                                    Files.move(
+                                        tmp.toPath(), out.toPath(),
+                                        StandardCopyOption.REPLACE_EXISTING,
+                                    )
                                     if (name.startsWith("bin/")) out.setExecutable(true, false)
-                                } else {
-                                    AppLogger.w("TERMUX", "改名失败: ${tmp.name}")
+                                } finally {
+                                    tmp.delete()
                                 }
                             }
                         }
@@ -302,14 +344,16 @@ class TermuxBootstrap(private val context: Context) {
             // 🔴 必须重写 node 与这批库里的烤死路径。它们全是 Termux 官方构建，
             //    二进制里带着 /data/data/com.termux/files/usr/lib 作为 RUNPATH，
             //    不重写就永远去读 com.termux 的私有目录（读不到 ⇒ 链接失败）。
-            rewriteTermuxPaths(prefixDir)
+            rewriteTermuxPathsLocked(prefixDir)
 
-            if (nodeBinary.isFile) {
+            // 装完再验一次：写坏了就**别写标记**，让下次启动重来一遍，而不是把
+            // 一个坏运行时封印成「已安装」。
+            if (nodeBinary.isFile && nodeIsUsable()) {
                 nodeMarker.writeText("ok")
                 AppLogger.i("TERMUX", "Node 运行时就绪: ${nodeBinary.absolutePath}")
                 true
             } else {
-                AppLogger.w("TERMUX", "Node 运行时安装后仍找不到 ${nodeBinary.absolutePath}")
+                AppLogger.w("TERMUX", "Node 运行时安装后仍不可用: ${nodeBinary.absolutePath}")
                 false
             }
         } catch (t: Throwable) {
@@ -318,8 +362,93 @@ class TermuxBootstrap(private val context: Context) {
         }
     }
 
+    /**
+     * 跑一次 `node --version`，判断这个二进制**真的能起来**。
+     *
+     * ## 🔴 为什么不能只查「文件在不在」
+     *
+     * 粉丝真机反馈（`Check failed: magic_number_ == SerializedData::kMagicNumber`）：
+     * 崩溃点在 V8 反序列化内嵌启动快照，**早于任何一行 JS**。所以这不是插件、
+     * `engine/`、profile 的问题，而是 `$PREFIX/bin/node` 本身坏了。而 [nodeMarker]
+     * 的判据原本只是「标记在 + 文件在」，坏了的 node 照样命中 ⇒ 引擎永远起不来，
+     * 而「进入安全模式」只推开 profile patch / 第三方 bundle / `engine/.stamp`，
+     * **完全不碰 `$PREFIX`** ⇒ 用户唯一的出路是卸载重装，那会清掉整个 `$DSH_HOME`。
+     *
+     * ## 为什么用 `--version` 当判据
+     *
+     * - 不引入 sha256 常量：资产一更新就要重新算，漏算就是静默失效（本项目已有
+     *   多处「版本戳漏改 ⇒ 老装机永远不更新」的教训）。
+     * - 不做 47 MB 全量读校验：那是每次启动的常态开销。
+     * - `--version` 恰好走完「ELF 可加载 + 动态库齐 + V8 启动快照可反序列化」这三步，
+     *   正是上面那个报错发生的地方，成本约 50 ms。
+     *
+     * ⚠️ 判据是**版本字符串相符**，不只是「跑起来了」。链接器指错目录、库不匹配等
+     * 情况会打印别的版本或直接报错，都应当判为不可用。
+     */
+    private fun nodeIsUsable(): Boolean {
+        if (!nodeBinary.isFile) return false
+        return try {
+            val pb = ProcessBuilder(nodeBinary.absolutePath, "--version")
+            pb.environment().apply {
+                // 与真正启动**同一套**环境：node 的 NEEDED 靠 LD_LIBRARY_PATH 找
+                // $PREFIX/lib，缺了它会以 `CANNOT LINK EXECUTABLE ... not found`
+                // 失败，从而把「环境没给对」误判成「二进制坏了」。
+                put("PREFIX", prefixDir.absolutePath)
+                put("LD_LIBRARY_PATH", "${prefixDir.absolutePath}/lib")
+                put("TMPDIR", "$prefixDir/tmp")
+            }
+            val proc = pb.start()
+            // 必须把输出读走：不读会让子进程卡在写管道上，waitFor 等到超时。
+            val text = proc.inputStream.bufferedReader().use { it.readText() }
+            val err = proc.errorStream.bufferedReader().use { it.readText() }
+            val ok = proc.waitFor(NODE_CHECK_TIMEOUT_MS, TimeUnit.MILLISECONDS) &&
+                proc.exitValue() == 0 &&
+                text.trim() == NODE_EXECUTABLE_VERSION
+            if (!ok) {
+                AppLogger.w(
+                    "TERMUX",
+                    "node --version 校验失败: rc=${if (proc.isAlive) "timeout" else proc.exitValue()} " +
+                        "out=${text.trim().take(120)} err=${err.trim().take(200)}",
+                )
+                if (proc.isAlive) proc.destroyForcibly()
+            }
+            ok
+        } catch (t: Throwable) {
+            AppLogger.w("TERMUX", "node --version 校验异常: ${t.message}")
+            false
+        }
+    }
+
     /** 内置 Node 可执行文件的绝对路径。 */
     val nodeBinary: File get() = File(prefixDir, "bin/node")
+
+    /**
+     * 用户显式触发「安全模式」时调用的 Node 自愈入口：**只有当 node 真的不可用时**
+     * 才重解包，可用时零成本返回。
+     *
+     * ## 为什么安全模式必须带上这一步
+     *
+     * [enterSafeMode] 原本只推开三样：profile patch 层、第三方 bundle、`engine/.stamp`。
+     * 这三样都在 `$DSH_HOME` / `engine/` 里，**完全不碰 `$PREFIX`**。而 node 损坏
+     * （真机实测：`Check failed: magic_number_ == SerializedData::kMagicNumber`）会让
+     * 引擎**连一行 JS 都跑不到**就死掉 —— 于是用户点了「进入安全模式」也一样打不开，
+     * 唯一出路是卸载重装，而卸载会清掉整个 `$DSH_HOME`（会话、凭据、工作区）。
+     *
+     * 成本：一次 `node --version`（约 50 ms）。**不会**在 node 正常时重解包。
+     *
+     * @return true = 确实做了修复（调用方据此更新「已推开哪些东西」的提示）。
+     */
+    fun repairNodeRuntimeIfNeeded(): Boolean = prefixLock.withLock {
+        if (!prefixDir.exists()) return@withLock false
+        // 用与 [installNodeRuntime] 完全相同的判据，别另立一套。
+        if (nodeMarker.exists() && nodeBinary.isFile && nodeIsUsable()) return@withLock false
+
+        AppLogger.w("TERMUX", "安全模式：内置 Node 运行时不可用，重新解包 $NODE_VERSION")
+        nodeMarker.delete()
+        nodeBinary.delete()
+        installNodeRuntimeLocked()
+        true
+    }
 
     /**
      * 每次启动都跑：把 ELF 路径重写补到新铺进来的文件上（幂等，已正确则零成本）。
@@ -330,7 +459,9 @@ class TermuxBootstrap(private val context: Context) {
     fun ensureNodeRuntimePatched() {
         if (!nodeBinary.isFile) return
         try {
-            rewriteTermuxPaths(prefixDir)
+            // 走锁：本方法与 DshApplication 的 installNodeRuntime 是**两个不同实例**
+            // 上的两条并发路径，都会原地重写同一个 47 MB 的 node 二进制。
+            prefixLock.withLock { rewriteTermuxPathsLocked(prefixDir) }
         } catch (e: Exception) {
             AppLogger.w("TERMUX", "ensure node patched: ${e.message}")
         }
@@ -345,19 +476,21 @@ class TermuxBootstrap(private val context: Context) {
     fun ensurePathsRewritten() {
         if (prefixDir.exists() && !rewriteMarker.exists()) {
             AppLogger.i("TERMUX", "rewriting Termux paths")
+            prefixLock.withLock {
             // Same first-install sequence, minus the zip extraction: existing
             // installs need the aliases and the dpkg skeleton too, not just the
             // path rewrite.
             createPrefixAliases()
             ensureDpkgDirs()
             ensureAptInstdirRoot()
-            rewriteTermuxPaths(prefixDir)
+            rewriteTermuxPathsLocked(prefixDir)
             // Re-assert our apt/dpkg config on the repair path too — an install
             // that predates the instdir redirect would otherwise keep failing.
             // Only Boo-authored files are (re)written; sources.list is left
             // alone because the user or `pkg` may have repointed the mirror.
             writeAptConfig()
             rewriteMarker.writeText("ok")
+            }
         }
     }
 
@@ -1104,8 +1237,12 @@ DPkg::options { "--instdir=$instdir"; };
      * `/files` suffix) and `bin/termux-am*` carries a socket path under
      * `.../apps/com.termux/` — neither matches the rule, and Boo never invokes
      * any of them.
+     *
+     * ⚠️ 本函数会**原地重写** prefix 里的可执行文件（含 47 MB 的 node），所以
+     * 调用方**必须已持有 [prefixLock]** —— 两个实例并发跑它会产出内容交错的
+     * 二进制。对外的入口见 [ensureNodeRuntimePatched] / [ensurePathsRewritten]。
      */
-    private fun rewriteTermuxPaths(prefixDir: File) {
+    private fun rewriteTermuxPathsLocked(prefixDir: File) {
         val textNew = dataDir
         if (OLD_TERMUX_ROOT == textNew) return
 
@@ -1162,6 +1299,17 @@ DPkg::options { "--instdir=$instdir"; };
      * the number of substitutions. Uses only Java 8 APIs and a manual read loop
      * — see the project's rule against Java 9+ APIs, which compile fine on the
      * host JDK and then throw `NoSuchMethodError` on device.
+     *
+     * ## 🔴 写回为什么必须是「临时文件 + 改名」
+     *
+     * 原来是 `FileOutputStream(file).write(bytes)`：**直接截断并原地重写**。
+     * node 是 47 MB，这个窗口有几十毫秒，期间磁盘上是一个**半截文件** ——
+     * 任何在这个窗口里 exec 它、或读到一半的进程，都会拿到「大小对得上、
+     * 内容已经坏掉」的二进制。
+     *
+     * 临时文件 + `Files.move` 让写回变成全有或全无：目标要么是改前的完整文件，
+     * 要么是改后的完整文件，**没有中间态**。同目录内的改名在同一文件系统上，
+     * 不涉及拷贝。
      */
     private fun patchElfInPlace(file: File, old: ByteArray, new: ByteArray): Int {
         if (old.size != new.size) return 0
@@ -1198,8 +1346,32 @@ DPkg::options { "--instdir=$instdir"; };
         if (hits == 0) return 0
 
         val wasExec = file.canExecute()
-        FileOutputStream(file).use { it.write(bytes) }
-        if (wasExec) file.setExecutable(true, false)
+        val dir = file.absoluteFile.parentFile ?: return 0
+        var tmp: File? = null
+        try {
+            // 临时名必须唯一：固定名字会让并发/残留进程写到同一个文件上。
+            tmp = File.createTempFile(".${file.name}.", ".patched", dir)
+            FileOutputStream(tmp).use {
+                it.write(bytes)
+                it.flush()
+                // fsync：close() 只把数据交给 OS，掉电会留下一个大小正确但内容全零的文件 ——
+                // 对一个可执行文件来说与写坏无异。
+                it.fd.sync()
+            }
+            if (wasExec) tmp.setExecutable(true, false)
+            Files.move(
+                tmp.toPath(), file.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE,
+            )
+            tmp = null
+        } catch (t: Throwable) {
+            // 保留改前的完整文件，这是本函数这层保护的全部意义。
+            AppLogger.w("TERMUX", "重写 ${file.name} 失败，保留原文件: ${t.message}")
+            return 0
+        } finally {
+            tmp?.delete()
+        }
         return hits
     }
 
@@ -1251,5 +1423,40 @@ DPkg::options { "--instdir=$instdir"; };
          * marker 命中而跳过安装，拿到的是旧运行时且没有任何报错。
          */
         private const val NODE_VERSION = "26.4.0-2"
+
+        /**
+         * `node --version` 应当打印的字符串，[nodeIsUsable] 的判据。
+         *
+         * ⚠️ 与 [NODE_VERSION] **必须同步改**：那个是安装标记的版本，这个是资产
+         * 里 node 自报的版本。资产一换，两个都得跟着走，否则 `nodeIsUsable()`
+         * 会把刚铺好的新 node 判成「损坏」，然后每次启动都白重解包一遍。
+         */
+        private const val NODE_EXECUTABLE_VERSION = "v26.4.0"
+
+        /**
+         * `node --version` 的超时。
+         *
+         * 正常约 50 ms（真机实测）。给到 10 秒是因为校验发生在**启动路径**上，
+         * 而它跑在一个可能已经被拖慢的机器上；超时即判为损坏并重解包，代价是
+         * 一次约 15 秒的重装 —— 远小于把一个起不来的运行时封印成「已安装」。
+         */
+        private const val NODE_CHECK_TIMEOUT_MS = 10_000L
+
+        /**
+         * prefix 的写锁。
+         *
+         * ## 🔴 为什么必须是 **companion**（进程级）而不是实例级
+         *
+         * [installNodeRuntime] / [rewriteTermuxPathsLocked] 会被**两个不同实例**
+         * 上的两条路径并发调用：
+         *
+         * - `DshApplication.bootstrapTermux()`（`applicationScope`，IO 线程）
+         * - `EngineManager.start()`（`lifecycleScope`，主线程调度到 IO）
+         *
+         * 两者都持有各自 `by lazy { TermuxBootstrap(context) }` 的实例，所以实例级
+         * 锁挡不住它们。而这两条路径都会**原地重写同一个 47 MB 的 node 二进制**，
+         * 交错写入的产物就是粉丝那个「文件大小对、ELF 头在、内容已坏」的 node。
+         */
+        private val prefixLock = ReentrantLock()
     }
 }

@@ -3300,6 +3300,17 @@ class EngineManager private constructor(private val context: Context) {
             changed = true
         }
 
+        // ④ Node 运行时：上面三样都在 $DSH_HOME / engine/ 里，**都不碰 $PREFIX**，
+        //    而 node 损坏会让引擎连一行 JS 都跑不到 —— 真机实测那种坏法报
+        //    `Check failed: magic_number_ == SerializedData::kMagicNumber`（V8 反序列化
+        //    内嵌启动快照，早于任何 JS）。不带上这一步，用户点了安全模式也照样打不开，
+        //    唯一出路是卸载重装，而卸载会清掉整个 $DSH_HOME。
+        //    node 可用时这一步是零成本的（一次 node --version）。
+        if (bootstrap.repairNodeRuntimeIfNeeded()) {
+            Log.w(TAG, "安全模式：内置 Node 运行时已重新解包")
+            changed = true
+        }
+
         Log.w(TAG, "安全模式：已推开损坏的配置（改动=$changed），准备重启引擎")
         changed
     }
