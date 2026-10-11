@@ -679,7 +679,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-47`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-49`） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -2959,6 +2959,61 @@ let n=0; for (const sh of document.styleSheets){let rs;try{rs=sh.cssRules}catch(
 不弹这个菜单，必须维持**立即 blur**，否则白等一个兜底周期，那段时间足够键盘被挂回来。
 ⚠️ 不要退回「立即 blur」，也不要改成「在 keepFocus 里 blur」—— 后者同样抢在 React
 渲染菜单之前。
+
+### API 密钥输入框弹安全键盘（修复 68，**改过两次才对**）
+
+**症状**：设置 → 模型 → 添加模型提供商，点 API 密钥输入框弹出「华为安全键盘」，
+**没有粘贴入口**。API key 是 51 字符的 `sk-...`，手抄不现实 ⇒ 功能实际不可用。
+
+**根因（第一版没找对，第二版才定论）**：官方把凭据框渲染成 `<input type="password">`
+（`dsh-client-ui-settings-models/lib/client.js` L1692 与 L2552），Android WebView 据此
+把 `inputType` 定成 `TYPE_TEXT_VARIATION_WEB_PASSWORD`，输入法切安全键盘（按设计屏蔽剪贴板）。
+
+**两次踩坑，都要记住：**
+
+**坑一：用 CSS 补圆点 ⇒ 修复完全失效。**
+第一版摘掉 `type=password` 后，又写了
+`input[data-mp-key="1"] { -webkit-text-security: disc !important; }` 把圆点补回来。
+而 blink 判定「密码字段」用的是 `Element::ShouldObscureValue()`，它检查的正是
+**`computedStyle.textSecurity != none`** —— `type=password` 只是经 UA 样式表拿到同一条声明。
+摘掉属性、再手写同一条声明 ＝ 原样把密码语义装了回去。
+⚠️ **「普通键盘」与「圆点遮蔽」在 Android WebView 上不可兼得**，要剪贴板就必须放弃遮蔽。
+
+**坑二（更隐蔽）：事后改属性永远追不上 —— WebView 不为已建立的输入连接重算 `inputType`。**
+官方那两个框带 **`autoFocus: true`**（L1699、L2552）。React 把元素插入 DOM 的**同一帧**
+就以 `type=password` 聚焦，WebView 在那时建立了密码型连接。MutationObserver 是**之后**
+才改属性的，**太晚了**。实测 `blur() + focus()` 也刷不动 —— 确认是缓存的。
+
+**决定性对照实验**（真机 CDY-TN90 / Android 10，读 `dumpsys input_method` 的实时值）：
+
+| 聚焦的元素 | DOM | IME `inputType` |
+|---|---|---|
+| 手工造的纯净 `<input type=text>` | `type=text` | `0x0` |
+| 同样纯净 + `data-mp-key="1"` | `type=text` | `0x0` |
+| 官方凭据框（**只做事后改属性**） | `type=text`、`ts=none` | **`0xe1`** ✗ |
+| 官方凭据框（**原型层拦截**） | `type=text`、`ts=none` | **`0x80a1`** ✓ |
+
+`0xe1` = `TYPE_CLASS_TEXT(0x1)` \| `TYPE_TEXT_VARIATION_WEB_PASSWORD(0xe0)`
+`0x80a1` = `TYPE_CLASS_TEXT(0x1)` \| `TYPE_TEXT_VARIATION_VISIBLE_PASSWORD(0x10)` \| `NO_SUGGESTIONS`
+
+**做法**：`installPasswordTypeShim()` 在 `HTMLInputElement.prototype` 层重定义 `type`
+访问器与 `setAttribute`，把写入的 `"password"` 就地换成 `"text"` ——
+**让 DOM 里从头到尾没出现过 password**，输入连接从建立的第一刻就是普通文本框。
+React 完全无感（它只认自己的 props，不读 DOM 属性），受控逻辑不受影响。
+MutationObserver 保留作兜底 + 摘 `autocomplete="new-password"`。
+
+**顺带排除掉的嫌疑（都实测过，别再往这些方向查）**：
+- `data-mp-key` 标记本身 —— 带它的纯净 input 仍是 `0x0`
+- CSS `-webkit-text-security` —— 已确认 `getComputedStyle().webkitTextSecurity` 可读，
+  焦点框实测 `ts=none`，证明遮蔽确实清掉了
+- `blur() + focus()` 重建连接 —— 实测刷不动 `inputType`
+
+**验收**：`0xe1` → `0x80a1`，键盘顶部「华为安全键盘」标识消失，键盘出现剪贴板入口。
+
+⚠️ 改的是 `mobile-ui.zip` 内容 ⇒ **必须同时改两处版本戳**，否则老设备静默不更新：
+`EngineManager.MOBILE_UI_VERSION`（→ `1.0.0-49`）与
+`tools/build-webview-compat.ps1` 的 `-CompatVersion`（→ `6`，并重跑脚本）。
+降级产物会**覆盖**源文件，这是「改了没生效」最常见的陷阱（见 ⑯）。
 
 ## 调试真机
 

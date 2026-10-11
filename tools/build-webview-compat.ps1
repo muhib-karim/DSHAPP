@@ -74,7 +74,12 @@ param(
     #     `mobileui/lib/client.js` 的降级产物随之变化。**必须 bump** ——
     #     否则已装 v3 的设备会命中「两戳都一致 → 整体跳过」，
     #     mobile-ui 那棵树继续用**旧**的降级产物覆盖源文件，图标改动静默失效。
-    [string]$CompatVersion = "4",
+    # v5：修复 68 真正生效（去掉凭据输入框的 `-webkit-text-security: disc` 遮蔽）。
+    #     同 v4 的道理：改的是 mobile-ui 源码，降级产物变了就必须 bump，
+    #     否则 mobileui 那棵树的戳对得上、会被跳过，插件继续是旧的。
+    # v6：修复 68 补上真正生效的那一层（原型层拦截 `type=password`）。
+    #     仍然必须 bump —— 改的还是 mobile-ui 源码。
+    [string]$CompatVersion = "6",
 
     [string]$EngineBin,
     [string]$OutZip

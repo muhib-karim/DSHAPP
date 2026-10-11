@@ -4700,8 +4700,21 @@ class EngineManager private constructor(private val context: Context) {
         /**
          * 插件内容版本：改了 `mobile-ui.zip` 里的任何东西都必须改这里，
          * 否则设备上已解包的旧版不会被覆盖（同 TermuxBootstrap.NODE_VERSION 的道理）。
+         *
+         * −48：修复 68 真正生效。第一版把 `type=password` 改成 `text` 之后，
+         *      又用 CSS `-webkit-text-security: disc` 补圆点 —— 而 blink 判定
+         *      「密码字段」用的正是 `computedStyle.textSecurity != none`，
+         *      等于把密码语义原样装了回去，输入法照样切安全键盘、照样屏蔽剪贴板。
+         *      本版把这层 CSS 遮蔽彻底移除。
+         * −49：修复 68 的**真正生效点**。去掉 CSS 之后键盘仍是安全键盘 —— 因为
+         *      官方那两个凭据框带 `autoFocus: true`，元素插入 DOM 的同一帧就以
+         *      `type=password` 聚焦，WebView 在那一刻就把输入连接的 inputType
+         *      定成 `TYPE_TEXT_VARIATION_WEB_PASSWORD`(0xe1)，而**它不会为已建立
+         *      的连接重算**（实测 blur+focus 也刷不动）。本版改为在
+         *      `HTMLInputElement.prototype` 层拦截 `type=password`，让 DOM 里
+         *      从头到尾没出现过 password。真机实测 inputType 0xe1 → 0x80a1。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-47"
+        private const val MOBILE_UI_VERSION = "1.0.0-49"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
