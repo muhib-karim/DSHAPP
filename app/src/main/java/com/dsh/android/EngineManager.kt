@@ -3440,6 +3440,25 @@ class EngineManager private constructor(private val context: Context) {
             put("SSL_CERT_FILE", "$prefix/etc/tls/cert.pem")
             put("CURL_CA_BUNDLE", "$prefix/etc/tls/cert.pem")
             put("NODE_OPTIONS", "--max-old-space-size=1024")
+            // 镜像环境变量必须注入**引擎进程**，不能只靠 shell 工具那条路。
+            //
+            // ⚠️ 实测漏掉它的后果（2026-10-10，同一台设备）：
+            //   `pkg install` 会调 `select_mirror()` 从 60+ 个上游镜像里**加权随机**
+            //   重挑一个并覆写 `sources.list`，把 App 刚写好的国内快源冲掉。重置成
+            //   USTC 后跑一次 `pkg install zlib`，源立刻变成 grimler.se。
+            //   而 `TERMUX_PKG_NO_MIRROR_SELECT=1`（上游自己的开关）实测能挡住这次覆写。
+            //
+            // ⚠️ [TermuxBootstrap.getShellEnv] 早就带了这组变量，但那条路只覆盖
+            //   `runProbeScript` 与 shell 工具；引擎进程自己 spawn 的 bash（模型装依赖
+            //   用的就是它）走的是本函数的 environment，于是**恰好缺了这一条**。
+            //
+            // 代价实测（同一台设备、同一个包）：USTC 源 71 秒 vs 慢源 21 分钟。
+            try {
+                putAll(com.dsh.android.termux.MirrorProbe.shellEnv(bootstrap.loadMirrors()))
+            } catch (t: Throwable) {
+                // 读状态失败不影响引擎启动 —— 配置文件那一层仍然生效。
+                Log.w(TAG, "注入镜像环境变量失败: ${t.message}")
+            }
             // link()/linkat() 语义转译：SELinux 不允许 untrusted_app 对 app_data_file
             // 做硬链接，而 DSH 上游用硬链接做独占原子发布。见 [ensureLinkCompat]。
             //
