@@ -38,6 +38,14 @@ object WirelessDebugging {
     /** 切过去的固定 TCP 端口，与 `dsh-android-shell.mjs` 的 `PORT` 必须一致。 */
     const val DEFAULT_TCP_PORT = 5555
 
+    /**
+     * 启动自愈发现无线调试端口的**总预算**（ms）。
+     *
+     * 重启手机后 adbd 起得比一轮发现慢是常态，所以要允许多轮重试。
+     * 取 15 秒：足够覆盖冷启动，又不会让启动线程长时间挂着（它本来就在后台线程）。
+     */
+    private const val TCP_PORT_DISCOVER_BUDGET_MS = 15_000L
+
     private const val TAG = DshApplication.TAG
 
     /** 常驻监听器；null 表示未启动。 */
@@ -98,10 +106,30 @@ object WirelessDebugging {
             Log.i(TAG, "固定端口 $DEFAULT_TCP_PORT 已在监听，无需切换")
             return Result(true, "固定端口已在监听")
         }
-        // 没有无线调试端口就无从下手（切 tcpip 必须先有一条活连接）。
-        val discovered = discoverConnectPort(context, portFile, timeoutMs = 3000)
+        // ⚠️ **重试而不是只探一次。** 重启手机后 adbd 往往要好几秒才广播出
+        //    `_adb-tls-connect._tcp`，而单次发现在 3 秒内落空是常态 —— 原来的
+        //    「一次 3 秒、失败就放弃」等于让「重启后自动恢复」这条路径基本失效，
+        //    用户看到的现象就是「重启后特权身份没了」。
+        //    这里探 3 轮（每轮 3 秒，中间隔 2 秒），总预算约 13 秒，仍然远小于
+        //    任何用户可感知的「卡住」。任一轮拿到端口就立刻往下走。
+        val deadline = System.currentTimeMillis() + TCP_PORT_DISCOVER_BUDGET_MS
+        var discovered = -1
+        var attempt = 0
+        while (discovered <= 0 && System.currentTimeMillis() < deadline) {
+            attempt += 1
+            discovered = discoverConnectPort(context, portFile, timeoutMs = 3000)
+            if (discovered <= 0 && System.currentTimeMillis() < deadline) {
+                Log.i(TAG, "第 $attempt 次未发现无线调试端口，2 秒后重试")
+                try {
+                    Thread.sleep(2000)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+        }
         if (discovered <= 0) {
-            return Result(false, "无线调试不可用，跳过自动切换")
+            return Result(false, "无线调试不可用，跳过自动切换（已重试 $attempt 次）")
         }
         return switchToTcp(nodeBin, runner, adbHome, dshHome)
     }
@@ -123,7 +151,14 @@ object WirelessDebugging {
      */
     fun discoverConnectPort(context: Context, portFile: File, timeoutMs: Long = 5000): Int {
         val port = AdbMdns.discover(context, AdbMdns.TLS_CONNECT, timeoutMs)
-        writePort(portFile, port)
+        // ⚠️ **没发现时不要动端口文件。** 一次「没探到」不等于「端口已失效」：
+        //    无线调试刚配对/刚重启 adbd 时会短暂不可见，`NsdManager` 也常先失败
+        //    一次再成功。原实现无条件 `writePort(port)`，超时就等于**删掉**常驻
+        //    监听刚写好的好端口（见 writePort 的 `port <= 0` 分支），于是紧接着的
+        //    补切拿不到端口 → 跳过 → 通道只剩无线调试 → 关 Wi-Fi 就断。
+        //    真正确认失效的信号是 `AdbMdns.onServiceLost`，那条路径仍然会清文件。
+        if (port > 0) writePort(portFile, port)
+        else Log.i(TAG, "[mdns] 本次未发现连接端口（保留已有端口文件，等常驻监听更新）")
         return port
     }
 
@@ -147,6 +182,13 @@ object WirelessDebugging {
      * ⚠️ 这是个**阻塞**调用（发现最多 8 秒 + adb pair 若干秒），**不要在主线调用**。
      *
      * @param code 用户从系统「使用配对码配对设备」界面抄来的 6 位配对码。
+     * @param knownPort 通知栏那条通知**已经带着**的配对端口（来自 `AdbMdns` 的发现）。
+     *   传 `<= 0` 时本方法自己重新发现一次。
+     *
+     *   ⚠️ 为什么要让调用方把端口传进来：用户是在**通知栏**回复配对码的，而那个
+     *   「使用配对码配对设备」界面在他回复时**多半已经切走或关掉了** —— 端口随之
+     *   消失，重新发现必然落空，于是「明明已经找到端口、却报没找到端口」。
+     *   通知里带下来的那个端口是**当时确实存在**的，直接用它成功率最高。
      * @return 可展示给用户的结果。
      */
     fun pair(
@@ -156,11 +198,18 @@ object WirelessDebugging {
         adbHome: File,
         dshHome: File,
         code: String,
+        knownPort: Int = -1,
     ): Result {
         if (!runner.isFile) return Result(false, "执行通道文件不存在：${runner.absolutePath}")
         if (!nodeBin.isFile) return Result(false, "Node 可执行文件不存在：${nodeBin.absolutePath}")
 
-        val port = discoverPairingPort(context)
+        // 优先用通知带下来的端口；没有再自己发现。
+        val port = if (knownPort > 0) {
+            Log.i(TAG, "使用通知携带的配对端口 $knownPort")
+            knownPort
+        } else {
+            discoverPairingPort(context)
+        }
         if (port <= 0) {
             return Result(
                 false,
@@ -200,7 +249,26 @@ object WirelessDebugging {
 
         val text = output.toString().trim()
         return if (exit == 0) {
-            Result(true, "配对成功，ADB 密钥已被设备信任。")
+            // ⚠️ 退出码 0 只代表**配对成功**，不代表通道可用。
+            //
+            //   配对成功后 runner 会立刻尝试切到固定端口 5555，而那一步**可能失败**
+            //   （端口还没广播出来、无线调试刚好被关掉等，见 `switchToTcp()`）。
+            //   失败时 runner 会往 stderr 打一句明确的警告，且因为 `redirectErrorStream`
+            //   它就在 `text` 里。
+            //
+            //   必须把这两种结果**分开说**：只吞下 `exit == 0` 一律回「配对成功，特权身份
+            //   已可用」，用户会看到通知栏宣告成功、而设置页重新检测却报检测不到 ——
+            //   正是要根治的那个现象。诚实分流后，失败那种情况会直接告诉用户
+            //   「还差一步，去点『切到固定端口』」。
+            if (text.contains(SWITCH_TC_FAILED_MARK)) {
+                Result(
+                    true,
+                    "配对成功，但还没切到固定端口 —— 现在只能靠无线调试，关掉 Wi-Fi 或" +
+                        "无线调试开关后特权通道会失效。请回设置页点「切到固定端口」重试。",
+                )
+            } else {
+                Result(true, "配对成功，ADB 密钥已被设备信任。")
+            }
         } else {
             Result(false, pairingFailureReason(exit, text))
         }
@@ -274,6 +342,16 @@ object WirelessDebugging {
         else ->
             "配对失败（退出码 $exit）。\n$output"
     }
+
+    /**
+     * runner 在「配对成功但没能切到固定端口」时打的 stderr 标记。
+     *
+     * ⚠️ **必须与 `assets/dsh-android-shell.mjs` 里那句话逐字对应。** 那边改文案
+     * 而这边不改，判据就会静默失效 —— 于是又回到「通知栏宣告配对成功、界面却说
+     * 检测不到」的状态，而且再也没有任何地方能提示原因。
+     * （配对进程用 `redirectErrorStream(true)`，所以 stderr 就在 stdout 里。）
+     */
+    private const val SWITCH_TC_FAILED_MARK = "配对成功，但固定端口"
 
     /** 把端口写进文件；`port <= 0` 时**删除**文件（避免留下过期端口误导 Node 侧）。 */
     private fun writePort(portFile: File, port: Int) {

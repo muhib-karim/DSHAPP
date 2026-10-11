@@ -111,8 +111,29 @@ class AdbMdns(
         }
 
         override fun onServiceFound(info: NsdServiceInfo) {
-            // 找到服务只是第一步，端口要 resolve 之后才有
-            runCatching { nsdManager.resolveService(info, resolveListener) }
+            // 找到服务只是第一步，端口要 resolve 之后才有。
+            //
+            // ⚠️ **每次都新建一个 ResolveListener，不能复用同一个实例。**
+            //    `NsdManager` 对同一个 listener **同一时刻只允许一次 resolve**，
+            //    并发调用会以 `FAILURE_ALREADY_ACTIVE` 直接失败（只打一行日志、
+            //    没有重试）。而本机的 `_adb-tls-connect._tcp` 会被系统**重复通告**
+            //    （开关无线调试、切网络、adbd 重启时尤其明显），于是「第一次
+            //    resolve 还没回、第二次 onServiceFound 就来了」是常态 ——
+            //    复用 listener 会把第二次（往往才是拿到端口的那次）静默丢掉。
+            //
+            //    这正是一条**表现为「有的手机行、有的不行」**的缺陷：不同 ROM 的
+            //    mdnsd 重复通告的频率不同，撞上的概率就不同。
+            val resolver = object : NsdManager.ResolveListener {
+                override fun onResolveFailed(info2: NsdServiceInfo, errorCode: Int) {
+                    Log.w(
+                        DshApplication.TAG,
+                        "[mdns] 解析失败 ${info2.serviceName} error=$errorCode（等待下一次通告重试）",
+                    )
+                }
+
+                override fun onServiceResolved(info2: NsdServiceInfo) = acceptResolved(info2)
+            }
+            runCatching { nsdManager.resolveService(info, resolver) }
                 .onFailure { Log.w(DshApplication.TAG, "[mdns] resolve 失败: ${it.message}") }
         }
 
@@ -121,32 +142,47 @@ class AdbMdns(
             // 服务消失 = 端口大概率已经没了（无线调试被关掉时就是这个信号）。
             // 必须先清掉本地缓存的端口与落盘文件，否则设置页会拿着一个
             // 早已没人监听的端口显示绿灯。
+            //
+            // ⚠️ **但「有一个服务条目消失」不等于「端口没了」。** 本机的
+            //    `_adb-tls-connect._tcp` 会被系统**重复通告**（开关无线调试、切网络、
+            //    adbd 重启时尤其明显），`NsdManager` 于是为每个条目各发一次
+            //    `onServiceLost`。若收到就无脑清，那么「两个条目、其中一个消失」这种
+            //    完全正常的情况会把**仍然活着**的端口清掉 —— 紧接着的切 5555 拿不到
+            //    端口、通道退回只靠无线调试，于是「关 Wi-Fi 就掉」。
+            //    判据用**端口真的不在了**（bind 试一下），比「某个条目报丢了」扎实。
+            if (port > 0 && isPortInUse(port)) {
+                Log.i(
+                    DshApplication.TAG,
+                    "[mdns] 端口 $port 仍在监听，忽略这次服务消失（重复通告的旧条目）"
+                )
+                return
+            }
             port = -1
             runCatching { onLost() }
                 .onFailure { Log.w(DshApplication.TAG, "[mdns] onLost 回调失败: ${it.message}") }
         }
     }
 
-    private val resolveListener = object : NsdManager.ResolveListener {
-        override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
-            Log.w(DshApplication.TAG, "[mdns] 解析失败 ${info.serviceName} error=$errorCode")
+    /**
+     * 收下一个解析结果：校验地址是本机、端口真在监听，通过才回调出去。
+     *
+     * ⚠️ 抽成方法而不是复用同一个 `ResolveListener` 实例 —— 原因见
+     * [listener] 的 `onServiceFound`（`NsdManager` 同一 listener 不许并发 resolve）。
+     */
+    private fun acceptResolved(info: NsdServiceInfo) {
+        val candidate = info.port
+        if (!isLocalAddress(info) || !isPortInUse(candidate)) {
+            Log.i(
+                DshApplication.TAG,
+                "[mdns] 忽略 ${info.serviceName} → ${info.host?.hostAddress}:$candidate" +
+                    "（非本机或端口无人监听）"
+            )
+            return
         }
-
-        override fun onServiceResolved(info: NsdServiceInfo) {
-            val candidate = info.port
-            if (!isLocalAddress(info) || !isPortInUse(candidate)) {
-                Log.i(
-                    DshApplication.TAG,
-                    "[mdns] 忽略 ${info.serviceName} → ${info.host?.hostAddress}:$candidate" +
-                        "（非本机或端口无人监听）"
-                )
-                return
-            }
-            port = candidate
-            Log.i(DshApplication.TAG, "[mdns] 解析到 $serviceType 端口 $candidate")
-            runCatching { onFound(candidate) }
-                .onFailure { Log.w(DshApplication.TAG, "[mdns] 回调失败: ${it.message}") }
-        }
+        port = candidate
+        Log.i(DshApplication.TAG, "[mdns] 解析到 $serviceType 端口 $candidate")
+        runCatching { onFound(candidate) }
+            .onFailure { Log.w(DshApplication.TAG, "[mdns] 回调失败: ${it.message}") }
     }
 
     /** 服务地址必须是本机地址，否则是局域网里别的设备的 adbd。 */

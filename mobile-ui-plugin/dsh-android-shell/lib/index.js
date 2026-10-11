@@ -51,6 +51,15 @@
  *   `scrubbedParentEnv()` 会剥掉**所有** `DSH_*` 变量，不显式传的话 runner
  *   会退回 `os.homedir()/.dsh`，而密钥在 `$DSH_HOME`，路径不一致就找不到密钥、
  *   静默回落成 app 身份。
+ * - `DSH_ADB_HOME`：内置 adb 工具链目录。**同样必须显式传**，理由与上一行完全
+ *   一样（`DSH_*` 全被剥掉）。漏传的后果比漏 `DSH_HOME` 更隐蔽：runner 里
+ *   `ADB_BIN` 变空串 ⇒ 通道 1.5 与通道 2 的门卫双双为假 ⇒ **无线调试通道整条
+ *   不存在**，只剩 legacy 5555；而 5555 没在听时就静默回落成 app 身份。
+ *   更糟的是设置页探测走的是宿主半插件自己 spawn（env 完整），于是
+ *   **探测说「uid 2000 可用」、模型执行却进不去无线通道**。
+ *
+ * 这两个变量都是「插件必须转交的引擎事实」：引擎进程自己的 env 里有它们
+ * （见 `EngineManager.runEngine()` 里 `put("DSH_...")` 那几处），但子进程默认看不到。
  *
  * @module dsh-android-shell
  */
@@ -161,8 +170,10 @@ function parseExitStatus(text) {
  * @param runner uid 2000 通道脚本的绝对路径
  * @param nodeBin 引擎自己的 node（`process.execPath`），绝对路径不依赖 PATH
  * @param dshHome `$DSH_HOME`，runner 靠它定位 `adbkey`
+ * @param adbHome 内置 adb 工具链目录（`$DSH_ADB_HOME`）；没有（空串）时 runner
+ *   只会走 legacy 5555，无线调试通道不可用。**必须原样转交**，理由见模块头注释。
  */
-function shellTool(ctx, runner, nodeBin, dshHome) {
+function shellTool(ctx, runner, nodeBin, dshHome, adbHome) {
 	return {
 		name: TOOL_NAME,
 		description: DESCRIPTION,
@@ -239,7 +250,15 @@ function shellTool(ctx, runner, nodeBin, dshHome) {
 					sandboxPolicy: { mode: 'danger-full-access' },
 					// ⚠️ 必须显式传 DSH_HOME：引擎的 scrubbedParentEnv() 会剥掉所有
 					// `DSH_*`，不传的话 runner 找不到 adbkey，会静默回落成 app 身份。
-					env: { DSH_HOME: dshHome },
+					//
+					// ⚠️ `DSH_ADB_HOME` 同样必须传，而且**漏了它更隐蔽**：runner 里
+					// `ADB_BIN` 变空串 ⇒ 无线调试通道整条不存在 ⇒ 只能靠 legacy 5555。
+					// 而设置页探测是宿主半插件自己 spawn 的（env 完整），会出现
+					// 「探测说可用、模型执行进不去无线通道」。见模块头注释。
+					env: {
+						DSH_HOME: dshHome,
+						...(adbHome === '' ? {} : { DSH_ADB_HOME: adbHome }),
+					},
 					signal: exec.signal,
 				})
 			);
@@ -277,6 +296,25 @@ export function apply(ctx) {
 		return;
 	}
 
-	ctx.tools.register(shellTool(ctx, runner, process.execPath, dshHome));
-	ctx?.logger?.info?.(`[dsh-android-shell] 已注册 uid 2000 特权工具 ${TOOL_NAME}: ${runner}`);
+	// 内置 adb 工具链目录。缺失**不阻止注册** —— legacy 5555 那条通道不需要它，
+	// 设备照常能用特权身份（这正是「有些手机没问题」的原因）。但没有它就只剩
+	// legacy：重启后 5555 消失、或用户从未做过 `adb tcpip`，通道就静默回落成
+	// app 身份。所以这里要**把缺失说清楚**，而不是默默少传一个变量。
+	//
+	// ⚠️ 必须从**引擎进程**的 env 读（插件跑在引擎进程里，这里是完整的）；
+	// 传给子进程时再显式带上 —— 子进程那份会被 `scrubbedParentEnv()` 剥掉。
+	const adbHome = process.env.DSH_ADB_HOME;
+	const adbHomeValue = typeof adbHome === 'string' ? adbHome : '';
+	if (adbHomeValue === '') {
+		ctx?.logger?.warn?.(
+			'[dsh-android-shell] 未配置 DSH_ADB_HOME —— 无线调试通道不可用，' +
+				'shell 工具只能走 legacy 5555（重启后需重新 `adb tcpip 5555`）'
+		);
+	}
+
+	ctx.tools.register(shellTool(ctx, runner, process.execPath, dshHome, adbHomeValue));
+	ctx?.logger?.info?.(
+		`[dsh-android-shell] 已注册 uid 2000 特权工具 ${TOOL_NAME}: ${runner}` +
+			(adbHomeValue === '' ? '（无线调试通道不可用）' : `（内置 adb: ${adbHomeValue}）`)
+	);
 }

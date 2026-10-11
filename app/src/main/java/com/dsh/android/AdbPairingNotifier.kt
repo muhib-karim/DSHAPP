@@ -98,10 +98,26 @@ object AdbPairingNotifier {
             Log.i(DshApplication.TAG, "配对监听已在进行中，忽略重复请求")
             return
         }
+        // ⚠️ 先查通知权限再起监听：没有通知就没有任何交互出口（见 runWatch 的注释）。
+        //   在这里拦下来的好处是**设置页能立刻告诉用户原因**，而不是让用户
+        //   对着一句「已开始配对」发呆。
+        if (!NotificationManagerCompat.from(app).areNotificationsEnabled()) {
+            Log.w(DshApplication.TAG, "拒绝开始配对：本应用的通知被系统关闭，配对流程无法交互")
+            return
+        }
         watchJob = DshApplication.applicationScope.launch {
             runWatch(app)
         }
     }
+
+    /**
+     * 通知是否可用（设置页据此提示用户去授权）。
+     *
+     * 与 [start] 的拦截图的是同一件事，但这个是**只读查询**，供 JS 桥随时问。
+     */
+    fun notificationsEnabled(context: Context): Boolean =
+        runCatching { NotificationManagerCompat.from(context).areNotificationsEnabled() }
+            .getOrDefault(true)
 
     /**
      * 常驻监听配对端口，直到被取消。
@@ -109,7 +125,32 @@ object AdbPairingNotifier {
      * 只在**端口发生变化**时重发通知（而不是每 300ms 刷一次），避免通知栏闪烁。
      */
     private suspend fun runWatch(app: Context) {
-        notify(app, app.getString(R.string.pairing_title), app.getString(R.string.pairing_waiting_open), null, true)
+        // ⚠️ **首条通知发不出去就必须收摊**，不能继续常驻监听。
+        //
+        //   常驻通知是这套流程**唯一**的用户出口：它既提示用户去打开「使用配对码
+        //   配对设备」，又带着输入配对码的输入框、还带着「取消」按钮。通知发不出去
+        //   （最常见的成因是 Android 13+ 没给通知权限，而本 App 的 `targetSdk=28`
+        //   拿不到那个运行时授权），用户就**什么都看不到**：不知道要做什么，
+        //   更没有任何东西可点。
+        //
+        //   此时若还留着监听，结果是：后台一直跑 mDNS、用户毫无察觉，而唯一能停下
+        //   它的入口在设置页（用户根本不知道要去点）。净效果是一个静默泄漏的后台任务。
+        //   所以这里直接返回 —— 什么都没发生，好过留下一个用户看不见也关不掉的监听。
+        val posted = notify(
+            app,
+            app.getString(R.string.pairing_title),
+            app.getString(R.string.pairing_waiting_open),
+            null,
+            true,
+        )
+        if (!posted) {
+            Log.w(
+                DshApplication.TAG,
+                "配对通知无法显示（多半是未授予通知权限），已放弃常驻监听 —— " +
+                    "请在系统设置里允许「DSH」发送通知后重试",
+            )
+            return
+        }
 
         // ⚠️ 用**一个常驻的** AdbMdns 实例，而不是反复调 `AdbMdns.discover(timeout)`：
         //   后者每次都要重新注册 discovery（`NsdManager` 同一 listener 不能重复注册，
@@ -218,7 +259,7 @@ object AdbPairingNotifier {
      *   前者是「正在等你操作」的指引，被划掉用户就不知道该去哪开无线调试了；
      *   后者更不用说。终态（成功）才让它自己走掉。
      */
-    private fun notify(context: Context, title: String, text: String, port: Int?, ongoing: Boolean) {
+    private fun notify(context: Context, title: String, text: String, port: Int?, ongoing: Boolean): Boolean {
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle(title)
@@ -238,11 +279,22 @@ object AdbPairingNotifier {
             builder.addAction(cancelAction(context))
         }
 
-        try {
-            NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, builder.build())
+        return try {
+            val manager = NotificationManagerCompat.from(context)
+            // ⚠️ 权限被禁时 `notify()` **不抛异常**，只是静默什么都不做（Android 13+
+            //   未授权 POST_NOTIFICATIONS 就是这样）。只看 try/catch 会把「用户
+            //   什么也没看到」误判成「已成功显示」，于是监听照常挂起、而用户界面
+            //   上找不到任何出口。所以这里要**显式查一次权限**。
+            if (!manager.areNotificationsEnabled()) {
+                Log.w(DshApplication.TAG, "配对通知未显示：本应用的通知被系统关闭")
+                return false
+            }
+            manager.notify(NOTIFICATION_ID, builder.build())
+            true
         } catch (t: Throwable) {
-            // 通知发不出去不该让配对流程崩掉（Android 13+ 未授权通知权限时会抛）
+            // 通知发不出去不该让配对流程崩掉（个别 ROM 仍会抛 SecurityException）
             Log.w(DshApplication.TAG, "配对通知发送失败: ${t.message}")
+            false
         }
     }
 

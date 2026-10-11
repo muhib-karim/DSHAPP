@@ -683,7 +683,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
-| `adb-wireless-arm64.zip` | 无需改（只查 `bin/adb` 存在且非空） |
+| `adb-wireless-arm64.zip` | 无需改（判据是 `bin/adb` 非空 + 完整性哨兵 `.extracted`，见 ⑪.1） |
 | `node-addon-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `node-addon-system-android-arm64.zip` | 无需改（只查文件存在且非空） |
 | `ripgrep-android-arm64.zip` | 无需改（只查文件存在且非空） |

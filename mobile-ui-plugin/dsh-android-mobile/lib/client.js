@@ -4235,6 +4235,7 @@ window.__ModuleLoader__.load({
 			wlTcp: "切到固定端口",
 			wlTcpHint: "切到固定端口后就不依赖无线调试开关了 —— 关无线调试、关 Wi-Fi 都不断。重启手机后会自动重切，通常不用管。",
 			wlNoBridge: "当前环境没有原生的配对入口（DSHAndroid 桥不可用），无法发起配对。",
+			wlNoNotify: "配对全程靠通知栏交互（提示 → 输入配对码 → 取消），但本应用的通知被系统关掉了，配对无法进行。请到「系统设置 → 应用 → DSH → 通知」里打开通知后重试。",
 			wlPortStale: "已失效（无线调试可能已关）",
 			recommended: "推荐",
 			// Android 10 上「无线调试」根本不存在，说清楚比让用户去系统设置里白找一遍好。
@@ -4266,7 +4267,10 @@ window.__ModuleLoader__.load({
 			rootRecheck: "重新检测",
 			rootChecking: "检测中…",
 			// 「下一步」按三态各写一句 —— 三种情况下用户该做的事完全不同。
+			// ⚠️ 还有第四种：结论是 GRANTED，但**本次启动没挂上**（用户是刚点完
+			//   「重新检测」才授权成功的）—— 那句单独写，见 rootNextOnPendingReload。
 			rootNextOn: "root 工具已注册，AI 可以直接以 uid 0 执行命令（读写 /data、改挂载、iptables 等）。",
+			rootNextOnPendingReload: "已检测到 uid 0，但 root 工具要下次启动才会挂上（它是启动时挂载的，当前这个会话里还看不到）。请重启 App 后再用。",
 			rootNextDenied: "本机有 su，但本应用没拿到 uid 0。请在 Magisk / SuperSU 之类的授权管理里给「DSH」授权，然后点「重新检测」。",
 			rootNextAbsent: "本机没有 root（也没找到 su）。需要 root 的功能用不了，其余功能不受影响 —— 上方的 uid 2000 通道与之无关，照常可用。",
 			rootNextUnknown: "还没检测过。点「重新检测」跑一次（首次可能会弹 root 授权框）。",
@@ -4415,6 +4419,7 @@ window.__ModuleLoader__.load({
 			wlTcp: "Switch to fixed port",
 			wlTcpHint: "After switching to a fixed port the channel no longer depends on the wireless debugging toggle — turning wireless debugging or Wi-Fi off will not break it. It re-switches automatically after a reboot.",
 			wlNoBridge: "The native pairing entry point is unavailable in this environment (the DSHAndroid bridge is missing), so pairing cannot be started.",
+			wlNoNotify: "Pairing is driven entirely from the notification shade (prompt → code entry → cancel), but this app's notifications are turned off, so pairing cannot proceed. Enable notifications under Settings → Apps → DSH → Notifications, then retry.",
 			wlPortStale: "Stale (wireless debugging may be off)",
 			recommended: "Recommended",
 			wlUnsupported: "This device runs Android 10, which has no \"Wireless debugging\" — that feature starts at Android 11. Use the computer-based guide below; it is the only workable path on this device.",
@@ -4446,6 +4451,7 @@ window.__ModuleLoader__.load({
 			rootRecheck: "Re-check",
 			rootChecking: "Checking…",
 			rootNextOn: "The root tool is registered — the AI can run commands as uid 0 directly (read/write /data, remount, iptables, and so on).",
+			rootNextOnPendingReload: "uid 0 was detected, but the root tool is only mounted at startup — it is not available in this session yet. Restart the app to use it.",
 			rootNextDenied: "This device has su, but the app did not obtain uid 0. Grant \"DSH\" root access in Magisk / SuperSU or similar, then tap \"Re-check\".",
 			rootNextAbsent: "This device has no root (no su found either). Root-only features are unavailable; everything else is unaffected — the uid 2000 channel above is unrelated and still works.",
 			rootNextUnknown: "Not checked yet. Tap \"Re-check\" to run a probe (the first one may show a root authorization dialog).",
@@ -4628,7 +4634,7 @@ window.__ModuleLoader__.load({
 			// ⚠️ 桥上的 `rootState()` **只读缓存、不触发探测** —— 它跑在 WebView 的
 			//   JS 线程上，同步探测会把页面卡住。重新探测走 `rootRecheck()`，那是
 			//   后台线程，界面靠下面的轮询拿结果。
-			const [root, setRoot] = React.useState({ known: false, state: "", granted: false, detail: "", at: 0 });
+			const [root, setRoot] = React.useState({ known: false, state: "", granted: false, detail: "", at: 0, mounted: false });
 			const [rootBusy, setRootBusy] = React.useState(false);
 			// 在跑的轮询计时器。用 ref 而不是普通变量：`recheckRoot` 是 useCallback，
 			// 闭包捕获的必须是一个**跨渲染稳定**的容器，否则每次渲染新建一个 Set，
@@ -4640,7 +4646,7 @@ window.__ModuleLoader__.load({
 			const readRoot = React.useCallback(() => {
 				const bridge = window.DSHAndroid;
 				if (!bridge || typeof bridge.rootState !== "function") {
-					setRoot({ known: false, state: "", granted: false, detail: "", at: 0 });
+					setRoot({ known: false, state: "", granted: false, detail: "", at: 0, mounted: false });
 					return;
 				}
 				try {
@@ -4653,10 +4659,14 @@ window.__ModuleLoader__.load({
 						granted: !!o.granted,
 						detail: String(o.detail || ""),
 						at: Number(o.at) || 0,
+						// ⚠️ 这是「本会话里 root 工具真的挂上了没有」，与 granted 不是一回事：
+						//   overlay 只在引擎启动时读一次，重新检测把结论刷成 GRANTED 之后
+						//   工具并不会凭空出现。见下面的 rootNextOnPending。
+						mounted: !!o.mounted,
 					});
 				} catch (e) {
 					console.warn("[dsh-android-mobile] 读取 root 状态失败:", e && e.message);
-					setRoot({ known: false, state: "", granted: false, detail: "", at: 0 });
+					setRoot({ known: false, state: "", granted: false, detail: "", at: 0, mounted: false });
 				}
 			}, []);
 
@@ -4790,6 +4800,19 @@ window.__ModuleLoader__.load({
 					: action === "switchTcp" ? "switchToTcpMode" : null;
 				if (fn === null) return;
 				if (!b || typeof b[fn] !== "function") { window.alert(t("wlNoBridge")); return; }
+				// ⚠️ 配对的一切交互（提示、配对码输入框、取消按钮）**都挂在那条常驻
+				//   通知上**，通知被系统关掉时原生侧会直接拒绝开始（见
+				//   `AdbPairingNotifier.start`）。不在这里先说清楚的话，用户看到的是
+				//   「点了配对，什么都没发生」—— 然后反复点，永远不知道为什么。
+				if (action === "pair") {
+					try {
+						if (typeof b.pairingNotificationsEnabled === "function"
+							&& !b.pairingNotificationsEnabled()) {
+							window.alert(t("wlNoNotify"));
+							return;
+						}
+					} catch (e) { /* 查不了就照常走，原生侧还有一道拦截 */ }
+				}
 				b[fn]();
 				// 只有配对需要回写「进行中」—— 它是一条要用户离开本页去系统设置的
 				// 长流程；「切到固定端口」是几秒钟的原生调用，不需要。
@@ -5031,8 +5054,13 @@ window.__ModuleLoader__.load({
 			const rootBadge = !root.known ? t("rootUnknown")
 				: root.granted ? t("rootOn")
 					: root.state === "DENIED" ? t("rootDenied") : t("rootAbsent");
+			// ⚠️ `granted` 与 `mounted` 必须分开判：前者是「探测结论」，后者是
+			//   「本次启动真的挂上了 root 工具」。工具走 `--patch`，启动时定死 ——
+			//   用户在设置页点「重新检测」把结论刷成 GRANTED 的那一刻，引擎已经在跑，
+			//   这个会话里**没有** root 工具。此时若还说「已注册」，就是在说假话。
 			const rootNext = !root.known ? t("rootNextUnknown")
-				: root.granted ? t("rootNextOn")
+				: root.granted
+					? (root.mounted ? t("rootNextOn") : t("rootNextOnPendingReload"))
 					: root.state === "DENIED" ? t("rootNextDenied") : t("rootNextAbsent");
 			// 检测时间：结论是 24 小时缓存的，用户需要知道这是刚测的还是昨天的。
 			const rootAtText = root.at > 0 ? new Date(root.at).toLocaleString() : t("rootDetailNever");

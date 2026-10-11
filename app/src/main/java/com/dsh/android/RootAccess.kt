@@ -58,8 +58,29 @@ object RootAccess {
      * 取 24 小时：root 状态极少变化（装/卸 Magisk、授权/撤销），一天一次的成本
      * （一次进程启动）可以忽略；而每次冷启动都探会让启动路径多一个可能弹框的
      * 阻塞操作 —— 那是不可接受的。
+     *
+     * ⚠️ 只对**确定**的结论生效（[Result.tentative] 为 false）。
      */
     private const val CACHE_TTL_MS = 24 * 60 * 60 * 1000L
+
+    /**
+     * [Result.tentative] 结论的缓存有效期（ms）。
+     *
+     * ## 为什么需要两个 TTL
+     *
+     * 探测超时（[PROBE_TIMEOUT_SEC] 秒内 su 没返回）**不等于「没有 root」** ——
+     * 它最常见的原因是「Magisk 弹了授权框，用户还没来得及点」。而首次探测发生在
+     * **引擎启动路径上**，用户此刻多半正盯着启动页，等他切到 Magisk 点「允许」
+     * 再切回来，5 秒早就过了。
+     *
+     * 原来超时也按 24 小时缓存，后果是：**用户明明授权成功了，却要等一整天
+     * （或手动点「重新检测」）才可能看到 root 工具被挂上** —— 而挂载只发生在
+     * 启动时，所以实际上等到下次冷启动、且缓存过期，才真的生效。
+     *
+     * 现在超时只锁 60 秒：既避免在启动路径上反复弹框，又不会把一次「没点到」
+     * 当成一天的定论。
+     */
+    private const val TENTATIVE_CACHE_TTL_MS = 60 * 1000L
 
     /**
      * 探测超时（秒）。
@@ -93,7 +114,18 @@ object RootAccess {
     }
 
     /** 一次探测的完整结果（结论 + 给用户看的诊断文本）。 */
-    data class Result(val state: State, val detail: String) {
+    data class Result(
+        val state: State,
+        val detail: String,
+        /**
+         * 这是不是一次**暂定**结论（探测没真正跑完 —— 目前只有超时这一种）。
+         *
+         * ⚠️ 暂定结论**不能按 24 小时缓存**：它最常见的成因是「授权框弹出来了
+         * 用户没来得及点」，把它当一天的定论会让用户授权成功后仍然用不上 root。
+         * 见 [TENTATIVE_CACHE_TTL_MS]。
+         */
+        val tentative: Boolean = false,
+    ) {
         /** 是否可用（只有 [State.GRANTED] 为真）。 */
         val granted: Boolean get() = state == State.GRANTED
     }
@@ -126,7 +158,9 @@ object RootAccess {
     /** 读缓存（未过期才返回），不触发探测。 */
     fun cached(context: Context): Result? {
         val snap = snapshot(context) ?: return null
-        if (System.currentTimeMillis() - snap.at > CACHE_TTL_MS) return null
+        // 暂定结论（超时）只锁一小会儿，理由见 TENTATIVE_CACHE_TTL_MS。
+        val ttl = if (snap.result.tentative) TENTATIVE_CACHE_TTL_MS else CACHE_TTL_MS
+        if (System.currentTimeMillis() - snap.at > ttl) return null
         return snap.result
     }
 
@@ -146,9 +180,14 @@ object RootAccess {
         return try {
             val lines = f.readLines()
             if (lines.size < 2) return null
-            val at = lines[0].toLongOrNull() ?: return null
+            // 首行 = `<落盘时刻> [<tentative 0|1>]`。
+            // ⚠️ 第二个字段是**后加的**，所以旧缓存（只有时间戳）必须仍然读得出来
+            //   —— 缺字段时按 `false`（确定结论）处理，与改动前行为一致。
+            val head = lines[0].trim().split(Regex("\\s+"))
+            val at = head.getOrNull(0)?.toLongOrNull() ?: return null
+            val tentative = head.getOrNull(1) == "1"
             val state = runCatching { State.valueOf(lines[1]) }.getOrNull() ?: return null
-            Snapshot(Result(state, lines.drop(2).joinToString("\n")), at)
+            Snapshot(Result(state, lines.drop(2).joinToString("\n"), tentative), at)
         } catch (t: Throwable) {
             Log.w(TAG, "读取 root 探测缓存失败: ${t.message}")
             null
@@ -169,7 +208,11 @@ object RootAccess {
         try {
             File(context.filesDir, CACHE_FILE).writeText(
                 buildString {
-                    appendLine(System.currentTimeMillis().toString())
+                    // `tentative` 与时间戳同放首行，读取侧按空白切分（见 snapshot）。
+                    appendLine(
+                        System.currentTimeMillis().toString() +
+                            (if (result.tentative) " 1" else " 0")
+                    )
                     appendLine(result.state.name)
                     appendLine(result.detail)
                 }
@@ -204,9 +247,15 @@ object RootAccess {
             if (!finished) {
                 process.destroyForcibly()
                 // 超时 = 弹了授权框没人点。这是**有 su 但没拿到**，不是「没 root」。
+                //
+                // ⚠️ 标成 `tentative`：它只锁 60 秒而不是 24 小时。首次探测跑在
+                //    启动路径上，用户此刻多半还在看启动页，等切到 Magisk 点「允许」
+                //    再切回来早就超过 5 秒了 —— 把这种「没点到」当成一天的定论，
+                //    用户会以为授权没生效。见 TENTATIVE_CACHE_TTL_MS。
                 return Result(
                     State.DENIED,
                     "su 等待超时（${PROBE_TIMEOUT_SEC}s）—— 多半是 root 授权框弹出来了没人点",
+                    tentative = true,
                 )
             }
             val output = process.inputStream.bufferedReader().use { it.readText() }.trim()

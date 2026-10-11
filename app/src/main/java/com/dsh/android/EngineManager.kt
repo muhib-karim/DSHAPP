@@ -119,6 +119,43 @@ class EngineManager private constructor(private val context: Context) {
     var webViewCompatApplied = false
         private set
 
+    /**
+     * 本次引擎启动时，root 工具是否**真的挂上了**。
+     *
+     * ## 为什么必须单独记一笔，而不是让界面去看探测结论
+     *
+     * `root` 工具是作为 `--patch` overlay 挂载的，而 overlay 是**命令行参数** ——
+     * 只在引擎进程启动那一刻读一次。所以「本机有 root」与「这个会话里能用 root 工具」
+     * 是**两件事**：
+     *
+     * - 用户在设置页点「重新检测」，拿到 `GRANTED` ⇒ 结论变了；
+     * - 但引擎已经在跑，overlay 不会再读 ⇒ **`root` 工具这个会话里根本不存在**。
+     *
+     * 此时界面若照旧显示「root 工具已注册，AI 可以直接以 uid 0 执行命令」，
+     * 就是**在说假话**：模型根本没有这个工具可调。用户会以为可用，然后发现
+     * AI 完全不碰 root，只能靠重启 App 才「突然好了」—— 而这没有办法自己发现。
+     *
+     * 所以：探测结论（缓存，随时可刷新）与**挂载事实**（启动时定死）必须分开暴露，
+     * 界面按这两者组合出诚实的文案（见 `client.js` 的 `rootNextOnPendingReload`）。
+     *
+     * ⚠️ 由启动协程写、WebView 的 JS 线程读（[MainActivity] 的 `rootState()` 桥），
+     *   必须 `@Volatile`。
+     */
+    @Volatile
+    var rootToolMounted = false
+        private set
+
+    /**
+     * 本次引擎启动时，uid 2000（`shell`）通道是否**真的挂上了**。
+     *
+     * 与 [rootToolMounted] 同构：`shell` 工具同样走 `--patch`，同样是启动时定死。
+     * 区别在于它的挂载判据用的是产物文件是否存在（见 [writePrivilegedPatch]），
+     * 而 root 用的是端到端探测结果。
+     */
+    @Volatile
+    var shellToolMounted = false
+        private set
+
     /** Termux 环境：提供 node 可执行文件与 $PREFIX。 */
     private val bootstrap by lazy { com.dsh.android.termux.TermuxBootstrap(context) }
 
@@ -2878,13 +2915,25 @@ class EngineManager private constructor(private val context: Context) {
     private fun ensureAdbWireless(): File? {
         val dest = File(context.filesDir, ADB_WIRELESS_DIR)
         val adb = File(dest, "bin/adb")
-        // 幂等判据与 ripgrep / node-pty 一致：只查文件存在且非空。
-        // 每次启动解 105 个文件 / 5.26MB 会拖慢启动，而这套工具链不随版本变。
-        if (adb.isFile && adb.length() > 0) {
+        // ⚠️ 幂等判据用**完整性哨兵**，不是「bin/adb 在不在」。
+        //
+        // 这套工具链有 107 个条目 / 5.26MB，解包要好几秒 —— 而启动过程中进程被系统
+        // 杀掉、用户强退、磁盘满，都会**中途停下**。若判据只看 `bin/adb`，而 zip 的
+        // 条目顺序恰好让 `bin/adb` 落在前面（实际就是这样），那么一次中断就会留下
+        // 「adb 在、lib/* 缺失」的半成品，且此后**每次启动都判定为已完成**并跳过 ——
+        // 于是这台设备上的无线调试**永久**坏掉，还查不出原因（解包日志早就滚走了）。
+        //
+        // 哨兵在**全部条目写完之后**才落盘，所以「哨兵存在」= 解包完整走完过一次。
+        // 老安装没有哨兵，会多解一次（一次性代价），换来此后不会再锁死半成品。
+        val sentinel = File(dest, ADB_WIRELESS_STAMP)
+        if (adb.isFile && adb.length() > 0 && sentinel.isFile) {
             adb.setExecutable(true, false)
             File(dest, "tmp").mkdirs()
             File(dest, "home").mkdirs()
             return dest
+        }
+        if (adb.isFile && adb.length() > 0 && !sentinel.isFile) {
+            Log.w(TAG, "无线调试 adb 工具链缺少完整性标记（疑似上次解包中断），重新解出")
         }
         try {
             context.assets.open(ADB_WIRELESS_ASSET).use { input ->
@@ -2906,6 +2955,8 @@ class EngineManager private constructor(private val context: Context) {
             adb.setExecutable(true, false)
             File(dest, "tmp").mkdirs()
             File(dest, "home").mkdirs()
+            // 全部写完之后才落哨兵 —— 顺序不能反，否则中途失败反而留下「已完成」的假象。
+            sentinel.writeText("ok\n")
             Log.i(TAG, "已解出无线调试 adb 工具链 ($ADB_WIRELESS_DIR, adb ${adb.length()} 字节)")
             return dest
         } catch (t: Throwable) {
@@ -3062,10 +3113,21 @@ class EngineManager private constructor(private val context: Context) {
      * `dumpsys battery` 在 app 域返回 **rc=0 但输出 `Can't find service`**。
      * 模型若不知道自己在哪个身份下，会基于假前提继续推理、越走越错。
      *
-     * @param available 特权通道是否可用（runner 已解出）。不可用时只写「当前不可用」，
-     *   免得模型去试一个必然回落的功能。
+     * @param available 特权工具是否**真的挂上了**（overlay 写入成功，即
+     *   [shellToolMounted]），而不是「runner 文件解出来了没有」。
+     *
+     *   ⚠️ 这两个判据差一层，而差的正是结果：runner 解出成功、但插件入口文件没解出来
+     *   （或 overlay 写失败）时，`shell` 工具**根本没注册**。若此时仍告诉模型「你有
+     *   uid 2000 通道，需要设备级操作就用它」，模型会去调一个不存在的工具 ——
+     *   表现为它反复尝试、或者干脆改用 `bash` 去做注定失败的设备级操作，而**没有任何
+     *   一条报错指向真正的原因**。判据取「挂载结果」而不是「前置产物」才是诚实的。
      */
     private fun ensurePrivilegedPrompt(available: Boolean) {
+        // ⚠️ 单独打一行「通道可用=…」：AGENTS.md 的验收手法查的就是这条。
+        //   它与下面 `writePromptSection` 的日志**互为补充** —— 后者只在文本
+        //   真的变了时才打（幂等），所以稳态下看不到；而「这一轮到底可不可用」
+        //   是每次启动都必须能查的事实。
+        Log.i(TAG, "特权身份说明（uid 2000）: 通道可用=$available")
         writePromptSection(
             begin = PRIVILEGED_PROMPT_BEGIN,
             end = PRIVILEGED_PROMPT_END,
@@ -3780,8 +3842,11 @@ class EngineManager private constructor(private val context: Context) {
         // 默认走 app 身份，模型读工具描述后自己决定要不要用 2000。见 ensurePrivilegedPlugin()。
         ensurePrivilegedPlugin()
         val privPatch = writePrivilegedPatch(privRunner != null)
-        // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」
-        ensurePrivilegedPrompt(privRunner != null)
+        shellToolMounted = privPatch != null
+        // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」。
+        // ⚠️ 判据用**挂载结果**（`privPatch != null`）而不是 `privRunner != null`：
+        //   前者才是「`shell` 工具真的注册了」。见 ensurePrivilegedPrompt 的 @param。
+        ensurePrivilegedPrompt(privPatch != null)
 
         // root（uid 0）通道：**先端到端探测**再决定挂不挂。
         // ⚠️ 顺序是硬性的 —— 探测要起 su 进程（可能弹授权框），必须早于引擎进程
@@ -3791,6 +3856,7 @@ class EngineManager private constructor(private val context: Context) {
         val rootState = RootAccess.detect(context)
         ensureRootPlugin()
         val rootPatch = writeRootPatch(rootRunner != null && rootState.granted)
+        rootToolMounted = rootPatch != null
         if (rootState.granted) {
             Log.i(TAG, "root 可用（${rootState.detail}），已挂载 root 工具")
         } else {
@@ -3977,6 +4043,11 @@ class EngineManager private constructor(private val context: Context) {
                             adbHome = adbHomeRef,
                             dshHome = dshHome,
                         )
+                    }.onSuccess {
+                        // ⚠️ 成功也要打：这条自愈**没有**任何界面反馈，不打日志的话
+                        //   「到底切没切成功」只能去翻 runner 的 stderr。
+                        if (it.ok) Log.i(TAG, "启动自愈：${it.message}")
+                        else Log.i(TAG, "启动自愈未切换固定端口：${it.message}")
                     }.onFailure { Log.w(TAG, "启动自动切固定端口失败: ${it.message}") }
                 }.start()
             }
@@ -4077,32 +4148,45 @@ class EngineManager private constructor(private val context: Context) {
             adbHome = adbHome,
             dshHome = dshHome,
             code = code,
+            // ⚠️ 把通知带下来的端口**真的传下去**。它一直到这一步都没被用过：
+            //    方法签名收下了 port，却没往下传，`WirelessDebugging.pair()` 于是
+            //    自己重新发现一次 —— 而用户此刻多半已经从「使用配对码配对设备」
+            //    界面切到了通知栏，那个端口早没了，重新发现必然落空。
+            //    症状就是「通知栏明明显示了端口，配对却报没找到端口」。
+            knownPort = port,
         )
-        // 配对成功后立刻发现一次连接端口并落盘，这样用户不必再等常驻监听
-        // 撞上「无线调试已开启」那一刻。失败也无所谓，监听器会补上。
+        // 配对成功后立刻发现连接端口并落盘，这样用户不必再等常驻监听
+        // 撞上「无线调试已开启」那一刻。
+        //
+        // ⚠️ 用**带重试的** `ensureTcpPort` 而不是单次 `discoverConnectPort`。
+        //   配对过程中无线调试会重启 adbd，端口要过一会儿才广播出来 —— 单次发现
+        //   常常落空，而原实现在落空时**静默跳过整个补切**（连一句日志都没有），
+        //   于是「配对成功但特权身份还是 app」既没修好、也查不出原因。
+        //   现在失败会明确记日志，并且和启动自愈共用同一套重试预算。
         if (result.ok) {
-            val fresh = WirelessDebugging.discoverConnectPort(
-                context,
-                File(dshHome, WirelessDebugging.PORT_FILE),
-            )
-            // ⚠️ runner 在 `--pair` 里已经自己切过一次，但**那一次用的是配对前的
+            // runner 在 `--pair` 里已经自己切过一次，但**那一次用的是配对前的
             // 旧端口**：无线调试在配对过程中会重启 adbd，端口随之改变，于是
-            // `adb -s 127.0.0.1:<旧端口> tcpip 5555` 必然失败，用户看到「配对成功
-            // 但身份还是 app」。这里拿着**刚发现的新端口**补切一次，把那条缝补上。
-            //
+            // `adb -s 127.0.0.1:<旧端口> tcpip 5555` 必然失败。
+            // 这里拿着**重新发现的端口**再补切一次，把那条缝补上。
             // 已经切成 5555 时 `switchToTcp` 是幂等的（先探 legacy，通就返回 true），
             // 所以重复调用没有代价。
-            if (fresh > 0) {
-                val switched = WirelessDebugging.switchToTcp(
-                    nodeBin = bootstrap.nodeBinary,
-                    runner = runner,
-                    adbHome = adbHome,
-                    dshHome = dshHome,
-                )
-                if (!switched.ok) {
-                    Log.w(TAG, "配对成功但补切固定端口失败: ${switched.message}")
-                }
+            val switched = WirelessDebugging.ensureTcpPort(
+                context = context,
+                nodeBin = bootstrap.nodeBinary,
+                runner = runner,
+                adbHome = adbHome,
+                dshHome = dshHome,
+            )
+            if (switched.ok) {
+                Log.i(TAG, "配对成功且已切到固定端口: ${switched.message}")
+                // ⚠️ 补切成功就要**改掉** runner 那句「还没切到固定端口」的结论。
+                //   runner 报「没切成」时用的是旧端口（配对过程中 adbd 重启、端口变了），
+                //   这里用新端口补切成功，那句话此刻已经不成立。不改的话通知栏会告诉
+                //   用户「请去设置页点『切到固定端口』重试」—— 而实际上什么都不用做，
+                //   用户白跑一趟还会以为修复没生效。
+                return result.copy(message = "配对成功，并已切到固定端口 5555 —— 现在关掉无线调试、关掉 Wi-Fi 都不影响特权通道。")
             }
+            Log.w(TAG, "配对成功但补切固定端口失败: ${switched.message}")
         }
         return result
     }
@@ -4725,7 +4809,7 @@ class EngineManager private constructor(private val context: Context) {
          *      `HTMLInputElement.prototype` 层拦截 `type=password`，让 DOM 里
          *      从头到尾没出现过 password。真机实测 inputType 0xe1 → 0x80a1。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-49"
+        private const val MOBILE_UI_VERSION = "1.0.0-50"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -4881,6 +4965,15 @@ class EngineManager private constructor(private val context: Context) {
          */
         private const val ADB_WIRELESS_ASSET = "adb-wireless-arm64.zip"
         private const val ADB_WIRELESS_DIR = "adbwire"
+
+        /**
+         * 无线调试 adb 工具链的**完整性哨兵**（落在 [ADB_WIRELESS_DIR] 内）。
+         *
+         * 只在 107 个条目全部写完之后才落盘，因此「哨兵存在」= 解包完整走完过。
+         * 幂等判据必须带上它，否则一次中断留下的半成品会被永久认定为「已完成」——
+         * 详见 `ensureAdbWireless()`。
+         */
+        private const val ADB_WIRELESS_STAMP = ".extracted"
 
         /** 特权身份说明写进这个文件 —— agent-instructions 会自动读它并注入系统提示词。 */
         private const val INSTRUCTIONS_FILE = "AGENTS.md"

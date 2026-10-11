@@ -776,6 +776,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         /**
+         * 配对需要的通知是否可用。
+         *
+         * 配对流程的一切交互（提示、配对码输入框、取消按钮）**都挂在那条常驻通知上**，
+         * 所以通知被系统关掉时配对根本无法进行。原生侧会直接拒绝开始（见
+         * [AdbPairingNotifier.start]），但那样用户只会看到「点了没反应」——
+         * 界面必须能问出原因并明说。
+         *
+         * 返回 Boolean（`@JavascriptInterface` 支持基本类型）。
+         */
+        @android.webkit.JavascriptInterface
+        fun pairingNotificationsEnabled(): Boolean =
+            AdbPairingNotifier.notificationsEnabled(this@MainActivity)
+
+        /**
          * 移动端 UI 插件激活完成 —— 界面真正可用的时刻。
          *
          * 这是启动动画该收尾的信号：`onPageFinished` 只代表 DOM 到了，实测之后
@@ -925,6 +939,14 @@ class MainActivity : AppCompatActivity() {
                 .put("granted", snap?.result?.granted ?: false)
                 .put("detail", snap?.result?.detail ?: "")
                 .put("at", snap?.at ?: 0L)
+                // ⚠️ 「探测到有 root」与「本会话里 root 工具真的挂上了」是**两件事**。
+                //   工具是 `--patch` 挂的，只在引擎启动那一刻生效；用户点「重新检测」
+                //   把结论刷成 GRANTED 之后，引擎已经在跑，overlay 不会再读 ——
+                //   这个会话里**没有** root 工具。
+                //   不把这两个事实分开暴露，界面就只能在「结论已可用」时一律宣称
+                //   「root 工具已注册」，那是在说假话，而且用户无法自行发现（只能
+                //   靠重启 App 才「突然好了」）。所以这里把挂载事实一并给出去。
+                .put("mounted", EngineManager.get(this@MainActivity).rootToolMounted)
                 .toString()
         } catch (t: Throwable) {
             Log.w(DshApplication.TAG, "读取 root 状态失败: ${t.message}")

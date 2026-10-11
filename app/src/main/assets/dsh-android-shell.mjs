@@ -162,7 +162,7 @@ const TAG = '[dsh-adb]';
  *
  * ⚠️ **拿不到文件就说明无线调试没开或没发现** —— 直接回落，不猜、不扫。
  */
-const ADB_HOME = process.env.DSH_ADB_HOME ?? '';
+const ADB_HOME = process.env.DSH_ADB_HOME ?? defaultAdbHome();
 const ADB_BIN = ADB_HOME === '' ? '' : path.join(ADB_HOME, 'bin', 'adb');
 
 /** Kotlin 侧（`AdbMdns`）把发现到的端口写在这里，供本脚本读取。 */
@@ -220,6 +220,40 @@ const SHA1_DIGEST_INFO = Buffer.from('3021300906052b0e03021a05000414', 'hex');
 // ── 密钥 ─────────────────────────────────────────────────────
 function homeDir() {
   return process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
+}
+
+/**
+ * `DSH_ADB_HOME` 缺失时的兜底推导：`<filesDir>/adbwire`。
+ *
+ * ## 为什么必须有这个兜底
+ *
+ * 引擎的 `scrubbedParentEnv()`（`@deepseek-ai/dsh-subprocess`）会剥掉子进程 env 里
+ * **所有** `DSH_*` 变量，所以插件必须**显式**把要用的每一个都传下来。而
+ * `dsh-android-shell` 插件原先只传了 `DSH_HOME`，漏了 `DSH_ADB_HOME` ——
+ * 结果是 runner 里 `ADB_BIN` 变成空串，通道 1.5 与通道 2 的门卫
+ * （`ADB_BIN !== ''`）双双为假，**无线调试通道整条不存在**，只能靠 legacy 5555；
+ * 5555 没在听时就静默回落成 app 身份。
+ *
+ * 更隐蔽的是：设置页的「重新检测」走的是宿主半插件**自己** spawn（env 里
+ * `DSH_ADB_HOME` 完整），于是**探测报告「uid 2000 可用」，而模型执行时进不去
+ * 无线通道** —— 同一台设备上两处对同一件事给出相反结论。
+ *
+ * 插件那次传递已经补上（`dsh-android-shell/lib/index.js`），这里再加一层兜底：
+ * 布局是固定的（`$DSH_HOME` = `<filesDir>/home/.dsh`，adb 工具链在
+ * `<filesDir>/adbwire`），所以从 `$DSH_HOME` 上溯两级即可，与
+ * `dsh-android-mobile/lib/index.js` 的 `runnerPath()` 同一手法。
+ * 两者都对时才用（目录真的存在），避免在桌面端瞎猜出一个不存在的路径。
+ *
+ * @returns {string} adb 工具链目录；推导不出可用目录时给 `''`。
+ */
+function defaultAdbHome() {
+  const candidate = path.resolve(homeDir(), '..', '..', 'adbwire');
+  try {
+    if (fs.existsSync(path.join(candidate, 'bin', 'adb'))) return candidate;
+  } catch {
+    /* 读不到当作没有 */
+  }
+  return '';
 }
 function keyPath() {
   return path.join(homeDir(), 'adbkey');
@@ -870,12 +904,26 @@ class StreamQueue {
  * 这个降级是**有意**的 —— 特权命令本就不该依赖工作区里的相对路径
  * （uid 2000 读不到工作区，相对路径对它没有意义）。而如果用 `&&`，
  * 那么「在工作区里跑 `screencap`」这种完全合理的用法会直接失败。
+ *
+ * ⚠️ 与 root runner（`dsh-android-root.mjs`）的 `cd … || exit 79` **刻意不同**：
+ * 那边是 uid 0，任何目录都进得去，切不过去就是真错误、必须失败。
+ *
+ * ⚠️ 但降级**不能是无声的**。原实现把 `cd` 的报错 `2>/dev/null` 丢掉、又没有任何
+ * 替代提示，于是「workdir 不存在 / 进不去」与「workdir 正常」在输出上**完全一样**：
+ * 模型 `shell(command="ls", workdir="/sdcard/nope")` 会在 `/` 下执行并拿到一堆
+ * 看起来正常的结果，据此认为命令在目标目录里跑成功了 —— 这是**静默失真**，
+ * 比命令直接失败更难查（调用方甚至不会起疑）。
+ *
+ * 所以这里在切不过去时补一行带 `[dsh-adb]` 前缀的 stderr 提示（与 runner 里
+ * 其它诊断同一格式），说明实际用的是哪个目录。命令本身仍照常执行、退出码不受影响。
  */
 function withCwd(command, cwd) {
   if (typeof cwd !== 'string' || cwd === '' || cwd === '/') return command;
   // 单引号包裹 + 内部单引号转义，避免路径里的空格/特殊字符破坏命令
   const quoted = `'${cwd.replaceAll("'", `'\\''`)}'`;
-  return `cd ${quoted} 2>/dev/null; ${command}`;
+  const notice =
+    `printf '%s\\n' '[dsh-adb] 无法进入工作目录 ${cwd.replaceAll("'", `'\\''`)}（uid 2000 通常读不到应用私有目录），已在 / 下执行' >&2; `;
+  return `cd ${quoted} 2>/dev/null || { ${notice}cd / 2>/dev/null; }; ${command}`;
 }
 
 // ── 无线调试通道（经内置 adb 二进制）────────────────────────
@@ -1126,16 +1174,39 @@ function pairWireless(port, code) {
  */
 async function switchToTcp() {
   if (ADB_BIN === '' || !fs.existsSync(ADB_BIN)) return false;
-  // 先用**已经可用**的通道连一次，把 tcpip 命令发出去。
-  // 优先 legacy（已经在听说明已经是 TCP 模式，无需再切）；否则走无线调试。
+  // 已经在听说明已经是 TCP 模式，无需再切。
   const already = await legacyAlive();
   if (already) return true;
 
-  const { connect: port } = readWirelessPorts();
+  // ⚠️ 端口**不能只读一次就放弃**。配对刚成功的那一刻，Kotlin 侧的常驻 mDNS 监听
+  //    往往还没来得及把新端口写进文件（无线调试在配对过程中重启了 adbd，端口是
+  //    全新的）—— 此时立刻 `return false` 会把「还没写」误报成「切不了」，
+  //    而用户看到的就是「配对成功，但权限还是 app 身份」。
+  //    给一小段重试窗口（5 秒，成本可忽略：本来就要等 adbd 重启），
+  //    拿到端口就往下走。
+  let port = null;
+  for (let i = 0; i < 20; i += 1) {
+    port = readWirelessPorts().connect;
+    if (port !== null) break;
+    await new Promise((r) => setTimeout(r, 250));
+  }
   if (port === null) {
-    process.stderr.write(`${TAG} 无法切 TCP 模式：没有可用的无线调试端口\n`);
+    process.stderr.write(`${TAG} 无法切 TCP 模式：没有可用的无线调试端口（已等待 5 秒）\n`);
     return false;
   }
+
+  // ⚠️ **必须先 `connect` 一次**，否则下面那句 `-s ${HOST}:${port}` 会因为
+  //    adb server 里根本没有这个 device 而直接报 `device not found`。
+  //    这一段原先只在 `--switch-tcp` 分支里做，`--pair` 分支没做 ——
+  //    于是「配对成功后自动切 5555」**必然失败**，用户只能一直靠无线调试
+  //    顶着，一关 Wi-Fi 通道就断。现在收进来，三个调用点共用同一份保证。
+  await adbExec(['start-server']);
+  const conn = await adbExec(['connect', `${HOST}:${port}`]);
+  if (!conn.out.includes('connected')) {
+    process.stderr.write(`${TAG} 无法切 TCP 模式：连不上无线调试 ${HOST}:${port} (${(conn.out + conn.err).trim()})\n`);
+    return false;
+  }
+
   const rc = await adbExec(['-s', `${HOST}:${port}`, 'tcpip', String(PORT)]);
   if (rc.code !== 0) {
     process.stderr.write(`${TAG} 切换 TCP 模式失败: ${(rc.out + rc.err).trim()}\n`);
@@ -1207,7 +1278,19 @@ async function main() {
       // 立刻切到固定的 TCP 端口 —— 配对只给了我们「能连无线调试」的权利，而
       // 无线调试的端口**一关开关就没了**（实测断连）。切成 tcpip 之后通道就
       // 不再依赖那个开关，也不会随重启换端口。详见 switchToTcp()。
-      await switchToTcp();
+      //
+      // ⚠️ 配对刚成功时端口文件可能还没写成（或刚被清掉），`switchToTcp()`
+      //    会因此拿不到端口而失败。这**不该**让配对报错（配对本身是成功的），
+      //    但也不能再像以前那样静默 —— 结果要如实写进 stderr，让 Kotlin 侧
+      //    和设置页能区分「配对成功且已切固定端口」与「配对成功但还得靠无线调试」。
+      const switched = await switchToTcp();
+      if (!switched) {
+        process.stderr.write(
+          `${TAG} 配对成功，但固定端口 ${PORT} 未切成功 —— ` +
+            `当前只能靠无线调试，关掉 Wi-Fi 或无线调试开关后特权通道会失效。` +
+            `可在设置页点「切到固定端口」重试。\n`
+        );
+      }
     }
     process.exitCode = rc;
     return;
@@ -1220,36 +1303,21 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    // ⚠️ 必须先起 server 并 connect 一次 —— `switchToTcp()` 发的是
-    // `adb -s 127.0.0.1:<port> tcpip 5555`，没有这条连接时 adb 会直接报
-    // 「device not found」，切换必然失败。通道 1.5 里也是这个顺序。
-    const { connect: wlPort } = readWirelessPorts();
-    if (wlPort !== null) {
-      await adbExec(['start-server']);
-      await adbExec(['connect', `${HOST}:${wlPort}`]);
-    }
+    // ⚠️ 这里不再自己 `connect` —— `switchToTcp()` 现在负责建立那条连接
+    //    （它必须知道端口，而端口就是它自己读的）。
     process.exitCode = (await switchToTcp()) ? 0 : 1;
     return;
   }
 
-  // ── 子命令：只报告无线调试状态（供设置页显示）──────────────
-  if (argv[0] === '--discover') {
-    const adbOk = ADB_BIN !== '' && fs.existsSync(ADB_BIN);
-    // ⚠️ 这里**只查密钥文件在不在**，不生成：设置页每刷新一次就凭空造一把密钥
-    // 是意外副作用。生成留给真正的执行路径与 `--pair`。
-    const keyOk = fs.existsSync(keyPath());
-    // 端口由 Kotlin 侧发现后写入，这里只读文件，不做任何探测
-    const ports = readWirelessPorts();
-    process.stdout.write(`${JSON.stringify({
-      adb: adbOk,
-      key: keyOk,
-      keyOrigin: keyOrigin(),
-      connect: ports.connect,
-      pairing: ports.pairing,
-    })}\n`);
-    process.exitCode = 0;
-    return;
-  }
+  // ⚠️ 这里**曾经**有一个 `--discover` 子命令（打印密钥来源与端口文件内容，
+  // 供设置页显示）。它已被删除，理由有两条：
+  //   1. **没有任何调用者**：设置页的状态走的是宿主半插件的 HTTP 路由
+  //      （`dsh-android-mobile`），那条路由自己 spawn runner 跑真实探测，
+  //      从不经过这个子命令。留着等于一条永不执行的死路径。
+  //   2. 它的输出会**误导排查**：它把 `readWirelessPorts()` 读到的文件内容
+  //      当成「当前可用端口」报出去，而那个文件可能已经过期（端口是随机且
+  //      每次重启都变的）。伪造出一个精确但陈旧的结论，比不报更坏事。
+  // 需要无线调试状态时看日志里的 `[mdns] 解析到 … 端口 N` 与 `[dsh-adb]` 行。
 
   const command = argv[0];
   if (command === undefined || command === '') {
