@@ -8180,8 +8180,8 @@
       ],
       "entered": true,
       "verified": true,
-      "total": 36,
-      "labelled": 36,
+      "total": 26,
+      "labelled": 26,
       "blocked": 7,
       "offscreen": 3,
       "elements": [
@@ -8577,240 +8577,6 @@
         },
         {
           "ref": "e15",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(4) > div > span:nth-of-type(4) > span > button",
-          "tag": "button",
-          "role": "button",
-          "text": "会话“图谱种会话”的操作",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 197,
-            "y": 318,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 205,
-            "y": 326
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e16",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(4) > div > span:nth-of-type(4) > div > button:nth-of-type(1)",
-          "tag": "button",
-          "role": "button",
-          "text": "归档会话",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 223,
-            "y": 318,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 231,
-            "y": 326
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e17",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(4) > div > span:nth-of-type(4) > div > button:nth-of-type(2)",
-          "tag": "button",
-          "role": "button",
-          "text": "置顶会话",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 249,
-            "y": 318,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 257,
-            "y": 326
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e18",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(5) > div > span:nth-of-type(4) > span > button",
-          "tag": "button",
-          "role": "button",
-          "text": "会话“探针量一下”的操作",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 197,
-            "y": 352,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 205,
-            "y": 360
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e19",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(5) > div > span:nth-of-type(4) > div > button:nth-of-type(1)",
-          "tag": "button",
-          "role": "button",
-          "text": "归档会话",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 223,
-            "y": 352,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 231,
-            "y": 360
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e20",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(5) > div > span:nth-of-type(4) > div > button:nth-of-type(2)",
-          "tag": "button",
-          "role": "button",
-          "text": "置顶会话",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 249,
-            "y": 352,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 257,
-            "y": 360
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e21",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(6) > div > span:nth-of-type(4) > span > button",
-          "tag": "button",
-          "role": "button",
-          "text": "会话“探针量一下”的操作",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 197,
-            "y": 386,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 205,
-            "y": 394
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e22",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(6) > div > span:nth-of-type(4) > div > button:nth-of-type(1)",
-          "tag": "button",
-          "role": "button",
-          "text": "归档会话",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 223,
-            "y": 386,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 231,
-            "y": 394
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e23",
-          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(6) > div > span:nth-of-type(4) > div > button:nth-of-type(2)",
-          "tag": "button",
-          "role": "button",
-          "text": "置顶会话",
-          "testid": "",
-          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
-          "rect": {
-            "x": 249,
-            "y": 386,
-            "w": 16,
-            "h": 16
-          },
-          "center": {
-            "x": 257,
-            "y": 394
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e25",
           "sel": "#root > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(3) > div:nth-of-type(2) > div > div > div > button",
           "tag": "button",
           "role": "button",
@@ -8836,33 +8602,7 @@
           "value": ""
         },
         {
-          "ref": "e24",
-          "sel": "div > div:nth-of-type(1) > div > div > div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > button",
-          "tag": "button",
-          "role": "button",
-          "text": "展开其余 20 个会话",
-          "testid": "",
-          "cls": "_9lTDKa_sessionOverflowButton",
-          "rect": {
-            "x": 12,
-            "y": 410,
-            "w": 261,
-            "h": 28
-          },
-          "center": {
-            "x": 142.5,
-            "y": 424
-          },
-          "inViewport": true,
-          "offscreen": false,
-          "covered": false,
-          "blockedBy": null,
-          "enabled": true,
-          "checked": null,
-          "value": ""
-        },
-        {
-          "ref": "e26",
+          "ref": "e16",
           "sel": "div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > span:nth-of-type(2) > button",
           "tag": "button",
           "role": "button",
@@ -8893,7 +8633,7 @@
           "value": ""
         },
         {
-          "ref": "e27",
+          "ref": "e17",
           "sel": "div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(3) > div > button",
           "tag": "button",
           "role": "button",
@@ -8924,7 +8664,7 @@
           "value": ""
         },
         {
-          "ref": "e28",
+          "ref": "e18",
           "sel": "#root > div > div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > button",
           "tag": "button",
           "role": "button",
@@ -8950,7 +8690,7 @@
           "value": ""
         },
         {
-          "ref": "e29",
+          "ref": "e19",
           "sel": "div:nth-of-type(1) > div > div > div > div > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(2) > button",
           "tag": "button",
           "role": "button",
@@ -8981,7 +8721,7 @@
           "value": ""
         },
         {
-          "ref": "e32",
+          "ref": "e22",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(1) > button",
           "tag": "button",
           "role": "button",
@@ -9007,7 +8747,7 @@
           "value": ""
         },
         {
-          "ref": "e33",
+          "ref": "e23",
           "sel": "div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > span > button",
           "tag": "button",
           "role": "button",
@@ -9033,7 +8773,7 @@
           "value": ""
         },
         {
-          "ref": "e34",
+          "ref": "e24",
           "sel": "div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > button",
           "tag": "button",
           "role": "button",
@@ -9064,7 +8804,7 @@
           "value": ""
         },
         {
-          "ref": "e35",
+          "ref": "e25",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(2) > button",
           "tag": "button",
           "role": "button",
@@ -9095,7 +8835,7 @@
           "value": ""
         },
         {
-          "ref": "e31",
+          "ref": "e21",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(3) > div > div:nth-of-type(1)",
           "tag": "div",
           "role": "textbox",
@@ -9126,7 +8866,7 @@
           "value": null
         },
         {
-          "ref": "e30",
+          "ref": "e20",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(1) > div > div > div > div > div > div > div:nth-of-type(2) > div > button",
           "tag": "button",
           "role": "button",
@@ -9969,6 +9709,877 @@
       ]
     },
     {
+      "id": "workfiles",
+      "title": "右侧边栏 › 工作区文件",
+      "enter": [
+        {
+          "target": "打开右侧边栏",
+          "spec": {
+            "aria": "打开右侧边栏"
+          },
+          "ok": true,
+          "error": null,
+          "hint": null
+        },
+        {
+          "target": "工作区文件",
+          "spec": {
+            "text": "工作区文件"
+          },
+          "ok": true,
+          "error": null,
+          "hint": null
+        }
+      ],
+      "entered": true,
+      "verified": true,
+      "total": 29,
+      "labelled": 29,
+      "blocked": 17,
+      "offscreen": 2,
+      "elements": [
+        {
+          "ref": "e19",
+          "sel": "div > div > div > div > div > div > section > div:nth-of-type(1) > div > div:nth-of-type(1) > div > button",
+          "tag": "button",
+          "role": "button",
+          "text": "关闭",
+          "testid": "",
+          "cls": "_tabClose_6nhg2_417",
+          "rect": {
+            "x": 86.33,
+            "y": 14,
+            "w": 20,
+            "h": 20
+          },
+          "center": {
+            "x": 96.33,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e20",
+          "sel": "div > div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > button",
+          "tag": "button",
+          "role": "button",
+          "text": "新标签页",
+          "testid": "",
+          "cls": "_addTab_6nhg2_449",
+          "rect": {
+            "x": 114.33,
+            "y": 10,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 128.33,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e22",
+          "sel": "div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > span > button",
+          "tag": "button",
+          "role": "button",
+          "text": "分栏",
+          "testid": "",
+          "cls": "_iconButton_6nhg2_511",
+          "rect": {
+            "x": 254,
+            "y": 10,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 268,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": false,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e23",
+          "sel": "div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > div:nth-of-type(3) > button:nth-of-type(1)",
+          "tag": "button",
+          "role": "button",
+          "text": "退出全屏",
+          "testid": "",
+          "cls": "OUqwTW_iconButton",
+          "rect": {
+            "x": 290,
+            "y": 10,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 304,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e24",
+          "sel": "div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > div:nth-of-type(3) > button:nth-of-type(2)",
+          "tag": "button",
+          "role": "button",
+          "text": "收起右侧边栏",
+          "testid": "",
+          "cls": "OUqwTW_iconButton",
+          "rect": {
+            "x": 326,
+            "y": 10,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 340,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e25",
+          "sel": "div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "重新读取",
+          "testid": "",
+          "cls": "Woyo-G_tool",
+          "rect": {
+            "x": 281,
+            "y": 42.83,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 295,
+            "y": 56.83
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e26",
+          "sel": "div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > div > span > div > button:nth-of-type(1)",
+          "tag": "button",
+          "role": "button",
+          "text": "用 文件资源管理器 打开",
+          "testid": "",
+          "cls": "WgQWqa_main",
+          "rect": {
+            "x": 313.33,
+            "y": 45.17,
+            "w": 23,
+            "h": 23.33
+          },
+          "center": {
+            "x": 324.83,
+            "y": 56.83
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e27",
+          "sel": "div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > div > span > div > button:nth-of-type(2)",
+          "tag": "button",
+          "role": "button",
+          "text": "更多打开方式",
+          "testid": "",
+          "cls": "WgQWqa_chevron",
+          "rect": {
+            "x": 336.33,
+            "y": 45.17,
+            "w": 17.33,
+            "h": 23.33
+          },
+          "center": {
+            "x": 345,
+            "y": 56.83
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e18",
+          "sel": "div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > div:nth-of-type(1) > div",
+          "tag": "div",
+          "role": "tab",
+          "text": "文件",
+          "testid": "",
+          "cls": "_tab_6nhg2_134 _tabActive_6nhg2_346",
+          "rect": {
+            "x": 10.33,
+            "y": 10,
+            "w": 100,
+            "h": 28
+          },
+          "center": {
+            "x": 60.33,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": null
+        },
+        {
+          "ref": "e21",
+          "sel": "div > div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > span",
+          "tag": "span",
+          "role": "",
+          "text": "栏宽不足，拖宽侧边栏后再分栏",
+          "testid": "",
+          "cls": "",
+          "rect": {
+            "x": 254,
+            "y": 10,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 268,
+            "y": 24
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": null
+        },
+        {
+          "ref": "e9",
+          "sel": "#root > div > div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(2) > button:nth-of-type(1)",
+          "tag": "button",
+          "role": "tab",
+          "text": "对话",
+          "testid": "",
+          "cls": "Dc7zOa_tab Dc7zOa_tabActive",
+          "rect": {
+            "x": -42,
+            "y": 50.33,
+            "w": 26,
+            "h": 25.33
+          },
+          "center": {
+            "x": -29,
+            "y": 63
+          },
+          "inViewport": false,
+          "offscreen": true,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e10",
+          "sel": "#root > div > div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(2) > button:nth-of-type(2)",
+          "tag": "button",
+          "role": "tab",
+          "text": "轨迹",
+          "testid": "",
+          "cls": "Dc7zOa_tab",
+          "rect": {
+            "x": 20,
+            "y": 50.33,
+            "w": 26,
+            "h": 25.33
+          },
+          "center": {
+            "x": 33,
+            "y": 63
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > span:nth-of-type(1) > span > span:nth-of-type(1)",
+            "tag": "span",
+            "cls": "_directory_1kiio_22",
+            "text": "C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\home\\Documents\\deepseek-harness\\"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e0",
+          "sel": "#root > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(1) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "打开侧边栏",
+          "testid": "",
+          "cls": "_2H3hWW_iconButton _2H3hWW_toggle",
+          "rect": {
+            "x": 10,
+            "y": 18,
+            "w": 36,
+            "h": 36
+          },
+          "center": {
+            "x": 28,
+            "y": 36
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > div > section > div:nth-of-type(1) > div > div:nth-of-type(1) > div",
+            "tag": "div",
+            "cls": "_tab_6nhg2_134 _tabActive_6nhg2_346",
+            "text": "文件"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e1",
+          "sel": "#root > div > div > div:nth-of-type(1) > div > div > button",
+          "tag": "button",
+          "role": "button",
+          "text": "新建会话",
+          "testid": "",
+          "cls": "_2H3hWW_newSession",
+          "rect": {
+            "x": 10,
+            "y": 66,
+            "w": 36,
+            "h": 36
+          },
+          "center": {
+            "x": 28,
+            "y": 84
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > ul > li",
+            "tag": "li",
+            "cls": "Woyo-G_note",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e2",
+          "sel": "#root > div > div > div:nth-of-type(1) > div > div > nav > button",
+          "tag": "button",
+          "role": "button",
+          "text": "插件",
+          "testid": "",
+          "cls": "_2H3hWW_panelRow",
+          "rect": {
+            "x": 10,
+            "y": 114,
+            "w": 36,
+            "h": 36
+          },
+          "center": {
+            "x": 28,
+            "y": 132
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e3",
+          "sel": "#root > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(2) > div > div > div:nth-of-type(1) > div:nth-of-type(1) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "添加工作区",
+          "testid": "",
+          "cls": "_9lTDKa_iconButton",
+          "rect": {
+            "x": 10,
+            "y": 162,
+            "w": 36,
+            "h": 36
+          },
+          "center": {
+            "x": 28,
+            "y": 180
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e4",
+          "sel": "#root > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(2) > div > div > div:nth-of-type(2) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "搜索会话",
+          "testid": "",
+          "cls": "_9lTDKa_searchButton",
+          "rect": {
+            "x": 10,
+            "y": 210,
+            "w": 36,
+            "h": 36
+          },
+          "center": {
+            "x": 28,
+            "y": 228
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e5",
+          "sel": "#root > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(3) > div:nth-of-type(2) > div > div > div > button",
+          "tag": "button",
+          "role": "button",
+          "text": "设置",
+          "testid": "",
+          "cls": "wCInkW_trigger wCInkW_rail",
+          "rect": {
+            "x": 9.83,
+            "y": 728,
+            "w": 36,
+            "h": 36
+          },
+          "center": {
+            "x": 27.83,
+            "y": 746
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e6",
+          "sel": "div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > span:nth-of-type(1) > div > button:nth-of-type(1)",
+          "tag": "button",
+          "role": "button",
+          "text": "用 文件资源管理器 打开",
+          "testid": "",
+          "cls": "WgQWqa_main",
+          "rect": {
+            "x": 137.33,
+            "y": 13.5,
+            "w": 23,
+            "h": 23.33
+          },
+          "center": {
+            "x": 148.83,
+            "y": 25.17
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div:nth-of-type(3) > div > div > div > div > div > div > div > div > section > div:nth-of-type(1) > div",
+            "tag": "div",
+            "cls": "_tabStrip_6nhg2_237",
+            "text": "文件"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e7",
+          "sel": "div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > span:nth-of-type(1) > div > button:nth-of-type(2)",
+          "tag": "button",
+          "role": "button",
+          "text": "更多打开方式",
+          "testid": "",
+          "cls": "WgQWqa_chevron",
+          "rect": {
+            "x": 160.33,
+            "y": 13.5,
+            "w": 17.33,
+            "h": 23.33
+          },
+          "center": {
+            "x": 169,
+            "y": 25.17
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div:nth-of-type(3) > div > div > div > div > div > div > div > div > section > div:nth-of-type(1) > div",
+            "tag": "div",
+            "cls": "_tabStrip_6nhg2_237",
+            "text": "文件"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e8",
+          "sel": "div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > span:nth-of-type(2) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "更多操作",
+          "testid": "",
+          "cls": "_button_1rv3m_2 _ghost_1rv3m_45 _sm_1rv3m_28 _4Nnt6q_moreButton",
+          "rect": {
+            "x": 186,
+            "y": 11.17,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 200,
+            "y": 25.17
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div:nth-of-type(3) > div > div > div > div > div > div > div > div > section > div:nth-of-type(1) > div",
+            "tag": "div",
+            "cls": "_tabStrip_6nhg2_237",
+            "text": "文件"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e11",
+          "sel": "div:nth-of-type(1) > div > div > div > div > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(2) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "复制",
+          "testid": "",
+          "cls": "xD_KDq_action",
+          "rect": {
+            "x": 172,
+            "y": 140,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": 186,
+            "y": 154
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e14",
+          "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(1) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "添加文件或调用指令",
+          "testid": "",
+          "cls": "RlGAzG_add",
+          "rect": {
+            "x": -46,
+            "y": 713,
+            "w": 28,
+            "h": 28
+          },
+          "center": {
+            "x": -32,
+            "y": 727
+          },
+          "inViewport": false,
+          "offscreen": true,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e15",
+          "sel": "div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > span > button",
+          "tag": "button",
+          "role": "button",
+          "text": "访问模式，当前：工作区内修改",
+          "testid": "",
+          "cls": "dlU_AG_trigger",
+          "rect": {
+            "x": -10,
+            "y": 713,
+            "w": 44,
+            "h": 28
+          },
+          "center": {
+            "x": 12,
+            "y": 727
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e16",
+          "sel": "div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > button",
+          "tag": "button",
+          "role": "button",
+          "text": "选择模型，当前 DeepSeek-V41-Flash，推理等级 High",
+          "testid": "",
+          "cls": "wq12jW_trigger",
+          "rect": {
+            "x": 112,
+            "y": 713,
+            "w": 46,
+            "h": 28
+          },
+          "center": {
+            "x": 135,
+            "y": 727
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e17",
+          "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(2) > button",
+          "tag": "button",
+          "role": "button",
+          "text": "发送消息",
+          "testid": "",
+          "cls": "RlGAzG_primary",
+          "rect": {
+            "x": 174,
+            "y": 708,
+            "w": 34,
+            "h": 34
+          },
+          "center": {
+            "x": 191,
+            "y": 725
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": false,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e28",
+          "sel": "body > button",
+          "tag": "button",
+          "role": "button",
+          "text": "打开导航",
+          "testid": "",
+          "cls": "mp-nav-btn",
+          "rect": {
+            "x": 6,
+            "y": 6,
+            "w": 40,
+            "h": 40
+          },
+          "center": {
+            "x": 26,
+            "y": 26
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > section > div:nth-of-type(1) > div > div:nth-of-type(1) > div > span > span > div > svg > path",
+            "tag": "path",
+            "cls": "",
+            "text": ""
+          },
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e13",
+          "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(3) > div > div:nth-of-type(1)",
+          "tag": "div",
+          "role": "textbox",
+          "text": "发消息或创建任务, / 调用指令, @ 文件或对话",
+          "testid": "",
+          "cls": "RlGAzG_input",
+          "rect": {
+            "x": -54,
+            "y": 660,
+            "w": 266,
+            "h": 36
+          },
+          "center": {
+            "x": 79,
+            "y": 678
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": true,
+          "checked": null,
+          "value": null
+        },
+        {
+          "ref": "e12",
+          "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(1) > div > div > div > div > div > div > div:nth-of-type(2) > div > button",
+          "tag": "button",
+          "role": "button",
+          "text": "处理失败",
+          "testid": "",
+          "cls": "_4AI11G_root",
+          "rect": {
+            "x": -38,
+            "y": 184,
+            "w": 238,
+            "h": 33
+          },
+          "center": {
+            "x": 81,
+            "y": 200.5
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": true,
+          "blockedBy": {
+            "sel": "div > div > div > div > div > div > section > div:nth-of-type(2) > div > div > div > div:nth-of-type(2)",
+            "tag": "div",
+            "cls": "Woyo-G_body",
+            "text": "空目录"
+          },
+          "enabled": false,
+          "checked": null,
+          "value": ""
+        }
+      ]
+    },
+    {
       "id": "terminal",
       "title": "右侧边栏 › 终端",
       "enter": [
@@ -10231,7 +10842,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10293,7 +10904,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10324,7 +10935,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10355,7 +10966,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10386,7 +10997,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10417,7 +11028,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10541,7 +11152,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10598,7 +11209,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10629,7 +11240,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10660,7 +11271,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": false,
           "checked": null,
@@ -10722,7 +11333,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": true,
           "checked": null,
@@ -10753,7 +11364,7 @@
             "sel": "div > div > div > section > div:nth-of-type(2) > div > div > section > div > div > div:nth-of-type(2) > div:nth-of-type(1)",
             "tag": "div",
             "cls": "xterm-screen",
-            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-isolat …"
+            "text": "Microsoft Windows [版本 10.0.26200.9457] (c) Microsoft Corporation。保留所有权利。 C:\\Users\\XIAOPAN\\AppData\\Local\\Temp\\dsh-iso2\\h …"
           },
           "enabled": false,
           "checked": null,
