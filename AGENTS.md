@@ -25,6 +25,8 @@ APK
  ├─ assets/shell-tool.zip          uid 2000 特权工具插件（注册 `shell` 工具）
  ├─ assets/bubble-tool.zip         悬浮球控制工具插件（注册 `bubble` 工具，见 ⑫.3）
  ├─ assets/pet-bridge.zip          桌面宠物状态桥插件（订阅 `session/event`，见 ⑫.4）
+ ├─ assets/uiagent-tool.zip        UI 调试工具插件（注册 `ui` 工具，见 ⑫.5）
+ ├─ assets/ui-probe.js             UI 探针（页面世界，**不走转译**，见 ⑫.5）
  ├─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片（补**运行时 API**）
  └─ assets/webview-compat.zip      按 chrome74 降级编译的前端 bundle（补**语法**，见 ⑯）
 
@@ -38,7 +40,10 @@ APK
  │   ├─ pet-bridge/dsh-android-pet/      桌面宠物状态桥插件（同上，见 ⑫.4）
  │   ├─ bubble-cmd.json               悬浮球命令信箱：插件写、原生 250ms 轮询读（见 ⑫.3）
  │   ├─ bubble-result.json            同上，回执方向（原生写、插件读）
- │   └─ bubble-state.json             运行状态信箱：插件单向写、原生读完即删（见 ⑫.4）
+ │   ├─ bubble-state.json             运行状态信箱：插件单向写、原生读完即删（见 ⑫.4）
+ │   ├─ uiagent-tool/dsh-android-uiagent/  UI 调试工具插件（同上，刻意在 pnpm 之外，见 ⑫.5）
+ │   ├─ ui-cmd.json                   UI 命令信箱：插件写、原生 120ms 轮询读（见 ⑫.5）
+ │   └─ ui-result.json                同上，回执方向（原生写、插件读）
  ├─ bubble-frames/                    悬浮球默认动作的帧集（见 ⑫.4）
  │   └─ sets/<动作名>/                各命名动作的帧集（见 ⑫.4）
  ├─ dsh-android-shell.mjs  uid 2000 执行通道（每次启动覆盖写）
@@ -739,6 +744,8 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `shell-tool.zip` | 无需改（每次启动解包覆盖写） |
 | `bubble-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.3） |
 | `pet-bridge.zip` | 无需改（每次启动解包覆盖写，见 ⑫.4） |
+| `uiagent-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.5） |
+| `ui-probe.js` | 无需改（原生每次启动读一次进内存，见 ⑫.5）。⚠️ 但改了语义要同步升 `ui-probe.js` 内部的 `VERSION`（页面上的旧探针靠它判断要不要换） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
 
@@ -2936,6 +2943,191 @@ stdout/stderr 转发进 logcat（`dsh-core-memory` 的"已激活"就是这么打
 **测试残留**：`am force-stop` → 配置重置为默认（含 `action:""` 与空 `actionMap`）→
 删 `files/bubble-frames/`、`files/bubble-avatar.bin`、`files/home/.dsh/bubble-state.json`、
 `files/sample.sh`、`files/sample.log`。
+
+
+### ⑫.5 `ui` 工具 —— 让**模型自己**看和点这个 App 的界面
+
+⑫.3 把「改悬浮窗」接到了模型的工具列表里，但它只能改**悬浮球**。
+界面本身（官方 DSH Web GUI 那个聊天页）仍然是模型碰不到的：
+
+| 谁 | 能不能操作界面 | 为什么 |
+|---|---|---|
+| 页面侧插件（`client.js`） | ✅ | 浏览器里直接摸到 DOM |
+| **模型（AI）** | ❌ | 工具跑在 **Node 进程**里，没有 `window`、没有 `document` |
+
+于是「让 AI 自己测这个 App」在能力上是空的 —— 它既看不见界面，也动不了界面。
+⑫.5 补的就是这一段：注册一个独立工具 `ui`，把**枚举可交互元素（带屏幕精确坐标）
+/ 点击 / 输入 / 滚动 / 读文本 / 等元素出现**整套能力交给模型。
+
+```
+模型 ──调用 ui 工具──> dsh-android-uiagent（Node 插件，跑在引擎进程）
+                            │ 写 $DSH_HOME/ui-cmd.json
+                            ↓
+                UiProbeBridge（原生，120ms 轮询）
+                            │ WebHost.evaluateJavascript( (<ui-probe.js 源码>)(cmd) )
+                            ↓
+                页面世界 window.__DSH_UI_PROBE__.run(cmd)  ← React 渲染的真实 DOM
+                            │ JSON 结果
+                            ↑
+                原生把 CSS 坐标换算成屏幕物理坐标
+                            │ 写 $DSH_HOME/ui-result.json
+                            ↑
+模型 <──工具返回────────────┘
+```
+
+| 件 | 位置 |
+|---|---|
+| 页面探针 | `app/src/main/assets/ui-probe.js`（**不走转译**，见下） |
+| 插件源码 | `mobile-ui-plugin/dsh-android-uiagent/` |
+| 打包产物 | `assets/uiagent-tool.zip`（解到 `$DSH_HOME/uiagent-tool/dsh-android-uiagent/`） |
+| overlay | `$DSH_HOME/uiagent-tool.patch.yml`（`ensureUiTool()` + `writeUiToolPatch()`） |
+| 原生通道 | `UiProbeBridge.kt`（`MainActivity.installUiProbeBridge()`） |
+
+⚠️ **信箱文件与 `bubble` 工具完全分开**（`ui-cmd.json` / `ui-result.json` vs
+`bubble-cmd.json` / `bubble-result.json`）。两者各自从 `id=1` 自增，共用文件会让
+工具调用收到对方的回执。理由与 `bubble-state.json` 独立成文件完全一致。
+
+#### ⚠️ 模型的 `action` 与原生内部 `control` 是**两个名字，必须都认**
+
+原生最初只认 `control` 字段（内部旁路信号），而工具对外暴露的是统一的 `action` ——
+模型不可能知道原生内部另有一个字段名。只认 `control` 的后果是**静默降级**：
+
+| 调用 | 只认 `control` 时 | 修复后 |
+|---|---|---|
+| `action:"wait"` | 落进 else 分支，**只查一次**就报「没出现」 | 原生按 250ms 循环查，最多 10s |
+| `action:"reload"` | 探针不认识这个 action → 报「未知 action: reload」 | 走原生 `reload()` 分支 |
+
+两者都不报错到能看出根因。`UiProbeBridge.handle()` 现在写成
+`control.ifBlank { action }`，**只有 `wait`/`reload` 会被拦下**，其余动作行为不变。
+
+#### ⚠️ 探针**不经过任何转译**，必须守 ES5
+
+`ui-probe.js` 是运行时被 `evaluateJavascript` 直接 eval 的源码，**不经过
+`build-webview-compat.ps1` 那套 esbuild 降级**。用了 ES6+ 语法（`?.`、`??`、
+`=>`、模板串）在老 WebView 上会**整段语法错误、探针静默全废** ——
+而页面里看不到任何症状，只有原生侧每次调用都超时。
+
+用 esbuild 验（包装成表达式再降级，因为探针本身是**匿名函数表达式**，
+直接喂给 esbuild 会报 `Expected identifier but found "("`，那是语法形态不是兼容性问题）：
+
+```powershell
+$esbuild = "$env:TEMP\dsh-esbuild-tool\node_modules\.bin\esbuild.cmd"
+$src = Get-Content app\src\main\assets\ui-probe.js -Raw
+Set-Content "$env:TEMP\wrapped.js" -Value "var __probe = ($src);" -Encoding UTF8
+& $esbuild "$env:TEMP\wrapped.js" --target=chrome74 --outfile="$env:TEMP\o74.js"
+# 实测 chrome74 / chrome69 / chrome64 三档全部 exit=0、零警告
+```
+
+`node --check` **对它无效**（匿名函数表达式不是独立语句，必报
+`Function statements require a function name`）—— 别拿它的失败当问题。
+
+#### 坐标系（「精确」二字的落点）
+
+探针只返回 **CSS 视口坐标**（`getBoundingClientRect`）+ 视口尺寸；换算全在原生侧，
+因为页面里拿不到 WebView 在屏幕上的位置（`window.screenX` 在 WebView 内恒为 0）：
+
+```
+scale     = webView物理宽度 / 页面视口CSS宽度
+屏幕物理X = webView屏幕X + cssX * scale
+```
+
+回执里因此有**两套坐标**，每个元素都带：
+
+| 字段 | 含义 | 用在哪 |
+|---|---|---|
+| `center` / `rect` | CSS 视口坐标 | 页面内的判断 |
+| `screenCenter` / `screenRect` | **屏幕物理坐标** | 要驱动真机触控（`input tap`）时**只能用这个** |
+
+⚠️ `ScreenGeometry` 是通过**取值函数**（`provider` lambda）现取的，不是启动时存一份 View
+引用 —— Activity 重建（旋转、从后台回来）会换掉整个 WebView，持旧引用会把 JS 打进
+一个已销毁的内核，症状是「AI 说点过了，但界面没动」。
+
+#### ⚠️ 受控输入：`el.value = x` 是**无效**的
+
+React 在元素**实例**上定义 `value` 的 get/set 拦截器，把「上一轮的值」存在闭包里，
+靠 `tracked !== node.value` 判断要不要触发 `onChange`。直接 `el.value = x` 会**同时**
+更新拦截器里的记录 ⇒ React 认为没变化 ⇒ `onChange` 不触发 ⇒ 输入框看着有字、
+但组件状态是空的（发送出去还是空消息）。
+
+正解是走**原型上的原始 setter**，再派发冒泡的 `input` 事件：
+
+```js
+Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, text);
+el.dispatchEvent(new Event('input', { bubbles: true }));
+```
+
+`clickEl()` 同理要**按顺序**发 `pointerdown → mousedown → pointerup → mouseup → click`：
+React 18 用根级事件委托，缺前置事件时某些组件的状态机不推进，表现是「click 发了但界面没变」。
+
+#### `onTarget` 的判据是「手指会不会点到目标」
+
+`elementFromPoint` 的结果如实报告，与「我们把事件发给了谁」分开：
+
+- 事件**总是发给目标元素**（意图是「点它」，有装饰层浮在上面也不该丢掉意图）；
+- `onTarget:false` 表示**有无关元素压在上面**（遮罩、蒙层），此时 `hitTopmost` 会告诉
+  你实际接收点击的是谁。
+
+⚠️ 第一版把这个判据写成 `target === el`，而 `target` 只在「命中元素与目标有祖先/后代
+关系」时才被改掉 —— 于是无关遮罩压上来时 `target` 仍是 `el`，**`onTarget` 恒为 true、
+这个字段等于没有**，而工具文档还写着「onTarget:false 说明被遮挡」。判据必须直接看
+命中元素本身。
+
+#### ⚠️ 并发调用必须串行化
+
+原生只有**一个**轮询线程 + **一个**命令文件。两条命令同时写进去，后一条**覆盖**前一条：
+
+- 前一条命令从未被执行（模型以为点了，界面没动）；
+- 它的 `id` 再也等不到回执，`sendCommand` 一路超时到 20 秒；
+- 后一条的结果可能被前一条按 `id` 判为「不是给我的」而丢弃。
+
+症状是「偶发、看起来随机」。插件侧因此有一个 `enqueue()` 串行闸门（模型确实会
+同一轮并行发起多个工具调用）。⚠️ 闸门用 `.then(task, task)` 而不是 `.then(task)` ——
+前一个任务抛异常时也必须放行，否则一次失败会**永久卡死**后续所有调用。
+
+#### `text` 与 `value` 是两种意思（踩过）
+
+| 字段 | 含义 |
+|---|---|
+| `text` | **按可见标签定位**元素（tap/find/type/wait 共用） |
+| `value` | 往输入框里**写的内容**（仅 `type`） |
+
+⚠️ 第一版在插件里做了 `text` ↔ `value` 的翻译，于是 `tap{text:"发送"}` 的定位条件被
+当成「输入内容」处理、**转手就把 `text` 删了** —— 所有按文本定位的 tap/find/wait
+全部报「找不到元素」，而报错文案完全指不到真因。现在两边字段名一致、**原样透传**，
+中间没有任何翻译层，也就没有再搞错的机会。
+
+#### 怎么用（模型的正确姿势）
+
+1. `{"action":"dump"}` 先看界面上有什么（返回每个元素的位置、文本、选择器）；
+2. 用 `sel`（首选，从刚才的 dump 里复制）或 `text` / `aria` / `testid` 定位；
+3. `{"action":"tap","text":"发送"}`；
+4. 界面变化是异步的 —— 接着 `{"action":"wait","text":"确认"}` 等面板出现，再点里面；
+5. **永远先看 `ok` 字段**，`ok:false` 要如实报失败，不能假设点成功了。
+
+其它动作：`type`（写输入框，`enter:true` 附带回车）、`key`（发按键）、
+`scroll`（`to:"bottom"` 跳到底）、`text`（读可见文本）、`info`（一眼看当前界面）、
+`find` / `html`（看单个元素）、`ping`（探针是否活着）、`reload`（界面白了就重载）。
+
+#### PC 侧自动化验收（不需要真机）
+
+设备上装的是别处签名的包、无法 `install -r`（会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），
+而卸载会清掉 `filesDir` 下的整个 Termux 环境与 `$DSH_HOME`。所以验收走
+**真实 Chrome + 真实 DOM**（`--headless=new` + CDP，Node 24 自带 `WebSocket`，零依赖）：
+
+```powershell
+node tools\ui-probe-verify.mjs      # 探针行为，63 项断言（真实 DOM，含 React 受控输入模拟）
+```
+
+| 覆盖 | 判据 |
+|---|---|
+| `dump` / `find` | 找到 React 的 `role=button`、CSS 中心坐标、`includeHidden`、`filter`、`limit` |
+| `tap` | 五个事件按序派发 + **页面计数器真的 +1** + 遮挡识别 |
+| `type` | **React 的 onChange 真的被触发、拿到的值正确**（模拟实例级 value 拦截器） |
+| `scroll` / `key` / `text` / `info` / `html` | 容器真的滚动、按键送达、文本可读 |
+| 健壮性 | 未知 action 不崩、返回值可 JSON 序列化、**不污染页面**、幂等装填 |
+
+⚠️ `onTarget` 那条断言曾经失败并**暴露了探针的真实缺陷**（见上文）——
+PC 侧验收的价值就在这里：真机上你只会看到「AI 说点过了但界面没动」。
 
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了

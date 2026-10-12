@@ -229,6 +229,17 @@ class EngineManager private constructor(private val context: Context) {
     /** DSH_HOME：DSH 自己的数据目录。 */
     private val dshHome get() = File(homeDir, ".dsh")
 
+    /**
+     * `$DSH_HOME` 的**只读**对外视图 —— 给宿主侧的信箱桥用
+     * （见 [UiProbeBridge]、[BubbleCommandBridge]）。
+     *
+     * 那些桥跑在 App 进程里，和模型（Node 进程）靠**同一个目录下的文件**通信，
+     * 所以它们都得知道 `$DSH_HOME` 在哪。暴露成 `val` 而不是让各处自己拼
+     * `File(filesDir, "home/.dsh")`：拼错一次就是两个进程永远看不到对方的文件，
+     * 而症状只是「工具超时」，没有任何线索指向路径。
+     */
+    val dshHomeDir: File get() = dshHome
+
     /** 引擎工作目录（agent 的文件操作以此为根）。 */
     private val workspaceDir get() = File(context.filesDir, "workspace")
 
@@ -3018,6 +3029,81 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出 UI 调试工具插件（`uiagent-tool.zip` → `$DSH_HOME/uiagent-tool/dsh-android-uiagent/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `ui` 的**独立工具**，让模型能枚举界面上的
+     * 可交互元素（带屏幕精确坐标）、点击、输入、滚动、读文本 —— 也就是把「操作并
+     * 观察这个 App 的界面」接到模型的工具列表里。真实执行者是 [UiProbeBridge]
+     * 与页面探针 `assets/ui-probe.js`。
+     *
+     * ⚠️ **必须解到 `$DSH_HOME/uiagent-tool/` 而不是 profile 的 `node_modules`**：
+     *   与 [ensureBubbleTool] 同一个坑 —— 那个目录归 pnpm 管，而本包不在 profile
+     *   的 `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`。
+     *
+     * 与 `shell-tool` / `bubble-tool` 一样**不做版本戳**：包很小（两个文件），
+     * 每次启动覆盖写。
+     */
+    private fun ensureUiTool() {
+        val target = File(dshHome, "$UI_TOOL_DIR/$UI_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(UI_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装 UI 调试工具插件 $UI_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 ui 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装 UI 调试工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载 UI 调试工具的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeBubbleToolPatch] 同构。**没有「能力探测」这一步**：ui 工具不需要
+     * 任何特权（只要界面加载出来了就能用），所以文件在就挂载 —— 真正能不能用
+     * 由 [UiProbeBridge] 在运行时判断（`probeReady`），工具照常返回它读到的状态。
+     */
+    private fun writeUiToolPatch(): File? {
+        val patch = File(dshHome, UI_TOOL_PATCH)
+        val entry = File(dshHome, "$UI_TOOL_DIR/$UI_TOOL_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "UI 调试工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载 UI 调试工具插件：注册一个独立的 `ui` 工具，
+                # 让模型能枚举/点击/输入/滚动这个 App 的界面（带屏幕精确坐标）。
+                - insert:
+                    - id: $UI_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入 UI 调试工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入 UI 调试工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出桌面宠物的**状态桥**插件（`pet-bridge.zip` → `$DSH_HOME/pet-bridge/dsh-android-pet/`）。
      *
      * 该插件订阅引擎的 `session/event`（`@deepseek-ai/dsh-session` 声明的 post-commit
@@ -4079,6 +4165,11 @@ class EngineManager private constructor(private val context: Context) {
         //   悬浮球不需要任何身份，只要求用户开过开关并授权过悬浮窗。
         ensureBubbleTool()
         val bubblePatch = writeBubbleToolPatch()
+        // UI 调试工具：把「看/点这个 App 的界面」接到模型的工具列表里。
+        // ⚠️ 与 bubble 工具**完全并列且独立**（不同信箱、不同能力）。
+        //   同样必须早于引擎启动：overlay 要在 profile 解析前落盘。
+        ensureUiTool()
+        val uiToolPatch = writeUiToolPatch()
         // 桌面宠物状态桥：把引擎的 `session/event` 转成悬浮球的动作切换。
         // ⚠️ 与上面那条**并列且独立**：那条给模型 `bubble` 工具，这条让宠物自己会动。
         ensurePetBridge()
@@ -4165,6 +4256,11 @@ class EngineManager private constructor(private val context: Context) {
             // 桌面宠物状态桥：同样是 overlay（只订阅事件，不注册工具）
             if (petPatch != null) {
                 add("--patch"); add(petPatch.absolutePath)
+            }
+            // UI 调试工具：同样是 overlay，注册成独立的 `ui` 工具。
+            // ⚠️ 必须留在 `--port` **之前** —— 见下面那段关于内层 flag 的说明。
+            if (uiToolPatch != null) {
+                add("--patch"); add(uiToolPatch.absolutePath)
             }
             // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
             // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
@@ -5327,6 +5423,33 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val BUBBLE_TOOL_DIR = "bubble-tool"
+
+        // ── UI 调试工具 ──────────────────────────────────────────────
+        //
+        // 与 bubble 工具**同一套做法**（独立工具 + 文件信箱 + 刻意在 pnpm 管辖之外），
+        // 差别只在能力：那个改悬浮窗，这个**看和点页面里的界面**。
+        //
+        // 为什么需要它：界面是官方 DSH Web GUI 跑在 WebView 里，按钮全是 React
+        // 渲染的 DOM；而模型跑在 Node 进程里，那里既没有 `window` 也没有 `document`
+        // —— 于是「让 AI 自己测试这个 App」在能力上是空的。这个插件把「枚举界面
+        // 上的按钮（带屏幕精确坐标）/ 点击 / 输入 / 滚动 / 读文本」注册成一个 `ui`
+        // 工具，靠 [UiProbeBridge] 的信箱把命令送到原生、再由原生经
+        // `WebHost.evaluateJavascript` 打进页面里的探针（`assets/ui-probe.js`）。
+        //
+        // ⚠️ 与 bubble 工具**走不同的信箱文件**：命令可能并发发起，回执按 `id`
+        //   配对，而两个插件各自从 1 自增 —— 共用文件会让工具调用收到对方的回执。
+        //   理由与 `bubble-state.json` 独立成文件完全一致。
+
+        /** 注册 `ui` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val UI_TOOL_ASSET = "uiagent-tool.zip"
+        private const val UI_TOOL_PACKAGE = "dsh-android-uiagent"
+        private const val UI_TOOL_PATCH = "uiagent-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。同样刻意在 pnpm 管辖之外。 */
+        private const val UI_TOOL_DIR = "uiagent-tool"
+
+        /** 页面探针源码；由 [UiProbeBridge] 读走打进 WebView。 */
+        private const val UI_PROBE_ASSET = "ui-probe.js"
 
         // ── 桌面宠物状态桥 ───────────────────────────────────────────
         //

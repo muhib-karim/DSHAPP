@@ -501,6 +501,7 @@ class MainActivity : AppCompatActivity() {
         detectWebViewVersion()
         setupBackNavigation()
         installBubbleBridge()
+        installUiProbeBridge()
         // ⚠️ 必须在这里就绪：插件可能**在 App 前台**下发悬浮球外观，而那时
         //   onAppBackground 还没跑过。不提前记 context 的话 bubbleApply 会静默返回
         //   false（真机实测踩到），表现为"插件改了没反应"。
@@ -1833,6 +1834,69 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
+    }
+
+    /**
+     * 装好 UI 调试工具的原生侧。
+     *
+     * ## 这是一条什么通道
+     *
+     * 模型跑在 **Node 进程**里，看不到 DOM，也就没法自己操作这个 App 的界面。
+     * 这条通道把「看界面 / 点按钮 / 填输入框」变成模型可调用的工具：
+     *
+     * ```
+     * ui 工具(插件) ──写 ui-cmd.json──▶ UiProbeBridge ──evaluateJavascript──▶ 页面探针
+     *          ◀──读 ui-result.json────            ◀────JSON 结果──────────┘
+     * ```
+     *
+     * ## 为什么几何要用 lambda 现取，而不是存一份
+     *
+     * ⚠️ Activity 重建（转屏、从后台回来）会换掉整个 WebView 与 `binding`。
+     *   存一份 `View` 引用会让坐标算在一具"尸体"上 —— 而那种错误的表现是
+     *   「AI 点了，但点到了别的地方」，比直接失败难查得多。所以传取值函数。
+     *
+     * ⚠️ [UiProbeBridge.start] 是幂等的（内部只启一次轮询），所以 Activity
+     *   重建时重复调用是安全的，且正好把 provider 换成新实例。
+     */
+    private fun installUiProbeBridge() {
+        UiProbeBridge.start(
+            dshHome = engine.dshHomeDir,
+            assets = assets,
+            provider = {
+                // ⚠️ 未初始化时必须返回 null 而不是抛 —— 这个方法可能在任何时刻
+                //   被后台线程调到（信箱轮询），抛异常会把那条轮询线程杀掉。
+                if (!::web.isInitialized) null else object : UiProbeBridge.UiProbeHost {
+                    override fun evaluateJavascript(script: String, callback: ((String?) -> Unit)?) {
+                        // ⚠️ 必须切主线程：本方法由 `dsh-ui-cmd` 后台线程调用，
+                        //   而两个内核的 View/JS API 都要求 @UiThread。
+                        runOnUiThread { web.evaluateJavascript(script, callback) }
+                    }
+
+                    override fun screenGeometry(): UiProbeBridge.ScreenGeometry? {
+                        val view = if (::web.isInitialized) web.view else return null
+                        if (view.width <= 0 || view.height <= 0) return null
+                        val loc = IntArray(2)
+                        view.getLocationOnScreen(loc)
+                        val dm = resources.displayMetrics
+                        return UiProbeBridge.ScreenGeometry(
+                            screenX = loc[0],
+                            screenY = loc[1],
+                            widthPx = view.width,
+                            heightPx = view.height,
+                            density = dm.density,
+                            // 视口尺寸由探针在结果里回报；这里给 0 当哨兵，
+                            // `attachScreenCoords` 会用结果里的真实值覆盖。
+                            viewportWidthCss = 0.0,
+                            viewportHeightCss = 0.0,
+                        )
+                    }
+
+                    override fun reload() {
+                        runOnUiThread { engine.resetUiStage(); web.reload() }
+                    }
+                }
+            },
+        )
     }
 
     /**
