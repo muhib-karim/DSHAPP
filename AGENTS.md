@@ -2251,25 +2251,144 @@ if (allowEdgeCollapse && appearance.edgeSnap && overshoot >= dp(EDGE_OVERSHOOT_D
 
 #### 外观字段一览（`BubbleAppearance`）
 
+⚠️ **是分层模型，不是枚举模型。** 早期版本只有一个 `shape` 枚举 + 一张图片，
+于是 AI 无法满足任意诉求（"背景透明但图片不透明"、"把球做成星形"都表达不出来）。
+现在分三层，**三层的透明度相乘**：
+
+```
+形状层   shape / shapePath / bg / bg2 / border / bgOpacity
+内容层   avatar / frames / avatarOpacity / avatarScale
+动效层   spin / pulse
+```
+
 | 字段 | 取值 | 说明 |
 |---|---|---|
 | `state` | `auto` / `expanded` / `collapsed` / `hidden` | `auto` = 老行为（只在后台显示）；其余三态**前台也保持** |
-| `shape` | `circle` / `square` / `rounded` | 球的形状 |
-| `size` | dp | 球边长（默认 56） |
+| `shape` | `circle` / `square` / `rounded` / **`path`** | 球的形状；`path` 用下面的 `shapePath` |
+| `shapePath` | SVG path 的 `d` | **任意形状**（星形/心形/六边形/…）。坐标是 `shapeViewBox` 单位，不是 dp，所以同一串能适配任意 `size`。上限 `MAX_SHAPE_PATH_CHARS = 4000` |
+| `shapeViewBox` | `minX minY width height` | 默认 `0 0 100 100` |
+| `size` | dp | 球边长（默认 44） |
 | `cornerRadius` | dp | `rounded` 的圆角 |
-| `opacity` | 0–1 | 整体不透明度 |
+| `opacity` | 0.05–1 | **整体**不透明度（三层之上再乘一次） |
+| `bgOpacity` | 0–1 | **只压形状层**。`0` = 背景全透明、只剩图片 |
+| `avatarOpacity` | 0–1 | **只压内容层** |
+| `avatarScale` | 0.2–2.0 | 内容层缩放；>1 溢出球、由形状裁剪（这就是"放大裁切"） |
 | `bg` / `bg2` | `#RRGGBB` / `#AARRGGBB` | 底色 / 渐变第二色（留空 = 纯色） |
 | `border` / `borderWidth` | 色 / dp | 描边 |
-| `avatar` | `default` / `none` / data-URI | 头像（`none` = 露出底色） |
+| `avatar` | `default` / `none` / data-URI | 头像（`none` = **完全不要图片**） |
+| `frames` | data-URI 数组 | **轮播帧**（每项一帧）；`[]` = 清空轮播 |
+| `frameDurations` | int 数组 | 每帧时长（ms），与 `frames` 同序；缺省用 `frameIntervalMs` |
+| `frameIntervalMs` | ms（20–60000） | 统一帧时长，默认 400 |
+| `frameLoop` | int | `-1` = 无限（默认）；`N>0` = 播 N 轮后停在最后一帧 |
+| `spriteRows` / `spriteCols` | 0–32 | **精灵图网格**：`frames` 只给一张大图，按 `rows×cols` 行优先切片 |
+| `spin` | -720–720 | 每秒旋转角度（负 = 逆时针），0 = 不转。作用在**内容层**，形状层不动 |
+| `pulse` | bool | 呼吸缩放动画 |
 | `panelWidth` / `panelHeight` | dp | 展开面板尺寸（`panelHeight` = **总高**，0 = 自适应内容） |
 | `panelBg` / `panelText` / `panelAccent` | 色 | 面板配色 |
 | `statusAutoHideMs` | ms | 状态横条自动隐藏（≤0 = 永不隐藏） |
 | `edgeSnap` | bool | 是否启用「拖出屏幕自动贴边」 |
 
+**常见诉求 → 字段组合**（插件描述里也给了模型同一张表）：
+
+| 用户说 | 下发 |
+|---|---|
+| 背景透明、图片留着 | `{bgOpacity: 0}` |
+| 去掉图片 | `{avatar: "none"}` |
+| 做成星形/心形 | `{shape: "path", shapePath: "M50 3 L61 38 … Z"}` |
+| 让它转起来 | `{spin: 90}` |
+| 轮播几张图 | `{frameFiles: [...], frameIntervalMs: 200}` |
+| 用精灵图做动画 | `{frameFiles: ["sheet.png"], spriteRows: 4, spriteCols: 4}` |
+
 `merge()` 是**逐字段**合并：只写想改的字段，其余保持原值。落盘在
 `SharedPreferences("dsh_bubble")` 的 `appearance` 键；头像字节落
 `filesDir/bubble-avatar.bin`（`readAvatar`/`writeAvatar`，上限
-`MAX_AVATAR_BASE64 = 700_000`）。
+`MAX_AVATAR_BASE64 = 700_000`）；轮播帧字节落 `filesDir/bubble-frames/`（见下）。
+
+#### ⚠️⚠️ 加字段时 `save()` 与 `merge()` 必须同步（踩过的静默丢数据 bug）
+
+`load()` 的实现是「读 SharedPreferences 的 JSON → 走 `merge()`」，所以：
+
+- `merge()` 认的键，`save()` **必须写出来**，否则该字段只在本次运行有效、
+  重启即回默认 —— 用户看到的是「AI 改的时候看得见，重开 App 就没了」。
+- 反过来，`save()` 写了但 `merge()` 不认，重启后一样丢。
+
+两个函数各有一处 `put(...)` / `xxxOf(o, ...)` 列表，**加字段要一起改**。
+`frameCount` 尤其容易漏：漏了它重启后帧数读回 0，磁盘上那堆帧文件再没人引用，
+表现为「重启后动画没了」。
+
+#### ⚠️ 球的形状可以不是圆的 —— `BubbleShapeDrawable`
+
+`shape:"path"` 时用 `androidx.core.graphics.PathParser` 解析成 `Path`，
+`onBoundsChange` 里做等比缩放 + 居中（viewBox 空间 → 视图空间）。
+
+- `getOutline()` 走 `Outline.setPath`（API 30+）；API 29 及以下只有
+  `setConvexPath`，**非凸 path（星形、心形）会失败**，此时退回矩形 —— 那是
+  **优雅降级**：阴影变方，形状本身照常正确。
+  ⚠️ `setConvexPath` 返回 **void** 不是 boolean，判断"成没成"只能看
+  `outline.isEmpty`。
+- `setAlpha` **不能**把 alpha 乘进渐变分支：Skia 里 shader 的 alpha 与 paint 的
+  alpha 本来就相乘，再乘一次会双重衰减（`#80` 的渐变会淡到看不见）。
+- `getOpacity()` 恒返回 `TRANSLUCENT`：它是"最坏情况"声明，声明成不透明时
+  背景透明会画出黑块。
+
+`clipToShape()` 只在 `shape:"path"` 时给球设 `clipToOutline`，让图片跟着形状裁。
+⚠️ 非凸 path 在 API 29 及以下无法作为 outline，此时**不裁剪**（宁可"图没被裁"
+也不要"整个球不显示"）。
+
+#### ⚠️ 轮播帧：两种存储模式，写入是全有或全无
+
+`BubbleFrames`（`filesDir/bubble-frames/`，`META = meta.json`）：
+
+| 模式 | 磁盘上 | 帧数 |
+|---|---|---|
+| 普通轮播（`sprite == null`） | `0.bin` … `N-1.bin`，每帧一张完整图 | = 文件数 |
+| **精灵图**（`spriteRows/Cols > 0`） | **只有 `0.bin`** —— 那是整张大图 | = `rows × cols` |
+
+⚠️ **精灵图模式下 `loadFrame(index)` 必须无条件读第 0 个文件再切片**，
+不能去读 `index.bin`（它不存在）—— 漏了这条，球在精灵图模式下永远是空白。
+
+⚠️ 只改 `spriteRows`/`spriteCols` 而不重传 `frames` 时，走
+`BubbleFrames.rewriteSprite()` 只改 meta 不动字节；**普通轮播模式下没有"整图"
+可重切**，返回 null，`merge()` 会退回整图模式并打日志（静默用错网格会让球显示
+成网格里的碎块，比不显示更难查）。
+
+⚠️ `write()` 先**全部解码**再落盘，然后写 `$DIR.tmp` → 原子改名（旧目录先挪成
+`.old` 做备份）。任何一步失败都不动已有帧集 —— 半写好的帧集渲染出来是碎图。
+
+⚠️ `MAX_FRAMES = 64`、`MIN_DURATION_MS = 20`、`MAX_DURATION_MS = 60_000`。
+插件侧另设 `MAX_FRAMES_BASE64 = 6 MB` 总量闸：帧以 data URI 进 JSON，原生侧要
+`readText()` 整个文件再 `JSONObject(...)`，64 帧 × 700 KB ≈ 45 MB 足以让 App 被
+LMK 杀掉，而症状是「球突然消失、什么都没发生」。
+
+#### ⚠️ 动效必须用两个独立的 `ObjectAnimator`
+
+`spin` 与 `pulse` **不能**用 `view.animate()`（`ViewPropertyAnimator`）：它对同一个
+View 是**单例**，后一次 `.start()` 会取消前一次 —— 两个动画同时打开时只有一个生效，
+而且看不出是谁把谁取消了。且不能用 `withEndAction` 递归实现无限循环：递归入口有
+"已在跑就不重启"的守卫，会把它自己挡住，转完一圈就停。
+
+正确写法：`ObjectAnimator` + `repeatCount = INFINITE` + `repeatMode = RESTART`
+（旋转）/ `REVERSE`（呼吸）。旋转终值必须是**正好一整圈**（±360），否则每轮之间
+会跳一下。呼吸的 `SCALE_X` / `SCALE_Y` 各一个动画、时长与相位完全一致，否则会拉成椭圆。
+
+#### ⚠️ 改尺寸后夹取不能读 `root.width`
+
+`applyAppearance()` 改完 `layoutParams` 时布局**还没重测**，`root.width` 仍是
+**旧**尺寸（可能是贴边态的 6dp，也可能是上一版的小球）。拿它算夹取范围，AI 一把球
+改大，球就跑到屏幕右/下边缘外，用户看到的是「球消失了」。
+收起态直接用 `dp(appearance.size)` 算；展开态尺寸由面板决定，`root.post{}` 里再夹一次。
+
+#### AI 主动推送状态消息（`action:"notify"`）
+
+与 `set` 是**两条独立通道**：`notify` 只影响这一次显示，**不改持久配置**
+（否则下次启动气泡上会挂着上次推送的旧话）。推送期间引擎状态让位
+（`refreshStatusBubble` 里 `pushedStatus` 优先），推送自带停留时长，`sticky` = 常驻。
+
+⚠️ 横条自动消失时**必须一并清掉推送标记**：不清的话下一次引擎状态刷新（每几秒一次）
+会把同一条推送重新显示出来，用户看到的是"这条消息消失又冒出来、消失又冒出来"。
+
+⚠️ 气泡没显示时 `notify` 返回 `false` 而不是先把它显示出来：`state:"hidden"` 是插件
+明确要求"别出现"，为一条推送打破它是越权。
 
 #### ⚠️⚠️ 自定义头像必须能用**落盘标记**读回来（踩过的静默丢数据 bug）
 
@@ -2475,15 +2594,37 @@ adb shell dumpsys window windows | Select-String 'APPLICATION_OVERLAY|mFrame='
 
 | 步骤 | 判据 |
 |---|---|
-| 插件挂载 | `已安装悬浮球控制工具插件 dsh-android-bubble (15707 字节)` + `已写入悬浮球控制工具 overlay: bubble-tool.patch.yml` + 启动命令行里出现 `--patch .../bubble-tool.patch.yml` |
+| 插件挂载 | `已安装悬浮球控制工具插件 dsh-android-bubble (27981 字节)` + `已写入悬浮球控制工具 overlay: bubble-tool.patch.yml` + 启动命令行里出现 `--patch .../bubble-tool.patch.yml` |
 | 信箱启动 | `悬浮球命令信箱已启动: /data/.../files/home/.dsh/bubble-cmd.json` |
 | 通道往返（不经模型） | 手写 `{"id":1,"action":"get"}` 落进 `bubble-cmd.json` → 回执含完整外观 JSON，且请求文件被删 |
 | 写入生效 | 手写 `{"id":2,"action":"set","fields":{"size":120,"shape":"square"}}` → 回执 `ok:true`，日志 `插件下发悬浮球外观: state=collapsed shape=square size=120`，`dumpsys` 的 `Requested w=360 h=360`（120dp × density 3.0） |
 | **模型端到端** | 在官方 composer 里发「用 bubble 工具把悬浮球改成圆形、金黄色底 #FFC107、大小 90」→ 落盘 `shape=circle` / `size=90` / `bg=#FFC107`，日志同款一行，窗口 `Requested w=270 h=270` |
 
 ⚠️ 手写命令文件的坑：**PowerShell 里用 `adb shell "run-as ... sh -c 'printf ...'"` 转义
-嵌套引号会被 PS 解析器吃掉**。稳妥做法是先在 PC 落一个 `.json`（`-Encoding ascii`），
-`adb push` 到 `/sdcard`，再 `run-as cp` 进私有目录。
+嵌套引号会被 PS 解析器吃掉**。稳妥做法是先在 PC 落一个 `.json`，`adb push` 到 `/sdcard`，
+再 `run-as cp` 进私有目录。
+⚠️ **写 JSON 必须用 UTF-8**（`[System.IO.File]::WriteAllText($p, $s, (New-Object System.Text.UTF8Encoding($false)))`）。
+用 `-Encoding ascii` 会把中文替换成 `?`，而症状是**推送的横条显示成一串问号**，
+看起来像"中文渲染坏了"，实际是测试脚本自己把字写坏了。
+
+#### 分层外观的真机验收（2026-10-12，CDY-TN90 / Android 10）
+
+| 能力 | 下发 | 判据 |
+|---|---|---|
+| 任意 SVG 形状 | `{shape:"path", shapePath:"M50 3 L61 38 …Z", size:120, bg:"#FFFFC107", avatar:"none"}` | 截图里球变成**黄色五角星** |
+| 背景透明、图片留着 | `{bgOpacity:0, avatarOpacity:1}` | 截图里只剩头像、无背景板 |
+| 轮播（4 张独立图） | `{frames:[4 个 data URI], frameIntervalMs:250}` | 日志 `悬浮球帧集已更新: 4 帧`；连续截图在球心采到 **4 种不同颜色** |
+| 精灵图 2×2 | `{frames:[一张大图], spriteRows:2, spriteCols:2}` | 日志 `悬浮球帧集已更新: 4 帧（精灵图 2×2）`；同样采到 4 种颜色 |
+| 旋转 + 呼吸同时 | `{spin:120, pulse:true}` | 蓝发重心与蓝像素数**均**周期变化（证明两个动画并行，没互相取消） |
+| AI 主动推状态 | `{"action":"notify","text":"AI 主动推送测试 · 收到请举手","durationMs":9000}` | 截图里球上方横条显示该文案（中文正常） |
+| 重启持久化 | 下发含全部新字段的配置 → `am force-stop` → 重启 → `action:"get"` | `shapePath` / `bgOpacity` / `avatarOpacity` / `avatarScale` / `frameCount` / `frameIntervalMs` / `frameLoop` / `spin` / `pulse` **全部完整读回** |
+| 改大不跑出屏幕 | 球在 `x=1062`（贴右缘）时下发 `{size:140}` | `dumpsys` 里 `mAttrs=(660,578)` + `Requested w=420 h=420`，即被夹到 `1080-420=660` |
+
+⚠️ **测试残留必须清回默认**（`state:"auto"` / `shape:"circle"` / `size:44` / 空 `shapePath`
+/ `spin:0` / 空帧集），并删掉 `files/bubble-frames/` 与 `files/bubble-avatar.bin`。
+⚠️ **必须先 `am force-stop` 再改 `shared_prefs/dsh_bubble.xml`** —— 不然内存里的旧配置
+会在下次落盘时把文件覆盖回去，用户看到的是"我改了但没生效"。
+
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
