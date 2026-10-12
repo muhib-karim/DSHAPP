@@ -722,7 +722,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-53`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（见 ⑯） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-56`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（见 ⑯） |
 | `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.12`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
@@ -1734,6 +1734,108 @@ runner 自己**回落为本地执行（app 域）**，并把原因写进输出�
 ⚠️ 这一级是**静默降级**：命令照样跑、退出码照样正常，只是身份变回了 app。
 所以插件在 `DESCRIPTION` 里明确告诉模型「输出里出现 `[dsh-adb] uid 2000 不可用`
 就说明这条命令实际是 app 身份跑的」，避免模型基于假前提继续推理。
+
+#### ⚠️ 固定端口 5555 的可靠性与 18 条缺陷（2026-10-12 全面修复）
+
+**用户症状**（三条，指向同一根因）：① 开无线调试拿到权限后**关掉 WiFi 权限就掉**；
+② 关 WiFi 后权限没掉、但**清后台重开就掉**；③ 用 Shizuku 取权限 + **打开固定端口**后，
+关 WiFi、关无线调试都**不掉**。
+
+③ 是决定性证据：**正解是真正切到 5555 并守住它**，而不是「无线调试开关开着」这种
+脆弱状态 —— 无线调试端口只在开关开着时存在，关掉开关立刻掐断已建立的连接。
+
+场景 ② 的完整链条：没切成 5555 → 关 WiFi ⇒ 没有网络接口 ⇒ mDNS 发现必然失败 →
+清后台被杀 → 重开时**没有任何东西**能拉起 5555。
+
+⚠️ **判定「固定端口是否可用」的唯一权威判据是 `connect()` + `conn.shell('id -u')`
+返回 `2000`**，不是「端口有人听」（`isPortListening` / `legacyAlive` 只验有人听，
+拿不到 `2000` 也算成功，是**假阳性**）。`isPortListening()` 已删除。
+
+本轮修掉的 15 条（`app/src/main/assets/dsh-android-shell.mjs` +
+`WirelessDebugging.kt` + `EngineManager.kt` + `mobile-ui-plugin/dsh-android-mobile/`）：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | `switchToTcp` 只等 6 秒判 `legacyAlive()` ⇒ 切成功却报失败 | 新 `fixedPortWorks()` + `TCPIP_VERIFY_BUDGET_MS = 20_000` 轮询 |
+| 2 | `--switch-tcp` 只读端口文件，而该文件在无线调试关闭时被删 | Kotlin 侧把 `knownPort` 作为 `argv[1]` 传下去 |
+| 3 | 通道 1.5 / 2 以「端口文件有值」为门卫 ⇒ 循环依赖 | 去掉 `if (wlPort !== null)` 前置条件 |
+| 4 | `startWatcher` 判据 `watcher != null`（线程死了也算在跑）且无看门狗 | 改 `watcher?.isRunning == true` + `ensureWatchdog()`（30 秒） |
+| 5 | App 进程重启后陈旧端口文件不被清理 | `purgeStalePort()`：先 `Socket.connect(127.0.0.1, port, 700)` 探，连不上才删 |
+| 6 | 全工程**零**周期性守护，无任何东西监听 5555 | `startFixedPortGuard()`：5 分钟一轮走完整 `ensureTcpPort`，连续 3 次失败退避到 15 分钟 |
+| 7 | `EngineManager.start()` 早返回分支跳过整个自愈块（用户「清后台重开」命中的就是它） | 抽出 `resumePrivilegedChannel()`，早返回前也调 |
+| 8 | `ensureTcpPort` 15 秒预算不够 | 先问 runner 再 mDNS 发现（13 秒），发现到的端口传下去 |
+| 9/13 | `isPortListening` / `legacyAlive` 只验「有人听」 | 删 `isPortListening`，统一用握手 + `id -u` |
+| 10/14 | `localabstract:dshadb-${pid}` 每条命令泄漏一个 adb server | 改 `ADB_SOCKET = 'localabstract:dshadb'`（去掉 pid） |
+| 11 | 设置页把 4 类失败混成一句不可执行的原因 | runner 输出 `诊断: kind=… key=… legacy=… wireless=…`，宿主半 `DIAG_KIND_RE` 解析成 `identity.kind`，客户端按 kind 分支给「下一步」 |
+| 12 | `keyMayBeAuthorized()` 的 `imported`/`paired` 短路绕过「删掉发公钥」那道闸 | `isKeyRevoked(key)` 检查**排在所有放行判据之前**；收到第二次 `A_AUTH` 即 `markKeyRevoked()` |
+| 15 | 端口文件 `pairing` 字段恒 null 且无消费方 | 两侧收敛为单值：`readWirelessPorts()` → `readWirelessPort()` |
+| 16 | 守护/看门狗线程可重入（共享布尔量当判据）⇒ 两个守护并存，各自周期往 adbd 发 `tcpip` 互相打断 | 循环判据改成**代际比对** `guard === Thread.currentThread()`；`stopXxx()` 先置空字段再中断旧引用 |
+| 17 | `markKeyRevoked()` 无条件落盘 ⇒ 全新设备上「必然被拒」的 `generated` 密钥被误记成「授权已被撤销」，把设置页结论引向错误方向，还多叠一道只有配对才能解的闸 | 只在 `origin = imported\|paired` 或 `isKeyTrusted()` 时记（与 `keyMayBeAuthorized()` 的放行条件逐条对齐） |
+| 18 | `importKeyIfNeeded()` 以「密钥文件在不在」为早返回判据 ⇒ **已撤销**（或损坏）的密钥被当成可用，用户「重新推一把密钥」这条补救路径被吞掉；**Android 10 上是死锁**（没有无线调试，配对那条路走不通） | 判据改成「有没有一把**设备可能还认**的密钥」（`generated` / 已撤销 / 解析不出来都继续）；并新增 `readKeyFileNoImport()` + `isStagedNewerThanDest()` 支撑「重新推入即解除撤销」 |
+
+⚠️ **缺陷 16 的机理值得记一笔（`interrupt()` 打不断阻塞读）**：守护线程会卡在
+`ProcessBuilder` 的 `forEachLine` 上读外部进程输出（最长 30 秒），`Thread.interrupt()`
+**对它无效**。所以 `stopFixedPortGuard()` 置 `guarding = false` 之后线程并不会马上退出；
+若此时用户又触发一次 `start()`，字段被置回 `true`，旧线程醒来看到 `true` 就**继续跑**。
+判据改成「我还是当前这一代吗」之后，旧线程必然自己退出。
+`ensureWatchdog()` 是同型问题（`stopWatcher` → `startWatcher`），已一并改。
+另外看门狗重建 `AdbMdns` 时，「写字段 → `start()`」两行之间被 `stopWatcher()` 穿过
+会 stop 一个尚未 start 的对象（等于没停）⇒ 监听常驻泄漏，故启动后补一次代际自校验。
+
+⚠️ **缺陷 17 的判据要与 `keyMayBeAuthorized()` 逐条对齐**，别简化成「握手失败就记」：
+`generated` 且从未配对成功的密钥被设备拒绝是**正常**的（全新设备就长这样），
+`keyMayBeAuthorized()` 本来就会挡它。把它记成 revoked 有两个坏后果：设置页会说
+「多半是你点过『撤销 USB 调试授权』」（用户没做过），以及多叠一道**只有配对/重新导入
+才能解除**的闸 —— 而原本只需一次成功握手就能自愈。
+
+⚠️ **缺陷 18 是 17 的「下游」**：17 修好「什么时候记 revoked」，18 修「记了之后怎么解除」。
+两处合起来才是完整闭环，只修一处会在 Android 10 上留下死锁。判定条件是**三种而不是一种**
+（`generated` / 已撤销 / 解析不出来），三者都允许被 `/sdcard/dsh_adbkey` 顶掉。
+「重新推入」的判据用 **mtime 而不是内容**：内容相同时既可能是用户刚重推（要清撤销标记，
+这是 Android 10 的唯一自救路径），也可能是上次 `unlinkSync` 没成功留下的残渣
+（**不能**清，否则每次启动都会放行一次可能弹授权框的通道）。容差 2 秒适配 `/sdcard`
+的时间戳粒度，取不到 mtime 时一律当作「不是新推的」。
+
+⚠️ **`importKeyIfNeeded()` 里不能调 `loadKey()`**：`loadKey()` 第一行就是
+`importKeyIfNeeded()`，直接无限递归（栈溢出，症状是启动即崩、看不出与密钥有关）。
+所以额外提供了不做导入/生成的 `readKeyFileNoImport()`。
+
+⚠️ **本轮的教训：这类纯判据逻辑可以离线断言，别拿真机试。** 把 runner 的源码
+（剥掉末尾 `main().catch(...)`）当模块 import，配合 `DSH_HOME` 指向临时目录、
+`C:\sdcard` 建目录模拟 `/sdcard`，就能把 17/18 的全部判据跑成 38 项断言，几秒出结果。
+**这类断言真的抓到了东西**：`classifyFallback()` 的 `key-revoked` 与 `wireless-stale`
+两条文案里带了全角 `）`，违反上面那条接口约束（会让设置页的原因显示被截断成半句）——
+`node --check` 与编译都不会报，只有把正则从宿主半源码里抠出来跑一遍才发现。
+
+⚠️ **新增守护引入的设计风险（已自纠，别改回去）**：固定端口守护每 5 分钟调一次
+`switchToTcp`，而它要用内置 adb 连无线端口 —— **未授权密钥会被放大成「每 5 分钟弹一次
+『允许 USB 调试吗』」**。所以 `switchToTcp` 里必须有 `keyMayBeAuthorized()` 守卫，
+且 `ensureKey()` 要排在守卫**之前**（否则「还没有密钥」会误报成「未授权」）。
+另外 `fixedPortWorks()` 的幂等短路要排在**密钥/内置 adb 检查之前** —— 否则
+「5555 已就绪但密钥未授权」会被误判成失败。
+
+⚠️ **回落文案的格式是接口**：`诊断: kind=` 必须与宿主半 `DIAG_KIND_RE = /诊断: kind=([a-z-]+)/`
+逐字对应；`classifyFallback()` 产出的 text 里**不可出现全角 `）`**，否则会截断宿主的
+`FALLBACK_RE = /uid 2000 不可用（(.+?)）/`。kind 取值：
+`no-key` / `key-revoked` / `key-unauthorized` / `adb-missing` / `key-blocked` /
+`wireless-stale` / `no-channel` / `unknown`（宿主半另有 `no-runner` / `timeout`）。
+
+⚠️ **宿主半的探测超时必须覆盖 runner 的最坏路径**：`PROBE_TIMEOUT_MS` 从 15_000
+提到 **45_000**（runner 最坏 ≈30 秒）。改 runner 的预算就必须同步改它，否则设置页
+会把「还在切」误报成失败。
+
+⚠️ **`startFixedPortGuard` 的闸是 `switching: AtomicBoolean`**：`ensureTcpPort()` 现在是
+薄包装（CAS 失败返回「已有一次固定端口切换正在进行中」），主体在
+`ensureTcpPortLocked()`；守护撞上 `switching.get()` 时 `continue`（**不计失败**），
+否则会把「用户正在手动切」累计成 3 次失败而退避。
+
+⚠️ **改了 `mobile-ui-plugin/` 就绕不开两个资产戳**（本轮都动过，别只改一个）：
+`EngineManager.MOBILE_UI_VERSION` → `1.0.0-56`，且重跑
+`tools/build-webview-compat.ps1`（`-CompatVersion` → `12`，戳变 `chrome74-v12`）。
+**这两个 zip 是预打包资产，源码改了必须重打**，否则「编译通过但改动不生效」——
+本轮真实踩到过一次（首轮构建后解包 APK 发现 `DIAG_KIND_RE` 不在里面）。
+验证手法就是解包 APK 断言：`assets/mobile-ui.zip` 内应含 `诊断: kind=` 与
+`PROBE 45000`，`assets/webview-compat.zip` 的戳应是 `chrome74-v11`。
 
 #### ⚠️ 走这条通道会绕过沙箱（这是固有代价，不是缺陷）
 

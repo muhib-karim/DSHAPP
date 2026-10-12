@@ -11,6 +11,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.RemoteInput
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -71,8 +72,52 @@ object AdbPairingNotifier {
     private const val CHANNEL_ID = "dsh-adb-pairing"
     private const val NOTIFICATION_ID = 1002
 
+    /**
+     * 「有一次配对没走完」的持久化标记。
+     *
+     * ⚠️ 为什么需要落盘：`watchJob` 与 `pairingGeneration` 都只在**进程内**有效。
+     *   真机反馈的现象是——配对把 App 拖到 ANR、进程被系统杀掉，用户重新打开 App，
+     *   通知栏**还挂着「正在配对」**（那是被杀之前发的常驻通知，新进程无从知晓）。
+     *   而 `setOngoing(true)` 让用户连划都划不掉，只能去强停应用。
+     *
+     *   所以在进程启动时读一次这个标记：有残留就撤掉通知并告诉用户「请重发配对码」。
+     */
+    private const val PREFS = "dsh-adb-pairing"
+    private const val KEY_PENDING = "pending"
+
+    private fun prefs(context: Context) =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /** 记下「配对进行中」，崩溃/被杀后下次启动能发现残留。 */
+    private fun markPending(context: Context, pending: Boolean) {
+        runCatching { prefs(context).edit().putBoolean(KEY_PENDING, pending).apply() }
+    }
+
     /** 端口轮询间隔。发现是异步的，300ms 足够及时又不费电。 */
     private const val POLL_INTERVAL_MS = 300L
+
+    /**
+     * 一次配对的总预算。
+     *
+     * ⚠️ **必须有限**，这是真机反馈修掉的缺陷：原来这一路没有任何超时，用户输入配对码
+     * 之后通知栏就一直停在「正在配对」，直到系统弹「DSH 没有响应」——**永远没有结论**。
+     *
+     * 预算取 75 秒的依据：`pair(port, code)` 自身（TLS-PSK 握手 + 内置 adb 启动）通常
+     * 几秒，之后 `pairWirelessDebugging` 还要补切固定端口 5555，而
+     * `WirelessDebugging.ensureTcpPort` 的发现预算（3 轮 × 3 秒 + 间隔 ≈ 13 秒）与
+     * `switchToTcp` 的握手确认预算（20 秒）相加最坏约 35 秒。正常路径远快于此，
+     * 75 秒是「慢机 + adbd 正在重启」仍能跑完、而用户不会觉得卡死的上限。
+     */
+    private const val PAIR_BUDGET_MS = 75_000L
+
+    /**
+     * 本次配对的代际号。
+     *
+     * ⚠️ 超时后那个在跑的配对任务**可能仍会返回**（`Process.waitFor()` 不响应中断），
+     *   若它晚到还去改通知，就会出现「刚告诉用户超时了、随即又变回正在配对」。
+     *   所以每次发起配对自增一次，回来时代际不匹配就**丢弃结果**。
+     */
+    private val pairingGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * 当前常驻监听任务；null 表示没有在等。
@@ -196,8 +241,44 @@ object AdbPairingNotifier {
      * ⚠️ 这是**唯一**能让常驻监听停下来的用户动作（另加配对成功）。
      */
     fun cancel(context: Context) {
+        // ⚠️ 必须先让代际失效：超时计时协程是**独立**在跑的，用户点了取消之后
+        //   它仍会在到点时醒来。不拦的话，用户明明取消了，75 秒后通知栏又冒出
+        //   一条「配对超时」—— 比不修还糟。计时协程开头就校验代际，这里自增即拦住。
+        pairingGeneration.incrementAndGet()
         stopWatch()
+        markPending(context, false)
         runCatching { NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID) }
+    }
+
+    /**
+     * 进程启动时清理上一次没走完的配对状态。
+     *
+     * ⚠️ 这是真机反馈修掉的缺陷的直接对策：配对把 App 拖到 ANR、进程被系统杀掉后，
+     *   用户重新打开 App 时通知栏**还挂着「正在配对」**，而权限其实已经开好了 ——
+     *   那条通知既没有意义（那个进程已经死了）、又划不掉（`setOngoing(true)`），
+     *   用户以为还在配对，于是一直等。
+     *
+     *   判据用持久化标记而不是「通知在不在」：从通知栏反查需要 `NotificationManager`
+     *   的 activeNotifications（API 23+ 且需权限），而标记是现成的、无副作用。
+     *
+     * 由 [DshApplication.onCreate] 调用，只做一次。
+     */
+    fun clearStaleOnStartup(context: Context) {
+        val app = context.applicationContext
+        val pending = runCatching { prefs(app).getBoolean(KEY_PENDING, false) }.getOrDefault(false)
+        if (!pending) return
+        Log.w(DshApplication.TAG, "发现上一次未走完的配对（进程曾被杀），已清理残留通知")
+        markPending(app, false)
+        runCatching { NotificationManagerCompat.from(app).cancel(NOTIFICATION_ID) }
+        // ⚠️ 只在**确实有残留**时才提示用户重发配对码 —— 不要在每次正常启动时打扰。
+        //   这里刻意复用那条输入框还在的失败通知语义：用户上次的配对码已经失效了。
+        notify(
+            app,
+            app.getString(R.string.pairing_failed_title),
+            app.getString(R.string.pairing_stale_cleared),
+            null,
+            false,
+        )
     }
 
     /** 只停监听，不动通知（配对成功后要留着那条成功提示）。 */
@@ -207,31 +288,134 @@ object AdbPairingNotifier {
     }
 
     /**
-     * 收到配对码后执行配对。
+     * 收到配对码后执行配对。**立即返回**，全程不阻塞调用方。
      *
-     * ⚠️ 由 [AdbPairingReceiver] 在 `goAsync()` 的后台线程里调用 ——
-     * 发现 + 配对可能要十几秒，超过广播接收器的 10 秒上限。
+     * ⚠️ 由 [AdbPairingReceiver] 在 `goAsync()` 的宽限期内调用，而那个宽限期只有约
+     *    10 秒 —— 所以本方法**必须马上返回**，重活交给 [DshApplication.applicationScope]。
+     *
+     * ## 这里的三条硬约束（都是真机反馈修出来的）
+     *
+     * 1. **必须有界**。原实现由广播接收器起一个 `Thread` 同步跑完整条配对链
+     *    （`pairWirelessDebugging` 里含发现端口 ≈13 秒 + 切换固定端口 ≈20 秒 +
+     *    内置 adb 启动），远超 `goAsync()` 的宽限期 ⇒ 系统判 ANR 弹
+     *    「DSH 没有响应」，而通知栏**永远**停在「正在配对」。
+     *    现在整条链跑在 `applicationScope` 里，**调用方一个字节都不等**。
+     * 2. **必须有兜底**。任何异常（含 `Error`、含 `CancellationException`）都要落成
+     *    一条**终态通知**，否则那条 `setOngoing(true)` 的常驻通知就成了幽灵：
+     *    App 重启后它还在，而用户连划都划不掉。
+     * 3. **结果回来时必须校验代际**。超时后原任务可能仍在跑并稍后返回，
+     *    不校验就会把「已超时」的通知又改回「正在配对」。
      */
     internal fun pairWithCode(context: Context, port: Int, code: String) {
         val app = context.applicationContext
+        // ⚠️ **先落盘再发通知**：顺序反过来的话，若进程恰好在两者之间被杀，
+        //   通知已发出而标记没写上 —— 下次启动就发现不了这条残留通知，
+        //   正是要修的那个「重开后通知还挂着正在配对」。
+        markPending(app, true)
         notify(app, app.getString(R.string.pairing_title), app.getString(R.string.pairing_working), null, true)
 
-        val manager = EngineManager.get(app)
-        val result = manager.pairWirelessDebugging(code, port)
-        Log.i(DshApplication.TAG, "配对结果 ok=${result.ok} msg=${result.message}")
+        val generation = pairingGeneration.incrementAndGet()
 
-        if (result.ok) {
-            // 成功了就没什么可等的了。停掉监听，否则那条常驻通知会一直挂着。
-            stopWatch()
-            notify(app, app.getString(R.string.pairing_title), app.getString(R.string.pairing_ok), null, false)
-        } else {
-            // 失败时保留输入框让用户重试 —— 最常见的失败是码抄错，
-            // 让用户重开一遍系统界面代价太大。
-            //
-            // ⚠️ 监听本身**不停**：那个「使用配对码配对设备」界面可能还开着，
-            //   端口还在，用户改一位数字重发就行。
-            notify(app, app.getString(R.string.pairing_failed_title), result.message, port, true)
+        // ⚠️ **不能用 `withTimeoutOrNull`**（第一版就是这么写的，是错的）：
+        //   `EngineManager.pairWirelessDebugging()` 是**普通阻塞函数**，内部卡在
+        //   `Process.waitFor()` 上，而协程超时是**协作式**的 —— 阻塞中的代码根本
+        //   不检查取消标志，那个 75 秒的 `withTimeoutOrNull` 到点也**不会**返回。
+        //   结果就是超时形同虚设，用户依旧永远等不到结论（正是要修的那个缺陷）。
+        //
+        //   所以改成**两条独立协程赛跑**：谁先到谁写终态，用 `settled` 仲裁。
+        //   - 结果协程：跑完那条阻塞链（可能几分钟都不回来）；
+        //   - 计时协程：`delay` 到点直接写「超时」终态，**不等**结果协程。
+        //   超时后结果协程若晚到，`settled` 已被占，它的结果被丢弃（代际号同理）。
+        val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val timer = DshApplication.applicationScope.launch {
+            delay(PAIR_BUDGET_MS)
+            if (!settled.compareAndSet(false, true)) return@launch
+            if (pairingGeneration.get() != generation) return@launch
+            Log.w(DshApplication.TAG, "配对超过 ${PAIR_BUDGET_MS / 1000} 秒未返回，判定超时")
+            // ⚠️ 超时也**要留标记**：那条常驻通知此刻还在，进程若被杀，
+            //   下次启动要靠这个标记撤掉它（与失败分支同理）。
+            markPending(app, true)
+            notify(
+                app,
+                app.getString(R.string.pairing_failed_title),
+                app.getString(R.string.pairing_timeout, (PAIR_BUDGET_MS / 1000).toInt()),
+                port,
+                true,
+            )
         }
+
+        DshApplication.applicationScope.launch {
+            val result: WirelessDebugging.Result? = try {
+                EngineManager.get(app).pairWirelessDebugging(code, port)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.w(DshApplication.TAG, "配对流程异常", t)
+                WirelessDebugging.Result(false, t.message
+                    ?: app.getString(R.string.pairing_failed_generic))
+            }
+
+            // 抢不到 `settled` 说明计时协程已经判过超时了，这次结果作废。
+            if (!settled.compareAndSet(false, true)) {
+                Log.i(DshApplication.TAG, "配对结果迟到（已判超时），丢弃")
+                return@launch
+            }
+            timer.cancel()
+
+            // 代际不匹配说明这次的结果已过时（用户重发了一次码）。
+            if (pairingGeneration.get() != generation) {
+                Log.i(DshApplication.TAG, "丢弃过期的配对结果（代际 $generation 已被取代）")
+                return@launch
+            }
+
+            if (result != null && result.ok) {
+                Log.i(DshApplication.TAG, "配对结果 ok=true msg=${result.message}")
+                // 成功了就没什么可等的了。停掉监听，否则那条常驻通知会一直挂着。
+                markPending(app, false)
+                stopWatch()
+                notify(app, app.getString(R.string.pairing_title), app.getString(R.string.pairing_ok), null, false)
+            } else {
+                val reason = result?.message
+                    ?: app.getString(R.string.pairing_timeout, (PAIR_BUDGET_MS / 1000).toInt())
+                Log.i(DshApplication.TAG, "配对结果 ok=false msg=$reason")
+                // ⚠️ 失败**要留标记**：此时监听与输入框都还开着（等用户重发），
+                //   若进程在这期间被杀，下次启动要能撤掉这条常驻通知。
+                markPending(app, true)
+                // 失败时保留输入框让用户重试 —— 最常见的失败是码抄错，
+                // 让用户重开一遍系统界面代价太大。
+                //
+                // ⚠️ 监听本身**不停**：那个「使用配对码配对设备」界面可能还开着，
+                //   端口还在，用户改一位数字重发就行。
+                notify(app, app.getString(R.string.pairing_failed_title), reason, port, true)
+            }
+        }
+    }
+
+    /**
+     * 确保配对通知渠道已存在，并**借此让系统补弹通知权限框**。
+     *
+     * ## ⚠️ 为什么必须由 App 启动时主动调（真机反馈修掉的缺陷）
+     *
+     * 本 App 的 `targetSdk = 28`（硬约束②，不能升），在 Android 13+ 上属于
+     * **旧应用**：系统不会把 `POST_NOTIFICATIONS` 当成运行时权限去要，而是走
+     * 「**创建第一个通知渠道时补弹一次**」的兼容路径。于是：
+     *
+     * - 原实现的渠道只在用户点「配对无线调试」时才建（[start] 里）——
+     *   也就是说用户**第一次打开 App 时压根没有渠道**，那个补弹根本没机会发生；
+     * - 用户必须退出重进（此时渠道已存在）才会被问，正是真机反馈的现象。
+     *
+     * ⚠️ 这也解释了为什么**判权限位没有用**：旧应用的 `POST_NOTIFICATIONS` 是
+     *   **隐式已授予**，`checkSelfPermission` 与 `areNotificationsEnabled()`
+     *   都返回 `true`（真机实测 appops 为 `Default mode: allow`），任何基于它们
+     *   的早返回都会让权限永远没人申请。
+     *
+     * 所以正确做法是**在启动早期就把渠道建出来**，把「要不要问用户」这件事
+     * 交回系统自己按平台规则决定。
+     */
+    fun ensureChannel(context: Context) {
+        runCatching { createChannel(context.applicationContext) }
+            .onFailure { Log.w(DshApplication.TAG, "创建配对通知渠道失败", it) }
     }
 
     private fun createChannel(context: Context) {
@@ -370,17 +554,22 @@ class AdbPairingReceiver : BroadcastReceiver() {
             return
         }
 
-        // ⚠️ 配对要十几秒（发现端口 + SPAKE2 握手 + adb 启动），远超广播接收器
-        //    的 10 秒上限。不 goAsync() 的话进程会被判为 ANR。
+        // ⚠️ 只做**投递**，不等结果 —— 这是 ANR 修复的关键一环。
+        //
+        //   原来这里 `goAsync()` 之后起一个 Thread 跑完整条配对链，并**在结束时**才
+        //   `pending.finish()`。但配对最坏要几十秒，而 `goAsync()` 的宽限期只有约 10 秒
+        //   （前台广播）/ 数十秒，超时系统就判 ANR 弹「DSH 没有响应」——
+        //   用户看到的现象正是「一直显示正在配对 → 程序挂了」。
+        //
+        //   现在 `pairWithCode` 内部把重活交给自己的受管线程池并**立即返回**，
+        //   广播接收器随即 finish，与配对耗时彻底解耦。
         val pending = goAsync()
-        Thread {
-            try {
-                AdbPairingNotifier.pairWithCode(context, port, code)
-            } catch (t: Throwable) {
-                Log.w(DshApplication.TAG, "配对流程异常", t)
-            } finally {
-                pending.finish()
-            }
-        }.start()
+        try {
+            AdbPairingNotifier.pairWithCode(context, port, code)
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "配对接管失败", t)
+        } finally {
+            pending.finish()
+        }
     }
 }

@@ -95,7 +95,12 @@ param(
     #     把 reasoning 发成独立的 `reasoning` 角色）。同 v7/v8/v9：改的还是
     #     mobile-ui 源码，不 bump 的话设备上那棵树不会被覆盖 ⇒
     #     面板仍是一坨一坨地出、思考与正文仍糊在一起。
-    [string]$CompatVersion = "10",
+    # v11：uid 2000 特权通道全面修复 —— mobile-ui 的 client.js 改了「下一步」的
+    #     推导（按 runner 的 `诊断: kind=…` 分类给不同动作/文案）。同 v4~v10 的
+    #     道理：改的是 mobile-ui 源码，`mobileui/lib/client.js` 的降级产物随之变化，
+    #     不 bump 会命中「两戳都一致 → 整体跳过」，设备上那棵树继续被**旧**降级产物
+    #     覆盖 ⇒ 设置页永远只显示改动前的通用引导。
+    [string]$CompatVersion = "12",
 
     [string]$EngineBin,
     [string]$OutZip

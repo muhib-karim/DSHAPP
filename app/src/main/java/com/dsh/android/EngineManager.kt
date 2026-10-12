@@ -3869,8 +3869,16 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /** 启动引擎，等待其打印带 token 的 URL。 */
-    suspend fun start() = withContext(Dispatchers.IO) {        if (process?.isAlive == true) {
+    suspend fun start() = withContext(Dispatchers.IO) {
+        if (process?.isAlive == true) {
             Log.i(TAG, "引擎已在运行")
+            // ⚠️ **早返回也必须跑特权通道自愈。** 这一段原先直接 return，于是
+            //   「引擎还活着」时整块自愈（常驻监听 + 启动自愈 + 固定端口守护）
+            //   一次都不跑 —— 而它恰恰是**用户重开 App 时唯一会走到的那条路**：
+            //   引擎进程被前台服务（`START_STICKY`）保着，`MainActivity.onCreate`
+            //   每次都会调 `start()`，每次都命中这个早返回。
+            //   症状就是用户报的那两条：「清后台重开，权限还是没回来」。
+            resumePrivilegedChannel()
             return@withContext
         }
 
@@ -4205,32 +4213,7 @@ class EngineManager private constructor(private val context: Context) {
         // 无线调试端口由 Kotlin 侧发现（Node 侧发不出 UDP 组播，见 WirelessDebugging）。
         // 常驻监听：端口会随用户重开无线调试/重启/切网络而变，只在启动时发现一次的话
         // 一变就永久失效。监听本身由系统 mdnsd 承担，开销可忽略。
-        if (adbWireless != null) {
-            WirelessDebugging.startWatcher(context, File(dshHome, WirelessDebugging.PORT_FILE))
-            // 启动自愈：重启手机后 5555 会消失（`persist.adb.tcp.port` 写不进去），
-            // 这里顺手切一次，省掉「用户得自己点一下切到固定端口」这一步。
-            // 已在监听时直接返回，无额外开销；失败也不影响任何通道。
-            val adbHomeRef = adbWireless
-            val runnerRef = privRunner
-            if (runnerRef != null) {
-                Thread {
-                    runCatching {
-                        WirelessDebugging.ensureTcpPort(
-                            context = context,
-                            nodeBin = bootstrap.nodeBinary,
-                            runner = runnerRef,
-                            adbHome = adbHomeRef,
-                            dshHome = dshHome,
-                        )
-                    }.onSuccess {
-                        // ⚠️ 成功也要打：这条自愈**没有**任何界面反馈，不打日志的话
-                        //   「到底切没切成功」只能去翻 runner 的 stderr。
-                        if (it.ok) Log.i(TAG, "启动自愈：${it.message}")
-                        else Log.i(TAG, "启动自愈未切换固定端口：${it.message}")
-                    }.onFailure { Log.w(TAG, "启动自动切固定端口失败: ${it.message}") }
-                }.start()
-            }
-        }
+        resumePrivilegedChannel()
 
         val proc = try {
             pb.start()
@@ -4286,6 +4269,68 @@ class EngineManager private constructor(private val context: Context) {
         }
     }
 
+    /**
+     * 让 uid 2000 特权通道回到「尽力可达」状态：常驻监听 + 一次性自愈 + 周期守护。
+     *
+     * ## 为什么单独抽出来
+     *
+     * 这三件事原先只写在 [start] 的**新建进程那条路**上，而 [start] 开头有个
+     * 「引擎已在运行 → 直接 return」的早返回 —— 用户「清后台重开 App」时命中的
+     * 恰恰是那个早返回（引擎进程被前台服务 `START_STICKY` 保着），于是整块自愈
+     * 一次都不跑。这正是用户报的「关掉 WiFi 再清后台重开，权限就没了」里
+     * **后半段**的根因。
+     *
+     * 抽成方法之后两条路都调用它，语义是「无论引擎是刚起还是早就在跑，都把特权
+     * 通道重新拉一遍」。幂等：监听与守护都带「已在跑就返回」的判据，自愈本身也幂等
+     * （5555 正常时 runner 第一句探测就返回）。
+     *
+     * ⚠️ **自愈与守护都在后台线程**，本方法本身不阻塞。
+     * ⚠️ 依赖的路径参数从字段现取（`bootstrap` / `dshHome` / `filesDir`），
+     *   不依赖 [start] 的局部变量 —— 早返回那条路上那些局部变量根本不存在。
+     */
+    private fun resumePrivilegedChannel() {
+        val runner = File(context.filesDir, PRIVILEGED_RUNNER_FILE)
+        // runner 不存在 = 连脚本都没解出来，后面两件事都无从谈起
+        if (!runner.isFile) return
+        val adbHome = File(context.filesDir, ADB_WIRELESS_DIR)
+        val portFile = File(dshHome, WirelessDebugging.PORT_FILE)
+        val nodeBin = bootstrap.nodeBinary
+
+        // 1) 常驻监听无线调试端口（端口会变，一变就永久失效）
+        WirelessDebugging.startWatcher(context, portFile)
+
+        // 2) 立即自愈一次：重启手机后 5555 必然消失（`persist.adb.tcp.port` 写不进去），
+        //    这里顺手切一次，省掉「用户得自己点一下切到固定端口」这一步。
+        Thread {
+            runCatching {
+                WirelessDebugging.ensureTcpPort(
+                    context = context,
+                    nodeBin = nodeBin,
+                    runner = runner,
+                    adbHome = adbHome,
+                    dshHome = dshHome,
+                )
+            }.onSuccess {
+                // ⚠️ 成功也要打：这条自愈**没有**任何界面反馈，不打日志的话
+                //   「到底切没切成功」只能去翻 runner 的 stderr。
+                if (it.ok) Log.i(TAG, "特权通道自愈：${it.message}")
+                else Log.i(TAG, "特权通道自愈未切换固定端口：${it.message}")
+            }.onFailure { Log.w(TAG, "特权通道自动切固定端口失败: ${it.message}") }
+        }.start()
+
+        // 3) 周期守护：这是「过一阵权限自己掉了」唯一的自动恢复路径。
+        //    ⚠️ 没有它的话，手机重启 / adbd 重启 / 端口被抢都只能靠用户手点。
+        if (adbHome.isDirectory) {
+            WirelessDebugging.startFixedPortGuard(
+                context = context,
+                nodeBin = nodeBin,
+                runner = runner,
+                adbHome = adbHome,
+                dshHome = dshHome,
+            )
+        }
+    }
+
     fun stop() {
         process?.let { p ->
             Log.i(TAG, "停止引擎")
@@ -4297,6 +4342,8 @@ class EngineManager private constructor(private val context: Context) {
         process = null
         // 引擎停了就别再占着 mDNS 监听（NsdManager 的 listener 注册是全局资源）
         WirelessDebugging.stopWatcher()
+        // 守护线程同理：引擎都停了，再去切 adbd 没有意义，还白耗电
+        WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
     }
 
@@ -4376,7 +4423,8 @@ class EngineManager private constructor(private val context: Context) {
      * 切完之后特权通道**不再依赖无线调试开关** —— 实测关掉无线调试、关掉 Wi-Fi
      * 都不影响（走 127.0.0.1 回环）。详见 [WirelessDebugging.switchToTcp]。
      *
-     * ⚠️ **阻塞调用**（最多约 6 秒：切换 + 轮询端口就绪），必须在后台线程调用。
+     * ⚠️ **阻塞调用**（最坏约 30 秒：发现无线调试端口 + 切换 + 轮询确认真的拿到
+     * uid 2000），必须在后台线程调用。稳态下（5555 已在听）只有几百毫秒。
      */
     fun switchToTcpMode(): WirelessDebugging.Result {
         val runner = File(context.filesDir, PRIVILEGED_RUNNER_FILE)
@@ -4996,7 +5044,7 @@ class EngineManager private constructor(private val context: Context) {
          *      ⚠️ 必须同时 bump `tools/build-webview-compat.ps1 -CompatVersion`，
          *      否则设备上那棵降级过的 mobile-ui 树不会被覆盖（见 ⑯）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-54"
+        private const val MOBILE_UI_VERSION = "1.0.0-56"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

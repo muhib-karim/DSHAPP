@@ -55,14 +55,38 @@ export const inject = ['webServer'];
 /** 状态接口路径。exact 路由优先于 `/api` 前缀，所以不会被 RPC 通道截走。 */
 const ROUTE = '/api/dsh-android/privileged';
 
-/** 探测超时。runner 连 adbd 自身有 4s 连接 + 8s 握手上限，这里留足余量。 */
-const PROBE_TIMEOUT_MS = 15000;
+/**
+ * 探测超时。
+ *
+ * ⚠️ **这个值必须覆盖 runner 最坏的一条路径**，否则设置页会拿到「探测超时」而不是
+ * 真正的原因 —— 而「告诉用户到底哪里不对」正是这个接口存在的理由。
+ *
+ * 最坏路径 = 通道 1 秒退（ECONNREFUSED）→ 通道 1.5 的 `switchToTcp`：
+ *   · 读无线调试端口文件，最多 5 秒重试窗口；
+ *   · `adb start-server` + `adb connect`（内置 adb 冷启动本身要 1~2 秒）；
+ *   · `adb tcpip 5555` 之后**最多 20 秒**轮询确认 `id -u` 真能拿到 2000
+ *     （adbd 重启常超过 6 秒，这里必须给足，见 runner 的 `TCPIP_VERIFY_BUDGET_MS`）。
+ * 合计约 30 秒，取 45 秒留余量。
+ *
+ * 稳态下（5555 正常）这一次探测只花几百毫秒 —— 大预算只在出问题时才被用到，
+ * 而那时用户恰恰**需要**等出一个明确结论。
+ */
+const PROBE_TIMEOUT_MS = 45000;
 
 /** runner 打在 stderr 上的前缀，与 `assets/dsh-android-shell.mjs` 的 `TAG` 一致。 */
 const TAG = '[dsh-adb]';
 
 /** runner 回落成 app 身份时的 stderr 文案（原因在中文括号里）。 */
 const FALLBACK_RE = /uid 2000 不可用（(.+?)）/;
+
+/**
+ * runner 那条机器可读的失败分类行：`[dsh-adb] 诊断: kind=xxx key=… legacy=… wireless=…`。
+ *
+ * ⚠️ **必须与 `assets/dsh-android-shell.mjs` 的输出逐字对应。** 那边的 `kind`
+ * 取值由 `classifyFallback()` 决定，改一边而另一边不改会让设置页静默退回通用引导
+ * （不会报错，只是不再给出针对性的下一步）。
+ */
+const DIAG_KIND_RE = /诊断: kind=([a-z-]+)/;
 
 /**
  * 端口是否**真的在监听**。
@@ -208,11 +232,12 @@ async function probe() {
 			importedNow: false,
 			origin: null,
 		},
-		identity: { ok: false, uid: null, reason: '', channel: 'none', log: [] },
+		identity: { ok: false, uid: null, reason: '', channel: 'none', kind: 'unknown', log: [] },
 	};
 
 	if (runnerStat === null) {
 		snapshot.identity.reason = '执行通道文件不存在，无法探测';
+		snapshot.identity.kind = 'no-runner';
 		return snapshot;
 	}
 
@@ -245,6 +270,20 @@ async function probe() {
 				: uid === ''
 					? '执行通道没有返回身份'
 					: `实际身份是 uid ${uid}，没有拿到 uid 2000`;
+		// ⚠️ **机器可读的失败分类**，来自 runner 那条 `诊断: kind=… key=… …` 行。
+		//
+		// 上面那句 `reason` 是给人看的（且受 `FALLBACK_RE` 的非贪婪匹配限制，
+		// 只能是一句话），而设置页需要据此决定**该给用户哪个按钮** —— 靠中文
+		// 文案去猜分支太脆（改一个字就失效），所以 runner 额外打了一条结构化行。
+		//
+		// 取值见 `assets/dsh-android-shell.mjs` 的 `classifyFallback()`：
+		//   no-key / key-revoked / key-unauthorized / adb-missing / key-blocked
+		//   / wireless-stale / no-channel / unknown
+		// 没拿到（老版本 runner、或异常退出）时保持 'unknown'，客户端会退回
+		// 现在的通用引导，不会因为多了个字段就显示空白。
+		const kind = DIAG_KIND_RE.exec(result.stderr);
+		if (kind !== null) snapshot.identity.kind = kind[1];
+		else if (result.timedOut) snapshot.identity.kind = 'timeout';
 	}
 
 	// 密钥可能是**这次探测**才导入的（runner 首次运行会搬运中转文件），复查一次。
@@ -279,20 +318,20 @@ async function probe() {
 	// （无线调试关了、`onServiceLost` 没来得及清）。只信文件会让设置页显示
 	// 一个早已死掉的端口，还点着绿灯。详见 portAlive()。
 	//
-	// 格式 `<connect端口> [<配对端口>]`，见 assets/dsh-android-shell.mjs。
-	snapshot.wireless = { connect: null, pairing: null, stale: null };
+	// 格式：**单个连接端口**（见 assets/dsh-android-shell.mjs 的 `readWirelessPort`）。
+	// ⚠️ 这里原先还解析第二个字段当「配对端口」——那是错的：写文件的
+	//   `WirelessDebugging.writePort()` 从来只写一个值，所以那个字段恒为 null，
+	//   而设置页也从不显示它。配对端口走的是通知 → `pair(knownPort)` 那条路。
+	snapshot.wireless = { connect: null, stale: null };
 	try {
 		const raw = (await readFile(path.join(home, 'adb-wireless-port'), 'utf8')).trim();
-		const [c, p] = raw.split(/\s+/);
-		const connect = Number.parseInt(c, 10);
-		const pairing = Number.parseInt(p, 10);
+		const connect = Number.parseInt(raw.split(/\s+/)[0], 10);
 		if (Number.isInteger(connect) && connect > 0) {
 			if (await portAlive(connect)) snapshot.wireless.connect = connect;
 			// 文件里有值、端口却没人听 —— 这是「无线调试已关」的确凿证据，
 			// 交给 UI 说明为什么绿灯没了（否则用户会以为是检测坏了）。
 			else snapshot.wireless.stale = connect;
 		}
-		if (Number.isInteger(pairing) && pairing > 0) snapshot.wireless.pairing = pairing;
 	} catch {
 		// 文件不存在 = 无线调试没开或还没发现，属于正常情况
 	}

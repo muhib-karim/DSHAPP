@@ -103,6 +103,78 @@ const PORT = 5555;
 
 const TAG = '[dsh-adb]';
 
+/**
+ * 内置 adb 的 **server socket 名**（`adb -L localabstract:<name>`）。
+ *
+ * ## ⚠️ 这里刻意**不带 pid**，与旧实现相反（那是一个真实缺陷）
+ *
+ * 旧实现是 `localabstract:dshadb-${process.pid}`。而 runner 是**每条特权命令一个
+ * 全新 node 进程**（shell 插件的 `execute()` 每次都 spawn），于是：
+ *
+ * - 每次命令的 socket 名都不同 ⇒ `adb start-server` **每次都新建一个 adb server**；
+ * - adb server 是 **daemonize** 的，runner 退出它**不会跟着退**；
+ * - 净效果是设备上不断堆积 `@dshadb-<pid>` 进程与 abstract socket，
+ *   用一次涨一个，`ss -xln` 越用越长。
+ *
+ * 改成固定名之后，**我们自己的所有调用共用同一个 server**：第一次起、之后复用，
+ * 不再泄漏。这不会与别人抢占 —— `-L` 正是为了避开默认的 `@chrome_devtools_remote`
+ * 之类的公共名，而这个名是本 App 专属的。
+ *
+ * ⚠️ **不要再改回带 pid 的形式**：那样只是把泄漏换个花样，且没有任何好处
+ * （adb server 本来就为多客户端并发设计，共享一个 server 是正确的用法）。
+ */
+const ADB_SOCKET = 'localabstract:dshadb';
+
+/**
+ * adbd 重启后等它重新在固定端口上**真的能被认证**的总预算。
+ *
+ * ⚠️ **旧的 6 秒是错的判据来源**（一个真实的用户症状根因）：`adb tcpip 5555`
+ * 会让 adbd **重启**，低端机上超过 6 秒是常态。超时那一刻旧代码返回 `false`，
+ * 而内核其实已经切成功了 —— 于是「配对成功但没切到固定端口」这种**误报**
+ * 会被写进通知栏，用户去点「切到固定端口」又失败（那条路当时也依赖无线端口），
+ * 最终一直靠无线调试顶着，一关 Wi-Fi 权限就掉。
+ *
+ * 取 20 秒：覆盖 adbd 重启 + 冷启动，仍远小于用户能忍受的一次性等待
+ * （这段只在**需要切换**时执行，稳态下第一句校验就返回了）。
+ */
+const TCPIP_VERIFY_BUDGET_MS = 20_000;
+
+/**
+ * 固定端口已经就绪时的**权威判据**：连上去、认证、跑 `id -u`，看它回什么。
+ *
+ * ⚠️ **不能只判「端口有人监听」**（那是旧实现的第二个错误判据）。
+ * 5555 是 >1024 的端口，**任何应用都能 bind**：撞上时旧代码会把别人的监听
+ * 当成「已经是 TCP 模式，无需再切」（假成功），随后每条特权命令都去连那个
+ * 不是 adbd 的端口 → 静默回落成 app 身份，而设置页显示「已切到固定端口」。
+ *
+ * 走一次真实握手（自实现协议，**永不发公钥**，所以不会弹授权框）才能把它
+ * 与「恰好有人占了 5555」区分开。
+ */
+const TCPIP_POLL_INTERVAL_MS = 500;
+
+/**
+ * 业务跑完之后，留给事件循环自然排空的宽限期；超过就强制退出。
+ *
+ * ⚠️ **这是一个兜底，不是主逻辑。** 本文件是**一次性** runner：Kotlin 侧
+ * `WirelessDebugging.runRunner()` 起它、`proc.waitFor()` 等它结束。
+ * 只要有一个 handle 没释放，node 就不退出，而 Kotlin 那边只能靠 90 秒看门狗
+ * 强杀 —— 用户看到的就是「通知栏一直显示正在配对」。
+ *
+ * 已经修掉的两个真实泄漏源（都踩过，见各自注释）：
+ *   1. `connect()` 里 `handshake()` 抛异常时那条已连上的 TCP socket 无人关闭；
+ *   2. `adbExec()` 的两条 pipe 被 adb 常驻 daemon 继承写端，读端永不 EOF。
+ *
+ * 但「穷举所有 handle」在 Android 上是不收敛的（本文件的历史就是一连串漏网的
+ * handle）。所以再钉一道**与具体 handle 无关**的保险：`main()` 一 settle 就武装
+ * 一个 `unref()` 过的定时器 —— 它**不会**自己吊住事件循环（正常情况下进程早退了），
+ * 但只要还有任何东西吊着循环，它就会在宽限期后强制收尾。
+ *
+ * ⚠️ 用 `process.exit()` 在这里是**安全的**，与 `finish()` 里禁用它的理由不冲突：
+ *   `finish()` 要保证的是「输出先排干」，而本定时器只在 `main()` 已经 settle
+ *   （输出早已写出去）之后才开始计时。宽限期取 5 秒，远大于管道排空所需。
+ */
+const EXIT_GRACE_MS = 5000;
+
 // ── 无线调试通道（Android 11+）──────────────────────────────
 /**
  * Android 11 起有「无线调试」（Wireless debugging），它和 legacy `adb tcpip`
@@ -342,6 +414,101 @@ function clearKeyTrust() {
 }
 
 /**
+ * 设备**已经明确拒绝过**这把密钥的标记文件（内容是公钥指纹，与信任标记同格式）。
+ *
+ * ## 为什么必须有它（否则「删掉发公钥」那道闸会被绕过）
+ *
+ * `keyMayBeAuthorized()` 对 `origin === 'imported' | 'paired'` 是**无条件放行**的，
+ * 依据是「设备曾经认得这把钥匙」。但设备端的授权**是会失效的**：
+ *
+ * - 开发者选项里点「撤销 USB 调试授权」；
+ * - 换 ROM / 恢复出厂 / 清 `/data/misc/adb/adb_keys`；
+ * - 系统在某些升级路径上重建 keystore。
+ *
+ * 失效之后那个 `origin` 标记**依然在**，于是：
+ *
+ * 1. `keyMayBeAuthorized()` 仍返回 `true`；
+ * 2. 通道 1.5 与通道 2 **双双放行**，去用**内置 adb**（一个我们拦不住的外部
+ *    进程）连无线调试端口；
+ * 3. 内置 adb 遇到未授权密钥时**自己会发 `AUTH_RSA_PUBLIC`** —— 那是 adbd
+ *    弹「允许 USB 调试吗」的唯一触发条件；
+ * 4. 用户**每执行一条特权命令就弹一次授权框**。
+ *
+ * 这正是 AGENTS.md ⑪ 记下的那个「本项目最严重的设计错误」，只是被 `origin`
+ * 的短路重新引了回来。握手失败时把这件事**记下来**，`keyMayBeAuthorized()`
+ * 才能据此收手。
+ *
+ * ⚠️ 只记「设备拒绝了这把密钥」这个**确定事实**（握手时 `A_AUTH` 再来一次），
+ * 不记「连接失败」「超时」—— 那些是网络/端口问题，不是授权问题，记了会误伤。
+ */
+const KEY_REVOKED_FILE = () => path.join(homeDir(), 'adbkey.revoked');
+
+/** 这把密钥是否已被设备明确拒绝过。 */
+function isKeyRevoked(key) {
+  try {
+    return fs.readFileSync(KEY_REVOKED_FILE(), 'utf8').trim() === keyFingerprint(key);
+  } catch {
+    return false;
+  }
+}
+
+/** 记下「设备拒绝了这把密钥」。 */
+function markKeyRevoked(key) {
+  try {
+    fs.writeFileSync(KEY_REVOKED_FILE(), keyFingerprint(key), { mode: 0o600 });
+  } catch {
+    // 写不进去只是下次可能多弹一次，不影响功能
+  }
+}
+
+/** 密钥重新可用（握手成功 / 重新配对 / 换了一把）时清掉撤销标记。 */
+function clearKeyRevoked() {
+  try {
+    fs.unlinkSync(KEY_REVOKED_FILE());
+  } catch {
+    // 本来就没有
+  }
+}
+
+/**
+ * 读现有密钥**但不触发导入/生成**。
+ *
+ * ⚠️ **不能改用 `loadKey()`**：它内部会调 `importKeyIfNeeded()`，而本函数的调用方
+ * 正是 `importKeyIfNeeded()` —— 那会变成无限递归（栈溢出，且症状是启动即崩、
+ * 看不出与密钥有关）。这里只做「读 + 解析」，与 `loadKey()` 的区别仅在于此。
+ *
+ * @returns {{priv: unknown, publicKey: string}|null} 解析不出来时给 `null`。
+ */
+function readKeyFileNoImport() {
+  const file = keyPath();
+  if (!fs.existsSync(file)) return null;
+  try {
+    const priv = crypto.createPrivateKey(fs.readFileSync(file));
+    return { priv, publicKey: publicKeyBlob(priv) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `/sdcard/dsh_adbkey` 是否比现有密钥**更新**（= 用户刚推了一遍）。
+ *
+ * ⚠️ 判据用 mtime 而不是内容：内容相同时也有两种完全不同的处境，见
+ * `importKeyIfNeeded()` 里那段注释。容差 2 秒，避免 FAT/FUSE 的时间戳粒度
+ * （实测 `/sdcard` 上是 1 秒级）把「同一次操作」判成「新推的」。
+ *
+ * ⚠️ 取不到时间戳时一律返回 `false`（= 当作「不是新推的」）。方向选保守的那边：
+ * 误判成「新推的」会让每次启动都放行一次可能弹授权框的通道。
+ */
+function isStagedNewerThanDest(staged, dest) {
+  try {
+    return fs.statSync(staged).mtimeMs > fs.statSync(dest).mtimeMs + 2000;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 记下密钥来源。写不进去不影响功能，只是设置页少一条提示。
  */
 function markKeyOrigin(origin) {
@@ -392,16 +559,43 @@ function keyOrigin() {
  */
 function importKeyIfNeeded() {
   const dest = keyPath();
-  if (fs.existsSync(dest) && keyOrigin() !== 'generated') return;
   const staged = '/sdcard/dsh_adbkey';
+  // ⚠️ 判据是「有没有一把**设备可能还认**的密钥」，不是「有没有密钥」。有三种情况
+  //    必须继续往下看 `/sdcard/dsh_adbkey`：
+  //
+  //    ① `origin === 'generated'` —— App 自己生成的，设备从来没认过（见下面的长注释）。
+  //    ② **已被设备撤销** —— 设备已经不认这把了，重新推一把正是它的补救手段。
+  //    ③ **文件损坏 / 解析不出来** —— 同样只能靠重新推一把救回来。
+  //
+  //    ⚠️⚠️ ② 这条是**必需的**，否则 Android 10 上会出现一条**死锁**：
+  //    设备端点了「撤销 USB 调试授权」⇒ `markKeyRevoked()` 记上标记 ⇒
+  //    `keyMayBeAuthorized()` 挡掉通道 1.5 / 2 ⇒ 而 Android 10 **没有无线调试、
+  //    配对那条路根本走不通**（配对要 Android 11+）⇒ 用户唯一能做的补救动作
+  //    （在 PC 上重新授权后 `adb push` 一把）会被早返回吞掉，于是
+  //    **永远**回落到 app 身份，怎么推都没反应。
+  //
+  //    ⚠️ 但 ②③ 只在**确实有中转文件**时才需要判断，所以判据分两层：
+  //    没有 `/sdcard/dsh_adbkey` 时（绝大多数启动）连私钥都不解析，直接返回 ——
+  //    这是每条 `shell` 命令都会经过的路径（`connect()` → `loadKey()` → 这里），
+  //    不该白白多做一次 RSA 解析。
+  //
+  //    ⚠️ 这里**不能**调 `loadKey()` —— 它内部会调回本函数，直接无限递归。
+  //       所以用不做导入/生成的 `readKeyFileNoImport()`。
+  if (fs.existsSync(dest) && keyOrigin() !== 'generated') {
+    // 没有中转文件 ⇒ 下面无论如何都会返回，不必判断现有密钥可不可用。
+    if (!fs.existsSync(staged)) return;
+    const existing = readKeyFileNoImport();
+    // 解析不出来（损坏）与已被撤销同样算「不可用」，都允许被顶掉。
+    // 下面会用 `crypto.createPrivateKey(pem)` 先验证新密钥，失败就什么都不做，无副作用。
+    if (existing !== null && !isKeyRevoked(existing)) return;
+  }
   try {
     if (!fs.existsSync(staged)) return;
     const pem = fs.readFileSync(staged);
     // 先验证能解析再落盘，避免把半个文件写进去后永久卡住导入
     crypto.createPrivateKey(pem);
     if (fs.existsSync(dest)) {
-      // 内容一模一样说明目标本来就是 PC 那把（只可能是上次导入后 origin 没写上），
-      // 修正来源即可，不必重复写盘。
+      // 内容一模一样说明目标本来就是 PC 那把（只可能是上次导入后 origin 没写上）。
       let same = false;
       try {
         same = fs.readFileSync(dest).equals(pem);
@@ -410,6 +604,20 @@ function importKeyIfNeeded() {
       }
       if (same) {
         markKeyOrigin('imported');
+        // ⚠️ 内容相同也有两种情形，**必须分开**：
+        //    ① 上次导入后 `unlinkSync(staged)` 没成功（比如没有存储权限），文件
+        //       一直躺在那里 —— 这不是用户的新动作，**不能**清撤销标记，否则每次
+        //       启动都会放行一次「会弹授权框」的通道。
+        //    ② 用户刚刚重新推了一遍（设备撤销授权后，他在 PC 上重新授权、再把同一把
+        //       密钥推过来）—— 这是**明确的重新授权信号**，必须清标记，否则上面那条
+        //       Android 10 死锁依然存在。
+        //    判据用 mtime：staged 比 dest 新 ⇒ 是刚推的。
+        if (isStagedNewerThanDest(staged, dest)) {
+          clearKeyRevoked();
+          process.stderr.write(
+            `${TAG} 检测到重新推入的密钥（比现有新）—— 已清除「授权被撤销」标记，重新尝试\n`,
+          );
+        }
         return;
       }
       process.stderr.write(`${TAG} 已存在的密钥不受设备信任（generated），改用 PC 推来的那把\n`);
@@ -419,6 +627,10 @@ function importKeyIfNeeded() {
     markKeyOrigin('imported');
     // 密钥换了，旧的信任标记随之作废：新密钥需要一次「首次授权」的机会。
     clearKeyTrust();
+    // ⚠️ 撤销标记同理必须清掉。它记的是**上一把**密钥被拒的事实；不清的话
+    //    这把新导入的（设备本就信任的）密钥会被那道闸挡在通道 1.5 / 2 之外，
+    //    表现为「明明导了 PC 密钥却一直回落成 app 身份」。
+    clearKeyRevoked();
     process.stderr.write(`${TAG} 已导入 ADB 密钥: ${staged} → ${dest}\n`);
     try {
       fs.unlinkSync(staged);
@@ -497,14 +709,21 @@ function loadKey() {
 function keyMayBeAuthorized() {
   const file = keyPath();
   if (!fs.existsSync(file)) return false;
-  const origin = keyOrigin();
-  if (origin === 'imported' || origin === 'paired') return true;
+  let priv;
   try {
-    const priv = crypto.createPrivateKey(fs.readFileSync(file));
-    return isKeyTrusted({ publicKey: publicKeyBlob(priv) });
+    priv = crypto.createPrivateKey(fs.readFileSync(file));
   } catch {
     return false;
   }
+  const key = { publicKey: publicKeyBlob(priv) };
+  // ⚠️ **这一句必须排在所有放行判据之前。** 设备已经明确拒绝过这把密钥时，
+  //    再进「会弹授权框」的通道（通道 1.5 / 通道 2 用的是**内置 adb**，
+  //    它自己会发公钥，我们拦不住）只会让用户每条命令都弹一次窗。
+  //    宁可回落成 app 身份，也不要骚扰用户。详见 markKeyRevoked()。
+  if (isKeyRevoked(key)) return false;
+  const origin = keyOrigin();
+  if (origin === 'imported' || origin === 'paired') return true;
+  return isKeyTrusted(key);
 }
 
 /**
@@ -584,7 +803,7 @@ function signToken(token, priv) {
  *
  * @returns {Promise<AdbConn>}
  */
-async function connect() {
+async function connect({ probe = false } = {}) {
   const key = loadKey();
   if (key === null) throw new Error('未找到 ADB 密钥（先用 PC 执行 adb push 导入）');
 
@@ -604,8 +823,49 @@ async function connect() {
     });
   });
 
-  const conn = new AdbConn(sock);
-  await conn.handshake(key);
+  // ⚠️⚠️ **握手失败必须显式销毁这条 socket —— 这是「通知栏一直正在配对」的根因之一。**
+  //
+  //   真机症状（OPPO / Android 15，17:58 那一次）：adb 明明报了
+  //   `Successfully paired`、runner 也把 `[dsh-adb] 无法切到固定端口：密钥尚未被
+  //   设备授权…` 打了出来，**但 node 进程迟迟不退出**（45 秒后 `ps` 里两个 node
+  //   仍活着），于是 Kotlin 的 `proc.waitFor()` 等不到，通知栏卡在「正在配对…」，
+  //   最后只能靠 90 秒看门狗强杀。
+  //
+  //   链路：`switchToTcp()` 第一句就是 `fixedPortWorks()`，而它内部 `connect()`
+  //   要跟 adbd 真握手一次 —— 刚配对完那会儿密钥还没被持久信任，`handshake()`
+  //   抛「ADB 密钥尚未被设备授权」。**异常从 `connect()` 里抛出时，上面那条
+  //   已经连上的 TCP socket 谁也没关**：
+  //
+  //     const conn = new AdbConn(sock);   // socket 已被包装、监听器已注册
+  //     await conn.handshake(key);        // ← 在这里抛
+  //     return conn;                      // ← 永远到不了，conn 从未被赋给调用方
+  //
+  //   调用方 `fixedPortWorks()` 是 `conn = await connect()` —— 抛异常时这个赋值
+  //   根本不发生，`conn` 保持 `null`，于是它 `finally { conn?.close() }` 成了空操作。
+  //   而 `net.connect()` 出来的 socket 是 **ref'd** 的活跃 handle，adbd 那边也不会
+  //   主动断开（它只是拒绝认证，等着我们重试），于是事件循环永远不空 ⇒
+  //   **node 永不退出**。
+  //
+  //   ⚠️ 不要试图靠 `AdbConn` 里那个 `sock.on('close', ...)` 兜底：那条路要求
+  //   对端先关，而这里对端恰恰不关。必须在**抛出的这一侧**主动销毁。
+  //
+  //   ⚠️ 这里用 `destroy()` 而不是 `unref()`：socket 已经被 `AdbConn` 接管，
+  //      它是我们唯一持有的引用，销毁它是正确且彻底的（与 `adbExec` 的 pipe 不同 ——
+  //      那条路下面那个 fd 仍被 libuv 算作活跃，只能 `unref`，见那里的实测对照表）。
+  let conn;
+  try {
+    conn = new AdbConn(sock);
+    // ⚠️ `probe` 透传给 `handshake()`：探测性握手**不许**写「授权已撤销」标记，
+    //    理由见 `handshake()` 的 `recordRevocation` 参数。
+    await conn.handshake(key, { recordRevocation: !probe });
+  } catch (e) {
+    try {
+      sock.destroy();
+    } catch {
+      // 已经断了，忽略
+    }
+    throw e;
+  }
   return conn;
 }
 
@@ -715,8 +975,11 @@ class AdbConn {
    *    那是**设备已经信任**的密钥，导入即可用。见 `importKeyIfNeeded()`。
    *
    * @param {{priv: unknown, publicKey: string}} key
+   * @param {{recordRevocation?: boolean}} [opts]
+   *   `recordRevocation=false` 表示这是**探测性**握手（只想知道「这条通道通不通」），
+   *   即使被设备拒绝也**不许**写下「授权已撤销」标记。理由见下面的 ⚠️⚠️。
    */
-  async handshake(key) {
+  async handshake(key, { recordRevocation = true } = {}) {
     this.send(CMD.CNXN, 0x01000001, MAX_PAYLOAD, Buffer.from('host::features=shell_v2,cmd,stat_v2\0'));
     let msg = await this.recv(HANDSHAKE_TIMEOUT_MS);
 
@@ -726,9 +989,67 @@ class AdbConn {
       if (msg.cmd === CMD.AUTH) {
         // ⚠️ 这里**故意不发公钥**。原因见上面的表 —— 它在本 App 的场景下要么
         // 无效、要么只制造弹窗，是纯粹的负收益。要授权请走配对或 PC 导入。
+        //
+        // ⚠️ **同时记下「设备拒绝了这把密钥」**：这是唯一能区分「授权被撤销」与
+        //   「端口/网络问题」的信号（adbd 又发了一次 `A_AUTH` 就是要我们重新证明
+        //   身份）。不记的话，`origin = imported|paired` 会让 `keyMayBeAuthorized()`
+        //   永远放行，于是内置 adb 在通道 1.5 / 2 里握着这把不受信的钥匙去连，
+        //   **它自己会发公钥** ⇒ 用户每执行一条命令弹一次授权框。
+        //
+        // ⚠️⚠️ **但不是所有被拒都算「撤销」，只在「本来会被放行」时才记。**
+        //   对 `generated` 且从未配对成功的密钥，被设备拒绝是**必然且正常**的 ——
+        //   全新的、只开了无线调试的设备就长这样，`keyMayBeAuthorized()` 本来就会
+        //   挡它（走 `isKeyTrusted()` 那条返回 false）。若这时也记上 revoked：
+        //
+        //   - `classifyFallback()` 会把结论从正确的「尚未授权，请去配对」改成
+        //     **「授权已被撤销，多半是在开发者选项里点了『撤销 USB 调试授权』」**——
+        //     用户从没做过那个动作，被引向错误的方向；
+        //   - 还多叠一道**只有配对/重新导入才能解除**的闸（见 `clearKeyRevoked()`
+        //     的两个调用点），而原本那条路只需一次成功握手就能自愈。
+        //
+        //   判据与 `keyMayBeAuthorized()` 的放行条件**逐条对齐**：只有这三种情况
+        //   才是「从可放行变成被拒」，也就是真的撤销。
+        //
+        // ⚠️⚠️ **探测性握手（`recordRevocation=false`）绝不写这个标记 —— 真机实证的坑。**
+        //
+        //   真机日志（OPPO / Android 15，17:58 那一次）逐行：
+        //
+        //     17:58:28.068 [pair] Successfully paired to 127.0.0.1:42549
+        //     17:58:28.127 [pair] 无法切到固定端口：密钥尚未被设备授权，跳过…
+        //                      ↑ 只隔了 59ms
+        //
+        //   这 59ms 里发生的事：`--pair` 成功后立刻调 `switchToTcp()`，而它的**第一句**
+        //   就是 `fixedPortWorks()` —— 那是一次**探测性**握手，目的是「5555 是不是
+        //   已经能给我 uid 2000」。此刻 adbd 刚收到配对、keystore 还没重载完，
+        //   于是它拒绝了这次签名。**探测失败本来只是一句「还不行」，但旧代码把它
+        //   当成权威结论写下了 `markKeyRevoked()`**，而这个标记紧接着就挡住了
+        //   `switchToTcp()` 自己后面的 `keyMayBeAuthorized()`：
+        //
+        //     探测失败 → 写「已撤销」→ keyMayBeAuthorized() 读到它 → 返回 false
+        //     → 报「密钥尚未被设备授权，跳过以免反复弹窗」→ 放弃切固定端口
+        //
+        //   结果就是「**刚配对成功，却立刻宣称密钥未授权**」，而用户回到设置页点
+        //   「重新检测」时又好了（那时 adbd 早已重载完 keystore，探测通过）。
+        //   这正是用户反馈的原话：「第一次匹配就是一直显示配对中，但是回到 APP
+        //   里面点重新检测，其实它是已经就绪了的。」
+        //
+        //   为什么「探测失败」不配当权威结论：
+        //   - 它是一次**瞬时**观测，而 keystore 重载、adbd 重启、端口刚监听上
+        //     这些过渡态都会让它假失败；
+        //   - 「授权已撤销」是个**很重**的结论 —— 它会叠加一道只有重新配对或重新
+        //     导入才能解除的闸（`clearKeyRevoked()` 的两个调用点），用户被引向
+        //     「去开发者选项看看是不是撤销了授权」这个他从没做过的动作。
+        //
+        //   所以：**只有「真的要执行特权命令、并且已经确认这把密钥本应可用」时
+        //   才允许记撤销**。`fixedPortWorks()` 是纯探测，传 `probe: true`。
+        const origin = keyOrigin();
+        if (recordRevocation && (origin === 'imported' || origin === 'paired' || isKeyTrusted(key))) {
+          markKeyRevoked(key);
+        }
         throw new Error(
           isKeyTrusted(key)
-            ? 'ADB 密钥被设备拒绝（授权可能已被撤销），请重新配对'
+            ? 'ADB 密钥被设备拒绝（授权已被撤销），请重新配对授权。' +
+              '在此之前特权命令会以应用身份执行。'
             : 'ADB 密钥尚未被设备授权，请用无线调试配对授权它'
               + '（Android 10 需先用 PC 执行 adb push 推入已授权的密钥）',
         );
@@ -740,6 +1061,9 @@ class AdbConn {
     }
     // 走到这里说明设备认了这把密钥。落盘标记，此后永不因它弹窗。
     markKeyTrusted(key);
+    // 设备重新认了 ⇒ 之前那次「授权被撤销」的结论已经过期，清掉它，
+    // 否则通道 1.5 / 通道 2 会一直被那道闸挡着（表现为「明明能用却总是回落」）。
+    clearKeyRevoked();
   }
 
   /**
@@ -930,28 +1254,35 @@ function withCwd(command, cwd) {
 /**
  * 读 Kotlin 侧（`AdbMdns`）写下的端口文件。
  *
- * 格式 `<connect端口> [<配对端口>]`，任一项可能缺失。
+ * 格式：**单个连接端口**，一行。
+ *
+ * ⚠️ **这里曾经声明成 `<connect端口> [<配对端口>]`，那是错的。** Kotlin 侧的
+ * `WirelessDebugging.writePort()` 从头到尾只写一个值，所以第二个字段永远是
+ * `undefined` → `pairing` 恒为 `null`，而全工程**没有任何地方读它**。
+ * 一个恒为 null 的字段比没有这个字段更坏：它让人以为「配对端口可以从文件里拿到」，
+ * 从而在排查配对问题时去查一个根本不存在的通道。
+ *
+ * 配对端口**不经文件传递**：它在 `AdbPairingNotifier` 里由 `AdbMdns` 发现后
+ * 直接经通知带进 `pair()` 的 `knownPort` 参数（见 `WirelessDebugging.pair`）。
+ * 那条路径是必需的 —— 配对端口只在「使用配对码配对设备」界面开着时才存在，
+ * 等用户回到 App 再读文件必然已经落空。
  *
  * ⚠️ 这里**不做任何端口探测**（不 connect、不 bind、不扫）。有效性由写入方
  * 负责 —— `AdbMdns` 已经用「bind 127.0.0.1:port 失败即 adbd 在听」筛过一遍，
  * 并且校验了解析出的地址必须是本机地址。重复校验只是白花时间。
+ * 端口死没死由调用方按实际连接结果判定（见通道 2 的 `clearWirelessPortFile()`）。
  *
- * @returns {{connect: number|null, pairing: number|null}} 解析结果。
+ * @returns {number|null} 连接端口；没有或格式不对给 `null`。
  */
-function readWirelessPorts() {
+function readWirelessPort() {
   try {
     const raw = fs.readFileSync(PORT_CACHE_FILE(), 'utf8').trim();
-    if (raw === '') return { connect: null, pairing: null };
-    const [c, p] = raw.split(/\s+/);
-    const connect = Number.parseInt(c, 10);
-    const pairing = Number.parseInt(p, 10);
-    return {
-      connect: Number.isInteger(connect) && connect > 0 ? connect : null,
-      pairing: Number.isInteger(pairing) && pairing > 0 ? pairing : null,
-    };
+    if (raw === '') return null;
+    const port = Number.parseInt(raw.split(/\s+/)[0], 10);
+    return Number.isInteger(port) && port > 0 ? port : null;
   } catch {
     // 文件不存在 = 无线调试没开或还没发现，属于正常情况
-    return { connect: null, pairing: null };
+    return null;
   }
 }
 
@@ -996,7 +1327,7 @@ function adbExec(args) {
     } catch {
       // 已存在
     }
-    const child = spawn(ADB_BIN, ['-L', `localabstract:dshadb-${process.pid}`, ...args], {
+    const child = spawn(ADB_BIN, ['-L', ADB_SOCKET, ...args], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
     });
@@ -1007,7 +1338,76 @@ function adbExec(args) {
     child.stdout.on('data', (c) => { out += c; });
     child.stderr.on('data', (c) => { err += c; });
     child.on('error', (e) => resolve({ code: 127, out, err: `${err}${e.message}` }));
-    child.on('close', (code) => resolve({ code: code ?? 1, out, err }));
+    // ⚠️ **必须监听 `'exit'`，不能监听 `'close'`**（真机踩过，是本文件最隐蔽的一个坑）。
+    //
+    //   `'close'` 要等**所有 stdio 流都关闭**才触发，而 `adb start-server` 起的是
+    //   **常驻 adb server daemon** —— 它继承了这两个 pipe 的写端并一直持有，
+    //   读端于是永远等不到 EOF ⇒ `'close'` 永不触发 ⇒ 这个 Promise 永不 resolve
+    //   ⇒ **node 事件循环不空、进程永不退出**，最后只能靠 Kotlin 侧的 90 秒看门狗
+    //   强杀（真机日志：`switch-tcp 超过 90 秒仍未结束，强制结束它`，
+    //   退出码 143 = SIGTERM）。
+    //
+    //   症状是「配对码填对了、adb 明明报了 Successfully paired，通知栏却一直
+    //   正在配对」—— 因为 `--pair` 里配对成功后要补切固定端口，而那条路会调
+    //   `adbExec`，而当时 `adbExec` 里正卡着一个永远不触发的 `'close'`。
+    //
+    //   `'exit'` 只等**进程**退出，正是我们要的语义：命令的输出在进程退出前
+    //   就已写进管道缓冲，进程一退即可安全读取。
+    child.on('exit', (code, signal) => {
+      // ⚠️ 进程退出 ≠ 数据已全部派发：pipe 里可能还有已到达但没触发 `data` 的字节
+      //   （`connect` 输出里的 `connected` 正是要匹配的，少几个字符就会误判成
+      //   连接失败）。所以**先给 `'close'` 一个窗口**让它把数据派发干净；
+      //   若 daemon 一直占着写端导致 `'close'` 不来，则由 `setTimeout` 兜底。
+      //
+      //   窗口取 1000ms：这一条只在**进程已经退出**之后才开始等，正常情况
+      //   `'close'` 几乎立刻到（数据早已在管道缓冲里），所以稳态零代价；
+      //   而慢机上 pipe 派发要几百毫秒，给 150ms 会**偶发**读到截断的输出。
+      //   这是「宁可偶尔多等 1 秒，也不要读到半个 connected」的取舍。
+      //   两路都走同一个 `finish()`，Promise 只认第一次 resolve。
+      const finish = () => {
+        // ⚠️⚠️ **必须 `unref()` 这两条 pipe，否则 node 照样不退出。**
+        //
+        //   光把监听器从 `'close'` 换成 `'exit'` 只解决了「Promise 永不 resolve」，
+        //   没有解决「handle 永不释放」——这是两个独立的问题，真机上表现为同一个
+        //   症状（通知栏一直「正在配对」）。
+        //
+        //   任何一条 adb 命令在 server 没跑时都会**自己 fork 出常驻 adb daemon**，
+        //   而这个 daemon **继承了我们给客户端的那两条 pipe 的写端**并一直持有。
+        //   于是 `child.stdout` / `child.stderr` 这两个 pipe socket 的读端永远等不到
+        //   EOF —— 子进程虽然退出了，但**pipe 本身仍是 ref'd 的活跃 handle**，
+        //   `process.exitCode` 设好之后事件循环依然不空 ⇒ node 不退出 ⇒
+        //   Kotlin 的 `proc.waitFor()` 等不到 ⇒ 90 秒看门狗强杀。
+        //
+        //   ## 为什么是 `unref()` 而不是 `destroy()`（实测对照，别改回去）
+        //
+        //   | 对两条 pipe 做什么 | 事件循环里残留的 handle |
+        //   |---|---|
+        //   | 什么都不做 | 2 个 Socket |
+        //   | 只 `destroy()` | **1 个**（底层 fd 仍在，仍吊着循环） |
+        //   | 只 `unref()` | **0 个** ← 只有这个能让循环真正排空 |
+        //   | `unref()` + `destroy()` | 1 个（`destroy` 又把它算回活跃） |
+        //
+        //   `destroy()` 关的是**我们这侧的读端**，但 libuv 那边仍把这条 pipe 算作
+        //   活跃句柄；`unref()` 才是「别再拿它当进程活着的理由」。这里不需要关 fd
+        //   （本 runner 是一次性进程，跑完即退，fd 随进程消失），只需要让循环能空。
+        //
+        //   ⚠️ 数据不会因此丢：`'exit'` 之后还有 `'close'`/兜底窗口把管道读干净，
+        //      `unref()` 只影响「循环是否被它吊住」，不影响已到达的数据。
+        for (const s of [child.stdout, child.stderr]) {
+          try {
+            s.unref();
+          } catch {
+            // 不支持就算了，还有 main() 尾部的兜底
+          }
+        }
+        resolve({ code: code ?? (signal ? 128 : 1), out, err });
+      };
+      const fallback = setTimeout(finish, 1000);
+      child.once('close', () => {
+        clearTimeout(fallback);
+        finish();
+      });
+    });
   });
 }
 
@@ -1027,7 +1427,11 @@ function adbExec(args) {
 function runWireless(adbBin, target, command) {
   return (async () => {
     try {
-      await adbExec(['start-server']);
+      // ⚠️ **不要在这里显式 `start-server`。** 任何 adb 命令都会自动拉起 server，
+      //   而且 adb 客户端**内部会等 server 就绪**再发这条命令。显式再调一次反而
+      //   有害：`start-server` 是**异步 daemonize** 的，它一返回 server 可能还在
+      //   初始化，紧接着的 `connect` 就会撞上未就绪的 server 并报
+      //   `error: protocol fault (couldn't read status message)`（真机踩过）。
       const conn = await adbExec(['connect', target]);
       if (!conn.out.includes('connected')) {
         return { stdout: '', stderr: `${TAG} 无线调试连接失败: ${(conn.out + conn.err).trim()}\n`, code: 1 };
@@ -1065,6 +1469,11 @@ function runLocal(command) {
  * 在 libc 缓冲区写回之前就终止进程，**静默截断**大输出 —— `screencap`、
  * `dumpsys`、`ps -A` 这类恰好都是大输出。用 `process.exitCode` 让事件循环
  * 自然退出，Node 会把流排干。
+ *
+ * ⚠️ **返回 Promise，调用方必须 `await`。** `main()` 尾部那个 `armExitBackstop()`
+ * 兜底会在 `main()` settle 之后强制 `process.exit()`；若这里不 await，兜底就可能
+ * 在输出排干之前开火，把上面那条「不许截断」的承诺破掉。await 之后，`main()`
+ * settle 即代表输出已确实写出，兜底只负责「释放 handle」这一件事。
  */
 function finish(stdout, stderr, code) {
   const write = (stream, buf) =>
@@ -1072,7 +1481,7 @@ function finish(stdout, stderr, code) {
       if (buf.length === 0) return resolve();
       stream.write(buf, () => resolve());
     });
-  Promise.all([write(process.stdout, stdout), write(process.stderr, stderr)]).then(() => {
+  return Promise.all([write(process.stdout, stdout), write(process.stderr, stderr)]).then(() => {
     process.exitCode = code;
   });
 }
@@ -1132,7 +1541,7 @@ function pairWireless(port, code) {
     } catch {
       // 已存在
     }
-    const child = spawn(ADB_BIN, ['-L', `localabstract:dshadb-${process.pid}`, 'pair', `${HOST}:${port}`, code], {
+    const child = spawn(ADB_BIN, ['-L', ADB_SOCKET, 'pair', `${HOST}:${port}`, code], {
       stdio: ['ignore', 'inherit', 'inherit'],
       env,
     });
@@ -1142,86 +1551,6 @@ function pairWireless(port, code) {
     });
     child.on('exit', (c) => resolve(c ?? 1));
   });
-}
-
-/**
- * 把 adbd 从「无线调试」切到固定的 legacy TCP 端口（默认 5555）。
- *
- * ## 为什么需要这一步（实测结论）
- *
- * 无线调试的 TLS 端口**只在无线调试开关开着时才存在**，而且**关掉开关会立刻
- * 掐断已建立的连接**（实测：`settings put global adb_wifi_enabled 0` 之后，
- * 已连上的 `adb-…._adb-tls-connect._tcp` 立刻变 `device offline`）。
- * 也就是说「连上后一直用无线调试」这条路是死的 —— 用户一关开关，通道就断。
- *
- * 而 `adb tcpip 5555` 会把 adbd **重启到 TCP 模式**，此后：
- *
- * | | 无线调试 | tcpip 5555 |
- * |---|---|---|
- * | 关掉无线调试开关 | **立刻断连** | **不受影响**（实测 `wifi=0` 时仍 `LISTEN *:5555`） |
- * | 关掉 Wi-Fi | 断 | **不受影响**（走 127.0.0.1 回环） |
- * | 端口 | 每次重启随机 | 固定 5555 |
- * | 加密 | TLS | 明文（但只在回环上，不出设备） |
- * | 重启手机后 | 需重开开关 | **需重新切一次**（`persist.adb.tcp.port` 实测为空） |
- *
- * ⚠️ **两者可以并存**：Android 15 实测 `adb tcpip 5555` **不会**关闭无线调试
- * （`adb_wifi_enabled` 仍是 1）。所以这是一个纯增益动作，不会破坏用户的设置。
- *
- * ⚠️ 切之前**必须先有一条活着的连接**（要么 legacy 已在听，要么无线调试连着），
- * 因为 `tcpip` 命令本身要通过 adb 发出去。
- *
- * @returns {Promise<boolean>} 是否切换成功。
- */
-async function switchToTcp() {
-  if (ADB_BIN === '' || !fs.existsSync(ADB_BIN)) return false;
-  // 已经在听说明已经是 TCP 模式，无需再切。
-  const already = await legacyAlive();
-  if (already) return true;
-
-  // ⚠️ 端口**不能只读一次就放弃**。配对刚成功的那一刻，Kotlin 侧的常驻 mDNS 监听
-  //    往往还没来得及把新端口写进文件（无线调试在配对过程中重启了 adbd，端口是
-  //    全新的）—— 此时立刻 `return false` 会把「还没写」误报成「切不了」，
-  //    而用户看到的就是「配对成功，但权限还是 app 身份」。
-  //    给一小段重试窗口（5 秒，成本可忽略：本来就要等 adbd 重启），
-  //    拿到端口就往下走。
-  let port = null;
-  for (let i = 0; i < 20; i += 1) {
-    port = readWirelessPorts().connect;
-    if (port !== null) break;
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  if (port === null) {
-    process.stderr.write(`${TAG} 无法切 TCP 模式：没有可用的无线调试端口（已等待 5 秒）\n`);
-    return false;
-  }
-
-  // ⚠️ **必须先 `connect` 一次**，否则下面那句 `-s ${HOST}:${port}` 会因为
-  //    adb server 里根本没有这个 device 而直接报 `device not found`。
-  //    这一段原先只在 `--switch-tcp` 分支里做，`--pair` 分支没做 ——
-  //    于是「配对成功后自动切 5555」**必然失败**，用户只能一直靠无线调试
-  //    顶着，一关 Wi-Fi 通道就断。现在收进来，三个调用点共用同一份保证。
-  await adbExec(['start-server']);
-  const conn = await adbExec(['connect', `${HOST}:${port}`]);
-  if (!conn.out.includes('connected')) {
-    process.stderr.write(`${TAG} 无法切 TCP 模式：连不上无线调试 ${HOST}:${port} (${(conn.out + conn.err).trim()})\n`);
-    return false;
-  }
-
-  const rc = await adbExec(['-s', `${HOST}:${port}`, 'tcpip', String(PORT)]);
-  if (rc.code !== 0) {
-    process.stderr.write(`${TAG} 切换 TCP 模式失败: ${(rc.out + rc.err).trim()}\n`);
-    return false;
-  }
-  // adbd 重启需要一点时间才重新监听
-  for (let i = 0; i < 20; i += 1) {
-    await new Promise((r) => setTimeout(r, 300));
-    if (await legacyAlive()) {
-      process.stderr.write(`${TAG} 已切到 TCP 模式 127.0.0.1:${PORT}（不再依赖无线调试开关）\n`);
-      return true;
-    }
-  }
-  process.stderr.write(`${TAG} 切换 TCP 模式后 ${PORT} 端口未就绪\n`);
-  return false;
 }
 
 /** legacy 端口是否有人监听（能连上即视为就绪）。 */
@@ -1238,6 +1567,341 @@ function legacyAlive() {
     sock.on('error', () => done(false));
     sock.on('timeout', () => done(false));
   });
+}
+
+/**
+ * 固定端口是否**真的能拿到 uid 2000**（而不是「有人占着这个端口」）。
+ *
+ * ⚠️ **这是本文件最重要的一条判据，不要退化成 `legacyAlive()`。**
+ *
+ * `legacyAlive()` 只做一次 TCP connect：5555 是 >1024 的端口，**任何应用都能
+ * bind**。旧实现用它当「固定端口已就绪」的判据，撞上别人的监听时会：
+ *
+ * 1. 报「已经是 TCP 模式，无需再切」（假成功）；
+ * 2. 之后每条特权命令都去连那个**不是 adbd** 的端口 → 握手失败 → 静默回落成
+ *    app 身份；
+ * 3. 而设置页因为拿到了 `通道: legacy` 之类的行（或至少 `switchToTcp` 返回 true）
+ *    而显示「已切到固定端口」。
+ *
+ * 走一次真实握手才能把两者分开。`connect()` 内部**永不发公钥**，所以这个探测
+ * 即使对上未授权的密钥也**不会弹「允许 USB 调试吗」**（见 `handshake()`）。
+ *
+ * @returns {Promise<boolean>} 是否真的以 uid 2000 跑通了 `id -u`。
+ */
+async function fixedPortWorks() {
+  let conn = null;
+  try {
+    // ⚠️ **必须 `probe: true`** —— 这是一次纯探测（「5555 现在能不能给我 uid 2000」），
+    //    它的失败可能只是 adbd 还没重载完 keystore（刚配对完那几十毫秒就是这样）。
+    //    若让它写「授权已撤销」，就会把**刚配对成功的密钥**当场判死，并且这个错误
+    //    结论会反过来挡住 `switchToTcp()` 自己后续的步骤（真机 59ms 内复现）。
+    //    完整推导见 `handshake()` 的 `recordRevocation` 参数。
+    conn = await connect({ probe: true });
+    const { stdout, exitCode } = await conn.shell('id -u');
+    return exitCode === 0 && stdout.toString().trim() === '2000';
+  } catch {
+    return false;
+  } finally {
+    conn?.close();
+  }
+}
+
+/** 阻塞 `ms` 毫秒。 */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 把 adbd 从「无线调试」切到固定的 legacy TCP 端口（默认 5555）。
+ *
+ * ## 为什么需要这一步（实测结论）
+ *
+ * 无线调试的 TLS 端口**只在无线调试开关开着时才存在**，而且**关掉开关会立刻
+ * 掐断已建立的连接**（实测：`settings put global adb_wifi_enabled 0` 之后，
+ * 已连上的 `adb-…._adb-tls-connect._tcp` 立刻变 `device offline`）。
+ * 也就是说「连上后一直用无线调试」这条路是死的 —— 用户一关开关，通道就断。
+ *
+ * 而 `adb tcpip 5555` 会把 adbd **重启到 TCP 模式**，此后走 `127.0.0.1` 回环：
+ *
+ * | | 无线调试 | tcpip 5555 |
+ * |---|---|---|
+ * | 关掉无线调试开关 | **立刻断连** | **不受影响**（实测 `wifi=0` 时仍 `LISTEN *:5555`） |
+ * | 关掉 Wi-Fi | 断 | **不受影响**（走 127.0.0.1 回环） |
+ * | 端口 | 每次重启随机 | 固定 5555 |
+ * | 加密 | TLS | 明文（但只在回环上，不出设备） |
+ * | 重启手机后 | 需重开开关 | **需重新切一次**（`persist.adb.tcp.port` 实测写不进去） |
+ *
+ * ⚠️ **两者可以并存**：Android 15 实测 `adb tcpip 5555` **不会**关闭无线调试
+ * （`adb_wifi_enabled` 仍是 1）。所以这是一个纯增益动作，不会破坏用户的设置。
+ *
+ * ⚠️ 切之前**必须先有一条活着的连接**（要么 legacy 已在听，要么无线调试连着），
+ * 因为 `tcpip` 命令本身要通过 adb 发出去。
+ *
+ * ## 本轮修掉的两个判据错误（都是真实用户症状的根因）
+ *
+ * 1. **成功判据**：旧代码用「20 × 300ms 轮询 `legacyAlive()`」—— 那只是
+ *    「端口有人听」，而且只等 6 秒。adbd 重启常超过 6 秒，于是**切成功了却报失败**
+ *    （通知栏说「还没切到固定端口」，用户去点重试又遇到问题 2）。
+ *    现在改成 `fixedPortWorks()`：**握手 + `id -u` == 2000**，预算 20 秒。
+ * 2. **端口从哪来**：旧代码**只**从 `adb-wireless-port` 文件读，而那个文件恰恰
+ *    在**无线调试被关掉时会被删除**（`AdbMdns.onServiceLost` → `writePort(-1)`）。
+ *    于是最需要切的时候它必然说「没有可用的无线调试端口」。
+ *    现在分两路：文件为空时给 5 秒重试窗口（adbd 重启后常驻监听可能还没写），
+ *    仍为空则接受**由 Kotlin 侧直接传进来的端口**（`--switch-tcp <port>`）——
+ *    `WirelessDebugging.ensureTcpPort()` 会先自己发现一次再调，所以
+ *    「刚关掉无线调试但设备上还开着」这个场景也能走通。
+ *
+ * @param {number|null} knownPort Kotlin 侧已发现的无线调试端口；`null` 表示没有。
+ * @returns {Promise<boolean>} 是否**确实**拿到了 uid 2000 的固定端口。
+ */
+async function switchToTcp(knownPort = null) {
+  // ── 已经就绪？先验一次（幂等，且这一句就是稳态下的全部开销）──
+  //
+  // ⚠️ **这一步必须排在「检查密钥 / 内置 adb」之前。** 它用的是**自实现 ADB 协议**
+  //    （见 `fixedPortWorks()` → `connect()`），既不依赖内置 adb，也不需要
+  //    `syncKeyForAdb()`。反过来把密钥检查提前会造成一个假失败：
+  //    「5555 明明已经在听、只是这把密钥还没被授权」时直接报「密钥不可用」，
+  //    而那时**什么都不用做**——固定端口本来就是好的。
+  if (await fixedPortWorks()) {
+    process.stderr.write(`${TAG} 固定端口 ${PORT} 已就绪（已确认可拿到 uid 2000）\n`);
+    return true;
+  }
+
+  if (ADB_BIN === '' || !fs.existsSync(ADB_BIN)) {
+    process.stderr.write(`${TAG} 内置 adb 不可用，无法切换固定端口\n`);
+    return false;
+  }
+
+  // 先保证有密钥（没有就现场生成一把）。**必须排在下面的授权判据之前** ——
+  // 否则「还没有密钥」会被误报成「密钥未被授权」，两种处境用户该做的事不同。
+  if (!ensureKey()) {
+    process.stderr.write(`${TAG} ADB 密钥不可用，无法切换固定端口\n`);
+    return false;
+  }
+
+  // ⚠️ **这一步必须排在 `syncKeyForAdb()` 与 `adbExec()` 之前**，理由是它挡的是
+  //    「弹授权框」而不是「功能不可用」：
+  //    下面 `adbExec(['connect', …])` 用的是**内置 adb**，它遇到设备不认识的密钥
+  //    会**自己**发公钥 → 系统弹「允许 USB 调试吗」。那个行为在外部进程里，
+  //    runner 拦不住，只能提前不进这条分支。
+  //
+  // ⚠️ 这一句原先**没有**，因为 `switchToTcp` 只有「用户手点按钮」与「引擎启动
+  //    自愈一次」两个调用点，最多弹一两次、用户还能理解成「点了按钮就该授权」。
+  //    现在多了**每 5 分钟一次的固定端口守护**（`WirelessDebugging.startFixedPortGuard`），
+  //    没有守卫就是**每 5 分钟弹一次窗**，用户会以为中了病毒。
+  //    所以这个守卫是随守护一起必须补上的。
+  //
+  // 判据与通道 1.5 / 通道 2 用的是同一个 `keyMayBeAuthorized()`：它只挡
+  // `origin = generated` 且从未握手成功的那把（唯一会弹窗的），
+  // `imported` / `paired` / 已建立过信任标记的密钥照常放行。
+  if (!keyMayBeAuthorized()) {
+    process.stderr.write(
+      `${TAG} 无法切到固定端口：密钥尚未被设备授权，跳过以免反复弹出「允许 USB 调试吗」\n` +
+        `${TAG}   → 请在设置页点「配对无线调试」完成一次授权，之后本步会自动完成。\n`,
+    );
+    return false;
+  }
+
+  if (!syncKeyForAdb()) {
+    process.stderr.write(`${TAG} ADB 密钥不可用，无法切换固定端口\n`);
+    return false;
+  }
+
+  // 优先用调用方给的端口（Kotlin 侧刚发现的新鲜值），否则读文件并重试。
+  let port = knownPort !== null && knownPort > 0
+    ? knownPort
+    : await readWirelessConnectPortWithRetry();
+  if (port !== null) {
+    process.stderr.write(`${TAG} 准备经无线调试端口 ${port} 切到固定端口 ${PORT}\n`);
+  }
+  if (port === null) {
+    process.stderr.write(
+      `${TAG} 无法切到固定端口：本机现在既没有 ${PORT}，也没有无线调试端口。\n` +
+        `${TAG}   → 请在系统设置里打开「无线调试」（Android 11+），或先用电脑执行一次 ` +
+        `adb tcpip ${PORT}，然后回到设置页点「切到固定端口」。\n`,
+    );
+    return false;
+  }
+
+  // ⚠️ **必须先 `connect` 一次**，否则下面那句 `-s ${HOST}:${port}` 会因为
+  //    adb server 里根本没有这个 device 而直接报 `device not found`。
+  //    （这一段原先只在 `--switch-tcp` 分支里做，`--pair` 分支没做 ——
+  //    于是「配对成功后自动切 5555」**必然失败**，用户只能一直靠无线调试
+  //    顶着，一关 Wi-Fi 通道就断。现在收进来，三个调用点共用同一份保证。）
+  //
+  // ⚠️ **不要再补 `await adbExec(['start-server'])`。** `connect` 自己就会把
+  //    server 拉起来并等它就绪；显式调反而会与紧随其后的命令抢时序，报
+  //    `error: protocol fault (couldn't read status message)`（真机踩过，
+  //    见 `adbExec` 里关于 `'exit'` 的注释）。
+  const conn = await adbExec(['connect', `${HOST}:${port}`]);
+  if (!conn.out.includes('connected')) {
+    // 无线调试端口已经失效（用户关了开关、或 adbd 重启换了端口）。
+    // 清掉陈旧端口文件，避免下一条命令再去连它。
+    clearWirelessPortFile();
+    process.stderr.write(
+      `${TAG} 无法切到固定端口：连不上无线调试 ${HOST}:${port}` +
+        `（${(conn.out + conn.err).trim()}）。若你刚关掉无线调试，请先重新打开它。\n`,
+    );
+    return false;
+  }
+
+  const rc = await adbExec(['-s', `${HOST}:${port}`, 'tcpip', String(PORT)]);
+  if (rc.code !== 0) {
+    process.stderr.write(`${TAG} 切换 TCP 模式失败: ${(rc.out + rc.err).trim()}\n`);
+    return false;
+  }
+
+  // ── 等 adbd 重启完，并用**握手 + id -u** 确认（不是「端口有人听」）──
+  const deadline = Date.now() + TCPIP_VERIFY_BUDGET_MS;
+  let checks = 0;
+  while (Date.now() < deadline) {
+    await sleep(TCPIP_POLL_INTERVAL_MS);
+    checks += 1;
+    if (await fixedPortWorks()) {
+      process.stderr.write(
+        `${TAG} 已切到固定端口 ${HOST}:${PORT}（第 ${checks} 次确认拿到 uid 2000，` +
+          `不再依赖无线调试开关与 Wi-Fi）\n`,
+      );
+      return true;
+    }
+  }
+  process.stderr.write(
+    `${TAG} 切换 TCP 模式后 ${TCPIP_VERIFY_BUDGET_MS / 1000} 秒内未能确认 ${PORT} 可拿到 uid 2000` +
+      `（已确认 ${checks} 次）。adbd 可能仍在重启，稍后会自动重试。\n`,
+  );
+  return false;
+}
+
+/**
+ * 找无线调试的连接端口：先读 Kotlin 侧写的文件，给它一段重试窗口。
+ *
+ * ⚠️ **本函数刻意只读文件，绝不自己发现。** 两条理由都是硬性的：
+ *
+ * 1. **Node 发不出 UDP 组播**（实测 `EPERM send EPERM 224.0.0.251:5353`），
+ *    而 Android 的 `mdnsd` 只应答组播查询 —— 所以 runner 自己做不了 mDNS。
+ *    真正的发现能力在 Kotlin 侧（`NsdManager` 走系统服务）。
+ * 2. 本项目**曾经**有一个 `--discover` 子命令，已经被删除（见 `main()` 里的注释），
+ *    留着它只会伪造出一个陈旧但精确的结论。**不要再加回来。**
+ *
+ * 因此「文件为空」时的正确做法是**让 Kotlin 侧去发现、把端口作为参数传进来**
+ * （`--switch-tcp <port>`）。本函数只负责那种情况的兜底：文件可能只是**还没写**
+ * （adbd 重启后常驻监听尚未更新），所以给 5 秒重试窗口，而不是立刻放弃。
+ *
+ * @returns {Promise<number|null>} 端口号；文件始终为空则给 `null`。
+ */
+async function readWirelessConnectPortWithRetry() {
+  for (let i = 0; i < 20; i += 1) {
+    const port = readWirelessPort();
+    if (port !== null) return port;
+    await sleep(250);
+  }
+  return null;
+}
+
+/**
+ * 删掉陈旧的无线调试端口文件。
+ *
+ * ⚠️ **只在确认那个端口已经连不上时调用。** 端口文件是 Kotlin 侧常驻监听写的，
+ * 无脑删会让正在工作的无线通道失去端口（那正是 AGENTS.md 里记过的
+ * 「一次没探到就删文件」那个缺陷）。所以这条只在 `adb connect` 明确失败时走。
+ */
+function clearWirelessPortFile() {
+  try {
+    fs.unlinkSync(PORT_CACHE_FILE());
+    process.stderr.write(`${TAG} 已清除失效的无线调试端口文件（下次会重新发现）\n`);
+  } catch {
+    // 本来就没有，或删不掉 —— 都不影响功能
+  }
+}
+
+/**
+ * 把三条通道的各自结论**收敛成一条可执行的原因**。
+ *
+ * ## 为什么需要它（旧实现的一个真实缺陷）
+ *
+ * 回落分支原来只报**通道 1** 的失败原因：
+ *
+ * ```js
+ * const why = legacyReason === '' ? '没有可用的 uid 2000 通道' : legacyReason;
+ * ```
+ *
+ * 于是四种完全不同的处境在设置页长得一模一样：
+ *
+ * | 真实处境 | 用户该做的事 |
+ * |---|---|
+ * | 还没有密钥 | 点「配对无线调试」 |
+ * | 密钥被设备撤销了 | 重新配对（旧的授权没了） |
+ * | 5555 没在听、无线调试也没开 | 打开无线调试，或点「切到固定端口」 |
+ * | 无线端口文件是陈旧的 | 重开一次无线调试 |
+ *
+ * 用户拿到「uid 2000 不可用（连接 127.0.0.1:5555 超时）」这种结论**无法照做** ——
+ * 他不知道 5555 是什么，也不知道该点哪个按钮。
+ *
+ * 所以这里按「最确定、最可执行」优先给出结论，并在末尾附一条机器可读的
+ * `诊断:` 行（`kind=` 供设置页分支）。
+ *
+ * ⚠️ **`text` 里不能出现全角右括号 `）`**：宿主半的 `FALLBACK_RE`
+ * （`mobile-ui-plugin/dsh-android-mobile/lib/index.js`）是
+ * `/uid 2000 不可用（(.+?)）/`，非贪婪匹配到**第一个** `）` 就停。插一个进去
+ * 会让设置页显示的原因被截断成半句。要断句用 `——`。
+ *
+ * @param {{key: string, legacy: string, wireless: string}} diag 三条通道的结论。
+ * @param {string} legacyReason 通道 1 的原始失败原因。
+ * @returns {{kind: string, text: string}} 分类与给人看的一句话。
+ */
+function classifyFallback(diag, legacyReason) {
+  if (diag.key === 'missing') {
+    return {
+      kind: 'no-key',
+      text: '还没有 ADB 密钥 —— 请在设置页点「配对无线调试」授权一把',
+    };
+  }
+  if (diag.key === 'revoked') {
+    return {
+      kind: 'key-revoked',
+      // ⚠️ 断句一律用 `——`，**不要**用全角括号包裹补充说明 —— 理由见本函数的
+      //    「text 里不能出现全角右括号」那段注释。这条曾经违反过一次。
+      text: '这把 ADB 密钥已被设备撤销授权 —— 请重新配对，' +
+        '多半是在开发者选项里点了「撤销 USB 调试授权」',
+    };
+  }
+  if (diag.key === 'unauthorized') {
+    return {
+      kind: 'key-unauthorized',
+      text: 'ADB 密钥尚未被设备授权 —— 请在设置页点「配对无线调试」',
+    };
+  }
+  if (diag.wireless === 'adb-missing') {
+    return {
+      kind: 'adb-missing',
+      text: '内置 adb 工具链缺失，无线调试通道不可用 —— 请重装 App',
+    };
+  }
+  if (diag.wireless === 'key-blocked') {
+    return {
+      kind: 'key-blocked',
+      text: '密钥未获设备信任，已跳过无线调试通道以免频繁弹出授权框 —— 请重新配对',
+    };
+  }
+  if (diag.wireless === 'connect-failed') {
+    return {
+      kind: 'wireless-stale',
+      // ⚠️ 同 `key-revoked`：补充说明用 `——` 引出，**不要**用全角括号包起来。
+      text: '无线调试端口已失效 —— 多半是无线调试被关掉或重启过，' +
+        '请重新打开无线调试，或在设置页点「切到固定端口」',
+    };
+  }
+  if (diag.wireless === 'no-port') {
+    return {
+      kind: 'no-channel',
+      text: '固定端口 5555 与无线调试都不可用 —— 请打开系统的「无线调试」，' +
+        '或在设置页点「切到固定端口」',
+    };
+  }
+  return {
+    kind: 'unknown',
+    text: legacyReason === '' ? '没有可用的 uid 2000 通道' : legacyReason,
+  };
 }
 
 async function main() {
@@ -1275,6 +1939,11 @@ async function main() {
       // 签名失败，就会去发公钥、白弹一次窗（那正是要根治的行为）。
       const paired = loadKey();
       if (paired !== null) markKeyTrusted(paired);
+      // ⚠️ 重新配对成功意味着设备**重新收下了**这把公钥 ⇒ 之前那次
+      //    「授权被撤销」的结论已经过期。不清的话 `keyMayBeAuthorized()`
+      //    会一直返回 false，通道 1.5 / 通道 2 永远进不去 —— 用户刚配对成功
+      //    却发现特权身份还是拿不到，这是最难查的一类「配对成功但没用」。
+      clearKeyRevoked();
       // 立刻切到固定的 TCP 端口 —— 配对只给了我们「能连无线调试」的权利，而
       // 无线调试的端口**一关开关就没了**（实测断连）。切成 tcpip 之后通道就
       // 不再依赖那个开关，也不会随重启换端口。详见 switchToTcp()。
@@ -1297,15 +1966,18 @@ async function main() {
   }
 
   // ── 子命令：切到固定 TCP 端口（供设置页按钮 / 配对后自动调用）──
+  //
+  // ⚠️ 可选第二个参数是 **Kotlin 侧刚发现的无线调试端口**。它必须能传进来：
+  //    「用户刚关掉无线调试，想让 App 切到固定端口」这个场景下，端口文件是空的
+  //    （被 `onServiceLost` 删了），而只有 Kotlin 侧的 `NsdManager` 能重新发现
+  //    （Node 发不出 UDP 组播）。收到就用它，收不到就走文件 + 重试。
   if (argv[0] === '--switch-tcp') {
-    if (!ensureKey() || !syncKeyForAdb()) {
-      process.stderr.write(`${TAG} ADB 密钥不可用，无法切换\n`);
-      process.exitCode = 1;
-      return;
-    }
-    // ⚠️ 这里不再自己 `connect` —— `switchToTcp()` 现在负责建立那条连接
-    //    （它必须知道端口，而端口就是它自己读的）。
-    process.exitCode = (await switchToTcp()) ? 0 : 1;
+    // ⚠️ 这里**不再**自己检查密钥 —— `switchToTcp()` 现在负责这件事，而且它把
+    //    检查排在了「5555 是否已就绪」**之后**：固定端口本来就好的时候，
+    //    密钥有没有授权都不该妨碍我们如实返回「已就绪」。
+    //    （在这里提前 `ensureKey()` 还会有一个副作用：每次探测都去生成/导入密钥。）
+    const hint = Number.parseInt(argv[1] ?? '', 10);
+    process.exitCode = (await switchToTcp(Number.isInteger(hint) && hint > 0 ? hint : null)) ? 0 : 1;
     return;
   }
 
@@ -1314,7 +1986,7 @@ async function main() {
   //   1. **没有任何调用者**：设置页的状态走的是宿主半插件的 HTTP 路由
   //      （`dsh-android-mobile`），那条路由自己 spawn runner 跑真实探测，
   //      从不经过这个子命令。留着等于一条永不执行的死路径。
-  //   2. 它的输出会**误导排查**：它把 `readWirelessPorts()` 读到的文件内容
+  //   2. 它的输出会**误导排查**：它把 `readWirelessPort()` 读到的文件内容
   //      当成「当前可用端口」报出去，而那个文件可能已经过期（端口是随机且
   //      每次重启都变的）。伪造出一个精确但陈旧的结论，比不报更坏事。
   // 需要无线调试状态时看日志里的 `[mdns] 解析到 … 端口 N` 与 `[dsh-adb]` 行。
@@ -1332,6 +2004,20 @@ async function main() {
   // 放在通道尝试**之前**，这样两条通道用的是同一把，诊断信息也准确。
   const hasKey = ensureKey();
 
+  // ── 诊断采集：每条通道各自记下「为什么没走成」──
+  // 旧实现只记通道 1 的原因，导致四种完全不同的处境在设置页长得一模一样
+  // （见 classifyFallback 的表）。这里三条通道分别记账，最后收敛成一条可执行的结论。
+  const diag = { key: 'ok', wireless: '' };
+  if (!hasKey) {
+    diag.key = 'missing';
+  } else {
+    const k = loadKey();
+    if (k !== null) {
+      if (isKeyRevoked(k)) diag.key = 'revoked';
+      else if (!keyMayBeAuthorized()) diag.key = 'unauthorized';
+    }
+  }
+
   // ── 通道 1：legacy 5555（自实现协议，最快，Android 10 唯一可用）──
   // 先试它是因为成本极低：端口没监听时是立刻 ECONNREFUSED，不拖慢。
   let legacyReason = hasKey ? '' : '没有 ADB 密钥';
@@ -1346,8 +2032,7 @@ async function main() {
       const { stdout, stderr, exitCode } = await conn.shell(wrapped);
       conn.close();
       process.stderr.write(`${TAG} 通道: legacy 127.0.0.1:${PORT}\n`);
-      finish(stdout, stderr, exitCode);
-      return;
+      return await finish(stdout, stderr, exitCode);
     } catch (e) {
       conn.close();
       legacyReason = `执行失败: ${e.message}`;
@@ -1362,28 +2047,34 @@ async function main() {
   //
   // ⚠️ 同样要 `keyMayBeAuthorized()` 守卫：这里用内置 adb 去 `connect` 无线调试
   // 端口，密钥未授权时**内置 adb 自己会弹授权窗**，拦不住，只能提前不进这条分支。
+  //
+  // ⚠️⚠️ **不要给这一段加「端口文件里得有值」的前置条件。** 那个文件正是
+  //    `AdbMdns.onServiceLost` 在**无线调试被关掉时删除**的，而「无线调试被关掉、
+  //    只剩 5555 可救」恰恰是最需要切一次的场景 —— 加了前置条件就形成循环依赖：
+  //
+  //        要恢复 5555 → 需要一条活的 adb 连接 → 只有无线调试点 → 文件却是空的
+  //
+  //    所以端口为空时**照样进去**：`switchToTcp()` 自己会先探 5555、再读文件、
+  //    最后接受调用方传进来的端口。它返回 false 时这一段什么都不做，成本只有
+  //    一次 TCP 探测。
   if (conn === null && hasKey && ADB_BIN !== '' && fs.existsSync(ADB_BIN) && keyMayBeAuthorized()) {
-    const { connect: wlPort } = readWirelessPorts();
-    if (wlPort !== null) {
-      await adbExec(['start-server']);
-      await adbExec(['connect', `${HOST}:${wlPort}`]);
-      if (await switchToTcp()) {
+    const wlPort = readWirelessPort();
+    // 只把「当前活着的那个端口」当线索用；为空就是 null，仍让 switchToTcp 自己决断。
+    if (await switchToTcp(wlPort)) {
+      try {
+        conn = await connect();
+      } catch (e) {
+        legacyReason = `切 TCP 后仍连不上: ${e.message}`;
+      }
+      if (conn !== null) {
         try {
-          conn = await connect();
+          const { stdout, stderr, exitCode } = await conn.shell(wrapped);
+          conn.close();
+          process.stderr.write(`${TAG} 通道: legacy 127.0.0.1:${PORT}（自动切自无线调试）\n`);
+          return await finish(stdout, stderr, exitCode);
         } catch (e) {
-          legacyReason = `切 TCP 后仍连不上: ${e.message}`;
-        }
-        if (conn !== null) {
-          try {
-            const { stdout, stderr, exitCode } = await conn.shell(wrapped);
-            conn.close();
-            process.stderr.write(`${TAG} 通道: legacy 127.0.0.1:${PORT}（自动切自无线调试）\n`);
-            finish(stdout, stderr, exitCode);
-            return;
-          } catch (e) {
-            conn.close();
-            legacyReason = `执行失败: ${e.message}`;
-          }
+          conn.close();
+          legacyReason = `执行失败: ${e.message}`;
         }
       }
     }
@@ -1393,28 +2084,82 @@ async function main() {
   // ⚠️ 守卫：内置 adb 遇到未授权的密钥**自己也会弹「允许 USB 调试吗」**，而它
   // 是外部进程，我们拦不住它的 AUTH 行为。所以只能在进这条通道**之前**就挡住 ——
   // 密钥没被接受过就干脆不试，宁可回落成 app 身份，也不去弹用户的窗。
-  if (hasKey && ADB_BIN !== '' && fs.existsSync(ADB_BIN) && keyMayBeAuthorized() && syncKeyForAdb()) {
-    const { connect: port } = readWirelessPorts();
-    if (port !== null) {
+  if (ADB_BIN === '' || !fs.existsSync(ADB_BIN)) {
+    diag.wireless = 'adb-missing';
+  } else if (!hasKey) {
+    diag.wireless = 'no-port'; // 没有密钥时通道 2 也不成立，但原因已由 key 那条报出
+  } else if (!keyMayBeAuthorized()) {
+    diag.wireless = 'key-blocked';
+  } else if (!syncKeyForAdb()) {
+    diag.wireless = 'key-blocked';
+  } else {
+    const port = readWirelessPort();
+    if (port === null) {
+      diag.wireless = 'no-port';
+    } else {
       const target = `${HOST}:${port}`;
       const r = await runWireless(ADB_BIN, target, wrapped);
       // 连不上就当作这条通道不可用，继续往下回落
       if (r.code !== 1 || !r.stderr.includes('无线调试连接失败')) {
         process.stderr.write(`${TAG} 通道: 无线调试 ${target}\n`);
-        finish(r.stdout, r.stderr, r.code);
-        return;
+        return await finish(r.stdout, r.stderr, r.code);
       }
+      // ⚠️ 端口连不上 ⇒ 那个文件已经陈旧（无线调试关掉或 adbd 重启换了端口）。
+      //    清掉它，避免**接下来每一条**特权命令都先去 connect 一个死端口 ——
+      //    那既拖慢速度，又会在 adb server 里留下一条 offline 设备记录。
+      clearWirelessPortFile();
+      diag.wireless = 'connect-failed';
       process.stderr.write(`${TAG} 无线调试端口 ${port} 连不上，继续回落\n`);
     }
   }
 
   // ── 通道 3：本地执行（app 身份）────────────────────────────
-  const why = legacyReason === '' ? '没有可用的 uid 2000 通道' : legacyReason;
-  process.stderr.write(`${TAG} uid 2000 不可用（${why}）→ 回落为本地执行\n`);
+  const why = classifyFallback(diag, legacyReason);
+  process.stderr.write(
+    `${TAG} uid 2000 不可用（${why.text}）→ 回落为本地执行\n` +
+      `${TAG} 诊断: kind=${why.kind} key=${diag.key} legacy=${legacyReason || 'n/a'} wireless=${diag.wireless || 'n/a'}\n`,
+  );
   process.exitCode = await runLocal(command);
 }
 
-main().catch((e) => {
-  process.stderr.write(`${TAG} 未捕获异常: ${e?.stack ?? e}\n`);
-  process.exitCode = 1;
-});
+/**
+ * 本 runner 是**一次性**的：跑完就该退。这里钉一道与具体 handle 无关的保险，
+ * 保证「有 handle 忘了释放」不会退化成「通知栏一直正在配对」。
+ *
+ * ⚠️ **定时器必须 `unref()`**：否则它自己就成了那个吊住事件循环的 handle，
+ *    本末倒置（这正是探测脚本里 `STILL_ALIVE_AT_3000MS` 那次假阳性的成因）。
+ *    `unref()` 之后，正常路径上进程在它触发前就自然退出，它是纯粹的后备。
+ *
+ * ⚠️ **只在 `main()` settle 之后武装**：不能更早，否则会打断仍在进行的业务。
+ *    宽限期 5 秒足够任何管道排空。
+ */
+function armExitBackstop() {
+  const timer = setTimeout(() => {
+    // ⚠️ 走到这里说明有 handle 没释放 —— 把现场写进 stderr 便于以后定位，
+    //    然后用 `process.exit()` 强制收尾（此时业务已结束、输出已写出，
+    //    与 `finish()` 里禁用 `process.exit()` 的场景不同）。
+    //
+    // ⚠️ `_getActiveHandles()` 是 Node 的内部 API，仅用于诊断，**必须容错**：
+    //    它不存在时不能让这条兜底自己抛异常（那会把「不退出」变成「退出码错」）。
+    let kinds = 'n/a';
+    try {
+      kinds = (process._getActiveHandles?.() ?? [])
+        .map((h) => h?.constructor?.name ?? typeof h)
+        .join(',') || 'n/a';
+    } catch {
+      // 拿不到就算了，兜底照常生效
+    }
+    process.stderr.write(
+      `${TAG} 业务已结束但事件循环仍不空（${EXIT_GRACE_MS}ms 后强制退出）: ${kinds}\n`,
+    );
+    process.exit(process.exitCode ?? 0);
+  }, EXIT_GRACE_MS);
+  timer.unref?.();
+}
+
+main()
+  .catch((e) => {
+    process.stderr.write(`${TAG} 未捕获异常: ${e?.stack ?? e}\n`);
+    process.exitCode = 1;
+  })
+  .finally(armExitBackstop);

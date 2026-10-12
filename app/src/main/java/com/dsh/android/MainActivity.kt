@@ -11,6 +11,7 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
@@ -372,6 +373,76 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { granted ->
         Log.i(DshApplication.TAG, "外部存储权限结果: $granted")
+        // ⚠️ 存储权限的结果回来后**接着**申请通知权限，而不是另起一次并行申请。
+        //
+        //   真机反馈的现象：首次打开 App 只弹了存储权限，通知权限要**退出重开**才弹。
+        //   根因有两层：
+    //     ① 本工程从未在代码里申请过 `POST_NOTIFICATIONS`（只在清单里声明了，
+    //        靠系统在「创建第一个通知渠道」时自动补弹）—— 而那条自动弹框的时机
+    //        由系统定，本 App 的 `targetSdk = 28` 在 Android 13+ 上属于「旧应用」
+    //        路径，系统只在渠道创建时补问一次，错过就再也不会问；
+    //     ② 于是首次启动时那一次自动弹框**被存储权限的框挤掉了**（同一时刻只能
+    //        显示一个权限对话框），用户只看到存储权限。
+        //   两者叠加的后果正是用户说的：没有通知权限 ⇒ 配对引导横幅根本发不出来
+        //   ⇒ 用户想设置特权权限却无处下手（横幅是唯一的交互出口）。
+        //
+        //   现在显式申请、且**串行**接在存储权限之后，保证首次打开就能拿到结论。
+        ensureNotificationAccess()
+    }
+
+    /**
+     * 申请通知权限（Android 13+）。
+     *
+     * 只在系统确实需要运行时授权时申请：`POST_NOTIFICATIONS` 是 API 33 才引入的
+     * 运行时权限，低版本声明了它也没有这回事（`checkSelfPermission` 恒为
+     * `PERMISSION_GRANTED`），所以先用 `SDK_INT` 判一次，避免在旧机上发一次
+     * 无意义的请求。
+     *
+     * ⚠️ **为什么这一个权限值得单独申请**：配对无线调试的整条交互（提示去打开
+     *   「使用配对码配对设备」、输入 6 位码、取消）**全部**走通知栏的 RemoteInput，
+     *   没有通知权限就等于没有出口。`AdbPairingNotifier.start()` 会在此情况下
+     *   直接拒绝开始配对并记日志，设置页据此提示用户 —— 但用户首次打开 App 时
+     *   本该一次性把权限拿齐，而不是先撞一次墙。
+     */
+    private fun ensureNotificationAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            // Android 13 以下没有这个运行时权限，通知默认可用。
+            return
+        }
+        // ⚠️ **这里刻意不做任何「已经授权就早返回」的判断 —— 那正是原缺陷的成因。**
+        //
+        //   本 App 的 `targetSdk = 28`（硬约束②，不能升），在 Android 13+ 上属于
+        //   「旧应用」。这一档的权限语义有两个**互相矛盾**的读数，而它们都不可靠：
+        //
+        //   | 读数 | 对 `targetSdk < 33` 的行为 |
+        //   |---|---|
+        //   | `checkSelfPermission(POST_NOTIFICATIONS)` | 恒为 `GRANTED`（系统把该权限当作隐式已授予）|
+        //   | `areNotificationsEnabled()` | 真机实测 appops 为 `Default mode: allow` ⇒ 也返回 `true` |
+        //
+        //   所以**任何**基于这两个读数的早返回都会让这一句永远走不到，
+        //   通知权限也就永远没人申请 —— 上一版用 `checkSelfPermission` 时就是这样，
+        //   换成 `areNotificationsEnabled()` 只是换了个同样恒真的判据。
+        //
+        //   真正的机制是**创建第一个通知渠道时由系统补弹**（旧应用的兼容路径），
+        //   那条路由 `AdbPairingNotifier.ensureChannel()` 在启动时负责，与这里互补。
+        //
+        //   而这里的显式申请**无条件发出**：若系统认为已授予，它立刻回调 granted=true、
+        //   不弹任何框（零代价）；若系统确实需要授权，它就给出那个框（正是要的）。
+        //   也就是说这一句在两种解释下都正确 —— 比挑一个判据去赌要好。
+        Log.i(DshApplication.TAG, "尝试申请通知权限（配对引导横幅依赖它）")
+        runCatching {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }.onFailure { Log.w(DshApplication.TAG, "发起通知权限申请失败", it) }
+    }
+
+    /**
+     * 通知权限的结果。只记日志 —— 拒绝了也不阻塞任何功能，只是配对引导会走
+     * 设置页那条「请先允许通知」的提示路径（见 `AdbPairingNotifier.notificationsEnabled`）。
+     */
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        Log.i(DshApplication.TAG, "通知权限结果: $granted")
     }
 
     /**
@@ -407,6 +478,10 @@ class MainActivity : AppCompatActivity() {
         ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (needed.isEmpty()) {
             Log.i(DshApplication.TAG, "外部存储权限已就绪")
+            // ⚠️ **这条早返回路径必须也申请通知权限。** 否则「存储权限已就绪」的机器
+            //   （例如重装后、或用户先前已给过存储权限）永远走不到那个 launcher 回调，
+            //   通知权限就再也没人申请 —— 正是「必须退出重开才弹通知权限」的另一半成因。
+            ensureNotificationAccess()
             return
         }
         Log.i(DshApplication.TAG, "申请外部存储权限: ${needed.joinToString()}")
@@ -847,8 +922,10 @@ class MainActivity : AppCompatActivity() {
          * 切完之后特权通道**不再依赖无线调试开关**（实测关掉开关、关掉 Wi-Fi
          * 都不影响）。这是个阻塞操作（几秒），所以丢到后台线程，结果用 Toast 回。
          *
-         * ⚠️ 不能直接在 JS 线程里做：它最多要等约 6 秒（切换 + 轮询端口就绪），
-         * 会卡住 WebView 的 JS 线程。
+         * ⚠️ 不能直接在 JS 线程里做：它最多要等约 30 秒（发现端口 + 切换 + 轮询确认
+         * 真的拿到 uid 2000），会卡住 WebView 的 JS 线程。
+         * ⚠️ 30 秒是**最坏**情况（adbd 要重启且无线调试端口得现发现）。稳态下
+         * 5555 已经在听，runner 第一句探测就返回，几百毫秒。
          */
         override fun switchToTcpMode() {
             Log.i(DshApplication.TAG, "设置页请求切到固定 TCP 端口")

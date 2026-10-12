@@ -25,6 +25,18 @@ class DshApplication : Application() {
         super.onCreate()
         instance = this
         Log.i(TAG, "DSH application created")
+        // ⚠️ 必须在**任何通知发出之前**清理残留（见该方法注释）：上一次配对把进程拖到
+        //   ANR 被杀后，那条常驻的「正在配对」通知会留在通知栏且划不掉，
+        //   用户重新打开 App 会以为还在配对。放在 onCreate 最前面是为了抢在
+        //   EngineService 起前台通知之前 —— 它们用的是不同的通知 id，互不覆盖，
+        //   但都该在启动早期就确定状态。
+        runCatching { AdbPairingNotifier.clearStaleOnStartup(this) }
+            .onFailure { Log.w(TAG, "清理残留配对状态失败", it) }
+        // ⚠️ 启动早期就建出配对通知渠道。本 App `targetSdk = 28`，在 Android 13+
+        //   上走「旧应用」兼容路径 —— 系统只在**创建第一个通知渠道**时补弹一次
+        //   通知权限框，错过就再也不问。原实现渠道要等用户点「配对」才建，
+        //   于是首次打开 App 永远拿不到那个弹框，必须退出重进（见方法注释）。
+        AdbPairingNotifier.ensureChannel(this)
         bootstrapTermux()
     }
 

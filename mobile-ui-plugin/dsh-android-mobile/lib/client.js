@@ -4452,6 +4452,30 @@ window.__ModuleLoader__.load({
 			nextSwitchHint: "建议切到固定端口，这样关掉无线调试开关也不会断。",
 			nextChoose: "还没开启。按下面「无线调试」那几步走一遍即可，不用电脑。",
 			nextChoosePc: "还没开启。按下面的「电脑引导」走一遍 —— 本机是 Android 10，只能用这种方式。",
+			// 探测还没返回、但界面已过软截止（8 秒）时的提示。
+			// ⚠️ 必须同时给出「不用等」和「能做什么」，不能只说「检测中」——
+			//    真机反馈：首次安装时这里一直显示「检测中」且没有任何按钮可点。
+			softPending: "还在探测（设备正在重启 adbd 时可能要几十秒）。你可以直接开始配对，不必等它。",
+			softPendingPc: "还在探测（设备正在重启 adbd 时可能要几十秒）。你可以直接按下面的「电脑引导」开始，不必等它。",
+			// ── 按失败原因给出的「下一步」──────────────────────────
+			//
+			// ⚠️ 判据是 runner 那条 `诊断: kind=…` 行（见宿主半的 `DIAG_KIND_RE`），
+			//    **不是**去匹配中文文案 —— 文案改一个字分支就会静默失效。
+			//    这里只覆盖「下一步动作明确不同」的几类；其余 kind（含 unknown、
+			//    老版本 runner 没有这个字段）继续走上面的通用引导，行为与改动前一致。
+			//
+			// 这几类的共同点：用户光看「App 身份（未提权）」完全不知道该点哪里，
+			// 而实际上每一类的正解都不一样。
+			nextRevoked: "密钥的授权已被设备撤销（多半是点过「撤销 USB 调试授权」）。需要重新配对一次。",
+			nextUnauthorized: "密钥还没被设备授权。点右边按钮走一次配对即可。",
+			nextNoKey: "还没有 ADB 密钥。点右边按钮走一次配对即可，不用电脑。",
+			nextNoKeyPc: "还没有 ADB 密钥。按下面的「电脑引导」走一遍 —— 本机是 Android 10，没有无线调试。",
+			nextWirelessStale: "无线调试端口已失效（多半是关过无线调试或重启过）。重开一次无线调试，或直接点右边按钮切到固定端口。",
+			nextNoChannel: "固定端口和无线调试都不可用。打开系统「无线调试」，或点右边按钮试一次。",
+			nextAdbMissing: "内置的 adb 工具链缺失，无线调试这条路走不通。装一次 App 更新即可修好。",
+			nextKeyBlocked: "密钥没被设备信任，为避免反复弹授权框已跳过无线调试。请重新配对。",
+			nextTimeout: "探测超时了 —— 多半是 adbd 正在重启。等十几秒再点一次「重新检测」。",
+			nextPair: "重新配对",
 
 			// ── root（uid 0）────────────────────────────────────────
 			// ⚠️ 这一块**必须存在**：`root` 工具只在检测到 root 时才注册，所以没有
@@ -4635,6 +4659,21 @@ window.__ModuleLoader__.load({
 			nextSwitchHint: "Switching to a fixed port is recommended so turning wireless debugging off will not break it.",
 			nextChoose: "Not enabled yet. Follow the \"Wireless debugging\" steps below — no computer needed.",
 			nextChoosePc: "Not enabled yet. Follow the computer-based guide below — this device runs Android 10, so that is the only way.",
+			// Probe hasn't returned but the UI passed its soft deadline (8s). Say both
+			// "you don't have to wait" and "what you can do" — never just "Checking…".
+			softPending: "Still probing (this can take a while when adbd is restarting). You can start pairing right away instead of waiting.",
+			softPendingPc: "Still probing (this can take a while when adbd is restarting). You can follow the computer-based guide below instead of waiting.",
+			// ── Cause-specific next steps (see the Chinese dictionary for the rationale) ──
+			nextRevoked: "This key's authorisation was revoked by the device (usually via \"Revoke USB debugging authorisations\"). Pair once more.",
+			nextUnauthorized: "The key has not been authorised by the device yet. Tap the button to pair once.",
+			nextNoKey: "No ADB key yet. Tap the button to pair once — no computer needed.",
+			nextNoKeyPc: "No ADB key yet. Follow the computer-based guide below — this device runs Android 10 and has no wireless debugging.",
+			nextWirelessStale: "The wireless debugging port went stale (wireless debugging was turned off or restarted). Turn it back on, or tap the button to switch to the fixed port.",
+			nextNoChannel: "Neither the fixed port nor wireless debugging is available. Turn on system \"Wireless debugging\", or tap the button to try a switch.",
+			nextAdbMissing: "The bundled adb toolchain is missing, so the wireless route cannot work. Installing an app update fixes it.",
+			nextKeyBlocked: "The key is not trusted by the device, so the wireless route was skipped to avoid repeated authorisation prompts. Pair again.",
+			nextTimeout: "The probe timed out — adbd is most likely still restarting. Wait a few seconds and tap \"Re-check\" again.",
+			nextPair: "Pair again",
 
 			// ── root (uid 0) ──────────────────────────────────────
 			// ⚠️ This block must exist: the `root` tool is only registered when root is
@@ -4810,19 +4849,39 @@ window.__ModuleLoader__.load({
 			const S = MP_PRIV_S;
 			const t = typeof props.t === "function" ? props.t : (key) => MP_PRIV_ZH[key] ?? key;
 			const [state, setState] = React.useState({ phase: "loading" });
+			// ⚠️ **软截止**：探测真正返回前，界面不能一直锁在「检测中」。
+			//
+			//   真机反馈的现象：首次安装打开本页，「当前状态」一直显示「检测中」，
+			//   既没有结论也没有任何按钮（那个「重新检测」按钮在 loading 期间是
+			//   `disabled` 的），只能硬等——而宿主半的探测超时是 **45 秒**，
+			//   用户描述为「等几分钟」。
+			//
+			//   为什么 45 秒砍不掉：那个预算是 runner 最坏路径（三条通道级联 +
+			//   adbd 重启）的上限，砍了会把「慢但成功」误判成失败。
+			//   但**界面不必陪着一起等** —— 超过这个软截止就先按「还没结论」渲染，
+			//   把按钮还给用户；真结果回来时照常覆盖（`phase` 变 ready/error）。
+			const SOFT_DEADLINE_MS = 8000;
+			const [softExpired, setSoftExpired] = React.useState(false);
 			const refresh = React.useCallback(() => {
 				let alive = true;
 				setState({ phase: "loading" });
+				setSoftExpired(false);
+				// 到点就把界面从「检测中」解锁。真正的 fetch 不取消：它回来时
+				// 下面的 then/catch 会用真实结论覆盖掉这个临时视图。
+				const softTimer = setTimeout(() => { if (alive) setSoftExpired(true); }, SOFT_DEADLINE_MS);
 				window.fetch(MP_PRIV_API, { cache: "no-store" })
 					.then((res) => {
 						if (!res.ok) throw new Error("HTTP " + res.status);
 						return res.json();
 					})
-					.then((data) => { if (alive) setState({ phase: "ready", data }); })
+					.then((data) => { if (alive) { clearTimeout(softTimer); setState({ phase: "ready", data }); } })
 					.catch((error) => {
-						if (alive) setState({ phase: "error", message: String((error && error.message) || error) });
+						if (alive) {
+							clearTimeout(softTimer);
+							setState({ phase: "error", message: String((error && error.message) || error) });
+						}
 					});
-				return () => { alive = false; };
+				return () => { alive = false; clearTimeout(softTimer); };
 			}, []);
 			React.useEffect(refresh, [refresh]);
 
@@ -4939,11 +4998,19 @@ window.__ModuleLoader__.load({
 			}, [readRoot]);
 
 			const data = state.phase === "ready" ? state.data : null;
+			// ⚠️ 软截止到期后**不再算 loading**：下一步提示与按钮可用性都按正常态渲染，
+			//   用户立刻拿回控制权（见 SOFT_DEADLINE_MS）。
+			//   真结果回来时 `state.phase` 会变成 ready/error，一切照常覆盖。
+			const loading = state.phase === "loading" && !softExpired;
+			// ⚠️ 但**徽章文案**不能因为软截止就改成「未开启」—— 那时根本没有结论，
+			//   报「未开启」是假话（真结果可能是「已开启」）。只有拿到真结论
+			//   （ready/error）才允许改徽章，否则一律维持「检测中」。
+			const settled = state.phase !== "loading";
 			const identityOk = !!(data && data.identity && data.identity.ok);
-			const tone = state.phase === "loading" ? "unknown"
+			const tone = !settled ? "unknown"
 				: state.phase === "error" ? "off"
 					: identityOk ? "on" : "off";
-			const badgeText = state.phase === "loading" ? t("statusUnknown")
+			const badgeText = !settled ? t("statusUnknown")
 				: state.phase === "error" ? t("failed")
 					: identityOk ? t("statusOn") : t("statusOff");
 
@@ -4975,10 +5042,40 @@ window.__ModuleLoader__.load({
 				&& (data.key.origin === "imported" || data.key.origin === "paired"));
 			let next = null;
 			if (data) {
+				// 失败分类（runner 那条 `诊断: kind=…` 行）。没拿到时是 "unknown"，
+				// 下面的分支会自动退回通用引导 —— 与改动前的行为一致。
+				const kind = data.identity && data.identity.kind ? data.identity.kind : "unknown";
+				// 四类「密钥侧」的问题，正解都是**再配对一次**，只是原因不同。
+				const keyKind = kind === "no-key" || kind === "key-revoked"
+					|| kind === "key-unauthorized" || kind === "key-blocked";
 				if (identityOk) {
 					next = channel === "wireless"
 						? { text: t("nextSwitchHint"), action: "switchTcp", label: t("wlTcp") }
 						: { text: t("nextAllGood"), action: null };
+				} else if (keyKind) {
+					// ⚠️ 只在系统真支持无线调试时才给配对按钮 —— 否则那个按钮在
+					//    Android 10 上永远走不通，点了只是白等（与下面同一条约束）。
+					const text = kind === "no-key"
+						? t(wirelessSupported ? "nextNoKey" : "nextNoKeyPc")
+						: kind === "key-revoked" ? t("nextRevoked")
+							: kind === "key-unauthorized" ? t("nextUnauthorized")
+								: t("nextKeyBlocked");
+					next = wirelessSupported
+						? { text, action: "pair", label: t(kind === "no-key" ? "wlPair" : "nextPair") }
+						: { text, action: null };
+				} else if (kind === "wireless-stale" || kind === "no-channel") {
+					// 这两类的正解是**切到固定端口**：固定端口一旦就绪就不再依赖
+					// 无线调试开关，恰好绕开「无线调试关着 ⇒ 无线通道必然不可用」。
+					next = {
+						text: t(kind === "wireless-stale" ? "nextWirelessStale" : "nextNoChannel"),
+						action: "switchTcp",
+						label: t("wlTcp"),
+					};
+				} else if (kind === "adb-missing" || kind === "timeout") {
+					// 这两类没有能替用户按的按钮：前者要重装 App，后者只是 adbd
+					// 还在重启（等一会儿点「重新检测」）。给一句可执行的说明就够，
+					// **不要**摆一个点了没用的按钮。
+					next = { text: t(kind === "adb-missing" ? "nextAdbMissing" : "nextTimeout"), action: null };
 				} else if (data.key && data.key.origin === "generated" && wirelessSupported) {
 					// 只有系统真支持无线调试时，才引导去配对 —— 否则那个按钮
 					// 在 Android 10 上永远走不通，点了只是白等。
@@ -5134,14 +5231,32 @@ window.__ModuleLoader__.load({
 						onClick: () => doAction(next.action),
 					}, next.label) : null,
 				) : null,
+				// ⚠️ 软截止到期、真结果还没回来时，明确告诉用户「还在探测、你可以不等」，
+				//   并直接给出「重新匹配」入口 —— 而不是留一个没有结论也没有按钮的死界面。
+				//   真机反馈原话：「你一检测没有就是没有了呀，没有就让用户重新走匹配流程啊，
+				//   我要这里等几分钟？」这条分支就是那个诉求的落点。
+				softExpired && state.phase === "loading" ? e("div", { style: S.next },
+					e("span", { style: S.nextText }, t(wirelessSupported ? "softPending" : "softPendingPc")),
+					// ⚠️ 只有系统真支持无线调试时才给配对按钮 —— Android 10 上配对
+					//   根本不存在，摆一个点了必然白等的按钮比不给更糟（与上面
+					//   `keyKind` 分支同一条约束）。
+					wirelessSupported ? e("button", {
+						type: "button",
+						style: S.btnPrimary,
+						onClick: () => doAction("pair"),
+					}, t("wlPair")) : null,
+				) : null,
 				state.phase === "error" ? e("p", { style: S.error }, state.message) : null,
 				e("div", { style: S.actions },
 					e("button", {
 						type: "button",
 						style: S.btn,
-						disabled: state.phase === "loading",
+						// ⚠️ 只在**软截止之前**禁用。到点即解锁，用户不必陪着探测一起等 ——
+						//   真机反馈的「一直显示检测中、又没有按钮、又没有停止」正是
+						//   这里一直 `disabled` 造成的。
+						disabled: loading,
 						onClick: refresh,
-					}, state.phase === "loading" ? t("checking") : t("recheck")),
+					}, loading ? t("checking") : t("recheck")),
 					data ? e("button", {
 						type: "button",
 						style: S.btnQuiet,
