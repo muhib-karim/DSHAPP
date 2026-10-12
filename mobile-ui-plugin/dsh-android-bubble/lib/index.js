@@ -84,6 +84,30 @@ const MAX_FRAMES = 64;
 const MAX_FRAMES_BASE64 = 6 * 1024 * 1024;
 
 /**
+ * 动作数量上限。与原生侧 `BubbleFrames.MAX_ACTIONS` 必须一致。
+ *
+ * 桌面宠物通常 3–5 个动作（待机/思考/干活/等待/出错），24 个够用很久。
+ */
+const MAX_ACTIONS = 24;
+
+/**
+ * **一次调用里全部动作**的 base64 总预算。
+ *
+ * ⚠️ 与 [MAX_FRAMES_BASE64] 是两个口径：那个是"一个动作的帧"，这个是"这次调用
+ *   要下发的全部帧"。只查前者的话，宠物一次配 5 个动作、每个 5 MB，合计 25 MB
+ *   会照样过闸 —— 而原生侧那一次 `readText()` 就足以被 LMK 杀掉。
+ */
+const ACTION_BUDGET_BASE64 = 12 * 1024 * 1024;
+
+/**
+ * 合法的运行状态名。与原生侧 `BubbleAppearance.RUN_STATES` 必须一致。
+ *
+ * ⚠️ 多一个、少一个都不会报错，只会**静默不生效**（原生 `actionMapOf` 会把
+ *   未知状态整条丢掉）—— 那种"配了但宠物不按它动"最难查。
+ */
+const RUN_STATES = ['idle', 'thinking', 'working', 'waiting', 'error'];
+
+/**
  * 模型可见的工具描述 —— **这是本插件最要紧的一段文本**。
  *
  * 三件事必须写死，理由与 `dsh-android-shell` 同：
@@ -146,6 +170,30 @@ Panel and status:
 - \`statusAutoHideMs\`: how long the status strip stays after its content stops changing; 0 disables auto-hide
 - \`edgeSnap\`: boolean — whether dragging the ball off-screen collapses it into an edge sliver
 
+## Desktop pet: one animation per state
+
+A single frame set can only say "this ball animates". To make the ball a **pet that
+reacts to what you are doing**, register several *named* actions and map run states
+to them:
+
+1. \`actions: {"idle": {...}, "work": {...}, "wait": {...}}\` — each spec is a frame
+   set (same fields as \`frameFiles\` + \`spriteRows\`/\`spriteCols\`/\`frameIntervalMs\`/
+   \`frameDurations\`/\`frameLoop\`, but named). Names: a–z 0–9 \`-\` \`_\`, max 24 chars.
+   An empty \`frames\` array deletes that action. \`action:"get"\` returns the \`actions\`
+   list that actually exists on disk.
+2. \`actionMap: {"thinking":"think","working":"work","waiting":"wait","error":"sad"}\` —
+   the pet then switches animation **by itself** as your run state changes. States:
+   \`idle\` (not running), \`thinking\` (you are generating), \`working\` (a tool/command is
+   executing), \`waiting\` (waiting for the user — approval or input), \`error\` (last turn
+   failed). Unmapped states fall back to the default action.
+3. \`action:"state"\` with \`runState\` (and optionally \`playAction\`) reports the state
+   right now **without saving anything** — this is how a state-bridge plugin drives the
+   pet from engine events. \`action:"notify"\` still works for one-off lines.
+
+\`pinAction\` pins one action by name (the pet ignores \`actionMap\`); \`pinAction:""\` goes
+back to automatic switching. Prefer \`action:"state"\` over \`pinAction\` for live control:
+\`pinAction\` is saved to disk, \`runState\` is not.
+
 ## Recipes for common asks
 
 - "transparent background, keep the picture" → \`{bgOpacity: 0}\`
@@ -156,6 +204,11 @@ Panel and status:
 - "animate this sprite sheet" → \`{frameFiles: ["/abs/sheet.png"], spriteRows: 4, spriteCols: 4, frameIntervalMs: 120}\`
 - "make it bigger and see-through" → \`{size: 96, opacity: 0.6}\`
 - "tell me when you're done" → \`{action: "notify", text: "搞定", durationMs: 4000}\`
+- "make it a desktop pet" → register \`actions\` for idle/think/work + an \`actionMap\`, then
+  drive it with \`{action:"state", runState:"working"}\` while you work
+- "have the pet react while you work" → \`{action:"state", runState:"thinking"}\` before you
+  start, \`runState:"working"\` around each tool call, \`runState:"idle"\` when done
+- "stop making it a pet" → \`{actionMap: {}, pinAction: ""}\`
 
 Invalid values fall back to the current value instead of failing, and unknown fields are ignored, so a typo does not make the ball disappear. The result tells you the appearance as it is *after* the change; check it if you need to be sure.
 
@@ -171,6 +224,9 @@ function pickFields(args) {
 		'bgOpacity', 'avatarOpacity', 'avatarScale',
 		'bg', 'bg2', 'border', 'borderWidth', 'avatar',
 		'frameIntervalMs', 'frameDurations', 'frameLoop', 'spriteRows', 'spriteCols',
+		// ⚠️ `action`（钦定的动作名）**允许空串**：空串的语义是"回到跟随状态自动
+		//   切换"，一刀切地丢掉空串会让模型没法从钦定切回自动。
+		//   所以它不放进这个通用循环，由 execute 单独处理（见那里的 pinAction）。
 		'spin', 'pulse',
 		'panelWidth', 'panelHeight', 'panelBg', 'panelText', 'panelAccent',
 		'statusAutoHideMs', 'edgeSnap',
@@ -248,6 +304,72 @@ function readFrameFiles(files) {
 		? `（只用了前 ${capped.length} 帧，上限 ${MAX_FRAMES}）`
 		: '';
 	return { ok: true, frames, note };
+}
+
+/**
+ * 把 `actions` 参数（动作名 → 规格）翻成原生认的那份 `actions` 对象。
+ *
+ * 规格里允许 `frameFiles`（本进程读文件）或 `frames`（已是 data URI），其余字段
+ * 原样透传。**全有或全无**：任何一个动作的图读不出来就整批放弃 —— 只写一半会让
+ * 宠物"有的动有的不动"，而模型拿到的是"成功"，无从知道哪几个没生效。
+ *
+ * ⚠️ 预算分两层：单个动作由 [readFrameFiles] 限 6 MB，**全部动作合计**由
+ *   [ACTION_BUDGET_BASE64] 限 12 MB。只限前者的话，一次配 5 个动作各 5 MB
+ *   会照样过闸，而原生侧那一次 `readText()` 就足以被 LMK 杀掉。
+ *
+ * @param {object} actions - `{动作名: 规格}`。
+ * @returns {{ok: true, actions: object, note: string, count: number} | {ok: false, error: string}}。
+ */
+function buildActions(actions) {
+	if (actions === null || typeof actions !== 'object' || Array.isArray(actions)) {
+		return { ok: false, error: 'actions 必须是对象（动作名 → 规格）' };
+	}
+	const names = Object.keys(actions);
+	if (names.length > MAX_ACTIONS) {
+		return { ok: false, error: `动作过多（${names.length} > 上限 ${MAX_ACTIONS}）` };
+	}
+
+	const out = {};
+	let budget = 0;
+	for (const rawName of names) {
+		const name = String(rawName).trim().toLowerCase();
+		if (!/^[a-z0-9_-]{1,24}$/.test(name)) {
+			return { ok: false, error: `动作名不合法: ${rawName}（只允许 a-z 0-9 - _，最多 24 字符）` };
+		}
+		const spec = actions[rawName];
+		if (spec === null || typeof spec !== 'object') {
+			return { ok: false, error: `动作 ${rawName} 的规格必须是对象` };
+		}
+		const entry = {};
+		for (const key of ['spriteRows', 'spriteCols', 'frameIntervalMs', 'frameDurations', 'frameLoop']) {
+			if (spec[key] !== undefined && spec[key] !== null) entry[key] = spec[key];
+		}
+		// 两种来源二选一：`frames` 已是 data URI（模型自己拼的），`frameFiles` 要读盘。
+		if (spec.frames !== undefined) {
+			if (!Array.isArray(spec.frames)) {
+				return { ok: false, error: `动作 ${rawName} 的 frames 必须是数组` };
+			}
+			budget += spec.frames.reduce((n, s) => n + (typeof s === 'string' ? s.length : 0), 0);
+			entry.frames = spec.frames;
+		} else if (spec.frameFiles !== undefined) {
+			const read = readFrameFiles(spec.frameFiles);
+			if (!read.ok) return { ok: false, error: `动作 ${rawName}: ${read.error}` };
+			budget += read.frames.reduce((n, s) => n + s.length, 0);
+			entry.frames = read.frames;
+		} else {
+			return { ok: false, error: `动作 ${rawName} 缺少 frames 或 frameFiles` };
+		}
+		if (budget > ACTION_BUDGET_BASE64) {
+			return {
+				ok: false,
+				error: `本次要下发的全部动作帧总量过大（已超 ${Math.round(ACTION_BUDGET_BASE64 / 1024 / 1024)} MB）。`
+					+ '请一次只配 2–3 个动作，或把图片压小 —— 一次塞太多会让原生侧被系统杀掉，'
+					+ '症状是"悬浮球突然消失、什么都没发生"。',
+			};
+		}
+		out[name] = entry;
+	}
+	return { ok: true, actions: out, note: '', count: Object.keys(out).length };
 }
 
 /** 写文件（先写临时文件再 rename —— 原生侧可能正读到一半）。 */
@@ -332,10 +454,33 @@ function bubbleTool(home) {
 			properties: {
 				action: {
 					type: 'string',
-					enum: ['set', 'get', 'notify'],
-					description: '"set" applies the fields below; "get" only reads the current appearance back; "notify" pushes text into the status strip above the ball without changing any setting.',
+					enum: ['set', 'get', 'notify', 'state'],
+					description: '"set" applies the fields below; "get" only reads the current appearance back; "notify" pushes text into the status strip above the ball without changing any setting; "state" reports the CURRENT RUN STATE (and optionally which action to play) without changing any setting — that is what a desktop-pet companion uses.',
 				},
 				state: { type: 'string', enum: ['expanded', 'collapsed', 'hidden', 'auto'] },
+				runState: {
+					type: 'string',
+					enum: ['idle', 'thinking', 'working', 'waiting', 'error'],
+					description: 'For action:"state" (and for actionMap below) — what the engine is doing right now. idle = not running; thinking = model generating; working = a tool/command is executing; waiting = waiting for the user (approval/input); error = the last turn failed.',
+				},
+				playAction: {
+					type: 'string',
+					description: 'For action:"state" — the action name to play right now. Pass "" to clear it and let actionMap decide again. Omit to leave the current forced action alone. Names come from the `actions` list; register them with `actions` first.',
+				},
+				actions: {
+					type: 'object',
+					description: 'Register/update named action frame sets — this is how you build a desktop pet with one animation per state. An object mapping action name → spec, e.g. {"idle":{"frameFiles":["/abs/idle.png"],"spriteRows":2,"spriteCols":4},"think":{"frameFiles":["/abs/a.png","/abs/b.png"],"frameIntervalMs":150}}. Each spec accepts frameFiles (or frames), spriteRows, spriteCols, frameIntervalMs, frameDurations, frameLoop. An empty frames array deletes that action. Names: a–z, 0–9, "-", "_" (max 24 chars).',
+					additionalProperties: true,
+				},
+				actionMap: {
+					type: 'object',
+					description: 'State → action name map, e.g. {"thinking":"think","working":"work","waiting":"wait","error":"sad"}. With an empty `action` the pet then switches animation by itself as the run state changes. Pass {} to clear the map.',
+					additionalProperties: { type: 'string' },
+				},
+				pinAction: {
+					type: 'string',
+					description: 'Pin ONE action by name so the pet always plays it and ignores actionMap. Use "default" to force the default action set, or "" to go back to automatic state-driven switching. Saved to disk, unlike playAction.',
+				},
 				shape: { type: 'string', enum: ['circle', 'square', 'rounded', 'path'] },
 				shapePath: { type: 'string', description: 'SVG path "d" for shape:"path" — any outline you like, in shapeViewBox units. Max 4000 chars.' },
 				shapeViewBox: { type: 'string', description: '"minX minY width height" for shapePath, default "0 0 100 100".' },
@@ -397,7 +542,8 @@ function bubbleTool(home) {
 			card: 'generic',
 			title: args.action === 'get'
 				? '读取悬浮窗外观'
-				: args.action === 'notify' ? '推送状态消息' : '修改悬浮窗',
+				: args.action === 'notify' ? '推送状态消息'
+					: args.action === 'state' ? '驱动宠物动作' : '修改悬浮窗',
 			description: describeCall(args),
 		}),
 		async execute(args) {
@@ -422,8 +568,75 @@ function bubbleTool(home) {
 				};
 			}
 
+			// `state` 的报状态分支。同样走独立通道：它不改外观（不落盘），
+			// 只影响"现在演哪个动作"。
+			if (action === 'state') {
+				const runState = typeof args.runState === 'string' ? args.runState.trim() : '';
+				if (runState !== '' && !RUN_STATES.includes(runState)) {
+					return {
+						ok: false,
+						appearance: '',
+						message: `runState 取值非法: ${runState}（可选 ${RUN_STATES.join(' / ')}）`,
+					};
+				}
+				// ⚠️ 「没传 playAction」与「传了空串」意思不同：前者不动钦定的动作，
+				//   后者清掉钦定、回到 actionMap。用 `!== undefined` 区分，不能靠 trim。
+				const hasPlay = args.playAction !== undefined;
+				const play = hasPlay && typeof args.playAction === 'string' ? args.playAction.trim() : '';
+				if (runState === '' && !hasPlay) {
+					return {
+						ok: false,
+						appearance: '',
+						message: 'action:"state" 至少要带 runState 或 playAction',
+					};
+				}
+				const payload = { action: 'state' };
+				if (runState !== '') payload.state = runState;
+				if (hasPlay) payload.name = play;
+				const reply = await sendCommand(home, ++seq, payload);
+				const what = [
+					runState === '' ? '' : `状态=${runState}`,
+					hasPlay ? (play === '' ? '动作=恢复自动' : `动作=${play}`) : '',
+				].filter(Boolean).join(' · ');
+				return {
+					ok: reply.ok,
+					appearance: reply.appearance ?? '',
+					message: reply.ok ? `已更新运行状态（${what}）` : reply.message,
+				};
+			}
+
 			const fields = pickFields(args ?? {});
 			const notes = [];
+
+			// 钦定的动作名单独处理：它**允许空串**（= 回到自动跟随状态），
+			// 而 pickFields 会把空串当"没传"丢掉。
+			if (typeof args?.pinAction === 'string') fields.action = args.pinAction.trim();
+
+			// `actionMap`：状态 → 动作名。逐条校验，非法的那条直接报错而不是静默丢 ——
+			// 「配了但宠物不按它动」是最难查的一类问题（原生侧也会丢未知状态）。
+			if (args?.actionMap !== undefined) {
+				const map = args.actionMap;
+				if (map === null || typeof map !== 'object' || Array.isArray(map)) {
+					return { ok: false, appearance: '', message: 'actionMap 必须是对象（状态 → 动作名）' };
+				}
+				const bad = Object.keys(map).filter((k) => !RUN_STATES.includes(k));
+				if (bad.length > 0) {
+					return {
+						ok: false,
+						appearance: '',
+						message: `actionMap 里有未知状态: ${bad.join(', ')}（可选 ${RUN_STATES.join(' / ')}）`,
+					};
+				}
+				fields.actionMap = map;
+			}
+
+			// `actions`：一次配多套动作帧集（桌面宠物的主体）。
+			if (args?.actions !== undefined) {
+				const built = buildActions(args.actions);
+				if (!built.ok) return { ok: false, appearance: '', message: `动作集不可用（${built.error}）` };
+				fields.actions = built.actions;
+				if (built.count > 0) notes.push(` · 已配 ${built.count} 个动作`);
+			}
 
 			// `avatarFile` → data URI。先做，因为它可能失败，失败时要**明确报错**
 			// 而不是静默退回内置头像（那样用户会看到球突然变成默认头像却没有任何提示）。
@@ -488,6 +701,19 @@ function summarizeFields(fields) {
 			parts.push(`frames:${n} 帧`);
 			continue;
 		}
+		// ⚠️ `actions` 里装的是**每个动作的整批帧**，同样不能 stringify ——
+		//   5 个动作 × 每动作几十万字符，回显一次就把上下文撑爆。只报动作名与帧数。
+		if (key === 'actions') {
+			const names = value && typeof value === 'object' ? Object.keys(value) : [];
+			const detail = names.map((n) => {
+				const spec = value[n] ?? {};
+				const frames = Array.isArray(spec.frames) ? spec.frames.length : 0;
+				const grid = spec.spriteRows && spec.spriteCols ? `,精灵图${spec.spriteRows}×${spec.spriteCols}` : '';
+				return `${n}(${frames} 帧${grid})`;
+			});
+			parts.push(`actions:{${detail.join(', ')}}`);
+			continue;
+		}
 		if (key === 'avatar' && typeof value === 'string' && value.startsWith('data:')) {
 			parts.push(`avatar:自定义图片(${Math.round(value.length / 1024)} KB)`);
 			continue;
@@ -504,8 +730,24 @@ function describeCall(args) {
 		const text = typeof args?.text === 'string' ? args.text : '';
 		return text === '' ? '推送状态消息' : `推送状态消息：${text}`;
 	}
+	if (args?.action === 'state') {
+		const bits = [];
+		if (args?.runState) bits.push(`状态 ${args.runState}`);
+		if (args?.playAction !== undefined) {
+			bits.push(args.playAction === '' ? '动作恢复自动' : `动作 ${args.playAction}`);
+		}
+		return bits.length > 0 ? `驱动宠物：${bits.join(' · ')}` : '驱动宠物动作';
+	}
 	const bits = [];
 	if (args?.state !== undefined) bits.push(String(args.state));
+	if (args?.actions !== undefined) {
+		const n = args.actions && typeof args.actions === 'object' ? Object.keys(args.actions).length : 0;
+		bits.push(`配 ${n} 个动作`);
+	}
+	if (args?.actionMap !== undefined) bits.push(`状态映射 ${Object.keys(args.actionMap ?? {}).length} 项`);
+	if (args?.pinAction !== undefined) {
+		bits.push(args.pinAction === '' ? '动作恢复自动' : `钦定动作 ${args.pinAction}`);
+	}
 	if (args?.size !== undefined) bits.push(`${args.size}dp`);
 	if (args?.shape !== undefined) bits.push(String(args.shape));
 	if (args?.shapePath !== undefined) bits.push('自定义形状');

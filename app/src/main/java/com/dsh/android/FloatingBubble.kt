@@ -28,6 +28,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -358,6 +359,44 @@ class FloatingBubble(private val context: Context) {
             return true
         }
 
+        /**
+         * 直接切动作（桌面宠物用），**不改持久配置**。
+         *
+         * ⚠️ 与 [applyAppearance] 是两条路：那条改的是"这个球以后长什么样"（落盘、
+         *   重启仍在），这条只影响"现在这一下演什么"。常驻状态桥插件每几秒就要报
+         *   一次状态，走落盘那条会把 SharedPreferences 刷爆、也会让 AI 的配置被
+         *   运行状态覆盖掉。
+         *
+         * ⚠️ 传空串 = 清掉临时钦定，回到 `actionMap`／配置里的动作。
+         *
+         * @return 是否已交给一个正在显示的悬浮球。
+         */
+        fun applyActionToActive(action: String): Boolean {
+            val cur = instance ?: return false
+            main.post { cur.setOverrideAction(action) }
+            return true
+        }
+
+        /**
+         * 按**运行状态**驱动动作（`session/event` 那一路的落点）。
+         *
+         * @param runState [BubbleAppearance.RUN_STATES] 之一；空串或未知值表示
+         *   只切动作、不动运行状态。
+         * @param action 该状态下要播的动作名；**null = 别动临时钦定的动作**，
+         *   空串 = 清掉钦定（回到 `actionMap` 自动映射）。
+         */
+        fun applyRunStateToActive(runState: String, action: String?): Boolean {
+            val cur = instance ?: return false
+            main.post {
+                // ⚠️ 顺序要紧：先落钦定动作，再落运行状态。反过来的话，钦定动作还没
+                //   生效时 [applyRunState] 会先按 `actionMap` 刷一次，紧接着钦定那一步
+                //   又刷一次 —— 一次状态推送重启两遍轮播。
+                if (action != null) cur.setOverrideAction(action)
+                if (runState.isNotEmpty()) cur.syncRunStateFromPlugin(runState)
+            }
+            return true
+        }
+
         /** 读回当前外观配置（JSON 文本）。插件据此做「读取-修改-写回」。 */        fun currentAppearanceJson(): String {
             val ctx = appContext ?: return "{}"
             val a = BubbleAppearance.load(ctx)
@@ -384,6 +423,25 @@ class FloatingBubble(private val context: Context) {
                 put("frameLoop", a.frameLoop)
                 put("spriteRows", a.spriteRows)
                 put("spriteCols", a.spriteCols)
+                // ⚠️ `action` 是**空串也要给**：空串正是"自动跟随状态"的取值，
+                //   插件要靠它判断"现在是不是自动模式"，省略掉会读成 undefined。
+                put("action", a.action)
+                put(
+                    "actionMap",
+                    JSONObject().apply {
+                        for ((k, v) in a.actionMap) put(k, v)
+                    },
+                )
+                // 磁盘上真实存在的动作名 —— AI 据此知道"现在能用哪些动作"，
+                // 不用自己维护一份清单。
+                put("actions", JSONArray().apply {
+                    for (n in BubbleFrames.actionNames(ctx)) put(n)
+                })
+                // ⚠️ 这两个只有"球正在显示"时才有意义（取自实例，不是配置）：
+                //   `runState` 是当前运行状态，`playingAction` 是**实际**在播的动作
+                //   （可能与配置里的 `action` 不同 —— 指向的动作没帧时会回退）。
+                put("runState", instance?.runState ?: "")
+                put("playingAction", instance?.frameAction ?: "")
                 put("spin", a.spin)
                 put("pulse", a.pulse)
                 put("panelWidth", a.panelWidth)
@@ -505,6 +563,29 @@ class FloatingBubble(private val context: Context) {
 
     /** 下一次切帧的 Runnable（用来取消）。null = 没有在跑。 */
     private var frameRunnable: Runnable? = null
+
+    /**
+     * 当前正在播的动作名。
+     *
+     * ⚠️ 与 [BubbleAppearance.action] 不是一回事：那个是**配置里的意愿**，
+     *   这个是**实际在播的那个**（意愿指向的动作没帧时会退回默认动作）。
+     *   帧下标 [frameIndex] 只对同一个动作有意义，所以换动作时必须把它清零。
+     */
+    private var frameAction = BubbleFrames.DEFAULT_ACTION
+
+    /** 当前运行状态（[BubbleAppearance.RUN_IDLE] 等），由引擎状态推导。 */
+    private var runState = BubbleAppearance.RUN_IDLE
+
+    /**
+     * 脚本/AI **临时**钦定的动作（不走持久配置）。
+     *
+     * ⚠️ 优先级低于 [BubbleAppearance.action]（那是落盘的明确意愿）、高于
+     *   `actionMap` 的自动映射 —— 否则"配了状态映射"就等于"脚本再也控制不了动作"。
+     */
+    private var stateOverrideAction = ""
+
+    /** 上一次因为"动作不存在"而回退时警告过的动作名，避免每帧刷日志。 */
+    private var warnedMissingAction = ""
 
     /** 旋转动画是否已在跑（避免重复 start）。 */
     private var spinning = false
@@ -861,8 +942,8 @@ class FloatingBubble(private val context: Context) {
             }
         }
 
-        // ── 内容层：内置头像 / 自定义图片 / 轮播帧 / 精灵图 ─────────────
-        applyContentLayer(side)
+        // ── 内容层：内置头像 / 自定义图片 / 动作帧集 / 精灵图 ───────────
+        applyActionLayer(side)
 
         // ── 贴边薄片：高度跟随球，宽度固定 ─────────────────────────────
         edgeView?.let { e ->
@@ -899,6 +980,161 @@ class FloatingBubble(private val context: Context) {
     }
 
     /**
+     * 按运行状态选一个动作，再交给 [applyContentLayer]。
+     *
+     * 选择优先级（桌面宠物的"该做哪个动作"就这三条）：
+     * ① 配置里的 `action` 非空 → 就播它（AI 明确点名，压过一切）；
+     * ② 脚本临时钦定的 [stateOverrideAction] → 播它；
+     * ③ `actionMap[runState]` → 按当前运行状态自动映射；
+     * ④ 都没有 → [BubbleFrames.DEFAULT_ACTION]。
+     *
+     * ⚠️ **要的那套帧不在磁盘上就退回默认动作**，并把 [frameAction] 记成实际播的
+     *   那个。若不退回：`actionMap` 配了 `thinking` 但用户没传过 thinking 的帧，
+     *   球会**整个变空白**（帧文件找不到），比"动作没换"严重得多。
+     */
+    private fun applyActionLayer(side: Int) {
+        val playable = resolvePlayableAction(wantedAction())
+        if (playable != frameAction) {
+            // ⚠️ 换动作必须清零帧下标：下标是"第几个动作里的第几帧"，
+            //   沿用旧下标会从新动作的中间开始播（甚至越界）。
+            frameIndex = 0
+            frameLoops = 0
+            frameAction = playable
+        }
+        applyContentLayer(side)
+    }
+
+    /**
+     * 当前**想要**播的动作名（还没核对磁盘上有没有）。
+     *
+     * 选择优先级（桌面宠物的"该做哪个动作"就这三条）：
+     * ① 配置里的 `action` 非空 → 就播它（AI 明确点名，压过一切）；
+     * ② 脚本临时钦定的 [stateOverrideAction] → 播它；
+     * ③ `actionMap[runState]` → 按当前运行状态自动映射；
+     * ④ 都没有 → [BubbleFrames.DEFAULT_ACTION]。
+     */
+    private fun wantedAction(): String = when {
+        appearance.action.isNotEmpty() -> appearance.action
+        stateOverrideAction.isNotEmpty() -> stateOverrideAction
+        else -> BubbleAppearance.actionFor(appearance, runState, BubbleFrames.DEFAULT_ACTION)
+    }
+
+    /**
+     * 由引擎状态推导**运行状态**（宠物该做哪一类动作）。
+     *
+     * ⚠️ 这是**粗粒度**那一路：页面每 1 秒才采一次，短于一秒的工具调用会整个漏掉。
+     *   细粒度那一路是 `dsh-android-pet` 插件订阅引擎的 `session/event`，
+     *   它走 [applyRunState] 直接点名动作 —— 两条路最终都落到同一处切换。
+     *
+     * ⚠️ 判定顺序要紧：「等待确认」这类文案往往**同时**含"运行命令"之类的词
+     *   （审批就是从工具调用里弹出来的），先判工具就会把"等你确认"显示成"干活中"。
+     */
+    private fun deriveRunState(status: EngineStatus): String {
+        if (!status.running) return BubbleAppearance.RUN_IDLE
+        val act = status.activity.lowercase()
+        val text = status.text
+        if (text.contains("等待") || text.contains("确认") ||
+            act.contains("approval") || act.contains("wait") || act.contains("input")
+        ) {
+            return BubbleAppearance.RUN_WAITING
+        }
+        if (act.contains("tool") || act.contains("command") ||
+            text.startsWith("正在运行") || text.contains("执行了")
+        ) {
+            return BubbleAppearance.RUN_WORKING
+        }
+        return BubbleAppearance.RUN_THINKING
+    }
+
+    /**
+     * 引擎状态刷新时顺带更新运行状态，并（在自动模式下）让动作跟上。
+     *
+     * ⚠️ **动作没变就不重刷内容层**：状态每秒推一次，无条件重刷会把正在播的那一轮
+     *   打断（每帧都从当前下标重新排一次 postDelayed）—— 表现为"宠物动作一卡一卡"。
+     */
+    private fun syncRunState(status: EngineStatus) {
+        applyRunState(deriveRunState(status))
+    }
+
+    /**
+     * 落到一个新的运行状态，并（在自动模式下）让动作跟上。
+     *
+     * ⚠️ **动作没变就不重刷内容层**：状态每秒推一次，无条件重刷会把正在播的那一轮
+     *   打断（每帧都从当前下标重新排一次 postDelayed）—— 表现为"宠物动作一卡一卡"。
+     *
+     * ⚠️ 两条状态通道（页面采样 / 插件事件）都必须走这里。曾经插件那一路只改
+     *   [runState] 而不刷新，理由是"动作名会紧接着设"—— 但插件**可以只报状态不带
+     *   动作名**（那是它的常态），于是 `actionMap` 永远不生效，表现为
+     *   "runState 跟着变、宠物动作纹丝不动"。
+     */
+    private fun applyRunState(next: String) {
+        if (next == runState) return
+        runState = next
+        // 钦定动作（配置或脚本）不受运行状态影响，不用白刷一遍。
+        if (appearance.action.isNotEmpty() || stateOverrideAction.isNotEmpty()) return
+        if (resolvePlayableAction(wantedAction()) == frameAction) return
+        avatarView?.let { applyActionLayer(dp(appearance.size)) }
+    }
+
+    /**
+     * 脚本/插件临时钦定一个动作。
+     *
+     * ⚠️ 传空串是**清掉钦定**，不是"播一个叫空串的动作"。
+     * ⚠️ 钦定的动作存在于磁盘时不必重刷内容层，由 [applyActionLayer] 幂等地判定。
+     */
+    private fun setOverrideAction(action: String) {
+        val next = if (action.isBlank()) "" else action.trim()
+        if (next == stateOverrideAction) return
+        stateOverrideAction = next
+        if (resolvePlayableAction(wantedAction()) != frameAction) {
+            applyActionLayer(dp(appearance.size))
+        }
+    }
+
+    /**
+     * `session/event` 那一路报来的运行状态（比页面的 1 秒采样细得多）。
+     *
+     * ⚠️ 与 [syncRunState] 走同一个落点：插件**可以只报状态、不带动作名**
+     *   （那是它的常态），这时动作就得靠 `actionMap` 自动跟上。
+     */
+    private fun syncRunStateFromPlugin(state: String) {
+        if (state !in BubbleAppearance.RUN_STATES) {
+            Log.w(TAG, "运行状态未知，已忽略: $state")
+            return
+        }
+        applyRunState(state)
+    }
+
+    /**
+     * 把一个"想播的动作名"落到磁盘上真实存在的动作。
+     *
+     * ⚠️ 名字不合法（含路径字符等）时 [BubbleFrames.normalizeAction] 返回 null ——
+     *   这种情况**只警告一次**，否则每帧（轮播 400ms 一帧）都会刷一行日志。
+     */
+    private fun resolvePlayableAction(wanted: String): String {
+        val name = BubbleFrames.normalizeAction(wanted)
+        if (name != null && BubbleFrames.available(context, name)) {
+            warnedMissingAction = ""
+            return name
+        }
+        if (name == null) {
+            if (warnedMissingAction != wanted) {
+                Log.w(TAG, "悬浮球动作名非法，改用默认动作: $wanted")
+                warnedMissingAction = wanted
+            }
+            return BubbleFrames.DEFAULT_ACTION
+        }
+        // ⚠️ **默认动作没有帧不是异常**，而是绝大多数用户的常态（他们只用内置头像）。
+        //   这里若也打日志，每次启动都会留一条"帧集不在磁盘上"的警告，把真正的
+        //   问题（配了 actionMap 却忘了传那套帧）淹掉。
+        if (name != BubbleFrames.DEFAULT_ACTION && warnedMissingAction != name) {
+            Log.i(TAG, "悬浮球动作 $name 的帧集不在磁盘上，改用默认动作")
+            warnedMissingAction = name
+        }
+        return BubbleFrames.DEFAULT_ACTION
+    }
+
+    /**
      * 内容层（头像 / 轮播帧 / 精灵图）。
      *
      * 优先级：**轮播帧 > 自定义头像 > 内置头像**。轮播在跑时不去碰单张头像的
@@ -916,9 +1152,12 @@ class FloatingBubble(private val context: Context) {
         // 轮播帧：先停掉旧的播放器，再按新配置决定要不要重启。
         stopFramePlayer()
 
-        if (appearance.frameCount > 0 && BubbleFrames.available(context)) {
+        // ⚠️ 帧数**按当前动作问磁盘**，不信 `appearance.frameCount` ——
+        //   那个值描述的是配置里那个动作，换到别的动作后会对不上。
+        val count = BubbleFrames.frameCount(context, frameAction)
+        if (count > 0 && BubbleFrames.available(context, frameAction)) {
             iv.visibility = View.VISIBLE
-            showFrame(frameIndex.coerceIn(0, appearance.frameCount - 1), side)
+            showFrame(frameIndex.coerceIn(0, count - 1), side)
             startFramePlayer()
             return
         }
@@ -981,10 +1220,14 @@ class FloatingBubble(private val context: Context) {
         view.invalidateOutline()
     }
 
-    /** 显示轮播的第 [index] 帧。解码失败时保持上一帧，不留白。 */
+    /** 显示当前动作的第 [index] 帧。解码失败时保持上一帧，不留白。 */
     private fun showFrame(index: Int, side: Int) {
         val iv = avatarView ?: return
-        val bmp = BubbleFrames.loadFrame(context, index, BubbleAppearance.spriteOf(appearance), side)
+        // ⚠️ 网格优先问**磁盘**（每个动作各自带网格），配置里那份只当兜底 ——
+        //   宠物不同动作常来自不同素材，共用一份网格必然有一套被切错。
+        val bmp = BubbleFrames.loadFrame(
+            context, index, side, frameAction, BubbleAppearance.spriteOf(appearance),
+        )
         if (bmp != null) iv.setImageBitmap(bmp)
     }
 
@@ -994,24 +1237,30 @@ class FloatingBubble(private val context: Context) {
      * ⚠️ 逐帧时长可以各不相同（`frameDurations`），所以用**自递归的 postDelayed**
      *   而不是 `scheduleAtFixedRate` —— 后者只能等间隔。
      *
-     * ⚠️ `frameLoop >= 0` 时播完指定轮数就停在最后一帧（不回到第一帧）：
+     * ⚠️ `loop >= 0` 时播完指定轮数就停在最后一帧（不回到第一帧）：
      *   那是"播一次作为提示"的用法，回到第一帧会让人以为它还在转。
+     *
+     * ⚠️ 帧数/时长/网格/轮数**全部在启动时从磁盘读一次**，而不是每帧去读：
+     *   轮播 400ms 一帧，每次都解析 meta.json 是白白的 I/O。中途换了动作由
+     *   `frameAction != action` 那一条判据退出，交给下一次切动作重启。
      */
     private fun startFramePlayer() {
-        val count = appearance.frameCount
+        val action = frameAction
+        val count = BubbleFrames.frameCount(context, action)
         if (count <= 1) return
-        val durations = BubbleFrames.durations(context, appearance.frameIntervalMs)
-        val sprite = BubbleAppearance.spriteOf(appearance)
+        val durations = BubbleFrames.durations(context, appearance.frameIntervalMs, action)
+        val loop = BubbleFrames.loop(context, appearance.frameLoop, action)
+        val interval = appearance.frameIntervalMs
         val side = dp(appearance.size)
 
         val step = object : Runnable {
             override fun run() {
-                // 配置变了（帧数/时长）就退出，由下一次 applyContentLayer 重启。
-                if (appearance.frameCount != count || !expandedSafeForFrames()) return
+                // 动作换了或球没了就退出，由下一次 applyActionLayer 重启。
+                if (frameAction != action || !expandedSafeForFrames()) return
                 val next = frameIndex + 1
                 if (next >= count) {
                     frameLoops++
-                    if (appearance.frameLoop in 0 until frameLoops) {
+                    if (loop in 0 until frameLoops) {
                         // 播够了：停在最后一帧。
                         frameRunnable = null
                         return
@@ -1019,12 +1268,12 @@ class FloatingBubble(private val context: Context) {
                 }
                 frameIndex = next % count
                 showFrame(frameIndex, side)
-                val delay = (durations.getOrNull(frameIndex) ?: appearance.frameIntervalMs).toLong()
+                val delay = (durations.getOrNull(frameIndex) ?: interval).toLong()
                 root?.postDelayed(this, delay.coerceAtLeast(20L))
             }
         }
         frameRunnable = step
-        val delay = (durations.getOrNull(frameIndex) ?: appearance.frameIntervalMs).toLong()
+        val delay = (durations.getOrNull(frameIndex) ?: interval).toLong()
         root?.postDelayed(step, delay.coerceAtLeast(20L))
     }
 
@@ -2079,6 +2328,9 @@ class FloatingBubble(private val context: Context) {
      */
     private fun applyStatus(status: EngineStatus) {
         lastStatus = status
+        // ⚠️ 先推状态、再换动作：换动作会重启轮播（一次 I/O + 一次解码），
+        //   而状态横条是用户立刻能看到的东西。顺序反了会让横条慢一拍。
+        syncRunState(status)
         try {
             paintDot(dotView, status.running)
             paintDot(panelDot, status.running, small = true)

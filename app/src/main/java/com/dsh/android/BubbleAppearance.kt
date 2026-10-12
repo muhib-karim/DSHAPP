@@ -110,6 +110,23 @@ data class BubbleAppearance(
     val spriteRows: Int = 0,
     val spriteCols: Int = 0,
     val frameLoop: Int = -1,
+    /**
+     * 当前动作名（桌面宠物用）。
+     *
+     * ⚠️ **空串 = 跟随 [actionMap] 自动切换**，非空 = 插件/脚本钦定这个动作。
+     *   这正是「AI 直接让宠物做某个动作」与「让宠物跟着运行状态自己动」两种用法
+     *   的分界：前者显式传 `action`，后者只配 `actionMap`。
+     */
+    val action: String = "",
+    /**
+     * 状态 → 动作名 的映射（桌面宠物的核心）。
+     *
+     * key 是**运行状态**（见 [STATE_IDLE] 等），value 是 [BubbleFrames] 里的动作名。
+     * 只配关心的那几个即可，没配的状态退回 [BubbleFrames.DEFAULT_ACTION]。
+     *
+     * 例：`{"thinking":"think","working":"work","waiting":"wait"}`
+     */
+    val actionMap: Map<String, String> = emptyMap(),
     val spin: Int = 0,
     val pulse: Boolean = false,
     val panelWidth: Int = 260,
@@ -135,6 +152,31 @@ data class BubbleAppearance(
 
         /** 形态：强制隐藏（连球都不显示）。 */
         const val STATE_HIDDEN = "hidden"
+
+        // ── 运行状态（桌面宠物的动作选择依据）───────────────────────────
+        //
+        // ⚠️ 这几个是**运行状态**，与上面的 `state`（窗口形态）是两回事：
+        //   一个是「球长什么样」，一个是「AI 在干什么」。
+        //   刻意只有 5 个：每多一个，插件就多一处要维护的映射，而映射错了
+        //   用户看到的是「宠物在做错的动作」，比少一个状态难查。
+
+        /** 空闲：没在跑，等你输入。 */
+        const val RUN_IDLE = "idle"
+
+        /** 思考：模型在生成（还没有工具在跑）。 */
+        const val RUN_THINKING = "thinking"
+
+        /** 干活：有工具/命令正在执行。 */
+        const val RUN_WORKING = "working"
+
+        /** 等待：等用户确认、等输入、等外部事件。 */
+        const val RUN_WAITING = "waiting"
+
+        /** 出错：上一轮失败了。 */
+        const val RUN_ERROR = "error"
+
+        /** 全部运行状态。用于校验 [actionMap] 的 key。 */
+        val RUN_STATES = listOf(RUN_IDLE, RUN_THINKING, RUN_WORKING, RUN_WAITING, RUN_ERROR)
 
         const val SHAPE_CIRCLE = "circle"
         const val SHAPE_SQUARE = "square"
@@ -217,6 +259,11 @@ data class BubbleAppearance(
                 spriteRows = clampInt(o, "spriteRows", base.spriteRows, 0, 32),
                 spriteCols = clampInt(o, "spriteCols", base.spriteCols, 0, 32),
                 frameLoop = clampInt(o, "frameLoop", base.frameLoop, -1, 100_000),
+                // ⚠️ `action` 空串是**合法取值**（= 自动跟随状态），不能像其它文本
+                //   字段那样"空串即保持原值" —— 那会让 AI 没法从钦定动作切回自动。
+                //   只在字段缺席时才保留原值。
+                action = if (o.has("action")) actionOf(o, "action") else base.action,
+                actionMap = if (o.has("actionMap")) actionMapOf(o, "actionMap") else base.actionMap,
                 spin = clampInt(o, "spin", base.spin, -720, 720),
                 pulse = if (o.has("pulse")) o.optBoolean("pulse", base.pulse) else base.pulse,
                 panelWidth = clampInt(o, "panelWidth", base.panelWidth, 180, 2000),
@@ -228,17 +275,30 @@ data class BubbleAppearance(
                 edgeSnap = if (o.has("edgeSnap")) o.optBoolean("edgeSnap", base.edgeSnap) else base.edgeSnap,
             )
 
-            // ── 轮播帧 ──
+            // ── 轮播帧 / 动作帧集 ──
             //
             // ⚠️ 帧字节**不落进配置**（几十张图进 SharedPreferences 会把它撑爆），
             //   这里只处理"要不要换帧集"以及随之而来的元信息。
             //   没有 context 时（纯解析场景）只认帧数，字节由调用方负责 —— 见 save()。
+            //
+            // ⚠️ **这段是"默认动作"的路径**：`action` 为空（或恰好是 default）时，
+            //   写的就是 `bubble-frames/` 本身 —— 也就是 0.2.6 及以前那套布局。
+            //   AI 只改 `frames` 的老用法因此一字不变。
+            val targetAction = BubbleFrames.normalizeAction(merged.action)
+            if (targetAction == null) {
+                Log.w(TAG, "悬浮球动作名非法，保持原动作")
+                merged = merged.copy(action = base.action)
+            }
+            val writeAction = targetAction ?: BubbleFrames.DEFAULT_ACTION
+
             if (o.has("frames") && context != null) {
                 val arr = o.optJSONArray("frames")
                 if (arr == null || arr.length() == 0) {
-                    // 显式传空数组 = 清空轮播，回到单张头像。
-                    BubbleFrames.clear(context)
-                    merged = merged.copy(frameCount = 0)
+                    // 显式传空数组 = 清空这个动作的轮播，回到单张头像。
+                    BubbleFrames.clear(context, writeAction)
+                    if (writeAction == BubbleFrames.DEFAULT_ACTION) {
+                        merged = merged.copy(frameCount = 0)
+                    }
                 } else {
                     val frames = ArrayList<String>(arr.length())
                     for (i in 0 until arr.length()) {
@@ -247,11 +307,19 @@ data class BubbleAppearance(
                     }
                     val durations = intArrayOf(o, "frameDurations")
                     val sprite = spriteOf(merged)
+                    val loop = clampInt(o, "frameLoop", merged.frameLoop, -1, 100_000)
                     val n = BubbleFrames.write(
                         context, frames, durations, sprite, merged.frameIntervalMs,
+                        writeAction, loop,
                     )
                     if (n != null) {
-                        merged = merged.copy(frameCount = n)
+                        if (writeAction == BubbleFrames.DEFAULT_ACTION) {
+                            merged = merged.copy(frameCount = n)
+                        }
+                        // ⚠️ 名字是这个动作唯一的记录 —— 磁盘上的目录建出来了，
+                        //   但配置里的 `action` 若还指着别的动作，刚写的这套帧
+                        //   就没人在播。所以写谁就切到谁。
+                        merged = merged.copy(action = writeAction)
                     } else {
                         Log.w(TAG, "轮播帧写入失败，保持原帧集")
                     }
@@ -261,18 +329,62 @@ data class BubbleAppearance(
                 // 做不到就退回"每帧一张完整图"，并明确告知 —— 静默用错网格会让
                 // 球显示成网格里的碎块，比不显示更难查。
                 val sprite = spriteOf(merged)
-                if (sprite != null && merged.frameCount > 0) {
-                    val n = BubbleFrames.rewriteSprite(context, sprite)
-                    if (n == null) {
+                if (sprite != null) {
+                    val n = BubbleFrames.rewriteSprite(context, sprite, writeAction)
+                    if (n == null && writeAction == BubbleFrames.DEFAULT_ACTION && merged.frameCount > 0) {
                         Log.w(TAG, "精灵图网格重切失败（帧字节已丢），退回整图模式")
                         merged = merged.copy(spriteRows = 0, spriteCols = 0)
                     }
                 }
             }
 
+            // ── 一次配一套动作（桌面宠物）──
+            //
+            // ⚠️ 传的是**对象**而不是数组：`{"idle":{"frames":[…]},"thinking":{…}}`。
+            //   用数组的话动作名要跟帧并列塞进同一层，解析时得分辨"这是帧还是名字"，
+            //   而对象让每个动作各自带着自己那套 `frames`/`spriteRows`/`frameLoop`。
+            //
+            // ⚠️ 每个动作**独立合并**，一个失败不影响其余：宠物有 4 个动作，
+            //   其中一个图坏了，另外 3 个照常换上，比整批回退好。
+            if (context != null && o.has("actions")) {
+                val acts = o.optJSONObject("actions")
+                if (acts != null) {
+                    val names = acts.keys().asSequence()
+                        .map { BubbleFrames.normalizeAction(it) }
+                        .filterNotNull()
+                        .filter { it != BubbleFrames.DEFAULT_ACTION }
+                        .take(BubbleFrames.MAX_ACTIONS)
+                        .toList()
+                    for (nm in names) {
+                        val spec = acts.optJSONObject(nm) ?: continue
+                        applyActionSpec(context, nm, spec)
+                    }
+                    if (names.isNotEmpty() && merged.action.isEmpty()) {
+                        // 只配动作集、没点名播哪个 —— 让状态映射（或默认动作）去决定。
+                        Log.i(TAG, "已写入悬浮球动作集: ${names.joinToString()}")
+                    }
+                }
+            }
+
+            // ⚠️ **帧数以磁盘为准**：配置里那个 `frameCount` 只是"上一次写成功了几帧"，
+            //   而动作集批量写入、清空、精灵图重切都会改变真实帧数。
+            //   不信磁盘就会显示空白（找不到 index.bin）或漏播最后几帧。
+            // ⚠️ 帧数与网格都以磁盘为准：写入、清空、精灵图重切都会改变真实帧数，
+            //   而配置里那份只是"上一次写成功了几帧"。不信磁盘就会显示空白
+            //   （找不到 index.bin）或按错网格切片（显示成碎块）。
+            if (context != null) {
+                val realCount = BubbleFrames.frameCount(context, writeAction)
+                val realSprite = BubbleFrames.sprite(context, writeAction)
+                merged = merged.copy(
+                    frameCount = realCount,
+                    spriteRows = realSprite?.first ?: 0,
+                    spriteCols = realSprite?.second ?: 0,
+                )
+            }
+
             // 帧集在磁盘上真的存在才算数：用户清过数据、或上一轮写失败时，
             // 配置里留着 frameCount>0 会让球显示空白（找不到帧文件）。
-            if (context != null && merged.frameCount > 0 && !BubbleFrames.available(context)) {
+            if (context != null && merged.frameCount > 0 && !BubbleFrames.available(context, writeAction)) {
                 Log.w(TAG, "配置里有轮播帧但磁盘上找不到，退回单张头像")
                 merged = merged.copy(frameCount = 0)
             }
@@ -291,6 +403,105 @@ data class BubbleAppearance(
         /** 精灵图网格（两者都 > 0 才有效）。 */
         fun spriteOf(a: BubbleAppearance): Pair<Int, Int>? =
             if (a.spriteRows > 0 && a.spriteCols > 0) a.spriteRows to a.spriteCols else null
+
+        /**
+         * 动作名字段。
+         *
+         * ⚠️ 空串是**合法取值**（= 跟随状态自动切换），所以不能复用 [textOf]
+         *   （它把空串当"没传"并返回 fallback）。非法名（含路径分隔符等）一律
+         *   退成空串：宁可回到自动，也不要让一个坏名字写到不该写的地方。
+         */
+        private fun actionOf(o: JSONObject, key: String): String {
+            val raw = o.optString(key, "").trim()
+            if (raw.isEmpty()) return ""
+            val name = BubbleFrames.normalizeAction(raw)
+            if (name == null) {
+                Log.w(TAG, "悬浮球动作名非法: $raw（退回自动跟随状态）")
+                return ""
+            }
+            // ⚠️ `default` 要**保留**而不是归一成空串：空串的语义是"跟随状态自动切换"，
+            //   而 `action:"default"` 的语义是"就播默认动作、别跟状态变"。两者不同，
+            //   归一了就没法强制回到默认动作。
+            return name
+        }
+
+        /**
+         * 状态 → 动作名 的映射。
+         *
+         * ⚠️ 两处都校验：key 必须是已知运行状态，value 必须是合法动作名。
+         *   任何一项不合规就**丢掉这一条而不是整份映射** —— 宠物配了 4 个状态，
+         *   其中一个打错字不该让另外 3 个也失效。
+         *
+         * ⚠️ 传空对象 = 清空映射（回到"永远播默认动作"），与"没传"不同。
+         */
+        private fun actionMapOf(o: JSONObject, key: String): Map<String, String> {
+            val src = o.optJSONObject(key) ?: return emptyMap()
+            val out = LinkedHashMap<String, String>()
+            for (state in src.keys()) {
+                if (state !in RUN_STATES) {
+                    Log.w(TAG, "动作映射的运行状态未知，已忽略: $state")
+                    continue
+                }
+                val raw = src.optString(state, "").trim()
+                if (raw.isEmpty()) continue
+                val name = BubbleFrames.normalizeAction(raw)
+                if (name == null) {
+                    Log.w(TAG, "动作映射里的动作名非法，已忽略: $state → $raw")
+                    continue
+                }
+                out[state] = if (name == BubbleFrames.DEFAULT_ACTION) "" else name
+            }
+            return out
+        }
+
+        /**
+         * 按 [RUN_STATES] 的顺序给出动作名，没配的用 [fallback]。
+         *
+         * 这是「哪个动作该播」的唯一判定入口 —— 原生自动切换与插件主动点名
+         * 都从这里取，免得两处各写一份 if 链。
+         */
+        fun actionFor(a: BubbleAppearance, runState: String, fallback: String): String {
+            val mapped = a.actionMap[runState]
+            if (!mapped.isNullOrEmpty()) return mapped
+            return fallback
+        }
+
+        /**
+         * 写入一个动作的帧集（`actions` 对象里的一项）。
+         *
+         * ⚠️ 每个动作**各自解析自己的网格与轮数**，不共用全局那份：宠物不同动作
+         *   常常来自不同的素材包（待机是 4 帧精灵图、思考是 6 帧独立图），
+         *   强制共用网格会让其中一套显示成碎块。
+         *
+         * ⚠️ 失败**不抛**：批量配动作时一个坏图不该让另外几个换不上。
+         */
+        private fun applyActionSpec(context: Context, name: String, spec: JSONObject) {
+            val arr = spec.optJSONArray("frames")
+            if (arr == null || arr.length() == 0) {
+                // 显式空数组 = 删掉这个动作。
+                BubbleFrames.clear(context, name)
+                Log.i(TAG, "已删除悬浮球动作: $name")
+                return
+            }
+            val frames = ArrayList<String>(arr.length())
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "")
+                if (s.isNotEmpty()) frames += s
+            }
+            val rows = spec.optInt("spriteRows", 0)
+            val cols = spec.optInt("spriteCols", 0)
+            val sprite = if (rows > 0 && cols > 0) rows to cols else null
+            val intervalMs = spec.optInt("frameIntervalMs", 400).coerceIn(20, 60_000)
+            val loop = spec.optInt("frameLoop", BubbleFrames.LOOP_FOREVER).coerceIn(-1, 100_000)
+            val n = BubbleFrames.write(
+                context, frames, intArrayOf(spec, "frameDurations"), sprite, intervalMs, name, loop,
+            )
+            if (n == null) {
+                Log.w(TAG, "悬浮球动作 $name 写入失败，保持原帧集")
+            } else {
+                Log.i(TAG, "悬浮球动作 $name 已就位: $n 帧")
+            }
+        }
 
         /** 读一个 int 数组字段；不存在或非法时返回空数组。 */
         private fun intArrayOf(o: JSONObject, key: String): List<Int> {
@@ -512,6 +723,16 @@ data class BubbleAppearance(
                 put("frameLoop", appearance.frameLoop)
                 put("spriteRows", appearance.spriteRows)
                 put("spriteCols", appearance.spriteCols)
+                // ⚠️ 动作名与状态映射必须落盘，否则重启后宠物就只会播默认动作 ——
+                //   而磁盘上那几套动作帧还在，表现为"重开 App 宠物就不动了"。
+                //   动作名空串也要写：它是"自动跟随"这个状态本身。
+                put("action", appearance.action)
+                put(
+                    "actionMap",
+                    JSONObject().apply {
+                        for ((k, v) in appearance.actionMap) put(k, v)
+                    },
+                )
                 put("spin", appearance.spin)
                 put("pulse", appearance.pulse)
                 put("panelWidth", appearance.panelWidth)

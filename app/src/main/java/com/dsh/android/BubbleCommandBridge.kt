@@ -49,6 +49,28 @@ object BubbleCommandBridge {
     /** 回执文件名。同上，两边必须一起改。 */
     private const val RESULT_FILE = "bubble-result.json"
 
+    /**
+     * **状态播报**文件（单向、无回执）。
+     *
+     * 由常驻状态桥插件（`dsh-android-pet`）写：它订阅引擎的 `session/event`，
+     * 每有进展就把"现在是什么运行状态"放进来，这里读走、**消费掉（删除）**。
+     *
+     * ## 为什么不让它复用 [CMD_FILE]
+     *
+     * 两条理由，任一条都足以否决复用：
+     *
+     * ① **id 空间会撞。** 回执是按 `id` 配对的，而本桥与那个插件各自从 1 开始
+     *    自增（两个独立进程里的两个独立计数器）。同一个 `id=5` 同时存在时，
+     *    工具调用会收到状态播报的回执 —— 表现为"AI 说改了悬浮球，但没生效"，
+     *    极难归因。
+     * ② **会互相覆盖。** 工具调用写完命令要等最多 4 秒回执，这期间状态播报若是
+     *    覆盖了同一个文件，工具调用必然超时。
+     *
+     * 而状态播报**本来就不需要回执**（它是"我现在在干什么"，不是"请你做什么"），
+     * 所以独立文件、读完即删，是最贴合语义的做法。
+     */
+    private const val STATE_FILE = "bubble-state.json"
+
     /** 轮询间隔。见类注释里为什么是粗粒度。 */
     private const val POLL_MS = 250L
 
@@ -89,6 +111,10 @@ object BubbleCommandBridge {
      */
     private fun pollOnce() {
         val dir = home ?: return
+        // 状态播报先读：它是**穷尽式**的（读到就删），与命令信箱互不影响。
+        // ⚠️ 顺序不能反 —— 命令分支在极端情况下会 return（缺 id 时丢弃请求），
+        //   放在它后面会让状态播报跟着一起漏读一拍。
+        pollState(dir)
         val cmd = File(dir, CMD_FILE)
         if (!cmd.isFile) return
 
@@ -133,6 +159,30 @@ object BubbleCommandBridge {
                 val sticky = json.optBoolean("sticky", false)
                 ok = FloatingBubble.pushStatusToActive(text, durationMs, sticky)
                 message = if (ok) "" else "悬浮球尚未显示（没有活动的悬浮球实例）"
+            } else if (action == "state") {
+                // 走**运行状态**这一路：常驻状态桥插件（见 `dsh-android-pet`）订阅引擎的
+                // `session/event`，每有进展就往这里推一次。
+                //
+                // ⚠️ 与 `set` 刻意分开：`set` 改的是**持久外观**（落盘），而运行状态
+                //   每几秒就变一次，走那条路会把 SharedPreferences 刷爆，还会把
+                //   AI 自己配好的外观冲掉。
+                //
+                // ⚠️ **动作名走 `name` 字段，不能用 `action`** —— 本文件的 `action`
+                //   已经被占用为「命令名」，拿它当动作名会读到命令名本身，插件那边
+                //   看着像"切动作成功"但宠物演的还是默认动作。
+                val state = json.optString("state", "").trim()
+                // ⚠️ `name` 缺席与空串是**两种意思**，所以不能用 optString：
+                //   缺席 = 别动临时钦定的动作（只更新运行状态），
+                //   空串 = 清掉临时钦定（回到 actionMap 自动映射）。
+                val hasName = json.has("name")
+                val act = if (hasName) json.optString("name", "").trim() else null
+                if (state.isEmpty() && act == null) {
+                    ok = false
+                    message = "state 命令至少要带 state 或 name"
+                } else {
+                    ok = FloatingBubble.applyRunStateToActive(state, act)
+                    message = if (ok) "" else "悬浮球尚未显示（没有活动的悬浮球实例）"
+                }
             } else {
                 // 合并语义在 applyAppearance 内部（它会把字段并到当前配置上），
                 // 所以这里只管把 fields 序列化过去。
@@ -151,6 +201,42 @@ object BubbleCommandBridge {
         // ②：先写回执，再删请求。反过来的话插件会超时。
         writeResult(dir, id, ok, message, appearance)
         cmd.delete()
+    }
+
+    /**
+     * 读一次**状态播报**（单向）。
+     *
+     * ⚠️ 「先读内容、再删文件」的窗口是**故意留的**：播报是幂等的（同一个状态
+     *   重复应用没有副作用），所以哪怕这一拍读到、删之前被杀、下一拍再读一次，
+     *   结果也完全一样。反过来（先删再读）会真丢一拍 —— 那才是要避免的。
+     *
+     * ⚠️ 解析失败**不删文件**，下一拍再试。写到一半的 JSON 是正常现象（插件用
+     *   「写临时文件 + rename」发布，虽然理论上不会留下半个，但这里不必依赖它）。
+     */
+    private fun pollState(dir: File) {
+        val f = File(dir, STATE_FILE)
+        if (!f.isFile) return
+        val text = try {
+            f.readText()
+        } catch (t: Throwable) {
+            return
+        }
+        val json = try {
+            JSONObject(text)
+        } catch (t: Throwable) {
+            return
+        }
+        val state = json.optString("state", "").trim()
+        // ⚠️ `action` 同样要能区分"缺席"与"空串"：缺席 = 只更新运行状态，
+        //   空串 = 清掉临时钦定、回到 actionMap 自动映射。
+        val hasAction = json.has("action")
+        val action = if (hasAction) json.optString("action", "").trim() else null
+        try {
+            FloatingBubble.applyRunStateToActive(state, action)
+        } catch (t: Throwable) {
+            Log.w(TAG, "应用悬浮球运行状态失败: ${t.message}")
+        }
+        f.delete()
     }
 
     /**

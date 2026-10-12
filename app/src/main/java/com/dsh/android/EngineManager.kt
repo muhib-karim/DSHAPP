@@ -2957,6 +2957,82 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出桌面宠物的**状态桥**插件（`pet-bridge.zip` → `$DSH_HOME/pet-bridge/dsh-android-pet/`）。
+     *
+     * 该插件订阅引擎的 `session/event`（`@deepseek-ai/dsh-session` 声明的 post-commit
+     * 事件流），把「AI 现在在干什么」翻译成运行状态写进 `$DSH_HOME/bubble-state.json`，
+     * 由 [BubbleCommandBridge] 读走喂给悬浮球 —— 悬浮球据此换动作，成为桌面宠物。
+     *
+     * ## 为什么不并进 `dsh-android-bubble`
+     *
+     * 两者生命周期完全不同：[BUBBLE_TOOL_PACKAGE] 只在**模型调用 `bubble` 工具**时
+     * 被用到，而这个桥**每一轮回复都在跑**。并在一起会让「只想让 AI 改外观」的用户
+     * 也长期挂着一个事件订阅者，而且 `inject: ['tools']` 是工具插件需要的、状态桥
+     * 不需要 —— 多声明的服务就是多一个"引擎没它就整个不激活"的机会。
+     *
+     * 与悬浮球工具插件一样**不做版本戳**：包很小（两个文件），每次启动覆盖写。
+     */
+    private fun ensurePetBridge() {
+        val target = File(dshHome, "$PET_BRIDGE_DIR/$PET_BRIDGE_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(PET_BRIDGE_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装桌面宠物状态桥插件 $PET_BRIDGE_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是宠物不会自己动，不该拖垮引擎启动
+            Log.w(TAG, "安装桌面宠物状态桥插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载状态桥的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * ⚠️ **与悬浮球工具是两条独立 overlay，不是一个**：那条走 [writeBubbleToolPatch]，
+     *   缺了它模型仍然能用 `bubble` 工具；这条缺了则宠物不会自己动。合在一起的话
+     *   任一侧失败会让另一侧也失效，而两者的失败原因毫无关系。
+     */
+    private fun writePetBridgePatch(): File? {
+        val patch = File(dshHome, PET_BRIDGE_PATCH)
+        val entry = File(dshHome, "$PET_BRIDGE_DIR/$PET_BRIDGE_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "桌面宠物状态桥入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载桌面宠物状态桥：订阅 session/event，把运行状态写进
+                # ${'$'}DSH_HOME/bubble-state.json，让悬浮球按状态换动作。
+                - insert:
+                    - id: $PET_BRIDGE_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入桌面宠物状态桥 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入桌面宠物状态桥 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出无线调试用的 adb 工具链（`adb-wireless-arm64.zip` → `filesDir/adbwire/`）。
      *
      * ## 为什么需要一个 adb 二进制
@@ -3930,6 +4006,10 @@ class EngineManager private constructor(private val context: Context) {
         //   悬浮球不需要任何身份，只要求用户开过开关并授权过悬浮窗。
         ensureBubbleTool()
         val bubblePatch = writeBubbleToolPatch()
+        // 桌面宠物状态桥：把引擎的 `session/event` 转成悬浮球的动作切换。
+        // ⚠️ 与上面那条**并列且独立**：那条给模型 `bubble` 工具，这条让宠物自己会动。
+        ensurePetBridge()
+        val petPatch = writePetBridgePatch()
         // 悬浮球命令信箱：`bubble` 工具把命令写进 `$DSH_HOME/bubble-cmd.json`，
         // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
         // 信箱还没人守，命令会一直等不到回执。
@@ -4008,6 +4088,10 @@ class EngineManager private constructor(private val context: Context) {
             // 悬浮球控制工具：同样是 overlay，注册成独立的 `bubble` 工具
             if (bubblePatch != null) {
                 add("--patch"); add(bubblePatch.absolutePath)
+            }
+            // 桌面宠物状态桥：同样是 overlay（只订阅事件，不注册工具）
+            if (petPatch != null) {
+                add("--patch"); add(petPatch.absolutePath)
             }
             // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
             // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
@@ -5076,6 +5160,23 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val BUBBLE_TOOL_DIR = "bubble-tool"
+
+        // ── 桌面宠物状态桥 ───────────────────────────────────────────
+        //
+        // 与悬浮球控制工具**分开两个包**，理由见 [ensurePetBridge] 的注释。
+        // 它订阅 `session/event`，把运行状态写进 `$DSH_HOME/bubble-state.json`。
+        //
+        // ⚠️ 与 `bubble` 工具走**不同的信箱文件**：回执按 `id` 配对，而两者各自
+        //   从 1 自增，共用文件会让工具调用收到状态播报的回执。见
+        //   `BubbleCommandBridge.STATE_FILE` 的注释。
+
+        /** 状态桥插件；打包成 zip 随 APK 分发。不做版本戳（每次启动覆盖写）。 */
+        private const val PET_BRIDGE_ASSET = "pet-bridge.zip"
+        private const val PET_BRIDGE_PACKAGE = "dsh-android-pet"
+        private const val PET_BRIDGE_PATCH = "pet-bridge.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。同样刻意在 pnpm 管辖之外。 */
+        private const val PET_BRIDGE_DIR = "pet-bridge"
 
         /**
          * 无线调试（Android 11+）用的 adb 工具链。
