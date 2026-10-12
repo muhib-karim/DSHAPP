@@ -3304,8 +3304,13 @@ overlay → 有遮挡层？→ 点「此刻能点的」里那个按钮 → 再�
 ```powershell
 node tools\ui-probe-verify.mjs            # 探针行为，107 项断言（真实 DOM，含 React 受控输入模拟）
 node tools\uiagent-bridge-verify.mjs      # 插件↔原生信箱契约，69 项断言（真插件代码 + 假原生对端）
-node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端，5 屏图谱 + 交互实测
+node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端，14 屏图谱 + 交互实测
 ```
+
+图谱结果落在 `tools\ui-map-real-frontend.json`：每屏列出每个按钮的 **CSS 中心坐标 +
+`sel`**，外加 `⛔被遮挡` / `📴屏幕外` 标记。**「按钮在哪」不用猜，查这个文件。**
+
+⚠️ **图谱是快照，会随官方前端更新漂**。前端升级后重新跑一遍即可，不用手工维护。
 
 **这一跳为什么单列一个脚本验**：整条链路是三跳的 ——
 
