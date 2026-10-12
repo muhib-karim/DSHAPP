@@ -114,9 +114,10 @@ Every element carries \`rect\`/\`center\` in **CSS viewport pixels** and, when t
 - The UI is a chat app: the composer input and its send button are the usual targets. \`dump\` with \`filter:"composer"\` finds them fast.
 - After tapping something that opens a panel/menu, follow with \`wait\` (e.g. \`{action:"wait", text:"确认"}\`) before tapping inside it — the panel animates in and is not immediately clickable.
 - \`dump\` only returns **visible** elements by default. Pass \`includeHidden:true\` to also see hidden ones (useful to diagnose "the button exists but I cannot click it").
-- ⚠️ **A button can be visible and still unclickable.** When something covers it (a modal backdrop, a loading mask, an open drawer's scrim), a real touch lands on the cover, not on the button. Every element therefore carries \`covered\` and \`blockedBy\`; \`dump\` also reports \`overlay\` + \`blocked\` counts and a \`warning\` when a full-screen cover is present. **When \`covered\` is true, do not tap — deal with the cover first.** A common case: on a fresh profile the official frontend opens a "预览版说明" dialog whose button reads **「继续」**; until you tap it, all 16 buttons behind it are dead.
-- \`{action:"overlay"}\` answers "what is covering the screen right now, and which buttons are actually live?" — it returns the cover plus the clickable elements **inside** it. Reach for it whenever \`covered\`/\`onTarget:false\` shows up.
-- \`{action:"dump", clickableOnly:true}\` drops everything currently covered, so you get only what a finger could really hit.
+- ⚠️ **A button can be visible and still unclickable — for TWO different reasons.** Every element carries \`covered\`/\`blockedBy\` (something is on top of it) and \`offscreen\` (its centre point is outside the viewport, so a finger has no coordinate to hit). \`dump\` also reports \`overlay\` + \`blocked\` + \`offscreen\` counts and a \`warning\` when a full-screen cover is present. **When \`covered\` is true, do not tap — deal with the cover first.** A common case: on a fresh profile the official frontend opens a "预览版说明" dialog whose button reads **「继续」**; until you tap it, all 16 buttons behind it are dead.
+- ⚠️ **\`offscreen\` is the other "tapped but nothing happened".** The element is real and the events do get dispatched, but its centre is outside the viewport — e.g. the sidebar slides to a negative \`left\` once the drawer collapses — so a real touch cannot land on it and the screen does not change. The fix is the opposite of a cover: switch the UI into the state that panel belongs to (open the drawer first), then re-\`dump\` to confirm it is on screen. \`tap\` returns \`offscreen:true\` with a \`hint\` in that case, and \`wait\` with \`clickable:true\` will **not** report it as satisfied.
+- \`{action:"overlay"}\` answers "what is covering the screen right now, and which buttons are actually live?" — it returns the cover plus the elements you can **really click right now**. (Deliberately *not* "the buttons inside the cover": in this frontend the dialog's buttons are **siblings** of the mask, not descendants, so a descendant search finds nothing.) Reach for it whenever \`covered\`/\`onTarget:false\` shows up.
+- \`{action:"dump", clickableOnly:true}\` drops everything currently covered **or off-screen**, so you get only what a finger could really hit right now.
 - If \`tap\` reports \`onTarget:false\`, something is covering the element (a modal backdrop or loading mask) — read \`hitTopmost\`/\`blockedBy\` to see what actually received the click, and the returned \`hint\` says what to do next.
 - Results include \`ok:false\` with an \`error\` when the element was not found or was not visible. **Always check \`ok\`** and report the failure instead of assuming the click worked.`;
 
@@ -342,7 +343,13 @@ function render(args, reply) {
 			//   「此刻真正能点的」而不是「里面的」—— 照那句理解会找不到按钮。
 			lines.push(`    先关掉它（用 overlay 动作看此刻真正能点的是哪几个），再操作下面的元素。`);
 		} else if ((reply.blocked ?? 0) > 0) {
-			lines.push(`  ⚠️ 其中 ${reply.blocked} 个被上层元素盖住，现在点不动（见元素行上的「被遮挡←」。）。`);
+			lines.push(`  ⚠️ 其中 ${reply.blocked} 个被上层元素盖住，现在点不动（见元素行上的「被遮挡←」）。`);
+		}
+		// ⚠️ 「屏幕外」要单独说一句，别和遮挡混在一起：两者的处置办法**相反** ——
+		//   遮挡是「先关掉挡在前面的东西」，屏幕外是「先把界面切到它所在的状态」。
+		if ((reply.offscreen ?? 0) > 0) {
+			lines.push(`  ⚠️ 另有 ${reply.offscreen} 个中心点在视口外（见元素行上的「屏幕外·点不到」）—— ` +
+				`它们在屏幕上没有可点的坐标，点了不会有反应。先把对应面板/状态切出来。`);
 		}
 		if (list.length === 0) {
 			lines.push('  （没有匹配的元素。界面可能还在加载，或 filter 太窄。）');
@@ -390,7 +397,14 @@ function render(args, reply) {
 		const el = reply.element;
 		lines.push(`✓ 已点击 ${el ? `「${el.text || el.sel}」` : ''}`);
 		if (el) lines.push(`  ${fmtElement(el)}`);
-		if (reply.onTarget === false) {
+		// ⚠️ 「屏幕外」必须排在遮挡判断**之前**、且**独立成支**：它的
+		//   `onTarget` 是 true（事件确实发到了目标元素上），走不进下面那个
+		//   `onTarget === false` 的分支 —— 而它恰恰是「点了没反应」的第二种成因。
+		if (reply.offscreen) {
+			lines.push(`  ⚠️ 该元素中心点在视口外 —— 事件发出去了，但屏幕上没有可点的坐标，` +
+				`真实手指点不到，界面不会有任何反应。`);
+			if (reply.hint) lines.push(`    ${reply.hint}`);
+		} else if (reply.onTarget === false) {
 			lines.push(`  ⚠️ 点击被上层元素接收（元素被遮挡，真机手指会点到那层而不是它）:`);
 			if (reply.hitTopmost) lines.push(`    ${fmtElement(reply.hitTopmost)}`);
 			if (reply.hint) lines.push(`    ${reply.hint}`);
@@ -504,6 +518,12 @@ function fmtElement(el) {
 	if (el.enabled === false) flags.push('已禁用');
 	if (el.checked !== null && el.checked !== undefined) flags.push(el.checked ? '已选中' : '未选中');
 	if (el.inViewport === false) flags.push('不在视口内');
+	// ⚠️ 与上一行**不是同一件事**，两个都要留：
+	//   「不在视口内」= 完全没有一部分露在屏幕里（滚动列表里滚过去的项）；
+	//   「屏幕外」    = 中心点在视口外 ⇒ 真手指**没有可点的坐标**，点了也不会有反应。
+	//   后者才是「能不能点」的判据。实测抽屉收起后侧栏滑到 `left:-312`，
+	//   它 `inViewport` 仍可能是 true（有一角露着），但中心点已在屏幕外。
+	if (el.offscreen) flags.push('屏幕外·点不到');
 	// ⚠️ 「被盖住」必须直接写在元素这一行上。只在 dump 顶部报一次是不够的：
 	//   模型是逐行扫这个清单的，遮挡信息跟元素分离时它会对被挡的那几条照点不误。
 	if (el.covered) {
@@ -549,7 +569,7 @@ function uiTool(home) {
 				filter: { type: 'string', description: 'For action:"dump" — only return elements whose text/testid/class/selector contains this substring. Great for narrowing to e.g. "composer".' },
 				limit: { type: 'number', description: 'For dump/text — max results (dump default 60, max 300).' },
 				includeHidden: { type: 'boolean', description: 'For dump — also list hidden elements. Useful to diagnose "the button exists but cannot be clicked".' },
-				clickableOnly: { type: 'boolean', description: 'For dump — drop every element that is currently covered by something else, leaving only what a real finger could hit right now.' },
+				clickableOnly: { type: 'boolean', description: 'For dump — drop every element that is currently covered by something else OR whose centre is outside the viewport, leaving only what a real finger could hit right now.' },
 				value: { type: 'string', description: 'The text to write into the input, for action:"type". (`value`, not `text` — `text` is the element locator.)' },
 				clear: { type: 'boolean', description: 'For action:"type" — empty the input before writing.' },
 				enter: { type: 'boolean', description: 'For action:"type" — also press Enter after writing.' },
@@ -563,7 +583,7 @@ function uiTool(home) {
 				dx: { type: 'number', description: 'For action:"scroll" — horizontal pixels to scroll.' },
 				container: { type: 'string', description: 'For action:"scroll" — CSS selector of the scroll container. Omit to auto-detect the main scrollable area.' },
 				visible: { type: 'boolean', description: 'For action:"wait" — require the element to be visible (default true). Pass false to wait for it to disappear.' },
-				clickable: { type: 'boolean', description: 'For action:"wait" — also require the element NOT to be covered by anything, i.e. wait until it is genuinely tappable.' },
+				clickable: { type: 'boolean', description: 'For action:"wait" — also require the element NOT to be covered by anything AND to be on screen (centre inside the viewport), i.e. wait until it is genuinely tappable.' },
 			},
 		},
 		async execute(args) {

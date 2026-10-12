@@ -320,6 +320,79 @@ section('⑦ 渲染层：模型读到的是文本，遮挡信息排在元素清�
 		'提示用 overlay 看「此刻真正能点的」，而不是误导成「遮挡层里面的」（官方弹窗里按钮是遮罩的兄弟节点）');
 }
 
+section('⑦.5 渲染层：屏幕外是第二类「点不到」，不能被混进遮挡那套话术');
+{
+	// ⚠️ 这一段的两个 case 都是「点了不会有反应」，但**处置办法相反**：
+	//   遮挡 → 先关掉挡在前面的东西；屏幕外 → 先把界面切到它所在的状态。
+	//   渲染层若把屏幕外也套上遮挡的文案，模型会去查 overlay，方向就错了。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			matched: 2,
+			blocked: 0,
+			offscreen: 1,
+			elements: [
+				{ text: '发送', tag: 'button', sel: '#send', rect: { x: 10, y: 20, w: 30, h: 30 } },
+				{ text: '打开侧边栏', tag: 'button', sel: '#sb', rect: { x: -312, y: 36, w: 36, h: 36 }, offscreen: true, inViewport: true },
+			],
+			viewport: { w: 360, h: 780 },
+		},
+	});
+	const r = await tool.execute({ action: 'dump' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/屏幕外/.test(msg), 'dump 文本里报出「屏幕外」这一类');
+	ok(/屏幕外·点不到/.test(msg),
+		'元素行上直接标出「屏幕外·点不到」（与「被遮挡←」是两个不同的标记）');
+	ok(!/被遮挡←/.test(msg), '没有屏幕外元素被误标成「被遮挡←」');
+	ok(/先把对应面板\/状态切出来/.test(msg),
+		'给出的处置办法是「切状态」而不是「关掉遮挡层」—— 两者方向相反');
+}
+
+section('⑦.6 渲染层：tap 报 offscreen 时不能被 onTarget:true 掩盖过去');
+{
+	// ⚠️ 这是真机上最容易骗过模型的一种返回：`onTarget` 是 **true**（事件确实
+	//    发到了目标元素上），只有 `offscreen` 说明屏幕上没有坐标可点。
+	//    渲染层若只判 `onTarget === false`，这条警告永远显示不出来。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			dispatched: ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'],
+			onTarget: true,
+			offscreen: true,
+			hint: '元素中心点在视口外（CSS -312,54，视口 360×780），真手指在屏幕上没有可点的坐标。',
+			element: { text: '打开侧边栏', tag: 'button', sel: '#sb', rect: { x: -312, y: 36, w: 36, h: 36 }, offscreen: true },
+		},
+	});
+	const r = await tool.execute({ action: 'tap', sel: '#sb' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/视口外/.test(msg), 'tap 渲染出「视口外」警告（onTarget 为 true 时也必须出现）');
+	ok(/不会有任何反应|没有可点的坐标/.test(msg), '说清后果是「不会有反应」');
+	ok(!/点击被上层元素接收/.test(msg),
+		'没有误用「被上层元素接收」那句遮挡话术 —— 那会把模型引向 overlay');
+}
+
+section('⑦.7 渲染层：wait clickable 的语义已含「在屏幕内」');
+{
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		// ⚠️ `attempts` 是原生**真的会回传**的字段（UiProbeBridge.runWait 的两条
+		//    路径都 put 了它），假对端也要照带 —— 否则渲染出来是「检查了 undefined
+		//    次」，那是夹具不完整造成的假象，不是产品缺陷。
+		replyExtra: { satisfied: false, attempts: 40, element: { text: '打开侧边栏', tag: 'button', sel: '#sb', offscreen: true } },
+	});
+	const r = await tool.execute({ action: 'wait', sel: '#sb', clickable: true });
+	native.stop();
+	ok(r.ok === true, 'wait 回执本身成功');
+	ok(/检查了 40 次/.test(r.message ?? ''),
+		`wait 把「没等到」如实渲染出来、且带上了检查次数: ${JSON.stringify(r.message)}`);
+	ok(!/undefined/.test(r.message ?? ''),
+		'渲染里没有 undefined（原生一定会回传 attempts，渲染层别引用别的字段名）');
+}
+
 section('⑧ 渲染层：type 的三态 applied 不能被当布尔');
 {
 	const three = [

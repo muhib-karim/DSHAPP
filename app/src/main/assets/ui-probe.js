@@ -52,7 +52,7 @@ function (CMD) {
   'use strict';
 
   /** 探针版本。**改了本文件的语义就要 +1** —— 页面上的旧探针靠它判断要不要换。 */
-  var VERSION = 2;
+  var VERSION = 3;
 
   /** 结果里单个元素的文本/类名截断长度（防超大 JSON 撑爆 IPC）。 */
   var MAX_TEXT = 120;
@@ -166,6 +166,42 @@ function (CMD) {
   function inViewport(r) {
     return r.bottom > 0 && r.right > 0 &&
       r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
+  }
+
+  /**
+   * 元素的**中心点**是否落在视口内 —— 这是「真手指能不能碰到它」的判据。
+   *
+   * ⚠️ 与 [inViewport] **不是一回事，别合并**：那个问的是「有没有任意一部分露在
+   *   视口里」，用于标记「滚出屏幕了」；这个问的是「中心点能不能被
+   *   `elementFromPoint` 命中」。一个元素可以**一半露在屏幕外**（`inViewport`
+   *   为 true）而中心点已经在视口外，那种情况下点击必然落空。
+   */
+  function inViewportPoint(r) {
+    var vw = window.innerWidth || 0;
+    var vh = window.innerHeight || 0;
+    var x = r.left + r.width / 2;
+    var y = r.top + r.height / 2;
+    return x >= 0 && y >= 0 && x < vw && y < vh;
+  }
+
+  /**
+   * 元素中心点是否在**视口外**（真手指无处可点）。
+   *
+   * ⚠️ 这是与遮挡**并列**的第二类「点不到」，此前完全没有判据 —— 探针把屏幕外的
+   *   元素报成 `onTarget:true`、`clickableOnly` 也照样列出来，`wait clickable:true`
+   *   还报「等到了」。实测（抽屉收起后侧栏滑出视口，`left` 为负）表现为
+   *   「AI 说点过了，界面纹丝不动」，与遮挡是同一类错觉，**但根因不同**：
+   *   一个是被别的东西吃掉事件，一个是**根本没有任何坐标可点**。
+   *
+   *   `clickEl` 里已经调了 `scrollIntoView`，可它对 `position:fixed` 的元素无效
+   *   （fixed 元素不参与滚动），所以「先滚一下就好了」这条路在这里不成立，
+   *   必须如实报出来。
+   */
+  function offscreen(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    return !inViewportPoint(r);
   }
 
   function rectOf(el) {
@@ -333,6 +369,7 @@ function (CMD) {
   function describe(el, index) {
     var r = el.getBoundingClientRect();
     var b = blocker(el);
+    var off = !inViewportPoint(r);
     return {
       ref: 'e' + index,
       sel: cssPath(el),
@@ -347,6 +384,11 @@ function (CMD) {
         y: Math.round((r.top + r.height / 2) * 100) / 100
       },
       inViewport: inViewport(r),
+      // ⚠️ 与上面的 `inViewport` **语义不同，两个都要留着**：
+      //   `inViewport` = 「有没有任意一部分露在屏幕里」（滚动列表标记用）；
+      //   `offscreen`  = 「中心点在屏幕外 ⇒ 真手指点不到」（能不能点的判据）。
+      //   合并成一个字段会让「滚出屏幕的列表项」与「滑出视口的侧栏」混为一谈。
+      offscreen: off,
       // 「盖住了」与「盖它的是谁」成对出现：只报 true 而不报是谁，模型还得再查一轮。
       covered: !!b,
       blockedBy: b ? {
@@ -374,6 +416,7 @@ function (CMD) {
     var seen = [];
     var out = [];
     var blocked = 0;
+    var offscreenCount = 0;
 
     for (var i = 0; i < found.length; i++) {
       var el = found[i];
@@ -383,12 +426,17 @@ function (CMD) {
 
       var d = describe(el, out.length);
       if (d.covered) blocked++;
-      if (clickableOnly && d.covered) continue;
+      if (d.offscreen) offscreenCount++;
+      // ⚠️ 「此刻真能点」= 既没被盖住、**中心点也在屏幕内**。只排除 `covered`
+      //   会漏掉第二类点不到：元素滑到视口外（抽屉收起后的侧栏就是这样），
+      //   它在屏幕上根本没有可点的坐标。`overlay` 的 `clickable` 用的正是
+      //   这个列表，漏排会让模型去点一个「不在屏幕上的按钮」。
+      if (clickableOnly && (d.covered || d.offscreen)) continue;
       if (needle) {
         var hay = (d.text + ' ' + d.testid + ' ' + d.cls + ' ' + d.sel + ' ' + d.role).toLowerCase();
         if (hay.indexOf(needle) < 0) continue;
       }
-      d._score = score(el) + (d.covered ? 0 : 1000); // 真能点的排前面
+      d._score = score(el) + (d.covered || d.offscreen ? 0 : 1000); // 真能点的排前面
       out.push(d);
       if (out.length >= MAX_ELEMENTS) break;
     }
@@ -397,7 +445,10 @@ function (CMD) {
     out.sort(function (a, b) { return b._score - a._score; });
     var trimmed = out.slice(0, limit);
     for (var j = 0; j < trimmed.length; j++) delete trimmed[j]._score;
-    return { matched: out.length, elements: trimmed, blocked: blocked, scanned: seen.length };
+    return {
+      matched: out.length, elements: trimmed, blocked: blocked,
+      offscreen: offscreenCount, scanned: seen.length
+    };
   }
 
   /**
@@ -817,6 +868,7 @@ function (CMD) {
         count: got.elements.length,
         scanned: got.scanned,
         blocked: got.blocked,
+        offscreen: got.offscreen,
         elements: got.elements
       };
       // ⚠️ 有全屏遮挡层时，**必须**在顶层把这件事说出来。否则模型拿到的是一份
@@ -842,14 +894,18 @@ function (CMD) {
       //   **没有被遮挡**的可交互元素。这在任何 DOM 结构下都成立。
       var live = collect({ limit: 30, clickableOnly: true });
       if (!layer) {
-        return ok({ present: false, clickable: live.elements, count: live.elements.length });
+        return ok({
+          present: false, clickable: live.elements, count: live.elements.length,
+          offscreen: live.offscreen
+        });
       }
       return ok({
         present: true,
         layer: layer,
         clickable: live.elements,
         count: live.elements.length,
-        blocked: live.blocked
+        blocked: live.blocked,
+        offscreen: live.offscreen
       });
     }
 
@@ -880,6 +936,20 @@ function (CMD) {
         covered: !!res.hit && !res.onTarget,
         blockedBy: res.onTarget ? null : res.hit
       };
+      // ⚠️ **屏幕外**是第二类「点不到」，必须与遮挡分开报。
+      //   它的表现与遮挡一模一样（界面纹丝不动、`ok` 还是 true），但处置办法
+      //   完全相反：遮挡要「先关掉挡在前面的东西」，屏幕外要「先把界面切到
+      //   它所在的那个状态」（例如抽屉收起时侧栏按钮滑出视口，得先点开导航）。
+      //   不报出来的后果是模型照着「遮挡」的思路去查 overlay，白费一轮还查不到。
+      if (info.offscreen) {
+        out.offscreen = true;
+        out.hint = '元素中心点在视口外（CSS ' + Math.round(info.center.x) + ',' +
+          Math.round(info.center.y) + '，视口 ' + (window.innerWidth || 0) + '×' +
+          (window.innerHeight || 0) + '），真手指在屏幕上没有可点的坐标 —— ' +
+          '事件虽然发出去了，但界面上看不出任何反应。' +
+          '先把它所在的面板/状态切出来（例如收起状态下先点开抽屉），再用 dump 确认它已进入视口。';
+        return ok(out);
+      }
       // ⚠️ 被遮挡时**把话说明白**。这是本探针最该省下的一轮来回：模型点不动时
       //   最想知道的是「谁挡着、我该先点谁」，而不是自己去猜选择器写错了没有。
       if (!res.onTarget) {
@@ -995,7 +1065,10 @@ function (CMD) {
       var satisfied = !!(hit && (!needVisible || isVisible(hit)));
       // ⚠️ 被遮挡的元素**不算「等到了」**：调用方等它出现是为了点它，而它现在
       //   点不动。报 satisfied 会让「等 → 点」这条路在弹窗场景下静默失败。
-      if (satisfied && cmd.clickable === true && blocker(hit)) satisfied = false;
+      //   **屏幕外同理**（`clickable` 的语义是「现在真能点」）：抽屉收起时侧栏
+      //   按钮滑出视口，`wait clickable:true` 报「等到了」，紧接着的 `tap`
+      //   就必然空点 —— 与遮挡是同一类错误的两个来源，必须一起排掉。
+      if (satisfied && cmd.clickable === true && (blocker(hit) || offscreen(hit))) satisfied = false;
       return ok({
         satisfied: satisfied,
         element: hit ? describe(hit, 0) : null
@@ -1014,6 +1087,7 @@ function (CMD) {
         focused: document.activeElement ? describe(document.activeElement, 0) : null,
         overlay: overlay(),
         blocked: got2.blocked,
+        offscreen: got2.offscreen,
         top: got2.elements,
         scrollable: (function () {
           var s = findScrollable(null);

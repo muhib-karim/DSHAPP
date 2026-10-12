@@ -99,6 +99,23 @@ const SCENE = `<!doctype html>
     var m = document.getElementById('mask');
     if (m) m.parentNode.removeChild(m);
   };
+
+  // 屏幕外用：一个**真实存在、可见、没被任何东西盖住**，但整体滑到视口外的按钮。
+  // 它是与遮挡**并列**的第二类「点不到」—— 事件发得出去，屏幕上却没有坐标可点。
+  window.showOffscreen = function () {
+    var b = document.createElement('button');
+    b.id = 'off';
+    b.textContent = '视口外按钮';
+    // position:fixed 是刻意的：fixed 元素不参与滚动，探针里的 scrollIntoView
+    // 救不了它 —— 这正是「先滚一下就好了」在真机上不成立的原因。
+    b.style.cssText = 'position:fixed;left:-500px;top:100px;width:200px;height:40px;z-index:1';
+    b.addEventListener('click', function () { window.__offClicked = (window.__offClicked || 0) + 1; });
+    document.body.appendChild(b);
+  };
+  window.hideOffscreen = function () {
+    var b = document.getElementById('off');
+    if (b) b.parentNode.removeChild(b);
+  };
 </script>
 </body></html>`;
 
@@ -313,6 +330,53 @@ async function main() {
 		const dumpClean = await call({ action: 'dump', limit: 50 });
 		check('遮罩移除后 dump 不再报遮挡', !dumpClean.overlay && dumpClean.blocked === 0,
 			{ overlay: dumpClean.overlay, blocked: dumpClean.blocked });
+
+		// ── 屏幕外：第二类「点不到」────────────────────────────────────
+		//
+		// ⚠️ 与遮挡是**同一类错觉的不同来源**：表现完全一样（界面纹丝不动、
+		//    `ok` 还是 true），但处置办法相反 —— 遮挡要「先关掉挡在前面的东西」，
+		//    屏幕外要「先把界面切到它所在的状态」。真机上实测过（抽屉收起后
+		//    侧栏滑到 `left:-312`），此前探针把这种元素报成 `onTarget:true`、
+		//    `clickableOnly` 照样列出来、`wait clickable:true` 还报「等到了」。
+		console.log('\n── 屏幕外（与遮挡并列的第二类点不到）─────────');
+		await cdp.eval('window.showOffscreen()');
+		const offDump = await call({ action: 'dump', limit: 50 });
+		const offEl = offDump.elements.find((e) => e.sel === '#off');
+		check('元素带 offscreen 标记', offEl?.offscreen === true, offEl?.offscreen);
+		check('offscreen 与 covered 是两件事（它没被盖住）', offEl?.covered === false, offEl?.covered);
+		check('dump 统计了屏幕外元素数', typeof offDump.offscreen === 'number' && offDump.offscreen > 0,
+			offDump.offscreen);
+
+		const offOnlyClickable = await call({ action: 'dump', limit: 50, clickableOnly: true });
+		check('★ clickableOnly 也滤掉屏幕外的元素（此前会列出来）',
+			!offOnlyClickable.elements.some((e) => e.sel === '#off'),
+			offOnlyClickable.elements.map((e) => e.sel));
+
+		const offTap = await call({ action: 'tap', sel: '#off' });
+		check('★ tap 屏幕外元素时报 offscreen:true（此前只报 onTarget:true）',
+			offTap.offscreen === true, { offscreen: offTap.offscreen, onTarget: offTap.onTarget });
+		check('tap 给出可操作的 hint（指明是屏幕外、要切状态）',
+			typeof offTap.hint === 'string' && offTap.hint.includes('视口外'), offTap.hint);
+		check('hint 与遮挡的提示不是同一句话（否则模型会去查错方向）',
+			!/遮挡/.test(offTap.hint ?? ''), offTap.hint);
+
+		const offWait = await call({ action: 'wait', sel: '#off', clickable: true, timeout: 400 });
+		check('★ wait clickable:true 不把屏幕外元素算作等到了',
+			offWait.satisfied === false, offWait.satisfied);
+		const offWaitVisible = await call({ action: 'wait', sel: '#off' });
+		check('wait 默认仍只看可见性（屏幕外不传 clickable 时行为不变）',
+			offWaitVisible.satisfied === true, offWaitVisible.satisfied);
+
+		const offOv = await call({ action: 'overlay' });
+		check('overlay 的 clickable 列表也不含屏幕外元素',
+			!offOv.clickable?.some((e) => e.sel === '#off'), offOv.clickable?.map((e) => e.sel));
+
+		// 元素回到视口内之后，判据必须自己恢复 —— 否则模型会永远点不到它
+		await cdp.eval("document.getElementById('off').style.left = '20px'");
+		const offBack = await call({ action: 'dump', limit: 50, clickableOnly: true });
+		check('元素移回视口内后重新算作可点（判据不粘住）',
+			offBack.elements.some((e) => e.sel === '#off'), offBack.elements.map((e) => e.sel));
+		await cdp.eval('window.hideOffscreen()');
 
 		console.log('\n── type（React 受控输入）─────────────────────');
 		await cdp.eval('window.__reactState = { value: "", onChangeCalls: 0 }; window.__events = []');
