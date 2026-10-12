@@ -75,6 +75,17 @@ class SystemWebHost(
             .orEmpty()
 
     init {
+        // ── 远程调试通道（给 UI 调试工具用，对用户不可见）────────────────
+        //
+        // 打开它，`webview_devtools_remote_<pid>` 这个抽象 socket 才会出现，
+        // 于是**同一个页面世界**可以经 CDP 被读和点 —— 也就是 `ui` 工具那条
+        // 信箱链路的另一半（原生 → 探针）可以在真机上被独立验证。
+        //
+        // ⚠️ 这不改变任何界面行为：它只多开一个**只监听本机**的调试 socket，
+        //   不开任何端口、不监听网络，页面与用户看到的东西一模一样。
+        //   Android 官方的定位就是「开发期开关」，此处常开是因为这个 App
+        //   本身就是自用调试机 —— 而 `ui` 工具在没有它的时候无法被验证。
+        WebView.setWebContentsDebuggingEnabled(true)
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true

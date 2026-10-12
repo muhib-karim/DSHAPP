@@ -831,6 +831,15 @@ private fun createRuntime(context: Context): GeckoRuntime {
     val settings = GeckoRuntimeSettings.Builder()
         // 页面要能打 console（转发由 content script 做，见 content.js）。
         .consoleOutput(true)
+        // ── 远程调试通道（给 UI 调试工具用，对用户不可见）──────────────────
+        //
+        // 与 system flavor 的 `WebView.setWebContentsDebuggingEnabled(true)` 同构：
+        // 让 GeckoView 暴露调试 socket，从而 `ui` 工具那条链路的「原生 → 页面」
+        // 一半可以在真机上被独立验证。
+        //
+        // ⚠️ 只监听本机、不改界面行为；不开它的话 gecko flavor 上这条链路
+        //   无法被验证（页面世界里没有任何入口能从外部进去）。
+        .remoteDebuggingEnabled(true)
         .build()
     return GeckoRuntime.create(context, settings)
 }

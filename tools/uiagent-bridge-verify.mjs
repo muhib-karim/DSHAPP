@@ -748,6 +748,70 @@ section('⑩ map / where / goto：插件侧的组合动作');
 }
 
 
+section('⑪ 注册契约：output 声明（真机上唯一会「整个插件不激活」的坑）');
+{
+	/*
+	 * 这一节的存在理由是一次**真机才发现**的失败：
+	 *
+	 *   [engine] dsh-android-uiagent (.../lib/index.js):
+	 *     TypeError: tool "ui" must declare output { schema, render, presentationMeta? }
+	 *   [engine] dsh: warning: 1 entry did not activate
+	 *
+	 * 也就是说 `ui` 工具**从未注册成功过**，而 PC 侧 111 项断言全绿 —— 因为它们
+	 * 直接调 `tool.execute()`，绕过了 `ctx.tools.register` 的校验。
+	 * 引擎的 register 是**硬校验**（`dsh-tools/lib/index.js:2881`）：
+	 *
+	 *   if (output === void 0 || typeof output !== 'object'
+	 *       || typeof output.render !== 'function'
+	 *       || (output.presentationMeta !== void 0 && typeof output.presentationMeta !== 'function'))
+	 *     throw new TypeError(...)
+	 *   assertSupportedJsonSchema(output.schema)
+	 *
+	 * 症状是**静默的**：插件不激活、没有 ui 工具、logcat 里只有一行 warning，
+	 * 界面完全正常 —— 模型只是「不知道有这个能力」。
+	 *
+	 * ⚠️ 用**引擎自己的断言函数**判，不自己复刻规则：schema 子集
+	 *   （type/oneOf/properties/required/additionalProperties/items/enum/const）
+	 *   的边界很细，复刻一份迟早与引擎分叉。
+	 */
+	const engineDir = process.env.UIAGENT_ENGINE_DIR;
+	if (!engineDir || !fs.existsSync(path.join(engineDir, 'lib/index.js'))) {
+		console.log('  ⚠️ 跳过：未设 UIAGENT_ENGINE_DIR（指向已解包的 @deepseek-ai/dsh-tools）');
+		console.log('     取法见 AGENTS.md「PC 侧自动化验收」—— 从 APK 的 assets/engine.bin 里解出来');
+	} else {
+		const dshTools = await import(pathToFileURL(path.join(engineDir, 'lib/index.js')).href);
+		ok(typeof tool?.output?.render === 'function',
+			'工具声明了 output.render（缺了它 register 直接抛 TypeError，插件整个不激活）');
+		ok(typeof tool?.output?.schema === 'object' && tool.output.schema !== null,
+			'工具声明了 output.schema');
+
+		try {
+			dshTools.assertSupportedJsonSchema(tool.output.schema);
+			ok(true, 'output.schema 落在引擎支持的子集里（引擎自己的断言函数判的）');
+		} catch (e) {
+			ok(false, `output.schema 不合法: ${e.message}`);
+		}
+
+		// 三条代表性返回值要真能过 schema —— 空 schema 与收窄都能在这里露出来
+		const samples = [
+			['dump/本地动作', { ok: true, message: 'x', details: { ok: true, detail: false } }],
+			['失败返回', { ok: false, message: 'x' }],
+			['tap 的 details', { ok: true, message: 'x', details: { ok: true, elements: [{ sel: '#a' }] } }],
+		];
+		for (const [label, v] of samples) {
+			const viol = dshTools.validateJsonSchemaValue(tool.output.schema, v, 'value');
+			ok(viol.length === 0, `${label} 的返回值能过 output.schema`, viol.join('; '));
+			try {
+				const r = tool.output.render({ action: 'dump' }, v);
+				ok(Array.isArray(r) && r.every((x) => typeof x?.text === 'string'),
+					`${label} 的 render 返回 text 块数组`);
+			} catch (e) {
+				ok(false, `${label} 的 render 抛错: ${e.message}`);
+			}
+		}
+	}
+}
+
 if (failures.length === 0) {
 	console.log(`全部通过：${pass} 项断言`);
 } else {

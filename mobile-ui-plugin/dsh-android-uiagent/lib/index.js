@@ -950,6 +950,21 @@ function uiTool(home) {
 				clickable: { type: 'boolean', description: 'For action:"wait" — also require the element NOT to be covered by anything AND to be on screen (centre inside the viewport), i.e. wait until it is genuinely tappable.' },
 			},
 		},
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					ok: { type: 'boolean' },
+					message: { type: 'string' },
+					// 原始回执：形状随 action 变（dump 是数组、tap 是元素对象、
+					// wait 带 satisfied…），所以这里**不能**收窄成固定形状，
+					// 否则真机上会以 ToolOutputError 的形式炸在渲染之前。
+					details: {},
+				},
+				required: ['ok', 'message'],
+			},
+			render: (_args, value) => [{ type: 'text', text: value.message }],
+		},
 		async execute(args) {
 			const bad = validate(args ?? {});
 			if (bad !== '') return { ok: false, message: bad };
