@@ -61,6 +61,18 @@ if (!chrome) {
 // ⚠️ 每屏都从**基态**（Hero，页面刚加载完）重新进入，而不是从上一屏接着走。
 //    这样屏与屏之间没有状态污染，某一屏的步骤写错了也不会连带毁掉后面的屏。
 //
+// ⚠️⚠️ **但「重载」并不足以回到基态 —— 这个前端会持久化好几样东西**，本轮
+//    在这上面连栽三次，症状全都是「找不到要点击的元素」（看着像定位写错了）：
+//
+//    | 被持久化的 | 后果 | 对策 |
+//    |---|---|---|
+//    | 右侧边栏的**开关状态** | 重载后它自己又开着，入口按钮的 aria 从「打开右侧边栏」变成「收起右侧边栏」 | 每屏重置后先 `collapsePanels()` 收掉 |
+//    | 右侧边栏的**内容页** | 点过「新建终端」后，再打开直接是终端页，启动页的「新建终端」不再出现 | 启动页那一屏排在终端屏**之前** |
+//    | **当前会话** | 种过会话就回不到空会话态，「选择新任务使用的 Agent 预设」再也不渲染 | 只在空态存在的屏排在 `drawer` 之前 |
+//
+//    共同点是**单向**：一旦进入就回不去。所以屏的顺序本身是有语义的，
+//    不是随手排的 —— 改顺序前先想清楚哪一屏会把状态推过去。
+//
 // `expect` 是「这一屏真的进去了吗」的判据 —— 只看 `tap` 的 `ok` 不够：
 // 点了没生效时 `ok` 照样是 true（那正是遮挡/屏幕外两类问题的表现）。
 const SCREENS = [
@@ -85,6 +97,72 @@ const SCREENS = [
     expect: { text: '会话插件' },
   },
   {
+    id: 'settings-model',
+    title: '设置 › 模型',
+    enter: [{ text: '设置' }, { text: '模型' }],
+    // ⚠️ 判据要挑**这一屏独有**的元素：「返回」「关闭」这类在好几屏都有，
+    //    拿它当判据等于没判（任何面板屏都能满足）。「添加模型」只在这一屏出现。
+    expect: { text: '添加模型' },
+  },
+  {
+    id: 'settings-preset',
+    title: '设置 › Agent 预设',
+    enter: [{ text: '设置' }, { text: 'Agent 预设' }],
+    expect: { text: '新任务默认: 标准模式' },
+  },
+  {
+    id: 'settings-priv',
+    title: '设置 › 特权权限',
+    enter: [{ text: '设置' }, { text: '特权权限' }],
+    expect: { text: '重新检测' },
+  },
+  {
+    id: 'settings-bubble',
+    title: '设置 › 悬浮气泡',
+    enter: [{ text: '设置' }, { text: '悬浮气泡' }],
+    expect: { text: '怎么用' },
+  },
+  {
+    id: 'plugins-panel',
+    title: '插件面板',
+    enter: [{ text: '插件' }],
+    expect: { text: '添加插件' },
+  },
+  {
+    id: 'model-picker',
+    title: '模型选择器',
+    // ⚠️ 用 `text` 而不是 `aria`：这个按钮**没有** `aria-label`（实测
+    //    `{aria:'选择模型，当前…'}` 报「找不到要点击的元素」）。同排的
+    //    「访问模式」「Agent 预设」两个倒是有 aria-label —— 同一行里三个按钮
+    //    的取值口径都不一样，所以**别照着邻居抄**，先 `dump` 看它报的是哪个字段。
+    enter: [{ text: '选择模型' }],
+    expect: { text: '推理等级' },
+  },
+  {
+    id: 'access-mode',
+    title: '访问模式选择器',
+    enter: [{ aria: '访问模式，当前：工作区内修改' }],
+    // 「完全权限」是三个选项里最不可能出现在别处的那个
+    expect: { text: '完全权限' },
+  },
+  {
+    id: 'preset-picker',
+    title: 'Agent 预设选择器',
+    enter: [{ aria: '选择新任务使用的 Agent 预设' }],
+    // 这一屏的选项文本很长（带整段说明），所以判据用**子串**：
+    // `byText` 先找完全相等、找不到才退回子串包含，所以给短名即可命中。
+    expect: { text: '极简模式' },
+  },
+  // ⚠️⚠️ **顺序是有语义的：`drawer` 必须排在最后几个。**
+  //
+  //    「种会话」是**单向**的 —— 前端会把当前会话持久化，重载也回不到空会话态。
+  //    实测：seed 之后「选择新任务使用的 Agent 预设」这个按钮**再也不出现**
+  //    （它在 Hero 空态才渲染），于是 `preset-picker` 屏永远进不去，
+  //    而且症状是「找不到要点击的元素」—— 看着像探针定位错了，其实是页面已经不是那一屏。
+  //
+  //    所以所有**只在空会话态存在**的屏都必须排在 `drawer` 之前。
+  //    这条与「每屏都从基态重来」是配套的：重载能回到基态，但**回不到空会话态**。
+  {
     id: 'drawer',
     title: '会话抽屉（左侧栏展开）',
     // ⚠️ **必须先进入「有会话」的页面**，否则抽屉根本开不出来：空会话（Hero）页
@@ -98,7 +176,8 @@ const SCREENS = [
     enter: [{ aria: '打开导航' }],
     // ⚠️ 这里必须用 `text` 不能用 `aria`：抽屉里的「收起侧边栏」**没有**
     //    `aria-label`，文案在文本节点里。而 `locate()` 的 `aria` 分支只查
-    //    `[aria-label="…"]`，**不回落**到文本 —— 用 `aria` 会「找不到要点击的元素」，
+    //    `[aria-label="…"]`（现已回落到 `title`，但抽屉这个连 `title` 也没有），
+    //    **不回落**到文本 —— 用 `aria` 会「找不到要点击的元素」，
     //    而那个按钮明明就在屏幕上（实测踩过：抽屉明明开了，校验却说没进去）。
     //    判据是 dump 里的字段：`aria` 有值才用 `aria`，否则用 `text`。
     expect: { text: '收起侧边栏' },
@@ -110,6 +189,12 @@ const SCREENS = [
     title: '右侧边栏',
     enter: [{ aria: '打开右侧边栏' }],
     expect: { text: '新建终端' },
+  },
+  {
+    id: 'terminal',
+    title: '右侧边栏 › 终端',
+    enter: [{ aria: '打开右侧边栏' }, { text: '新建终端' }],
+    expect: { text: '新标签页' },
   },
 ];
 
@@ -281,6 +366,46 @@ try {
     return false;
   };
 
+  // ── 把面板收起来（重载**不等于**回到基态）─────────────────────────
+  //
+  // ⚠️ 这是本轮踩到的第 5 个坑，也是最阴的一个：**前端会把右侧边栏的打开状态
+  //    持久化**（大概是 localStorage / 服务端 profile）。所以 `Page.navigate`
+  //    重载之后，右侧边栏**自己又开着了**，那个按钮的 aria 也从
+  //    「打开右侧边栏」变成了「收起右侧边栏」—— 于是照 `{aria:'打开右侧边栏'}`
+  //    去点会报「找不到要点击的元素」，而屏幕上明明有个侧边栏。
+  //
+  //    症状有迷惑性：图谱里「右侧边栏」那一屏单独跑是 ✅，排在「终端」屏**之后**
+  //    跑就 ❌ —— 因为终端屏把侧边栏打开了，下一屏重载后它还在。
+  //    **屏与屏之间有状态残留**，这正是「每屏都从基态重来」这条设计要防的事，
+  //    但重载并不足以回到基态。
+  //
+  //    所以基态 = 重载 **且** 把面板收掉。收的时候用面板自己的关闭按钮
+  //    （「收起右侧边栏」/「关闭」），**不是**去关掉面板本身（它是屏幕不是遮挡）。
+  const collapsePanels = async (tag) => {
+    for (let i = 0; i < 3; i++) {
+      const ov = await cdp.eval(`(${source})({action:"overlay"})`);
+      if (ov?.kind !== 'panel') return;
+      const pool = ov.clickable ?? [];
+      // ⚠️ 关闭按钮要**按优先级挑**：右侧边栏里同时有「退出全屏」「收起右侧边栏」
+      //    「关闭」，拿第一个正则命中的就用会点到「退出全屏」—— 面板照旧开着
+      //    （它只切换了全屏态），下一轮又拿到同一个面板，绕圈。实测踩过。
+      const closer =
+        pool.find((b) => /收起.*边栏|收起侧边栏|收起面板/.test(b.text || '')) ??
+        pool.find((b) => /^关闭$|^返回$/.test((b.text || '').trim())) ??
+        pool.find((b) => /关闭|返回/.test(b.text || ''));
+      if (!closer) {
+        console.log(`  ${tag}⚠️ 面板 ${ov.panel?.cls || ov.panel?.tag} 上没有关闭按钮，收不掉`);
+        return;
+      }
+      console.log(`  ${tag}收起面板「${closer.text}」`);
+      await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', sel: closer.sel })})`);
+      // ⚠️ 收起是**带动画的**（侧栏滑出）。动画没落定就点「打开右侧边栏」，
+      //    按钮还处在过渡态（aria 仍是「收起右侧边栏」），于是报
+      //    「找不到要点击的元素」—— 实测「右侧边栏」屏就是这么挂的。
+      await sleep(1600);
+    }
+  };
+
   console.log(`打开真实官方前端: ${url.slice(0, 60)}…`);
   const boot = await resetToBase();
   if (boot) console.log(`  已挂载：${boot.nodes} 个节点，title=${boot.title}`);
@@ -353,6 +478,11 @@ try {
       await sleep(2500);
       await cdp.eval(`(${source})({action:"ping"})`);
       await dismissOverlays('  ');
+      // ⚠️ **重载不等于回到基态**：前端会持久化右侧边栏的打开状态，重载后它
+      //    自己又开着，入口按钮的 aria 也随之从「打开右侧边栏」变成「收起右侧边栏」。
+      //    不收掉的话，这一屏的 `enter` 第一步就会报「找不到要点击的元素」。
+      //    见 `collapsePanels` 的注释。
+      await collapsePanels('  ');
     }
     // `seed:true` 的屏要先进入会话态（见 seedSession 的注释）
     if (spec.seed) await seedSession();
@@ -478,25 +608,7 @@ try {
   await sleep(2500);
   await cdp.eval(`(${source})({action:"ping"})`);
   await dismissOverlays('  ');
-  // ⚠️ 重载之后仍可能停在面板屏（前端会恢复上次的面板状态），再确认一次：
-  //    只要有面板就点它自己的关闭按钮，直到 overlay 报 `kind:null`。
-  for (let i = 0; i < 4; i++) {
-    const ov = await cdp.eval(`(${source})({action:"overlay"})`);
-    if (ov?.kind !== 'panel') break;
-    // ⚠️ 关闭按钮要**按优先级挑**，不能拿第一个正则命中的就用。实测右侧边栏里
-    //    同时有「退出全屏」「收起右侧边栏」「关闭」，正则 `退出全屏` 先命中，
-    //    结果点的是「退出全屏」—— 面板照旧开着（它只是切换了全屏态），
-    //    下一轮又拿到同一个面板，绕圈。真正收起面板的是「收起右侧边栏」。
-    const pool = ov.clickable ?? [];
-    const closer =
-      pool.find((b) => /收起.*边栏|收起侧边栏|收起面板/.test(b.aria || b.text || '')) ??
-      pool.find((b) => /^关闭$|^返回$/.test((b.aria || b.text || '').trim())) ??
-      pool.find((b) => /关闭|返回/.test(b.aria || b.text || ''));
-    if (!closer) { console.log(`  ⚠️ 面板 ${ov.panel?.cls} 上没有找到关闭按钮，改用重载`); break; }
-    console.log(`  关掉面板「${closer.aria || closer.text}」`);
-    await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', sel: closer.sel })})`);
-    await sleep(1000);
-  }
+  await collapsePanels('  ');
 
   const COMPOSER = `(() => {
     const ce = document.querySelector('[contenteditable="true"]');
