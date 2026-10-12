@@ -91,6 +91,20 @@ const SCREENS = [
     expect: { text: '通用设置' },
   },
   {
+    id: 'settings-general',
+    title: '设置 › 通用设置',
+    enter: [{ text: '设置' }, { text: '通用设置' }],
+    // ⚠️ 判据挑**这一屏独有**的：字号那对按钮只有通用设置里有
+    //    （「返回」「关闭」「中文」在别的设置页也有，不能用）
+    expect: { text: '增大字号' },
+  },
+  {
+    id: 'settings-group',
+    title: '设置 › 交流群',
+    enter: [{ text: '设置' }, { text: '交流群' }],
+    expect: { text: '复制群号' },
+  },
+  {
     id: 'settings-plugins',
     title: '设置 › 内置插件',
     enter: [{ text: '设置' }, { text: '内置插件' }],

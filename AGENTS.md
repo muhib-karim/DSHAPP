@@ -3291,7 +3291,7 @@ Hero 页的缺陷（见 `client.js` 修复 31 的注释），探针如实报 `on
 
 #### 怎么用（模型的正确姿势）
 
-**先查图谱，别现猜坐标。** `tools\ui-map-real-frontend.json` 里 15 屏的每个按钮都
+**先查图谱，别现猜坐标。** `tools\ui-map-real-frontend.json` 里 17 屏的每个按钮都
 记了 CSS 中心坐标与 `sel`，这是「按钮在哪」的权威答案；真机触控要的屏幕物理坐标
 由探针按当前视口现算（见「坐标系」一节），别拿图谱里的 CSS 值直接去 `input tap`。
 
@@ -3334,7 +3334,7 @@ overlay → kind:'mask' 吗？→ 是就点「此刻能点的」里那个按钮 
 ```powershell
 node tools\ui-probe-verify.mjs            # 探针行为，107 项断言（真实 DOM，含 React 受控输入模拟）
 node tools\uiagent-bridge-verify.mjs      # 插件↔原生信箱契约，69 项断言（真插件代码 + 假原生对端）
-node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端，15 屏图谱 + 交互实测
+node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端，17 屏图谱 + 交互实测
 ```
 
 图谱结果落在 `tools\ui-map-real-frontend.json`：每屏列出每个按钮的 **CSS 中心坐标 +
