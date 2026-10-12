@@ -44,6 +44,28 @@ class EngineManager private constructor(private val context: Context) {
         data object Starting : State
         data class Ready(val url: String) : State
         data class Failed(val message: String) : State
+
+        /**
+         * 引擎**曾经就绪过**，之后进程退出 —— 与 [Failed] 是两回事。
+         *
+         * ## 为什么必须单独一个状态
+         *
+         * 这个区分不是措辞讲究，而是**恢复动作完全不同**：
+         *
+         * - [Failed] 是「压根没起来」（Node 缺失、端口被占、插件没激活…）。
+         *   重试同一个配置只会再失败一次，用户得走「安全模式」推开坏配置。
+         * - [Dead] 是「本来跑得好好的，后来死了」。绝大多数是系统回收
+         *   （LMK / 国产 ROM 的后台冻结）或引擎自己 OOM。**配置是好的**，
+         *   原样重启就是正确动作，绝不该推开用户的插件配置。
+         *
+         * ## 症状（用户报的）
+         *
+         * 原先没有任何地方检测运行期退出：引擎进程一死，`_state` 永远是
+         * `Ready(url)`，界面停在上一次渲染好的页面上 —— 用户看着一切正常，
+         * 直到发消息才发现「发送失败 / 一直转圈」。而前端的重连逻辑打的是
+         * **那个已经没人监听的端口**，于是连错误提示都是误导性的。
+         */
+        data class Dead(val message: String) : State
     }
 
     /**
@@ -93,10 +115,49 @@ class EngineManager private constructor(private val context: Context) {
         _uiStage.value = UiStage.UiReady
     }
 
+    /**
+     * 把页面阶段退回 [UiStage.None]（引擎重启时用）。
+     *
+     * ## 为什么必须有这个「后退」
+     *
+     * [notifyPageLoaded] / [notifyUiReady] 都刻意**只前进不后退**（`onPageFinished`
+     * 会因转屏、iframe 重复触发，退回 None 会让启动动画倒放）。
+     *
+     * 但引擎**重启**是另一回事：整个页面要重新加载，那两段必须能重走一遍。
+     * 不复位的话，`_uiStage` 已经停在 `UiReady` —— 而 StateFlow **相同值不会重复
+     * 发射**，于是 `MainActivity` 里「等首帧再收启动层」的分支一次都不会跑到：
+     * `webViewPainted` 永远停在 false，启动层再也收不起来（界面上就是一直卡在
+     * 「正在加载界面…」）。
+     *
+     * ⚠️ 只在**引擎重启**这条路径上调用，不要挂到普通的页面重载上。
+     */
+    fun resetUiStage() {
+        _uiStage.value = UiStage.None
+    }
+
     private val _state = MutableStateFlow<State>(State.Idle)
     val state: StateFlow<State> = _state.asStateFlow()
 
+    /**
+     * 当前引擎进程。
+     *
+     * ⚠️ `@Volatile`：由启动协程写、由该进程自己的 stdout 消费线程读
+     *   （见 [markEngineDeadIfCurrent] 的 `process !== proc` 判据）。读到旧值时
+     *   判据会偏向「不动状态」，是安全的一侧；但没有可见性保证时行为不可预期，
+     *   所以显式标上。
+     */
+    @Volatile
     private var process: Process? = null
+
+    /**
+     * 是否是**我们自己**在停引擎（[stop]）。
+     *
+     * ⚠️ 用来区分「引擎意外死亡」与「用户/代码主动停止」。两者都会让 stdout 读到
+     *   EOF，若不区分，`stop()` 之后会立刻把状态打成 [State.Dead]（"引擎意外退出"），
+     *   盖掉 `stop()` 自己设的 [State.Idle]，界面上就会莫名其妙弹一句失败提示。
+     */
+    @Volatile
+    private var userStopped = false
     private val logLines = ArrayDeque<String>()
 
     /**
@@ -3884,6 +3945,10 @@ class EngineManager private constructor(private val context: Context) {
 
         _state.value = State.Starting
         logLines.clear()
+        // ⚠️ 每次启动都清掉「主动停止」标记，否则 stop() 之后再也起不来
+        //   （EOF 会被当成用户停止而不再上报死亡，这里反过来：新一轮启动了，
+        //   旧标记已经没有意义）。
+        userStopped = false
 
         homeDir.mkdirs()
         dshHome.mkdirs()
@@ -4253,6 +4318,20 @@ class EngineManager private constructor(private val context: Context) {
             } finally {
                 // 流关闭（引擎退出）时也要唤醒等待方，避免白等到超时
                 readyLatch.countDown()
+                // ⚠️ **运行期退出检测就在这一行**。
+                //
+                // stdout 读到 EOF ⇔ 引擎进程真的没了（管道写端全关）。这是唯一
+                // 可靠的死亡信号：`process.isAlive` 要靠轮询，而轮询在 App 被
+                // 冻结时同样停摆；EOF 是内核主动通知的，不需要我们醒着。
+                //
+                // 判据用「曾经就绪过」而不是「现在是 Ready」——后者会被
+                // 紧随其后的 `_state.value = State.Failed(...)` 覆盖掉顺序
+                // （见下面的 got/url 分支），用 readyUrl 更稳。
+                //
+                // 只读一次 volatile 快照，避免与 start() 的另一次调用赛跑：
+                // 这次线程属于**这一个** proc，若 process 已被换成新的进程，
+                // 说明有人重启过引擎，此时不该把状态打成 Dead。
+                markEngineDeadIfCurrent(proc, readyUrl != null)
             }
         }.apply { isDaemon = true; name = "dsh-engine-output" }.start()
 
@@ -4334,6 +4413,9 @@ class EngineManager private constructor(private val context: Context) {
     fun stop() {
         process?.let { p ->
             Log.i(TAG, "停止引擎")
+            // ⚠️ 必须在 destroy 之前置位：destroy 之后 stdout 线程会立刻读到 EOF
+            //   并进 markEngineDeadIfCurrent，两者是并发的。
+            userStopped = true
             p.destroy()
             if (!p.waitFor(3, TimeUnit.SECONDS)) {
                 p.destroyForcibly()
@@ -4345,6 +4427,43 @@ class EngineManager private constructor(private val context: Context) {
         // 守护线程同理：引擎都停了，再去切 adbd 没有意义，还白耗电
         WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
+    }
+
+    /**
+     * 引擎**运行期**退出时的收口（由 stdout 消费线程在读到 EOF 时调用）。
+     *
+     * @param proc     读到 EOF 的那个进程实例。
+     * @param wasReady 它是否曾经打印过带 token 的 URL。
+     *
+     * ## 为什么需要它
+     *
+     * 原先 `_state` 只在「启动期」被写：进程一启动就 `Ready(url)`，此后**再也没有
+     * 任何一处**会因进程退出而更新它。于是引擎被系统回收之后，界面仍停在
+     * `Ready(url)`、WebView 仍是上一帧渲染好的画面 —— 用户看不出任何异常，
+     * 直到发消息失败。更糟的是前端的重连逻辑打的是那个**已经没人监听的端口**，
+     * 报出来的错也是误导性的。
+     *
+     * ## 为什么是 [State.Dead] 而不是 [State.Failed]
+     *
+     * 见 `State.Dead` 的 KDoc：启动失败要「安全模式」推开配置，运行期死亡只需
+     * 原样重启。混在一起会诱导用户去点那个破坏性的按钮。
+     *
+     * ## 判据
+     *
+     * - `process !== proc` ⇒ 已经有人重启过引擎（或 stop 过了），本次 EOF 属于
+     *   被换掉的旧进程，**不动状态**。
+     * - `userStopped` ⇒ 是我们自己停的，状态已由 [stop] 设为 [State.Idle]。
+     * - 没 ready 过 ⇒ 是启动失败，那条路径由 `start()` 自己的超时分支负责
+     *   （它会给出更准确的 reason + 日志尾巴），这里不抢。
+     */
+    private fun markEngineDeadIfCurrent(proc: Process, wasReady: Boolean) {
+        if (userStopped) return
+        if (process !== proc) return
+        if (!wasReady) return
+        val code = runCatching { proc.exitValue() }.getOrNull()
+        val detail = if (code != null) "退出码 $code" else "进程已退出"
+        Log.w(TAG, "引擎在运行期退出（$detail），界面已失去后端")
+        _state.value = State.Dead(detail)
     }
 
     fun isRunning(): Boolean = process?.isAlive == true

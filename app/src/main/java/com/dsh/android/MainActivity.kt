@@ -214,6 +214,160 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 已经为「内核进程死亡」重载过几次。
+     *
+     * ⚠️ **必须有上界**：如果重载之后立刻又崩（比如某个必然让渲染进程 OOM 的
+     *   页面状态），无限重载就变成一个「白屏 ↔ 重载」的死循环，比直接告诉用户
+     *   出了什么事更难排查 —— 而且日志会被刷屏。
+     */
+    private var rendererRestarts = 0
+
+    /** 重载界面的退避 handler（见 [onRendererGone]）。 */
+    private val rendererHandler = Handler(Looper.getMainLooper())
+
+    /** 已经排队但还没执行的重载（用于去重，见 [onRendererGone]）。 */
+    private var rendererReloadQueued = false
+
+    /**
+     * 引擎重启后，即使 URL 与上次相同也**必须**重新加载页面。
+     *
+     * ## 为什么需要它
+     *
+     * `observeEngine` 的 `Ready` 分支用 `web.currentUrl != state.url` 做去重
+     * （避免同一次加载重复触发）。而 `currentUrl` 的语义是「最近一次**发起**的
+     * URL」—— 引擎重启后若端口与 token 都没变，两者**相等**，去重就会命中，
+     * 页面于是**不会**重新加载。
+     *
+     * 后果很严重：页面还活着，但它连的是**已经死掉的那个引擎端口**。用户看到
+     * 界面完好无损，实际每一条消息都发不出去 —— 这正是 [EngineManager.State.Dead]
+     * 要解决的那个「静默失效」，只是换了一层。
+     *
+     * 所以引擎重启这条路径必须显式声明「这次就是要强制重载」。
+     */
+    private var forceReloadOnReady = false
+
+    /**
+     * 已经为「引擎意外退出」自动重启过几次。
+     *
+     * ⚠️ **必须有上界**：如果引擎一起来就死（比如某个插件配置让 node 立刻 OOM），
+     *   不加限制就变成「启动 → 死 → 再启动」的无尽循环，界面永远在闪启动层，
+     *   用户既用不了也看不出原因。超过上界后改为把问题摆出来、让用户决定
+     *   （那时「安全模式」才是合适的出口 —— 反复死亡说明配置真的有问题，
+     *   与单次死亡不同）。
+     */
+    private var engineRestarts = 0
+
+    /** 上一次引擎意外退出的时刻（见 [engineRestarts] 的归零规则）。 */
+    private var lastEngineDeadAt = 0L
+
+    /**
+     * 承载页面的内核进程死了 —— 重载界面把它带回来。
+     *
+     * ## 为什么这件事必须由宿主做
+     *
+     * 两个内核都不会自己恢复（见 [WebHost.rendererGone] 的说明）：WebView 的
+     * `onRenderProcessGone` 默认实现**直接杀掉应用进程**（用户看到的是「App 突然
+     * 自己退了」）；GeckoView 的 `onCrash` / `onKill` 默认什么都不做，界面就永久
+     * 停在一块画不出东西的空壳上。两种情况都**没有任何提示**，因为进程还活着、
+     * 只是页面没了。
+     *
+     * ## 恢复动作
+     *
+     * 引擎（Node 进程）**不受影响** —— 死的是渲染进程，不是引擎。URL 与 token
+     * 都还有效，所以 `reload()` 一次就能把界面带回来，不需要重启引擎。
+     *
+     * ⚠️ **必须延迟一点再重载**：回调到达时内核正在收拾崩溃的现场，立刻 `loadUrl`
+     *   多半会被丢掉。实测在 WebView 上留一小段间隔（[RENDERER_RELOAD_DELAY_MS]）
+     *   重载成功率明显更高。
+     *
+     * ⚠️ **首次重载静默做**（用户通常察觉不到：界面闪一下而已）。超过
+     *   [MAX_RENDERER_RESTARTS] 次之后就必须明说了 —— 反复崩溃是真的有问题，
+     *   而静默重载会让用户以为「App 什么都没发生」。
+     *
+     * @param didCrash true = 崩溃；false = 被系统回收（低内存时的正常行为）。
+     */
+    private fun onRendererGone(didCrash: Boolean) {
+        // 内核的回调可能在非主线程来（GeckoView 的 contentDelegate 就在
+        // Gecko 线程），而这里要碰 View、还要 postDelayed，必须先切主线程。
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            rendererHandler.post { onRendererGone(didCrash) }
+            return
+        }
+
+        val reason = if (didCrash) "崩溃" else "被系统回收"
+        // 已经排好一次重载就不要再排 —— 一次崩溃可能同时从几个回调报上来。
+        if (rendererReloadQueued) {
+            Log.i(DshApplication.TAG, "界面内核$reason，已有重载在排队，忽略")
+            return
+        }
+
+        rendererRestarts++
+        Log.w(
+            DshApplication.TAG,
+            "界面内核$reason，准备重载（第 $rendererRestarts 次）",
+        )
+
+        // ⚠️ 状态复位：新渲染进程的第一帧还没提交，沿用旧值会让启动层立刻收尾。
+        webViewPainted = false
+        paintPending = false
+
+        if (rendererRestarts > MAX_RENDERER_RESTARTS) {
+            Log.e(DshApplication.TAG, "界面内核反复$reason，停止自动重载")
+            // 把出路摆给用户：不再自动重载，但说清发生了什么、以及该做什么。
+            // ⚠️ 这里显式放开 `overlayDismissed`（见 showOverlay 的第一行守卫），
+            //   否则界面早就收起过启动层，这条提示永远贴不上去。
+            overlayDismissed = false
+            showOverlay(
+                "界面反复出错",
+                hint = "Web 内核$reason 了 $rendererRestarts 次，已停止自动恢复。" +
+                    "点一下这里收起提示；若界面仍然空白，请重开 App",
+                isError = true,
+            )
+            return
+        }
+
+        rendererReloadQueued = true
+        rendererHandler.postDelayed({
+            rendererReloadQueued = false
+            // 用户可能已经手动恢复了（重开 Activity），此时不必再重载
+            if (isFinishing || isDestroyed) return@postDelayed
+            // ⚠️ 用带重试的封装：首次重载若仍失败（内核还没准备好新进程），
+            //   再补一次。不这样做的话，实测有一半概率停在白屏上不动。
+            reloadWithRetry(attempt = 1)
+        }, RENDERER_RELOAD_DELAY_MS)
+    }
+
+    /**
+     * 重载界面，失败就再试一次。
+     *
+     * ⚠️ 判据是「重载之后有没有拿到首帧」，而不是 `loadUrl` 有没有抛异常
+     *   （它从不抛）。
+     *
+     * ⚠️ **必须重新武装首帧等待**（[awaitWebViewPainted]）。重载之后插件会再走一次
+     *   `onUiReady`，但 `uiStage` 这个 StateFlow 的值**已经是 `UiReady`**，相同值
+     *   不会重复发射 —— 于是 `observeEngine` 里那个「等首帧再收启动层」的分支
+     *   一次都不会跑到，`webViewPainted` 就永远停在 `false`。这里主动注册一次，
+     *   它同时也是「重载成功了没有」的观测点。
+     */
+    private fun reloadWithRetry(attempt: Int) {
+        Log.i(DshApplication.TAG, "重载界面（第 $attempt 次尝试）")
+        awaitWebViewPainted {
+            // 首帧回来了 = 界面真的恢复到可用状态
+            Log.i(DshApplication.TAG, "界面已恢复（第 $attempt 次尝试拿到首帧）")
+        }
+        web.reload()
+        rendererHandler.postDelayed({
+            if (webViewPainted) return@postDelayed
+            if (attempt < MAX_RELOAD_ATTEMPTS) {
+                Log.w(DshApplication.TAG, "界面未恢复，再试一次")
+                reloadWithRetry(attempt + 1)
+            } else {
+                Log.e(DshApplication.TAG, "界面重载 $attempt 次仍未恢复为可用状态")
+            }
+        }, PAINT_TIMEOUT_MS + RENDERER_RELOAD_DELAY_MS)
+    }
+
+    /**
      * 键盘高度缓存的 key。
      *
      * ⚠️ 竖屏与横屏的键盘高度不同（横屏键盘更矮），必须分开存，
@@ -445,6 +599,77 @@ class MainActivity : AppCompatActivity() {
         Log.i(DshApplication.TAG, "通知权限结果: $granted")
     }
 
+    // ══ 麦克风（语音输入的第三层：内核授权回调 → 这里申请 Android 权限）══════
+    //
+    // ⚠️ **一次只能有一个权限请求在飞**：`registerForActivityResult` 的 launcher
+    //   是「启动即等待」的语义，同时发两个会互相顶掉（本项目在存储/通知那两处
+    //   踩过，见 storagePermissionLauncher 的注释）。所以这里用「结果队列」而不是
+    //   每来一个请求就 launcher.launch 一次。
+
+    /** 等待麦克风权限结果的回调（内核可能同时只有一个请求，但仍按队列处理）。 */
+    private val micResultSinks = ArrayDeque<(Boolean) -> Unit>()
+
+    /** 是否有一次麦克风权限请求正在飞；有的话后续请求排队等它回来。 */
+    private var micRequestInFlight = false
+
+    private val microphonePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        Log.i(DshApplication.TAG, "麦克风权限结果: $granted")
+        micRequestInFlight = false
+        // 本次请求的所有等待者都拿同一个结论（它们问的是同一个问题）
+        while (micResultSinks.isNotEmpty()) micResultSinks.removeFirst().invoke(granted)
+        // 队列里还有没发出去的（等待期间又来了请求）就继续发
+        drainMicQueue()
+    }
+
+    /**
+     * 把排队的麦克风请求发一个出去（幂等：已有请求在飞就返回）。
+     *
+     * ⚠️ 必须**串行**：launcher 同一时刻只允许一次请求，并发调用 `launch` 会抛
+     *   `IllegalStateException: Attempting to launch an unregistered ActivityResultLauncher`
+     *   或者干脆静默丢掉后一个。
+     */
+    private fun drainMicQueue() {
+        if (micRequestInFlight) return
+        if (micResultSinks.isEmpty()) return
+        // ⚠️ 已经授过就直接回 true，不再弹框（系统此时也不会弹，但显式判一次
+        //   可以避免"用户点录音却看到一次无意义的闪框"）。
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.i(DshApplication.TAG, "麦克风权限已就绪，直接放行")
+            while (micResultSinks.isNotEmpty()) micResultSinks.removeFirst().invoke(true)
+            return
+        }
+        micRequestInFlight = true
+        Log.i(DshApplication.TAG, "申请麦克风权限（语音输入依赖它）")
+        runCatching {
+            microphonePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }.onFailure {
+            // launcher 起不来（极罕见：Activity 已销毁）时必须回调 false，
+            // 否则内核那个授权请求永远挂着，页面录音按钮点了毫无反应。
+            Log.w(DshApplication.TAG, "发起麦克风权限申请失败", it)
+            micRequestInFlight = false
+            while (micResultSinks.isNotEmpty()) micResultSinks.removeFirst().invoke(false)
+        }
+    }
+
+    /**
+     * 内核在问「页面能不能用麦克风」—— 走这条通道（见 [MicrophoneChannel]）。
+     *
+     * ⚠️ 本方法**可能在非主线程**被调用（Gecko 的 delegate 回调在 Gecko 线程），
+     *   而 `registerForActivityResult` 的 launcher 必须在主线程 launch。
+     */
+    private fun onMicrophoneRequested(onResult: (Boolean) -> Unit) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            overlayHandler.post { onMicrophoneRequested(onResult) }
+            return
+        }
+        micResultSinks.addLast(onResult)
+        drainMicQueue()
+    }
+
     /**
      * 申请外部存储读写。
      *
@@ -573,6 +798,12 @@ class MainActivity : AppCompatActivity() {
                 fileChooser = { multiple, onResult -> launchFileChooser(multiple, onResult) },
                 onDownload = { req -> handleDownload(req) },
                 onDownloadStream = { stream -> handleDownloadStream(stream) },
+                // ⚠️ 必须接：不接的话 WebView 的默认实现会**直接杀掉本 App 进程**
+                //（见 WebHostCallbacks.onRendererGone 的说明）。
+                onRendererGone = { didCrash -> onRendererGone(didCrash) },
+                // ⚠️ 必须接：不接的话两个内核的默认实现都是**拒绝麦克风**，
+                //   页面的语音输入永远报「权限被拒绝」（见 MicrophoneChannel）。
+                microphone = { onResult -> onMicrophoneRequested(onResult) },
             ),
         )
         binding.webContainer.addView(
@@ -780,6 +1011,17 @@ class MainActivity : AppCompatActivity() {
     private var backQueryPending = false
 
     /**
+     * 返回键探针的世代号 —— 用来作废"超时之后才姗姗来迟"的回调。
+     *
+     * 每次发起探针递增一次；**超时兜底也会递增**，于是晚到的回调会因
+     * `seq != backQuerySeq` 被直接丢弃，不会重复执行收尾动作。
+     */
+    private var backQuerySeq = 0
+
+    /** 返回键探针的兜底定时器（见 [queryPageBack]）。 */
+    private val backHandler = Handler(Looper.getMainLooper())
+
+    /**
      * 安装返回键处理。
      *
      * 用 `OnBackPressedCallback` 而不是覆写 `onBackPressed()`：
@@ -804,11 +1046,42 @@ class MainActivity : AppCompatActivity() {
      * ⚠️ **桥不存在时必须直接退出**，不能"当作页面说 true" —— 那会让返回键
      *   在插件还没激活（或激活失败）时**完全失效**，用户被困在 App 里出不去。
      *   反过来，插件没起来时页面里也确实没有任何自建层级需要关，退出是对的。
+     *
+     * ## ⚠️⚠️ 为什么必须有超时兜底（用户反馈「返回不了对话界面」的根因）
+     *
+     * `WebHost.evaluateJavascript` 的契约**明确写着「不保证一定被调用」**
+     * （渲染进程崩溃、View 已销毁、GeckoView 扩展还没就绪时都不会回调）。
+     * 而本方法原先只在**回调里**复位 `backQueryPending` —— 于是只要有一次回调
+     * 没来，这个标志就**永久卡在 true**，此后每一次返回键都在第一行
+     * `if (backQueryPending) return` 处静默返回，返回键**彻底失效**。
+     *
+     * 用户的症状正是如此：界面卡住之后返回键毫无反应，只能靠右上角 ⋯ 或手势退出。
+     * 触发条件与「切回前台黑/白屏」同源 —— WebView 的渲染进程被系统回收后，
+     * `evaluateJavascript` 就是那个"永远不回"的调用。
+     *
+     * 兜底语义与「页面说 false」一致（退到后台）：超时说明**问不到**页面，
+     * 此时最不该做的就是继续把用户困在 App 里。
      */
     private fun queryPageBack() {
         if (backQueryPending) return
         backQueryPending = true
+        val seq = ++backQuerySeq
+
+        backHandler.postDelayed({
+            // 已经被回调正常收尾过（或又发起了新的一次探针）：什么都不做。
+            if (seq != backQuerySeq) return@postDelayed
+            // ⚠️ 递增世代号，让可能还在路上的回调作废 —— 否则它会再执行一次
+            //   moveTaskToBack，而且会把 backQueryPending 复位成"看起来正常"。
+            backQuerySeq++
+            backQueryPending = false
+            Log.w(DshApplication.TAG, "返回键探针超时（页面未响应），按无可退层级处理")
+            moveTaskToBack(true)
+        }, BACK_PROBE_TIMEOUT_MS)
+
         web.evaluateJavascript(BACK_PROBE_JS) { result ->
+            // 超时兜底已经收尾过：丢弃这次迟到的回调。
+            if (seq != backQuerySeq) return@evaluateJavascript
+            backQuerySeq++
             backQueryPending = false
             // 页面回 "true" ⇒ 已消费；其余（"false" / "null" / 异常）一律退到后台。
             val consumed = result != null && result.trim('"') == "true"
@@ -1249,7 +1522,11 @@ class MainActivity : AppCompatActivity() {
                         // ⚠️ 这里**不能**收起 overlay：引擎就绪只代表 HTTP 服务起来了，
                         //   页面还没加载、插件更没激活。实测后面还有约 3.8 秒。
                         showOverlay("正在加载界面…", hint = "渲染 Web GUI")
-                        if (web.currentUrl != state.url) {
+                        // ⚠️ 引擎**重启**过时必须无视 URL 去重（见
+                        //   `forceReloadOnReady` 的说明）：端口与 token 没变时
+                        //   URL 相等，而页面连的其实是已经死掉的旧端口。
+                        if (forceReloadOnReady || web.currentUrl != state.url) {
+                            forceReloadOnReady = false
                             Log.i(DshApplication.TAG, "加载 Web GUI: ${state.url}")
                             web.loadUrl(state.url)
                             // ⚠️ 计时必须**从这一刻**起算，不能放在 onCreate。
@@ -1267,6 +1544,64 @@ class MainActivity : AppCompatActivity() {
                             hint = state.message,
                             isError = true,
                         )
+                    }
+                    is EngineManager.State.Dead -> {
+                        // ⚠️ 与 Failed **刻意不同的动作**：引擎本来跑得好好的、
+                        //   之后被系统回收或自己 OOM 了，配置是**好的** —— 原样重启
+                        //   就是正确动作，绝不该引导用户去点「安全模式」（那会推开
+                        //   他辛苦配好的插件配置）。
+                        //
+                        // 见 `EngineManager.State.Dead` 的 KDoc。
+                        //
+                        // ⚠️ 计数只统计**短时间内连续**的死亡（见 ENGINE_RESTART_WINDOW_MS）：
+                        //   一次长期运行之后的死亡（比如跑了一天被系统回收）是**正常的**，
+                        //   把它算进「反复退出」会让用户无端看到「引擎反复停止」。
+                        val now = System.currentTimeMillis()
+                        if (now - lastEngineDeadAt > ENGINE_RESTART_WINDOW_MS) engineRestarts = 0
+                        lastEngineDeadAt = now
+                        engineRestarts++
+                        Log.w(
+                            DshApplication.TAG,
+                            "引擎已退出: ${state.message}，准备自动重启（第 $engineRestarts 次）",
+                        )
+                        // ⚠️ 反复死亡 ⇒ 配置真的有问题，不能再静默重启（见
+                        //   `engineRestarts` 的说明）。此时「安全模式」才是正确出口。
+                        if (engineRestarts > MAX_ENGINE_RESTARTS) {
+                            Log.e(DshApplication.TAG, "引擎反复退出，停止自动重启")
+                            overlayDismissed = false
+                            showOverlay(
+                                "引擎反复停止",
+                                hint = "${state.message}（已自动重启 $MAX_ENGINE_RESTARTS 次）。" +
+                                    "可点下面的「安全模式」推开损坏的插件配置",
+                                isError = true,
+                            )
+                            return@collect
+                        }
+                        // ⚠️ 先放开「已收起」守卫，否则提示贴不上（界面早就收起过
+                        //   启动层了）。
+                        overlayDismissed = false
+                        showOverlay("引擎已停止，正在重新启动…", hint = state.message)
+                        // ⚠️ 页面此刻是**活的**，但它连的是已经没人监听的端口 ——
+                        //   必须等引擎起来后重新加载，否则界面永远连不上。
+                        // ⚠️ 清掉 webViewPainted 让新一轮的「等首帧」重新生效。
+                        webViewPainted = false
+                        paintPending = false
+                        // ⚠️ 还要把页面阶段退回 None：否则 `uiStage` 停在 UiReady，
+                        //   而 StateFlow 相同值不重复发射 ⇒ 新一轮的「等首帧再收
+                        //   启动层」分支一次都跑不到 ⇒ 启动层永远收不起来。
+                        engine.resetUiStage()
+                        // ⚠️ 还要声明「这次必须重新加载」：端口与 token 没变时
+                        //   URL 与上次相等，去重会命中，页面就不会重新加载 ——
+                        //   而它连的是已经死掉的旧端口。
+                        forceReloadOnReady = true
+                        lifecycleScope.launch {
+                            try {
+                                engine.start()
+                            } catch (t: Throwable) {
+                                Log.e(DshApplication.TAG, "引擎自动重启失败", t)
+                                showOverlay("引擎重启失败", hint = t.message, isError = true)
+                            }
+                        }
                     }
                 }
             }
@@ -1554,6 +1889,14 @@ class MainActivity : AppCompatActivity() {
         imeHandler.removeCallbacks(imeRestoreRunnable)
         overlayHandler.removeCallbacks(overlayTimeoutRunnable)
         overlayHandler.removeCallbacks(paintTimeoutRunnable)
+        // ⚠️ 返回键探针的兜底定时器也要清：留着它会在 Activity 销毁后调
+        //   moveTaskToBack（对着已销毁的 Activity）。世代号自增让残留回调失效，
+        //   这里再显式移除一次，双保险。
+        backQuerySeq++
+        backHandler.removeCallbacksAndMessages(null)
+        // ⚠️ 渲染进程恢复的退避定时器同样要清：留着它会在 Activity 销毁后
+        //   继续重载一个已经拆掉的 Web 视图。
+        rendererHandler.removeCallbacksAndMessages(null)
         // ⚠️ 必须清掉：Web 视图随 Activity 一起销毁，留着这些闭包会让气泡
         //   对着一具"尸体"调 evaluateJavascript（静默无效，用户以为发成功了）。
         FloatingBubble.sendText = null
@@ -1731,6 +2074,61 @@ class MainActivity : AppCompatActivity() {
          * 提前点会点到 disabled 的按钮 —— 症状是"文字进去了但没发出去"。
          */
         const val BUBBLE_SEND_DELAY_MS = 500L
+
+        /**
+         * 返回键探针的兜底超时（ms）。
+         *
+         * 真机实测：正常一次往返在 WebView 上是**毫秒级**（同一个 JS 线程，
+         * `evaluateJavascript` 走 IPC 到 JS 引擎再回来）。GeckoView 侧要过一次
+         * 扩展的 IPC，明显更慢，但仍远在 1 秒以内。
+         *
+         * 取 1200ms：既比两个内核的正常路径宽裕得多，又不至于让用户觉得
+         * "按了返回键卡住不动"。超时后按「无可退层级」处理（退到后台），
+         * 与页面回 false 的语义一致 —— 最不该做的是把用户困在 App 里。
+         */
+        const val BACK_PROBE_TIMEOUT_MS = 1200L
+
+        /**
+         * 内核进程死亡之后，等多久再重载界面（ms）。
+         *
+         * ⚠️ **不能为 0**：回调到达时内核还在收拾崩溃现场，紧接着 `loadUrl` 有
+         *   相当概率被丢掉（然后用户就一直停在白屏上）。留一小段间隔让内核把
+         *   新渲染进程拉起来。
+         * 取值 400ms：远小于用户能察觉"怎么卡了一下"的量级，又足够避开收尾期。
+         */
+        const val RENDERER_RELOAD_DELAY_MS = 400L
+
+        /** 单次恢复最多重载几次（见 [reloadWithRetry]）。 */
+        const val MAX_RELOAD_ATTEMPTS = 2
+
+        /**
+         * 允许**自动**恢复的次数上界。
+         *
+         * 超过之后不再静默重载，改为把问题摆到界面上。理由见 [onRendererGone]：
+         * 反复崩溃是真的有问题，静默重载会让用户以为「什么都没发生」。
+         */
+        const val MAX_RENDERER_RESTARTS = 3
+
+        /**
+         * 允许**自动**重启引擎的次数上界。
+         *
+         * 超过之后不再静默重启，改为把问题摆到界面上并提示「安全模式」。
+         * 理由见 [engineRestarts] 的说明：单次死亡是系统回收（配置没问题，
+         * 原样重启就对），反复死亡才说明配置有问题。
+         */
+        const val MAX_ENGINE_RESTARTS = 2
+
+        /**
+         * 「连续死亡」的判定窗口（ms）。
+         *
+         * 两次死亡间隔超过它 ⇒ 计数归零、重新开始数。依据是「引擎跑了好一会儿
+         * 才死」与「刚起来就死」是**两种不同的事」：前者多半是系统在内存压力下
+         * 回收（正常，重启即可），后者才说明配置有问题。
+         *
+         * 取 90 秒：远大于引擎正常启动耗时（实测 7~10 秒，首次解包 15 秒），
+         * 所以「起来就死」必定落在窗口内；又远小于用户跑一次长任务的时间。
+         */
+        const val ENGINE_RESTART_WINDOW_MS = 90_000L
 
         /**
          * 把文本写进官方 composer。

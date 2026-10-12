@@ -42,6 +42,28 @@ interface WebHost {
     fun loadUrl(url: String)
 
     /**
+     * 重新加载 [currentUrl]。
+     *
+     * ## 为什么需要它（这是「渲染进程崩溃后白屏」的恢复路径）
+     *
+     * 两个内核都**不会**自己从渲染进程崩溃里恢复：
+     *
+     * - WebView：渲染进程死掉后，`WebView` 变成一个画不出任何东西的空壳，
+     *   页面内容不会自动重来。宿主若不处理，用户看到的是一块白（或黑）屏，
+     *   而且**没有任何提示** —— 退回桌面再进来也一样，因为 Activity 没重建。
+     * - GeckoView：内容进程崩溃后 session 同样停在坏状态，必须重新加载。
+     *
+     * 崩溃本身无法阻止（那是内核进程，宿主进程管不到），但**恢复是可以的**：
+     * 引擎还在跑，URL 还有效，`loadUrl` 一次就能把界面带回来。
+     *
+     * ⚠️ 实现方**不应**在这里切换 `currentUrl` 的语义 —— 它仍是「最近一次**发起**
+     *   的 URL」，重载不改它。
+     * ⚠️ 由 [com.dsh.android.MainActivity] 在收到 `onRendererGone` 之后调用，
+     *   调用时机由宿主的退避策略决定（见那里的注释）。
+     */
+    fun reload()
+
+    /**
      * 当前 URL；还没加载过任何页面时为 null。
      *
      * ⚠️ 语义是「最近一次发起加载的 URL」，不是内核内部的重定向结果 ——
@@ -100,6 +122,45 @@ fun interface FileChooserChannel {
 }
 
 /**
+ * 麦克风授权通道 —— 页面要录音，内核来问宿主同不同意。
+ *
+ * ## 为什么必须存在这一层（本项目第三处「默认实现静默失败」）
+ *
+ * 页面的语音输入（`dsh-experimental-client-ui-voice-input`）调
+ * `navigator.mediaDevices.getUserMedia({audio: true})`。这一句在 Android 的
+ * WebView / GeckoView 里**不是**只看 Android 权限就放行的，而是要经过内核的
+ * 授权回调：
+ *
+ * | 内核 | 回调 | 默认行为 |
+ * |---|---|---|
+ * | system | `WebChromeClient.onPermissionRequest` | **deny**（不弹框、不报错） |
+ * | gecko | `PermissionDelegate.onMediaPermissionRequest` | **deny** |
+ *
+ * 两边的默认实现都是拒绝，且**不留任何日志**。页面侧于是拿到
+ * `NotAllowedError`，前端把它翻译成 `RecordingError("permission")` ——
+ * 界面文案永远是「麦克风权限被拒绝」，**哪怕 Android 权限早就授过了**。
+ * 这正是本项目在文件选择器（⑦）与下载器（⑦.5）上踩过的同一种坑。
+ *
+ * ## 契约
+ *
+ * ⚠️ **必须回调**，且**必须在拿到结果之后回调**：内核的授权请求是挂起的，
+ *   不回就是「页面永远停在等待授权的状态」，录音按钮点了没有任何反应。
+ * ⚠️ 用户拒绝时回 `false`（不是抛异常、也不是不回）—— 页面会把它当正常拒绝
+ *   处理，弹一句「权限被拒绝」，这是一条**用户可理解**的失败路径。
+ * ⚠️ 宿主应当在回调里**先**确保 Android 运行时权限（`RECORD_AUDIO`）已授予，
+ *   再回 `true`；否则内核放行了、录音却拿不到音频，症状是「录出来是静音」——
+ *   比直接拒绝难查得多。
+ */
+fun interface MicrophoneChannel {
+    /**
+     * 请求麦克风使用权。
+     *
+     * @param onResult true = 允许，false = 拒绝。
+     */
+    fun request(onResult: (Boolean) -> Unit)
+}
+
+/**
  * 一个下载请求。
  *
  * ⚠️ 两个内核**触发下载的机制完全不同**，所以这个类只描述「要下什么」，不描述
@@ -153,6 +214,17 @@ data class DownloadStream(
  * @property onDownload 宿主**自己发 HTTP** 的下载（system 版）。
  * @property onDownloadStream 内核**已经代发**、只剩落盘的下载（gecko 版）。
  *   ⚠️ 两个内核各只会调其中一个 —— 见 [DownloadStream] 的说明。
+ * @property onRendererGone 承载页面的**内核进程死了**（WebView 的
+ *   `onRenderProcessGone` / GeckoView 的 `onCrash`）。
+ *
+ *   ⚠️ **必须处理，且默认行为是致命的**：`WebViewClient.onRenderProcessGone`
+ *   的默认实现返回 `false`，而文档明确写着 —— 返回 false 时**整个应用进程会被
+ *   系统杀掉**。也就是说，用户遇到的「App 突然自己退了/闪退」，很可能根本不是
+ *   App 的 bug，而是这个回调没被覆写。
+ *
+ *   ⚠️ 参数里的 `didCrash` 只是给日志用的分类：`true` = 渲染进程崩了，
+ *   `false` = 被系统回收（低内存时系统会主动收掉后台 WebView 的渲染进程，
+ *   **这不是异常**，但界面同样需要重载才会回来）。
  */
 class WebHostCallbacks(
     val bridge: PageBridge,
@@ -162,4 +234,7 @@ class WebHostCallbacks(
     val fileChooser: FileChooserChannel,
     val onDownload: (DownloadRequest) -> Unit,
     val onDownloadStream: (DownloadStream) -> Unit,
+    val onRendererGone: (didCrash: Boolean) -> Unit,
+    /** 页面要录音时的麦克风授权通道（见 [MicrophoneChannel]）。 */
+    val microphone: MicrophoneChannel,
 )

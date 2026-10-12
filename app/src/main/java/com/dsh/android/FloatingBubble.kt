@@ -1969,20 +1969,31 @@ class FloatingBubble(private val context: Context) {
                 }
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    val wasDrag = moved
                     dragging = false
-                    if (!wasDrag) {
-                        // 点它只把球弹回来，**不**直接展开面板。
-                        //
-                        // ⚠️ 用户实测反馈：贴边收起后点一下，期望先看到悬浮球，结果面板
-                        //   直接铺开，观感是"球没了、被聊天窗口顶掉"。展开是球的下一步
-                        //   动作，不该由这条 6dp 细条代劳。
-                        if (ev.actionMasked == MotionEvent.ACTION_UP) exitEdge()
-                    } else {
-                        // 拖动薄片本身没意义，但用户可能是想把它挪个位置 —— 直接
-                        // 弹回完整球，让他继续正常使用。
-                        exitEdge()
-                    }
+                    // ⚠️⚠️ **UP 与 CANCEL 必须一视同仁地退出贴边态**（用户反馈
+                    //   「悬浮窗躲进屏幕边框出不来，点击没反应，概率性」的根因）。
+                    //
+                    // 原实现在「未拖动 + ACTION_CANCEL」这一支上**什么都不做**：
+                    //
+                    //     if (!wasDrag) {
+                    //         if (ev.actionMasked == MotionEvent.ACTION_UP) exitEdge()
+                    //     } else { exitEdge() }
+                    //
+                    // 而薄片宽 6dp 且 `EDGE_MARGIN_DP = 0`（紧贴屏幕最边缘，见
+                    // `enterEdge` 里硬编码的 x = 0 / widthPixels - edgeW），正好落在
+                    // 系统的**边缘手势返回热区**里。手势一旦被系统识别，触摸会被
+                    // 抢走并转成 ACTION_CANCEL —— 于是这个分支被命中，薄片永远
+                    // 弹不回来。用户看到的就是「点了没反应」，而「概率性」正是
+                    // 因为是否被手势抢走取决于 ROM 的手势设置与手指落点。
+                    //
+                    // 语义上也该退出：CANCEL 的含义是「这次触摸被中断了」，用户
+                    // 的意图无从判断；而此刻**唯一安全的选择就是把球弹回完整形态**
+                    // —— 球比 6dp 薄片好点得多，用户下一手必然能操作到。反过来
+                    // （维持贴边态）才是把用户困住的唯一路径。
+                    //
+                    // ⚠️ 顺带解决了另一条同类路径：手指按下后滑出这 6dp 的边界时，
+                    //   Android 同样发 CANCEL（原实现同样吞掉）。
+                    exitEdge()
                     true
                 }
 

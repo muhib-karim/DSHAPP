@@ -59,6 +59,32 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
+    <!--
+        麦克风：语音输入（`dsh-experimental-client-ui-voice-input`）。
+
+        ⚠️ **光声明这一个权限没用**，这是本项目反复踩的第三处「默认实现静默失败」
+        （前两处是 ⑦ 的文件选择器、⑦.5 的下载器）。整条链有三层，缺一层就
+        「点了没反应、也没有任何报错」：
+
+            ① 本声明            ← Android 层许可
+            ② 运行时申请         ← Android 6+ 必须在代码里弹框拿（见 MainActivity）
+            ③ 内核授权回调       ← WebView 的 onPermissionRequest /
+                                   GeckoView 的 permissionDelegate
+
+        第 ③ 层最容易漏：两个内核的**默认实现都是 deny**。也就是说不覆写它，
+        页面的 `getUserMedia` 一定抛 `NotAllowedError`，而前端的错误处理把它
+        翻译成 `RecordingError("permission")`，界面上就是「麦克风权限被拒绝」——
+        **即使前两层都齐了也是这句话**，极具误导性。
+
+        ⚠️ 页面跑在 `http://127.0.0.1:3080`，看着像非安全上下文，但 `127.0.0.1`
+          属于浏览器规范的 localhost 例外、**算 secure context**，所以
+          `navigator.mediaDevices` 存在、`getUserMedia` 可调用。不需要 https。
+
+        ⚠️ 语音数据流向：页面用 MediaRecorder 录一段音频**上传给引擎**做识别
+          （本地 SenseVoice，首次使用时下载模型，约 239 MB），不是录成文件存本地。
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
     <application
         android:name=".DshApplication"
         android:allowBackup="false"

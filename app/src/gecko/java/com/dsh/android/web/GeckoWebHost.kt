@@ -162,10 +162,95 @@ class GeckoWebHost(
 
             /** 关窗请求：本 App 单页，直接忽略（不要让内核把会话关掉）。 */
             override fun onCloseRequest(session: GeckoSession) = Unit
+
+            /**
+             * 内容进程**崩溃**了（与 WebView 的 `onRenderProcessGone(didCrash=true)` 对应）。
+             *
+             * ⚠️ 与 system 版那处不同：这里的默认实现**不会**杀宿主进程，它只是
+             *   什么都不做 —— 于是 session 停在坏状态、界面画不出东西，而用户
+             *   得不到任何提示。所以同样必须处理（见 `MainActivity.onRendererGone`）。
+             */
+            override fun onCrash(session: GeckoSession) {
+                Log.w(DshApplication.TAG, "Gecko 内容进程已崩溃")
+                callbacks.onRendererGone(true)
+            }
+
+            /**
+             * 内容进程被系统**回收**（低内存时的正常资源管理，不是错误）。
+             *
+             * 与 [onCrash] 的区别只在日志措辞：两者都要重载界面才会回来。
+             */
+            override fun onKill(session: GeckoSession) {
+                Log.w(DshApplication.TAG, "Gecko 内容进程已被系统回收")
+                callbacks.onRendererGone(false)
+            }
         }
 
-        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
-            /**
+        /**
+         * 页面请求麦克风 —— **必须覆写**。
+         *
+         * ⚠️ 默认实现是 `GeckoResult.deny()`：不弹框、不打日志。页面拿到
+         *   `NotAllowedError`，前端把那个翻译成 `RecordingError("permission")`，
+         *   界面永远显示「麦克风权限被拒绝」—— 即使 Android 权限早就授过了。
+         *   与 system 版的 `onPermissionRequest` 是**同一个缺口**（见
+         *   [MicrophoneChannel]）。
+         *
+         * ## 与 system 版的两处结构差异
+         *
+         * 1. **只有这一个回调**：GeckoView 把「设备级权限」（相机/麦克风，走
+         *    [onMediaPermissionRequest]）与「站点级权限」（地理位置/通知，走
+         *    `onContentPermissionRequest`）分开了，而 WebView 只有笼统的一个
+         *    `onPermissionRequest`。所以这里只需覆写前者。
+         * 2. **返回类型是 `Unit`**（不是 `GeckoResult`）：媒体权限靠
+         *    `MediaCallback.grant()` / `reject()` 异步回应，是"回调式"而非"返回式"。
+         *
+         * ## 只放行麦克风
+         *
+         * `audio` 里出现 `SOURCE_MICROPHONE` 才放行；摄像头（`video`）一律
+         * `reject()` —— 本 App 用不到，收紧比放行安全。用 `reject()` 而不是
+         * 什么都不做：不回就是「页面永远停在等待授权」，录音按钮点了毫无反应。
+         */
+        session.permissionDelegate = object : GeckoSession.PermissionDelegate {
+            override fun onMediaPermissionRequest(
+                session: GeckoSession,
+                uri: String,
+                video: Array<GeckoSession.PermissionDelegate.MediaSource>?,
+                audio: Array<GeckoSession.PermissionDelegate.MediaSource>?,
+                callback: GeckoSession.PermissionDelegate.MediaCallback,
+            ) {
+                val wantsMic = audio?.any {
+                    it.source == GeckoSession.PermissionDelegate.MediaSource.SOURCE_MICROPHONE
+                } == true
+                if (!wantsMic) {
+                    Log.i(DshApplication.TAG, "页面请求媒体权限（非麦克风），拒绝: $uri")
+                    callback.reject()
+                    return
+                }
+                Log.i(DshApplication.TAG, "页面请求麦克风，转交宿主申请 Android 权限")
+                callbacks.microphone.request { granted ->
+                    // ⚠️ 必须在主线程回应（Gecko 的 delegate 回调契约要求）。
+                    geckoView.post {
+                        if (granted) {
+                            Log.i(DshApplication.TAG, "麦克风授权：允许")
+                            // ⚠️ 用 `grant(audio, null)` 这个重载（单个 MediaSource
+                            //   版本）：传 `null` 表示"不授权任何视频源"。传
+                            //   `MediaSource[]` 数组的那个重载在这里更啰嗦，
+                            //   而且必须自己保证数组非空。
+                            val mic = audio.first {
+                                it.source ==
+                                    GeckoSession.PermissionDelegate.MediaSource.SOURCE_MICROPHONE
+                            }
+                            callback.grant(mic, null)
+                        } else {
+                            Log.w(DshApplication.TAG, "麦克风授权：用户拒绝")
+                            callback.reject()
+                        }
+                    }
+                }
+            }
+        }
+
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {            /**
              * 外链交给系统浏览器。
              *
              * ⚠️ 与 system 版 `shouldOverrideUrlLoading` 的策略一致：只有本地引擎
@@ -622,6 +707,25 @@ class GeckoWebHost(
 
     override fun loadUrl(url: String) {
         lastLoadedUrl = url
+        session.loadUri(url)
+    }
+
+    /**
+     * 重新加载当前 URL（内容进程崩溃 / 被回收后的恢复路径）。
+     *
+     * ⚠️ `painted` 必须复位：新内容进程的第一帧还没提交，沿用旧的 `true`
+     *   会让启动层立刻收尾、露出白屏。
+     * ⚠️ 与 system 版同构：没有 URL 就没法恢复，静默返回。
+     */
+    override fun reload() {
+        val url = lastLoadedUrl
+        if (url.isNullOrEmpty()) {
+            Log.w(DshApplication.TAG, "内容进程已死但没有可用的 URL，无法重载")
+            return
+        }
+        Log.i(DshApplication.TAG, "重载界面: $url")
+        painted = false
+        pendingPaintAction = null
         session.loadUri(url)
     }
 
