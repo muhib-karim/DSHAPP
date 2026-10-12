@@ -116,7 +116,8 @@ Every element carries \`rect\`/\`center\` in **CSS viewport pixels** and, when t
 - \`dump\` only returns **visible** elements by default. Pass \`includeHidden:true\` to also see hidden ones (useful to diagnose "the button exists but I cannot click it").
 - ⚠️ **A button can be visible and still unclickable — for TWO different reasons.** Every element carries \`covered\`/\`blockedBy\` (something is on top of it) and \`offscreen\` (its centre point is outside the viewport, so a finger has no coordinate to hit). \`dump\` also reports \`overlay\` + \`blocked\` + \`offscreen\` counts and a \`warning\` when a full-screen cover is present. **When \`covered\` is true, do not tap — deal with the cover first.** A common case: on a fresh profile the official frontend opens a "预览版说明" dialog whose button reads **「继续」**; until you tap it, all 16 buttons behind it are dead.
 - ⚠️ **\`offscreen\` is the other "tapped but nothing happened".** The element is real and the events do get dispatched, but its centre is outside the viewport — e.g. the sidebar slides to a negative \`left\` once the drawer collapses — so a real touch cannot land on it and the screen does not change. The fix is the opposite of a cover: switch the UI into the state that panel belongs to (open the drawer first), then re-\`dump\` to confirm it is on screen. \`tap\` returns \`offscreen:true\` with a \`hint\` in that case, and \`wait\` with \`clickable:true\` will **not** report it as satisfied.
-- \`{action:"overlay"}\` answers "what is covering the screen right now, and which buttons are actually live?" — it returns the cover plus the elements you can **really click right now**. (Deliberately *not* "the buttons inside the cover": in this frontend the dialog's buttons are **siblings** of the mask, not descendants, so a descendant search finds nothing.) Reach for it whenever \`covered\`/\`onTarget:false\` shows up.
+- ⚠️ **A full-screen PANEL is not a cover — do not try to dismiss it.** 设置 / 右侧边栏 / the session drawer are all \`position:fixed\` containers covering the whole viewport, and they look identical in the DOM to a modal backdrop. The difference: a backdrop (\`_mask_\`) is **empty** — its buttons are its *siblings* — while a panel contains the buttons of the current screen. \`dump\` reports a panel via the \`panel\` field with a \`note\`, and \`overlay\` returns \`present:false, kind:"panel"\`. **When you see a panel, tap the buttons inside it; the elements behind it being dead is normal, not a fault.** Only \`kind:"mask"\` means "close it first".
+- \`{action:"overlay"}\` answers "what is covering the screen right now, and which buttons are actually live?" — it returns the cover plus the elements you can **really click right now**. (Deliberately *not* "the buttons inside the cover": in this frontend the dialog's buttons are **siblings** of the mask, not descendants, so a descendant search finds nothing.) Reach for it whenever \`covered\`/\`onTarget:false\` shows up. Its \`kind\` field distinguishes \`"mask"\` (a real cover — close it) from \`"panel"\` (your current screen — do not close it).
 - \`{action:"dump", clickableOnly:true}\` drops everything currently covered **or off-screen**, so you get only what a finger could really hit right now.
 - If \`tap\` reports \`onTarget:false\`, something is covering the element (a modal backdrop or loading mask) — read \`hitTopmost\`/\`blockedBy\` to see what actually received the click, and the returned \`hint\` says what to do next.
 - Results include \`ok:false\` with an \`error\` when the element was not found or was not visible. **Always check \`ok\`** and report the failure instead of assuming the click worked.`;
@@ -342,6 +343,14 @@ function render(args, reply) {
 			//   **平级**的（`_root_ > [_mask_, _dialog_]`），`overlay` 报的因此是
 			//   「此刻真正能点的」而不是「里面的」—— 照那句理解会找不到按钮。
 			lines.push(`    先关掉它（用 overlay 动作看此刻真正能点的是哪几个），再操作下面的元素。`);
+		} else if (reply.panel) {
+			// ⚠️ **面板屏绝不能套用遮挡那套措辞。** 设置 / 右侧边栏 / 会话抽屉都是
+			//   覆盖全屏的容器，探针早期版本把它们一律报成「遮挡层」，于是这里会
+			//   打出一句「先关掉它」—— 模型照着去点「返回」，那一屏就永远进不去
+			//   （实测踩过）。面板就是**当前屏幕**，它里面的按钮可以正常点。
+			lines.push(`  ℹ️ 当前屏幕是一个覆盖全屏的面板（${(reply.panel.cls || reply.panel.tag)}），` +
+				`它**里面**的按钮可以正常点。`);
+			lines.push(`    ${reply.note ?? ''}`);
 		} else if ((reply.blocked ?? 0) > 0) {
 			lines.push(`  ⚠️ 其中 ${reply.blocked} 个被上层元素盖住，现在点不动（见元素行上的「被遮挡←」）。`);
 		}
@@ -363,6 +372,18 @@ function render(args, reply) {
 	// ── overlay：现在谁盖着屏幕、此刻真正能点什么 ────────────────────
 	if (action === 'overlay') {
 		const live = reply.clickable ?? [];
+		// ⚠️ 先判 `kind`，再判 `present`。`present` 的语义是「**有没有**覆盖全屏的
+		//   层」（面板也算），`blocking` 才是「它挡不挡着下面的东西」（只有空遮罩
+		//   算）。把 `present` 读成「有遮挡」会把面板屏渲染成「当前有遮挡层」，
+		//   模型就会去关掉一个本该留着的屏幕。
+		if (reply.kind === 'panel') {
+			lines.push(`✓ 当前屏幕是一个覆盖全屏的面板（${(reply.panel?.cls || reply.panel?.tag)}）—— ` +
+				`它不是遮挡层，不用关掉它。`);
+			lines.push(`  它**里面**的按钮就是现在能操作的（共 ${live.length} 个）:`);
+			for (const el of live) lines.push(`    ${fmtElement(el)}`);
+			lines.push(`  它**下面**那层元素点不动是正常的。要回到下面那层，用面板自己的关闭/返回按钮。`);
+			return lines.join('\n');
+		}
 		if (!reply.present) {
 			lines.push(`✓ 当前没有遮挡层，界面可以正常操作。`);
 			if (live.length > 0) {
@@ -371,7 +392,7 @@ function render(args, reply) {
 			}
 			return lines.join('\n');
 		}
-		lines.push('✓ 当前有遮挡层:');
+		lines.push('✓ 当前有遮挡层（空遮罩，里面一个可点元素都没有）:');
 		lines.push(`  ${fmtElement(reply.layer)}`);
 		// ⚠️ 报「此刻真正能点的」而不是「遮挡层里面的」：官方前端的弹窗是
 		//   遮罩与内容**平级**（`_root_ > [_mask_, _dialog_]`），按后代找会得到
@@ -405,8 +426,17 @@ function render(args, reply) {
 				`真实手指点不到，界面不会有任何反应。`);
 			if (reply.hint) lines.push(`    ${reply.hint}`);
 		} else if (reply.onTarget === false) {
-			lines.push(`  ⚠️ 点击被上层元素接收（元素被遮挡，真机手指会点到那层而不是它）:`);
-			if (reply.hitTopmost) lines.push(`    ${fmtElement(reply.hitTopmost)}`);
+			// ⚠️ 被「面板」盖住与被「空遮罩」盖住，处置办法相反：前者是「你要点
+			//   的东西根本不在当前屏幕上」，后者是「先把弹窗关掉」。探针把两者
+			//   分开报（`panel` vs `overlay`），这里必须跟着分开，否则模型会拿着
+			//   「关掉遮挡层」的思路去关一个本该留着的面板。
+			if (reply.panel) {
+				lines.push(`  ⚠️ 该元素在当前面板**下面**（面板是「${reply.panel.cls || reply.panel.tag}」），` +
+					`所以点不到 —— 它不在你现在的屏幕上。`);
+			} else {
+				lines.push(`  ⚠️ 点击被上层元素接收（元素被遮挡，真机手指会点到那层而不是它）:`);
+				if (reply.hitTopmost) lines.push(`    ${fmtElement(reply.hitTopmost)}`);
+			}
 			if (reply.hint) lines.push(`    ${reply.hint}`);
 		}
 		lines.push(`  事件: ${(reply.dispatched ?? []).join(', ')}`);

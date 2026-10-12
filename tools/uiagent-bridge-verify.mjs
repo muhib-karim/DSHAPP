@@ -350,6 +350,68 @@ section('⑦.5 渲染层：屏幕外是第二类「点不到」，不能被混�
 		'给出的处置办法是「切状态」而不是「关掉遮挡层」—— 两者方向相反');
 }
 
+section('⑦.55 渲染层：全屏「面板」不能套用遮挡那套话术（否则模型会去关掉当前屏幕）');
+{
+	// ⚠️ 这是本轮修掉的第二个真实缺陷。设置面板 / 右侧边栏 / 会话抽屉都是覆盖
+	//    全屏的容器，探针早期版本一律报成「遮挡层」，渲染层于是打出「先关掉它」
+	//    —— 模型照着去点「返回」，那一屏**永远进不去**（实测：右侧边栏那一屏被
+	//    引去点「工作区文件」再点「关闭」，绕两圈才回到原位）。
+	//    面板是**当前屏幕**，它里面的按钮可以正常点。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			matched: 3,
+			blocked: 14,
+			panel: { tag: 'div', cls: 'wCInkW_panel', sel: 'body > div:nth-of-type(3) > div:nth-of-type(2)', rect: { x: 0, y: 0, w: 360, h: 780 } },
+			note: '当前屏幕是一个覆盖全屏的面板（wCInkW_panel），它里面的按钮可以点；它**下面**那层元素点不动是正常的，不要去关掉这个面板。',
+			elements: [
+				{ text: '返回', tag: 'button', sel: '#back', rect: { x: 12, y: 6, w: 36, h: 36 } },
+				{ text: '通用设置', tag: 'button', sel: '#general', rect: { x: 10, y: 92, w: 340, h: 50 } },
+				{ text: '发送', tag: 'button', sel: '#send', rect: { x: 300, y: 470, w: 34, h: 34 }, covered: true, blockedBy: { tag: 'div', cls: 'wCInkW_panel' } },
+			],
+			viewport: { w: 360, h: 780 },
+		},
+	});
+	const r = await tool.execute({ action: 'dump' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/面板/.test(msg), `dump 文本里报出「面板」这一类: ${JSON.stringify(msg.slice(0, 120))}`);
+	ok(!/先关掉它/.test(msg),
+		'没有把面板说成「先关掉它」—— 那句话会把模型引去点「返回」，永远进不了这一屏');
+	ok(!/有遮挡层盖住界面/.test(msg), '面板屏不报「有遮挡层盖住界面」');
+	ok(/里面.*可以正常点|可以正常点/.test(msg), '说清面板**里面**的按钮可以正常点');
+	ok(/正常/.test(msg) && /下面/.test(msg), '说清面板下面那层点不动是正常的，不是故障');
+}
+
+section('⑦.56 渲染层：overlay 对面板报 kind:panel，不报遮挡');
+{
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			present: false,
+			kind: 'panel',
+			layer: null,
+			panel: { tag: 'div', cls: 'wCInkW_panel', sel: 'body > div:nth-of-type(3) > div:nth-of-type(2)' },
+			clickable: [
+				{ text: '返回', tag: 'button', sel: '#back', rect: { x: 12, y: 6, w: 36, h: 36 } },
+				{ text: '通用设置', tag: 'button', sel: '#general', rect: { x: 10, y: 92, w: 340, h: 50 } },
+			],
+			count: 2,
+			viewport: { w: 360, h: 780 },
+		},
+	});
+	const r = await tool.execute({ action: 'overlay' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(!/当前没有遮挡层，界面可以正常操作/.test(msg),
+		'面板屏不能套用「没有遮挡层、可以正常操作」那句（会漏掉「这就是你的屏幕」）');
+	ok(/面板/.test(msg), 'overlay 文本里说明当前是面板');
+	ok(/不用关掉它|不是遮挡层/.test(msg), '明确说不用关掉它');
+	ok(/返回/.test(msg), '仍把面板里面能点的按钮列出来');
+}
+
 section('⑦.6 渲染层：tap 报 offscreen 时不能被 onTarget:true 掩盖过去');
 {
 	// ⚠️ 这是真机上最容易骗过模型的一种返回：`onTarget` 是 **true**（事件确实
@@ -373,6 +435,34 @@ section('⑦.6 渲染层：tap 报 offscreen 时不能被 onTarget:true 掩盖�
 	ok(/不会有任何反应|没有可点的坐标/.test(msg), '说清后果是「不会有反应」');
 	ok(!/点击被上层元素接收/.test(msg),
 		'没有误用「被上层元素接收」那句遮挡话术 —— 那会把模型引向 overlay');
+}
+
+section('⑦.65 渲染层：tap 被面板盖住时，说「不在当前屏幕上」而不是「被遮挡」');
+{
+	// ⚠️ 两种 `onTarget:false` 的处置办法相反：
+	//   - 被**空遮罩**盖住 → 先关掉弹窗；
+	//   - 在**面板下面**   → 它根本不在当前屏幕上，该做的是切回下面那层或改点面板里的。
+	//   探针把两者分开报（`panel` vs `overlay`），渲染层必须跟着分开。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			dispatched: ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'],
+			onTarget: false,
+			covered: true,
+			panel: { tag: 'div', cls: 'wCInkW_panel', sel: 'body > div:nth-of-type(3) > div:nth-of-type(2)' },
+			hitTopmost: { tag: 'div', cls: 'wCInkW_panel', sel: 'body > div:nth-of-type(3) > div:nth-of-type(2)' },
+			hint: '这个元素在当前面板**下面**（面板是「wCInkW_panel」），所以点不到。',
+			element: { text: '发送', tag: 'button', sel: '#send', rect: { x: 300, y: 470, w: 34, h: 34 }, covered: true },
+		},
+	});
+	const r = await tool.execute({ action: 'tap', sel: '#send' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/面板/.test(msg), 'tap 文本里报出「面板」');
+	ok(/下面/.test(msg), '说清该元素在面板**下面**，不在当前屏幕上');
+	ok(!/先处理挡在前面的元素|点击被上层元素接收/.test(msg),
+		'没有套用遮挡的话术 —— 那会把模型引去关掉一个本该留着的面板');
 }
 
 section('⑦.7 渲染层：wait clickable 的语义已含「在屏幕内」');

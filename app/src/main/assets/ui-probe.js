@@ -52,7 +52,7 @@ function (CMD) {
   'use strict';
 
   /** 探针版本。**改了本文件的语义就要 +1** —— 页面上的旧探针靠它判断要不要换。 */
-  var VERSION = 3;
+  var VERSION = 5;
 
   /** 结果里单个元素的文本/类名截断长度（防超大 JSON 撑爆 IPC）。 */
   var MAX_TEXT = 120;
@@ -476,6 +476,34 @@ function (CMD) {
   }
 
   /**
+   * 全屏层**内部**有多少个可见、可交互的元素。
+   *
+   * ⚠️ 这是区分「遮挡层」与「当前屏幕」的唯一判据，实测数据：
+   *
+   *   | 全屏层 | 内部可点数 | 是什么 |
+   *   |---|---|---|
+   *   | `_mask_o6lrb_18`（首启弹窗的遮罩） | **0** | 空装饰层，按钮是它的**兄弟** |
+   *   | `wCInkW_panel`（设置面板） | **8** | 应用自己的全屏面板 |
+   *   | `OUqwTW_panel`（右侧边栏） | **7** | 同上 |
+   *
+   *   官方弹窗的结构是 `_root_ > [_mask_（全屏空遮罩）, _dialog_（真内容）]` ——
+   *   遮罩**自己什么都不装**，所以「里面一个能点的都没有」正是它的指纹。
+   */
+  function interactiveInside(layer) {
+    if (!layer) return 0;
+    var found = toArray(document.querySelectorAll(INTERACTIVE));
+    var n = 0;
+    for (var i = 0; i < found.length; i++) {
+      var el = found[i];
+      if (el === layer) continue;
+      if (!layer.contains || !layer.contains(el)) continue;
+      if (!isVisible(el)) continue;
+      n++;
+    }
+    return n;
+  }
+
+  /**
    * 当前有没有**全屏级别的遮挡层**？有的话它是谁？
    *
    * ⚠️ 这是「现在这个界面能不能操作」的总开关。有全屏弹窗时，底下所有按钮都
@@ -486,6 +514,19 @@ function (CMD) {
    *   `fullScreenAncestor` 还没加时更是直接判成「没有遮挡」—— 于是出现了
    *   `overlay` 说「没有遮挡层」而同一时刻 `dump` 说「15 个元素被遮挡」的
    *   自相矛盾。两个字段对同一件事给出相反答案，比缺字段更糟。
+   *
+   * ⚠️ **必须区分「空遮罩」与「应用自己的全屏面板」**，否则会给出**相反的**
+   *   处置建议。设置面板、右侧边栏、会话抽屉都是覆盖全屏的 `position:fixed`
+   *   容器，一样会被采样点命中；第一版把它们全报成「遮挡层」，`dump` 于是
+   *   打出一句「先关掉它（通常是弹窗里的某个按钮）再操作」—— 模型照着去点
+   *   「返回」，于是**永远进不了设置**（实测：右侧边栏那一屏被这句误导后，
+   *   脚本点开「工作区文件」又点「关闭」，绕了两圈才回到原位）。
+   *
+   *   两者在 DOM 上完全同构（都是全屏 fixed 容器），差别只有一个：**里面装
+   *   不装当前屏幕的按钮**。所以用 `interactiveInside` 分：
+   *     - `inside === 0` → `kind:'mask'`，是空装饰层，底下全点不动，必须先关掉；
+   *     - `inside > 0`  → `kind:'panel'`，它就是**当前屏幕**，点它里面的按钮即可，
+   *                       底下那层点不动是正常的，不是故障。
    */
   function overlay() {
     var vw = window.innerWidth || 0;
@@ -513,20 +554,34 @@ function (CMD) {
     if (tally.length === 0) return null;
 
     tally.sort(function (a, b) { return b.n - a.n; });
-    // 只在**多数**采样点都被它挡住时才认定是遮挡层。少数点命中说明那只是
-    // 页面上某个恰好很大的普通元素，不是「盖住了整个界面」。
-    if (tally[0].n < 5) return null;
 
-    var el = tally[0].el;
-    return {
-      sel: cssPath(el),
-      tag: el.tagName.toLowerCase(),
-      cls: trunc(el.getAttribute && el.getAttribute('class') || '', MAX_CLASS),
-      text: labelOf(el),
-      rect: rectOf(el),
-      hits: tally[0].n,
-      samples: pts.length
-    };
+    // ⚠️ 逐名次往下找，**不要**只看第一名。两类全屏层可能同时存在
+    //    （弹窗盖在设置面板上），而它们的处置办法相反。判据：
+    //      - 只在**多数**采样点都被它挡住时才认（少数点命中说明那只是页面上
+    //        某个恰好很大的普通元素，不是「盖住了整个界面」）；
+    //      - 且必须**里面一个能点的都没有** —— 装着自己按钮的全屏层是**当前
+    //        屏幕**（设置面板 / 右侧边栏 / 抽屉），对它说「先关掉它」会把模型
+    //        引到「返回」上去，永远进不了那一屏。详见 interactiveInside 注释。
+    for (var k = 0; k < tally.length; k++) {
+      if (tally[k].n < 5) break; // 已排序，后面的更少
+      var el = tally[k].el;
+      var inside = interactiveInside(el);
+      var info = {
+        sel: cssPath(el),
+        tag: el.tagName.toLowerCase(),
+        cls: trunc(el.getAttribute && el.getAttribute('class') || '', MAX_CLASS),
+        text: labelOf(el),
+        rect: rectOf(el),
+        hits: tally[k].n,
+        samples: pts.length,
+        inside: inside
+      };
+      // 里面装着按钮 ⇒ 它是**当前屏幕**，不是遮挡。照样报出来（`kind:'panel'`），
+      // 但调用方据此把措辞从「先关掉它」换成「这就是你现在的屏幕」。
+      if (inside > 0) return { kind: 'panel', layer: info };
+      return { kind: 'mask', layer: info };
+    }
+    return null;
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -586,7 +641,15 @@ function (CMD) {
       el = bySel('[data-testid="' + spec.testid + '"]') || bySel('[data-test-id="' + spec.testid + '"]');
     }
     if (!el && spec.aria) {
-      el = bySel('[aria-label="' + String(spec.aria).replace(/"/g, '\\"') + '"]');
+      // ⚠️ **必须同时查 `title`**，与 [labelOf] 的取值口径一致。
+      //    `labelOf` 取的是 `aria-label || title`，dump 把它填进 `aria` 字段；
+      //    若这里只查 `[aria-label]`，那么「只有 title、没有 aria-label」的按钮
+      //    会被 dump 报出一个 `aria`，模型照着回传却**定位不到** ——
+      //    症状是「找不到要点击的元素」，而那个按钮明明就在 dump 列表里。
+      //    真机上 DSH 界面大量图标按钮只有 `title`，所以这条回落是必需的。
+      var want = String(spec.aria);
+      el = bySel('[aria-label="' + want.replace(/"/g, '\\"') + '"]') ||
+        bySel('[title="' + want.replace(/"/g, '\\"') + '"]');
     }
     if (!el && spec.text) el = byText(spec.text, spec.exact === true);
     return el;
@@ -874,17 +937,26 @@ function (CMD) {
       // ⚠️ 有全屏遮挡层时，**必须**在顶层把这件事说出来。否则模型拿到的是一份
       //   看起来正常的清单（元素有尺寸、opacity 为 1），挨个点却全部无效 ——
       //   这正是「AI 说点过了但界面没动」的现场。
-      if (ov) {
-        out2.overlay = ov;
-        out2.warning = '当前有覆盖视口大部分区域的遮挡层，它下面的按钮都点不动。' +
-          '先关掉它（通常是弹窗里的某个按钮）再操作。';
+      //
+      // ⚠️ 但**只有 `kind:'mask'` 才说「先关掉它」**。`kind:'panel'` 是应用
+      //   自己的全屏面板（设置 / 右侧边栏 / 抽屉），它就是当前屏幕 —— 对它说
+      //   「先关掉它」会把模型引去点「返回」，那一屏就永远进不去了。
+      if (ov && ov.kind === 'mask') {
+        out2.overlay = ov.layer;
+        out2.warning = '当前有覆盖视口大部分区域的遮挡层（空遮罩，里面一个可点元素都没有），' +
+          '它下面的按钮都点不动。先关掉它（通常是弹窗里的某个按钮）再操作。';
+      } else if (ov && ov.kind === 'panel') {
+        // 面板屏不算故障，但值得提一句：底下那层按钮点不动是**正常**的。
+        out2.panel = ov.layer;
+        out2.note = '当前屏幕是一个覆盖全屏的面板（' + (ov.layer.cls || ov.layer.tag) +
+          '），它里面的按钮可以点；它**下面**那层元素点不动是正常的，不要去关掉这个面板。';
       }
       return ok(out2);
     }
 
     // ── overlay：现在有没有遮挡层、它是什么、此刻真正能点什么 ────────
     if (action === 'overlay') {
-      var layer = overlay();
+      var found = overlay();
       // ⚠️ 不要试图回答「遮挡层**里面**有哪些按钮」—— 实测官方前端的弹窗结构是
       //   `_root_ > [_mask_（全屏空遮罩）, _dialog_（真内容）]`，也就是**按钮是
       //   遮罩的兄弟节点，不是后代**。按后代找会得到「0 个可点元素」，而屏幕
@@ -893,15 +965,21 @@ function (CMD) {
       //   模型真正要问的是「**现在我能点什么**」，所以直接回答那个：列出当前
       //   **没有被遮挡**的可交互元素。这在任何 DOM 结构下都成立。
       var live = collect({ limit: 30, clickableOnly: true });
-      if (!layer) {
-        return ok({
-          present: false, clickable: live.elements, count: live.elements.length,
-          offscreen: live.offscreen
-        });
-      }
+      // ⚠️ `present` = 「**有没有**覆盖全屏的层」，`kind` 才说明它是哪一种。
+      //   不要把 `present` 定义成「有没有遮挡」—— 面板屏会因此报 `present:false`，
+      //   而调用方（例如「关掉弹窗直到没有遮挡层」那种循环）看到 false 就以为
+      //   界面干净了，实际上面板正盖着 composer，后面每一步都点不动。
+      //   实测踩过：图谱脚本照 `present` 判，右侧边栏一直开着没被关掉，
+      //   紧接着的 `tap 发送` 就报 `onTarget:false`。
+      //
+      //   `blocking` 才是「它是否挡着下面的东西」—— 只有空遮罩才挡。
+      var isMask = !!found && found.kind === 'mask';
       return ok({
-        present: true,
-        layer: layer,
+        present: !!found,
+        kind: found ? found.kind : null,
+        blocking: isMask,
+        layer: found ? found.layer : null,
+        panel: found && found.kind === 'panel' ? found.layer : null,
         clickable: live.elements,
         count: live.elements.length,
         blocked: live.blocked,
@@ -953,10 +1031,20 @@ function (CMD) {
       // ⚠️ 被遮挡时**把话说明白**。这是本探针最该省下的一轮来回：模型点不动时
       //   最想知道的是「谁挡着、我该先点谁」，而不是自己去猜选择器写错了没有。
       if (!res.onTarget) {
-        out.hint = '点击被上层元素吃掉了，目标没收到事件。先处理挡在前面的元素' +
-          (res.hit && res.hit.text ? '（它的文案是「' + res.hit.text + '」）' : '') +
-          '，或用 overlay 动作查看当前遮挡层。';
-        out.overlay = overlay();
+        // ⚠️ 目标被「当前屏幕那个面板」吃掉不算故障：面板底下的元素本来就点不到。
+        //   只有**空遮罩**才是「先关掉它」的场景。
+        var ovHit = overlay();
+        if (ovHit && ovHit.kind === 'panel') {
+          out.hint = '这个元素在当前面板**下面**（面板是「' + (ovHit.layer.cls || ovHit.layer.tag) +
+            '」），所以点不到。它不在当前屏幕上 —— 要么先关掉面板回到下面那层，' +
+            '要么改点面板里面的按钮。';
+          out.panel = ovHit.layer;
+        } else {
+          out.hint = '点击被上层元素吃掉了，目标没收到事件。先处理挡在前面的元素' +
+            (res.hit && res.hit.text ? '（它的文案是「' + res.hit.text + '」）' : '') +
+            '，或用 overlay 动作查看当前遮挡层。';
+          if (ovHit) out.overlay = ovHit.layer;
+        }
       }
       return ok(out);
     }
@@ -1079,13 +1167,17 @@ function (CMD) {
     if (action === 'info') {
       var path = location.pathname + location.search;
       var got2 = collect({ limit: 12 });
+      // ⚠️ `overlay` 只报**空遮罩**（真遮挡）；面板屏走 `panel` 字段。
+      //   合并成一个字段会让调用方分不清「先关掉它」和「这就是你的屏幕」。
+      var found2 = overlay();
       return ok({
         viewport: viewportInfo(),
         path: path,
         hash: location.hash,
         readyState: document.readyState,
         focused: document.activeElement ? describe(document.activeElement, 0) : null,
-        overlay: overlay(),
+        overlay: found2 && found2.kind === 'mask' ? found2.layer : null,
+        panel: found2 && found2.kind === 'panel' ? found2.layer : null,
         blocked: got2.blocked,
         offscreen: got2.offscreen,
         top: got2.elements,

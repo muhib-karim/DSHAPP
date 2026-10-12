@@ -116,6 +116,59 @@ const SCENE = `<!doctype html>
     var b = document.getElementById('off');
     if (b) b.parentNode.removeChild(b);
   };
+
+  // 只有 title、**没有** aria-label 的按钮。
+  //
+  // ⚠️ 这一条锁的是一个真实的契约不对称：dump 的 text 字段来自 labelOf，
+  //    取值口径是 aria-label 或 title；而 locate() 的 aria 分支早期只查
+  //    [aria-label="…"]。于是「只有 title」的按钮会被 dump 报出名字、模型照着
+  //    回传却**定位不到** —— 症状是「找不到要点击的元素」，而它在列表里明明有。
+  //    真机上 DSH 界面大量图标按钮只有 title，所以这条回落是必需的。
+  //
+  // ⚠️ 本段在模板字符串里，**注释里不能出现反引号**（会提前终止模板，
+  //    症状是整个脚本语法错误 —— 这里刚踩过一次）。
+  window.showTitleOnly = function () {
+    var b = document.createElement('button');
+    b.id = 'titleOnly';
+    b.setAttribute('title', '仅标题按钮');
+    b.textContent = 'x';
+    b.addEventListener('click', function () { window.__titleOnlyClicked = (window.__titleOnlyClicked || 0) + 1; });
+    document.body.appendChild(b);
+  };
+  window.hideTitleOnly = function () {
+    var b = document.getElementById('titleOnly');
+    if (b) b.parentNode.removeChild(b);
+  };
+
+  // 面板用：一个覆盖全屏、**里面装着自己按钮**的容器。
+  //
+  // ⚠️ 它与遮罩在 DOM 上**完全同构**（都是 position:fixed 全屏容器），差别只有
+  //    一个：里面装不装当前屏幕的按钮。真实前端的指纹 ——
+  //      _mask_（弹窗遮罩）内部 0 个可交互元素（按钮是它的**兄弟**），
+  //      wCInkW_panel（设置面板）内部 8 个、OUqwTW_panel（右侧边栏）内部 7 个。
+  //    探针早期版本只看「是否覆盖全屏」，于是把设置面板、右侧边栏也报成「遮挡层」，
+  //    dump 打出一句「先关掉它」—— 模型照着去点「返回」，那一屏就永远进不去。
+  //
+  // ⚠️ 本段是模板字符串的内容，**里面不能出现反引号**（会提前终止模板，
+  //    症状是整个脚本语法错误 —— 这里刚踩过一次）。
+  window.showPanel = function () {
+    var p = document.createElement('div');
+    p.id = 'panel';
+    p.style.cssText = 'position:fixed;inset:0;background:#111;z-index:9998';
+    var title = document.createElement('div');
+    title.textContent = '设置';
+    var back = document.createElement('button');
+    back.id = 'panelBack';
+    back.textContent = '返回';
+    back.addEventListener('click', function () { window.__panelBackClicked = (window.__panelBackClicked || 0) + 1; });
+    p.appendChild(title);
+    p.appendChild(back);
+    document.body.appendChild(p);
+  };
+  window.hidePanel = function () {
+    var p = document.getElementById('panel');
+    if (p) p.parentNode.removeChild(p);
+  };
 </script>
 </body></html>`;
 
@@ -377,6 +430,81 @@ async function main() {
 		check('元素移回视口内后重新算作可点（判据不粘住）',
 			offBack.elements.some((e) => e.sel === '#off'), offBack.elements.map((e) => e.sel));
 		await cdp.eval('window.hideOffscreen()');
+
+		// ── 面板 ≠ 遮挡：同一类「全屏层」，处置办法相反 ────────────────
+		//
+		// ⚠️ 这一组锁的是一个**真实踩过的坑**：设置面板、右侧边栏、会话抽屉都是
+		//    覆盖全屏的 `position:fixed` 容器，与弹窗遮罩在 DOM 上**完全同构**，
+		//    早期探针只看「是否覆盖全屏」，于是把它们一律报成「遮挡层」——
+		//    `dump` 打出一句「先关掉它（通常是弹窗里的某个按钮）」，模型照着去点
+		//    「返回」，那一屏就**永远进不去**。
+		//
+		//    实测指纹（真实官方前端，360×780）：
+		//      `_mask_o6lrb_18`（弹窗遮罩）   内部可点元素 **0** 个
+		//      `wCInkW_panel`（设置面板）     内部 **8** 个
+		//      `OUqwTW_panel`（右侧边栏）     内部 **7** 个
+		//    判据就是「里面装不装当前屏幕的按钮」。
+		console.log('\n── 面板 ≠ 遮挡（全屏层要分两种）─────────────');
+		await cdp.eval('window.showPanel()');
+		const panelDump = await call({ action: 'dump', limit: 50 });
+		check('★ 面板不被报成遮挡层（dump.overlay 为空）', !panelDump.overlay, panelDump.overlay);
+		check('★ 面板改报 panel 字段', !!panelDump.panel && panelDump.panel.sel === '#panel',
+			panelDump.panel);
+		check('面板屏给的是「这就是你的屏幕」而不是「先关掉它」',
+			typeof panelDump.note === 'string' && !/先关掉/.test(panelDump.note), panelDump.note);
+		check('面板屏不再给出「先关掉它」的遮挡警告',
+			panelDump.warning === undefined, panelDump.warning);
+
+		const panelOv = await call({ action: 'overlay' });
+		// ⚠️ `present` 与 `blocking` 是**两个**字段，别合并：
+		//    `present`  = 「有没有一个覆盖全屏的层」（面板也算，它是你的屏幕）；
+		//    `blocking` = 「它是不是在挡你」（只有空遮罩才是 true）。
+		//    曾经把面板报成 `present:false`，结果调用方「循环到 !present」的收尾逻辑
+		//    再也不关右侧边栏，后面一步 `tap 发送` 报 onTarget:false 而消息其实发出去了。
+		check('★ overlay 对面板报 present:true（它确实是全屏层）', panelOv.present === true, panelOv.present);
+		check('★ overlay 对面板报 blocking:false（它不挡你，别去关它）',
+			panelOv.blocking === false, panelOv.blocking);
+		check('★ overlay 用 kind:"panel" 说明这是当前屏幕', panelOv.kind === 'panel', panelOv.kind);
+		check('overlay 仍列出面板里面能点的按钮',
+			panelOv.clickable?.some((e) => e.sel === '#panelBack'), panelOv.clickable?.map((e) => e.sel));
+
+		// 面板**里面**的按钮要照常能点 —— 面板是屏幕，不是障碍
+		const panelTap = await call({ action: 'tap', sel: '#panelBack' });
+		check('面板里面的按钮可以正常点（onTarget 不是 false）', panelTap.onTarget !== false, panelTap.onTarget);
+		check('面板里面的按钮真的收到了 click',
+			await cdp.eval('window.__panelBackClicked === 1'), await cdp.eval('window.__panelBackClicked'));
+
+		// 面板**下面**的元素点不动 —— 但提示必须说清是「不在当前屏幕上」，
+		// 而不是「被遮挡层挡住了」（后者会把模型引去关掉这个面板）。
+		const underPanel = await call({ action: 'tap', text: '发送' });
+		check('面板下面的元素报 onTarget:false', underPanel.onTarget === false, underPanel.onTarget);
+		check('★ 提示指向「面板」而不是「遮挡层」', !!underPanel.panel && underPanel.panel.sel === '#panel',
+			underPanel.panel);
+		check('★ 提示不说「先关掉挡在前面的元素」（那是遮挡的说法）',
+			!/挡在前面的元素/.test(underPanel.hint ?? ''), underPanel.hint);
+
+		await cdp.eval('window.hidePanel()');
+		const afterPanel = await call({ action: 'overlay' });
+		check('面板移除后 overlay 报 kind:null', afterPanel.kind === null, afterPanel.kind);
+
+		// 遮罩与面板同时存在时，**遮罩优先**（它才是要关掉的那个）
+		await cdp.eval('window.showPanel(); window.showMask()');
+		const bothOv = await call({ action: 'overlay' });
+		check('★ 遮罩与面板同时存在时报遮罩（要关掉的是它）',
+			bothOv.present === true && bothOv.layer?.sel === '#mask', bothOv);
+		await cdp.eval('window.hideMask(); window.hidePanel()');
+
+		// ── `aria` 必须回落查 `title`（与 dump 的取值口径对齐）─────────
+		console.log('\n── aria 回落到 title（dump 报得出就要点得到）──');
+		await cdp.eval('window.showTitleOnly()');
+		const toDump = await call({ action: 'dump', limit: 60 });
+		const toItem = (toDump.elements ?? []).find((e) => e.sel === '#titleOnly');
+		check('dump 能把「只有 title」的按钮报出名字', toItem?.text === '仅标题按钮', toItem?.text);
+		const toTap = await call({ action: 'tap', aria: '仅标题按钮' });
+		check('★ 照着 dump 的名字回传 aria 能定位到它', toTap.ok === true, toTap.error);
+		check('★ 且真的收到了 click', await cdp.eval('window.__titleOnlyClicked === 1'),
+			await cdp.eval('window.__titleOnlyClicked'));
+		await cdp.eval('window.hideTitleOnly()');
 
 		console.log('\n── type（React 受控输入）─────────────────────');
 		await cdp.eval('window.__reactState = { value: "", onChangeCalls: 0 }; window.__events = []');

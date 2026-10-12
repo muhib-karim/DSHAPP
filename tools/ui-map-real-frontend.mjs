@@ -6,6 +6,11 @@
 // 真机上跑不起来。但探针本身是**纯页面 JS**，只要有一份真实的官方
 // 前端 DOM，就能验证它在真前端上到底看见了什么。
 //
+// ⚠️ 真机上另有一条路也走不通：`uiautomator dump` 在 WebView 上**只给一个
+//    `android.webkit.WebView` 节点**（实测华为 CDY-TN90：3137 字节的树里
+//    只有 5 个 FrameLayout + 1 个 WebView，页面内的按钮一个都不在无障碍树里）。
+//    所以按钮坐标的唯一可靠来源就是本脚本 —— 在真实前端里直接量 CSS 坐标。
+//
 // 用法：
 //   1) 起一个独立实例（独立 DSH_HOME / 端口，别碰用户正在用的那个）：
 //        $env:DSH_HOME = "<隔离目录>"
@@ -45,6 +50,68 @@ if (!chrome) {
   console.error('找不到 Chrome/Edge');
   process.exit(2);
 }
+
+// ── 屏幕清单 ──────────────────────────────────────────────────────
+//
+// 「屏幕」= 一组**进入步骤**唯一确定的界面状态。进入步骤用的定位参数与 `ui`
+// 工具的 `tap` 完全同构（`text` / `aria` / `sel`），所以图谱里记下的每一步
+// 都能**原样**喂给 `ui tap` —— 这是这份图谱的价值所在：它既是坐标表，
+// 也是「怎么走到那一屏」的路线。
+//
+// ⚠️ 每屏都从**基态**（Hero，页面刚加载完）重新进入，而不是从上一屏接着走。
+//    这样屏与屏之间没有状态污染，某一屏的步骤写错了也不会连带毁掉后面的屏。
+//
+// `expect` 是「这一屏真的进去了吗」的判据 —— 只看 `tap` 的 `ok` 不够：
+// 点了没生效时 `ok` 照样是 true（那正是遮挡/屏幕外两类问题的表现）。
+const SCREENS = [
+  {
+    id: 'hero',
+    title: '空会话（Hero）',
+    enter: [],
+    // ⚠️ 判据用「打开导航」这个**基态特有**的悬浮按钮。它是 mobile-ui 在窄屏
+    //    下加的（`body > button`），只在这一屏出现，不会与别的屏撞车。
+    expect: { text: '打开导航' },
+  },
+  {
+    id: 'settings',
+    title: '设置面板',
+    enter: [{ text: '设置' }],
+    expect: { text: '通用设置' },
+  },
+  {
+    id: 'settings-plugins',
+    title: '设置 › 内置插件',
+    enter: [{ text: '设置' }, { text: '内置插件' }],
+    expect: { text: '会话插件' },
+  },
+  {
+    id: 'drawer',
+    title: '会话抽屉（左侧栏展开）',
+    // ⚠️ **必须先进入「有会话」的页面**，否则抽屉根本开不出来：空会话（Hero）页
+    //    上官方侧栏还没渲染（`.pI_x6G_sidebarCol` 不存在），mobile-ui 的
+    //    `mpToggleDrawer()` 里 `mpOfficialToggle()` 返回 null、`if (btn) btn.click()`
+    //    不执行 —— 点「打开导航」本来就没反应（那是 mobile-ui 在 Hero 页的缺陷，
+    //    探针如实报 `onTarget:true` 并没有说谎）。
+    //    实测：空会话下点「打开导航」后标签数仍是 15、没有「收起侧边栏」；
+    //    先发一条消息（页面进入会话态）再点，就能开出 36 个标签的抽屉。
+    seed: true,
+    enter: [{ aria: '打开导航' }],
+    // ⚠️ 这里必须用 `text` 不能用 `aria`：抽屉里的「收起侧边栏」**没有**
+    //    `aria-label`，文案在文本节点里。而 `locate()` 的 `aria` 分支只查
+    //    `[aria-label="…"]`，**不回落**到文本 —— 用 `aria` 会「找不到要点击的元素」，
+    //    而那个按钮明明就在屏幕上（实测踩过：抽屉明明开了，校验却说没进去）。
+    //    判据是 dump 里的字段：`aria` 有值才用 `aria`，否则用 `text`。
+    expect: { text: '收起侧边栏' },
+    // 抽屉要点两次（见下面的重试注释），所以给它多一次机会
+    enterAttempts: 3,
+  },
+  {
+    id: 'right-sidebar',
+    title: '右侧边栏',
+    enter: [{ aria: '打开右侧边栏' }],
+    expect: { text: '新建终端' },
+  },
+];
 
 // ── CDP 最小客户端 ────────────────────────────────────────────────
 class Cdp {
@@ -141,31 +208,87 @@ try {
   });
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
 
-  console.log(`打开真实官方前端: ${url.slice(0, 60)}…`);
-  await cdp.send('Page.navigate', { url });
+  const source = readFileSync(PROBE, 'utf8');
+  const probeVersion = Number(/var VERSION = (\d+)/.exec(source)?.[1] ?? 0);
 
-  // 等前端挂载：轮询直到出现 composer 或超时
-  let ready = false;
-  for (let i = 0; i < 80; i++) {
-    await sleep(500);
-    try {
-      const info = await cdp.eval(`(() => ({
-        title: document.title,
-        href: location.href,
-        nodes: document.querySelectorAll('*').length,
-        text: (document.body && document.body.innerText || '').slice(0, 120)
-      }))()`);
-      if (info.nodes > 50) { ready = true; console.log(`  已挂载：${info.nodes} 个节点，title=${info.title}`); break; }
-    } catch { /* 导航中 */ }
+  // 打开前端 + 装探针 + 关掉首启向导，收敛到**基态**（Hero）。
+  //
+  // ⚠️ 每屏都从这里重来，所以这段被抽成函数而不是内联一次。
+  async function resetToBase() {
+    await cdp.send('Page.navigate', { url });
+    let ready = false;
+    for (let i = 0; i < 80; i++) {
+      await sleep(500);
+      try {
+        const info = await cdp.eval(`(() => ({
+          title: document.title,
+          nodes: document.querySelectorAll('*').length,
+          text: (document.body && document.body.innerText || '').slice(0, 120)
+        }))()`);
+        if (info.nodes > 50) { ready = true; return info; }
+      } catch { /* 导航中 */ }
+    }
+    if (!ready) console.warn('  ⚠️ 前端似乎没挂载起来，继续尝试');
+    return null;
   }
-  if (!ready) console.warn('  ⚠️ 前端似乎没挂载起来，继续尝试');
 
+  // ── 先处理遮挡层（这是「操作方法」的第 0 步）───────────────────────
+  //
+  // ⚠️ 全新 profile 首次打开会弹「预览版说明」对话框（`z-index:1000` + 覆盖全屏
+  //    的 `_mask_`）。它会盖住底下**全部**按钮 —— 而底下的按钮在 DOM 里看着
+  //    完全正常（有尺寸、`opacity` 为 1），第一版探针因此把它们全报成可用，
+  //    模型挨个点、界面纹丝不动且拿不到任何提示。
+  //
+  //    现在探针会自己发现它：`overlay` 动作报出遮挡层与它**里面**的按钮，
+  //    `dump` 也会带上 `overlay` + `warning`。下面这段就是照着那个输出走的，
+  //    与真机上模型要走的路径**完全一致** —— 不是测试专用的特判。
+  // ⚠️ 要**循环**：全新 profile 的首启向导是**多步**的 —— 关掉「预览版说明」
+  //    之后立刻又弹「API 密钥」（稍后配置 / 保存并继续）。只关一次会停在
+  //    第二个弹窗上，拿到的坐标照样点不动。这正是模型要学的那套操作法：
+  //    `overlay` → 点此刻唯一能点的东西 → 再看 `overlay`，直到 present:false。
+  const dismissOverlays = async (tag) => {
+    for (let round = 1; round <= 5; round++) {
+      const ov = await cdp.eval(`(${source})({action:"overlay"})`);
+      // ⚠️ **必须按 `kind` 判，不能按 `present` 判。** `present` 的语义是
+      //    「有没有覆盖全屏的层」（面板也算），只有 `kind === 'mask'` 才是
+      //    「要关掉的那个空遮罩」。照 `present` 判会把设置面板 / 右侧边栏
+      //    也当遮挡层去「关」，实测把右侧边栏点开又点关，绕两圈才回到原位。
+      if (!ov?.present || ov.kind !== 'mask') {
+        console.log(`  ${tag}遮挡层: 没有了 ✅（此刻能点 ${ov?.count ?? 0} 个）` +
+          (ov?.kind === 'panel' ? `（当前屏幕是面板 ${ov.panel?.cls || ov.panel?.tag}，不是遮挡）` : ''));
+        return true;
+      }
+      console.log(`  ${tag}遮挡层 ${round}: ${ov.layer.cls || ov.layer.tag}（${ov.layer.rect.w}×${ov.layer.rect.h}，` +
+        `${ov.layer.hits}/${ov.layer.samples} 个采样点被它挡住）`);
+      console.log(`    此刻真正能点的有 ${ov.clickable.length} 个: ` +
+        ov.clickable.map((b) => `「${b.text || b.sel}」`).join(', '));
+      // ⚠️ 探针**如实**报出此刻能点的一切（可能是输入框 + 若干按钮），但**不替
+      //    模型猜语义** —— 关弹窗该点哪个是业务判断。这里照模型的思路来：
+      //    先挑「跳过/稍后/继续/知道了」这类**不要求填内容**的按钮，其次挑普通
+      //    button，最后才退到任意元素。盲选第一个会选中输入框，点了弹窗照旧
+      //    （踩过一次：连点 5 轮「API 密钥」输入框，弹窗纹丝不动）。
+      const SKIP = /稍后|跳过|以后|知道了|我知道了|继续|确定|关闭|取消|好$/;
+      const closer =
+        ov.clickable.find((b) => b.tag === 'button' && SKIP.test(b.text || '')) ??
+        ov.clickable.filter((b) => b.tag === 'button').pop() ??
+        ov.clickable[0];
+      if (!closer) { console.log('    ⚠️ 没有可点的东西，可能是纯加载蒙层，退出'); return false; }
+      const closed = await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', sel: closer.sel })})`);
+      console.log(`    点「${closer.text || closer.sel}」: ok=${closed?.ok} onTarget=${closed?.onTarget}`);
+      if (closed?.onTarget === false) console.log(`      hint: ${closed.hint}`);
+      await sleep(800);
+    }
+    return false;
+  };
+
+  console.log(`打开真实官方前端: ${url.slice(0, 60)}…`);
+  const boot = await resetToBase();
+  if (boot) console.log(`  已挂载：${boot.nodes} 个节点，title=${boot.title}`);
   await sleep(2500); // 给懒加载 chunk 一点时间
 
   // 装探针（与原生侧完全相同的调用方式：函数表达式直接调用）
-  const source = readFileSync(PROBE, 'utf8');
   const installed = await cdp.eval(`(${source})({action:"ping"})`);
-  console.log(`探针 ping: ${JSON.stringify(installed)}`);
+  console.log(`探针 ping: ${JSON.stringify(installed)}  (VERSION=${probeVersion})`);
 
   // ⚠️ 「界面加载出来了」不等于「mobile-ui 适配生效了」。
   //    mobile-ui 的客户端半靠 `dsh-client-modules` 扫 `dsh.client` 声明编入，
@@ -188,81 +311,149 @@ try {
     `CSS 规则=${adapt.mobileCssRules} 条, 视口=${adapt.viewport}` +
     (adapt.mobileCssRules === 0 ? '  ⚠️ 适配未生效（拿到的是桌面布局坐标）' : '  ✅'));
 
-  // ── 先处理遮挡层（这是「操作方法」的第 0 步）───────────────────────
-  //
-  // ⚠️ 全新 profile 首次打开会弹「预览版说明」对话框（`z-index:1000` + 覆盖全屏
-  //    的 `_mask_`）。它会盖住底下**全部**按钮 —— 而底下的按钮在 DOM 里看着
-  //    完全正常（有尺寸、`opacity` 为 1），第一版探针因此把它们全报成可用，
-  //    模型挨个点、界面纹丝不动且拿不到任何提示。
-  //
-  //    现在探针会自己发现它：`overlay` 动作报出遮挡层与它**里面**的按钮，
-  //    `dump` 也会带上 `overlay` + `warning`。下面这段就是照着那个输出走的，
-  //    与真机上模型要走的路径**完全一致** —— 不是测试专用的特判。
-  // ⚠️ 要**循环**：全新 profile 的首启向导是**多步**的 —— 关掉「预览版说明」
-  //    之后立刻又弹「API 密钥」（稍后配置 / 保存并继续）。只关一次会停在
-  //    第二个弹窗上，拿到的坐标照样点不动。这正是模型要学的那套操作法：
-  //    `overlay` → 点此刻唯一能点的东西 → 再看 `overlay`，直到 present:false。
-  for (let round = 1; round <= 5; round++) {
-    const ov = await cdp.eval(`(${source})({action:"overlay"})`);
-    if (!ov?.present) {
-      console.log(`\n第 ${round} 轮: 没有遮挡层了 ✅（此刻能点 ${ov?.count ?? 0} 个）`);
-      break;
-    }
-    console.log(`\n第 ${round} 轮遮挡层: ${ov.layer.cls || ov.layer.tag}（${ov.layer.rect.w}×${ov.layer.rect.h}，` +
-      `${ov.layer.hits}/${ov.layer.samples} 个采样点被它挡住）`);
-    console.log(`  此刻真正能点的有 ${ov.clickable.length} 个: ` +
-      ov.clickable.map((b) => `「${b.text || b.sel}」`).join(', '));
-    // ⚠️ 探针**如实**报出此刻能点的一切（可能是输入框 + 若干按钮），但**不替
-    //    模型猜语义** —— 关弹窗该点哪个是业务判断。这里照模型的思路来：
-    //    先挑「跳过/稍后/继续/知道了」这类**不要求填内容**的按钮，其次挑普通
-    //    button，最后才退到任意元素。盲选第一个会选中输入框，点了弹窗照旧
-    //    （踩过一次：连点 5 轮「API 密钥」输入框，弹窗纹丝不动）。
-    const SKIP = /稍后|跳过|以后|知道了|我知道了|继续|确定|关闭|取消|好$/;
-    const closer =
-      ov.clickable.find((b) => b.tag === 'button' && SKIP.test(b.text || '')) ??
-      ov.clickable.filter((b) => b.tag === 'button').pop() ??
-      ov.clickable[0];
-    if (!closer) { console.log('  ⚠️ 没有可点的东西，可能是纯加载蒙层，退出'); break; }
-    const closed = await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', sel: closer.sel })})`);
-    console.log(`  点「${closer.text || closer.sel}」: ok=${closed?.ok} onTarget=${closed?.onTarget}`);
-    if (closed?.onTarget === false) console.log(`    hint: ${closed.hint}`);
-    await sleep(800);
-  }
+  console.log('\n── 第 0 步：清掉遮挡层 ──');
+  await dismissOverlays('');
 
-  // ── 枚举按钮 ──────────────────────────────────────────────────────
-  const dump = await cdp.eval(`(${source})({action:"dump", limit:300})`);
-  if (!dump || dump.ok !== true) throw new Error(`dump 失败: ${JSON.stringify(dump)}`);
-  if (dump.overlay) console.log(`⚠️ dump 仍报遮挡: ${dump.warning}`);
+  const viewport = await cdp.eval(`({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})`);
 
-  const elements = dump.elements ?? [];
-  console.log(`\n真实前端上共枚举到 ${elements.length} 个可交互元素` +
-    (dump.blocked ? `（其中 ${dump.blocked} 个被遮挡）` : ''));
-
-  // 只打印「有标签的」——那就是用户说的「按钮」
-  const labelled = elements.filter((e) => e.text || e.testid || e.aria);
-  console.log(`\n其中有可见标签/aria 的 ${labelled.length} 个：\n`);
-  for (const e of labelled.slice(0, 80)) {
-    const label = e.text || e.aria || e.testid;
-    const c = e.center ? `${Math.round(e.center.x)},${Math.round(e.center.y)}` : '-';
-    const r = e.rect ? `${Math.round(e.rect.w)}×${Math.round(e.rect.h)}` : '-';
-    console.log(`  ${String(label).slice(0, 34).padEnd(36)} ${e.tag.padEnd(8)} CSS(${c}) ${r}` +
-      (e.covered ? '  ⛔被遮挡' : '') + `  ${e.sel}`);
-  }
-
-  const report = {
-    url: url.replace(/token=[^&]+/, 'token=***'),
-    viewport: await cdp.eval(`({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})`),
-    total: elements.length,
-    blocked: dump.blocked ?? 0,
-    labelled: labelled.length,
-    elements: labelled,
+  // ⚠️ 编辑器的定位**不能靠 placeholder 文案**：空会话（Hero）页是「描述你想要构建的
+  //    内容…」，一旦有了会话就变成「发消息或创建任务…」—— 照文案找会「找不到
+  //    composer」，而 composer 明明就在那儿（实测踩过两次）。
+  //    直接查 `[contenteditable="true"]`，与 `ui` 工具链在真机上用的是同一个抓手。
+  const EDITOR_SEL = '[contenteditable="true"]';
+  const findEditor = async () => {
+    const r = await cdp.eval(`(${source})(${JSON.stringify({ action: 'find', sel: EDITOR_SEL })})`);
+    return r?.ok === true ? r.element : null;
   };
-  const out = join(__dirname, 'ui-map-real-frontend.json');
-  writeFileSync(out, JSON.stringify(report, null, 2), 'utf8');
-  console.log(`\n已写出 ${out}`);
-  console.log(`视口: ${JSON.stringify(report.viewport)}`);
 
-  // ── 交互实测：探针能不能**真的**操作真实前端 ──────────────────────
+  // ── 「种」一个会话：某些屏幕只在有会话时才存在 ────────────────────
+  //
+  // ⚠️ 会话抽屉就是这种：Hero 页上官方侧栏还没渲染，点「打开导航」没反应。
+  //    发一条消息让页面进入会话态，抽屉才开得出来。见 SCREENS 里 drawer 的注释。
+  const seedSession = async () => {
+    const editor = await findEditor();
+    if (!editor) { console.log('  ⚠️ 找不到 composer，无法种会话'); return false; }
+    const seedText = '图谱种会话';
+    await cdp.eval(`(${source})(${JSON.stringify({ action: 'type', sel: editor.sel, value: seedText })})`);
+    await sleep(900); // execCommand 异步生效，见 setValue 的注释
+    await cdp.eval(`(${source})({action:"tap", aria:"发送消息"})`);
+    await sleep(3500); // 等消息落地、侧栏渲染出来
+    console.log(`  种会话完成（composer 已提交）`);
+    return true;
+  };
+
+  // ── 逐屏采集 ──────────────────────────────────────────────────────
+  const screens = [];
+  for (const spec of SCREENS) {
+    console.log(`\n══ 屏幕「${spec.title}」(${spec.id}) ══`);
+
+    // 非首屏才需要重置：首屏已经在基态上了，重载一次纯属浪费。
+    if (spec.enter.length > 0) {
+      await resetToBase();
+      await sleep(2500);
+      await cdp.eval(`(${source})({action:"ping"})`);
+      await dismissOverlays('  ');
+    }
+    // `seed:true` 的屏要先进入会话态（见 seedSession 的注释）
+    if (spec.seed) await seedSession();
+    // ⚠️ 种会话之后页面刚重渲染过，等它稳定再点 —— 紧接着就点「打开导航」会点到
+    //    还没挂载的按钮上（`tap` 返回 `ok:false` 找不到元素，或点了个空壳）。
+    if (spec.seed) await sleep(2000);
+
+    // ── 进入 + 校验：没等到特征元素就**重点一次** ──────────────────
+    //
+    // ⚠️ **不是所有屏幕都能一次点进去。** 实测会话抽屉要点**两次**「打开导航」：
+    //    第一次点完侧栏从 `x:-137` 滑到 `x:-340`（更外面，仍是关着的），第二次才
+    //    真正展开（`class` 加上 `mp-drawer-open`、`x:0`、「收起侧边栏」出现）。
+    //    根因是 mobile-ui 的时序竞态 —— 会话刚建立时官方侧栏组件还没渲染完，
+    //    `mpToggleDrawer()` 那一下切换落空了。
+    //
+    //    这正是 `ui` 工具链在真机上**必须**走的路径：点 → `wait` 等特征元素 →
+    //    没等到就**再点一次**（不是重载重来）。所以这里照做。
+    //
+    //    ⚠️ 重试必须是**原地重点**：重置回基态再点一次会撞上同一个竞态，永远
+    //    进不去（试过，三次全失败）。
+    const steps = [];
+    let entered = true;
+    for (const step of spec.enter) {
+      const r = await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', ...step })})`);
+      const label = step.text || step.aria || step.sel;
+      const stepOk = r?.ok === true && r?.onTarget !== false && r?.offscreen !== true;
+      console.log(`  tap「${label}」 ok=${r?.ok} onTarget=${r?.onTarget} offscreen=${r?.offscreen ?? false}` +
+        (stepOk ? '' : `  ⚠️ ${r?.error ?? r?.hint ?? ''}`));
+      steps.push({ target: label, spec: step, ok: stepOk, error: r?.error ?? null, hint: r?.hint ?? null });
+      if (!stepOk) entered = false;
+      await sleep(900);
+    }
+
+    let verified = null;
+    if (spec.expect && entered) {
+      const key = spec.expect.text ?? spec.expect.aria ?? spec.expect.sel;
+      const tries = spec.enterAttempts ?? 2;
+      for (let attempt = 1; attempt <= tries; attempt++) {
+        const w = await cdp.eval(`(${source})(${JSON.stringify({
+          action: 'wait', ...spec.expect, timeout: 2500,
+        })})`);
+        verified = w?.satisfied === true;
+        console.log(`  等「${key}」: ${verified ? '✅ 等到了' : '✗ 没等到'}` +
+          (verified ? '' : `（第 ${attempt}/${tries} 次）`));
+        if (verified) break;
+        if (attempt === tries) break;
+        // 原地重点最后一步 —— 与真机上「没等到就再点一次」完全一致
+        const last = spec.enter[spec.enter.length - 1];
+        const again = await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', ...last })})`);
+        console.log(`  ↻ 重点「${last.text || last.aria}」 ok=${again?.ok} onTarget=${again?.onTarget}`);
+        steps.push({ target: (last.text || last.aria) + '（重试）', spec: last, ok: again?.ok === true, retry: true });
+        await sleep(1200);
+      }
+    }
+
+    const dump = await cdp.eval(`(${source})({action:"dump", limit:400})`);
+    if (!dump || dump.ok !== true) throw new Error(`dump 失败: ${JSON.stringify(dump)}`);
+    const elements = dump.elements ?? [];
+    const labelled = elements.filter((e) => e.text || e.testid || e.aria);
+
+    // 「真的进去了吗」——最终以 **dump 的实际状态**为准。
+    // 只看 tap 的 ok 不够：点了没生效时 ok 照样是 true（遮挡/屏幕外就是这样）。
+    // 循环里那次 `wait` 决定「要不要再试一次」，这里决定「记进图谱的是什么」。
+    if (spec.expect) {
+      const found = labelled.find((e) =>
+        (spec.expect.text && (e.text || '').includes(spec.expect.text)) ||
+        (spec.expect.aria && e.aria === spec.expect.aria));
+      const byDump = !!found;
+      if (byDump !== verified) {
+        console.log(`  ⚠️ dump 复核与 wait 不一致（wait=${verified} dump=${byDump}），以 dump 为准`);
+      }
+      verified = byDump;
+      console.log(`  校验: ${verified ? '✅ 已进入' : '❌ 没进去'}（找「${spec.expect.text || spec.expect.aria}」）`);
+    }
+    if (dump.overlay) console.log(`  ⚠️ 该屏仍有遮挡层: ${dump.warning}`);
+
+    console.log(`  共 ${elements.length} 个可交互元素（有标签 ${labelled.length}，` +
+      `被遮挡 ${dump.blocked ?? 0}，屏幕外 ${dump.offscreen ?? 0}）`);
+    for (const e of labelled.slice(0, 60)) {
+      const c = e.center ? `${Math.round(e.center.x)},${Math.round(e.center.y)}` : '-';
+      const rr = e.rect ? `${Math.round(e.rect.w)}×${Math.round(e.rect.h)}` : '-';
+      console.log(`    ${String(e.text || e.aria || e.testid).slice(0, 30).padEnd(32)} ${e.tag.padEnd(9)} ` +
+        `CSS(${c.padEnd(9)}) ${rr.padEnd(9)}` +
+        (e.covered ? ' ⛔被遮挡' : '') + (e.offscreen ? ' 📴屏幕外' : '') + `  ${e.sel}`);
+    }
+
+    screens.push({
+      id: spec.id,
+      title: spec.title,
+      enter: steps,
+      entered,
+      verified,
+      total: elements.length,
+      labelled: labelled.length,
+      blocked: dump.blocked ?? 0,
+      offscreen: dump.offscreen ?? 0,
+      elements: labelled,
+    });
+  }
+
+  // ── 回到基态，做交互实测 ──────────────────────────────────────────
   //
   // ⚠️ 判据必须是「**业务状态真的变了**」，节点数不是判据 —— 两个反例都踩过：
   //    ① 抽屉靠 CSS transform/opacity 显隐，DOM 节点数一个都不增；
@@ -278,7 +469,34 @@ try {
   //    所以用 composer 走一遍**真正会改变界面**的链路：
   //    type 写入 → 发送按钮从禁用变可用（证明 React 认账）→ tap 发送 →
   //    消息出现在界面上。这三步任何一步失败都说明探针没真的驱动到应用。
+  //
+  // ⚠️ **重载一次是必须的，不能只靠「关掉面板」**：上一屏（右侧边栏）留下的
+  //    面板会盖住 composer —— 实测就是它导致「找不到 composer 编辑器」。
+  //    重载把整个页面状态清干净，比逐个去关面板可靠得多。
   console.log('\n══ 交互实测（探针真的驱动了应用）══');
+  await resetToBase();
+  await sleep(2500);
+  await cdp.eval(`(${source})({action:"ping"})`);
+  await dismissOverlays('  ');
+  // ⚠️ 重载之后仍可能停在面板屏（前端会恢复上次的面板状态），再确认一次：
+  //    只要有面板就点它自己的关闭按钮，直到 overlay 报 `kind:null`。
+  for (let i = 0; i < 4; i++) {
+    const ov = await cdp.eval(`(${source})({action:"overlay"})`);
+    if (ov?.kind !== 'panel') break;
+    // ⚠️ 关闭按钮要**按优先级挑**，不能拿第一个正则命中的就用。实测右侧边栏里
+    //    同时有「退出全屏」「收起右侧边栏」「关闭」，正则 `退出全屏` 先命中，
+    //    结果点的是「退出全屏」—— 面板照旧开着（它只是切换了全屏态），
+    //    下一轮又拿到同一个面板，绕圈。真正收起面板的是「收起右侧边栏」。
+    const pool = ov.clickable ?? [];
+    const closer =
+      pool.find((b) => /收起.*边栏|收起侧边栏|收起面板/.test(b.aria || b.text || '')) ??
+      pool.find((b) => /^关闭$|^返回$/.test((b.aria || b.text || '').trim())) ??
+      pool.find((b) => /关闭|返回/.test(b.aria || b.text || ''));
+    if (!closer) { console.log(`  ⚠️ 面板 ${ov.panel?.cls} 上没有找到关闭按钮，改用重载`); break; }
+    console.log(`  关掉面板「${closer.aria || closer.text}」`);
+    await cdp.eval(`(${source})(${JSON.stringify({ action: 'tap', sel: closer.sel })})`);
+    await sleep(1000);
+  }
 
   const COMPOSER = `(() => {
     const ce = document.querySelector('[contenteditable="true"]');
@@ -296,9 +514,8 @@ try {
   const before = await cdp.eval(COMPOSER);
   console.log(`输入前: 编辑器=${before.editorKind} 值=${JSON.stringify(before.value)} 发送键禁用=${before.sendDisabled}`);
 
-  const ed = await cdp.eval(`(${source})({action:"dump", limit:20, filter:"描述你想要构建"})`);
-  const editor = (ed.elements ?? []).find((e) => e.tag === 'div' || e.tag === 'textarea');
-  if (!editor) throw new Error('找不到 composer 编辑器');
+  const editor = await findEditor();
+  if (!editor) throw new Error('找不到 composer 编辑器（' + EDITOR_SEL + '）');
 
   const TEXT = '探针自检：这条消息由 ui-probe 写入并发送';
   const typed = await cdp.eval(`(${source})(${JSON.stringify({ action: 'type', sel: editor.sel, value: TEXT })})`);
@@ -315,6 +532,17 @@ try {
     const nodesBefore = await cdp.eval(`document.querySelectorAll('*').length`);
     const sent = await cdp.eval(`(${source})({action:"tap", aria:"发送消息"})`);
     console.log(`tap 发送: ok=${sent?.ok} onTarget=${sent?.onTarget}`);
+    // ⚠️ `onTarget:false` 时**必须**把命中者打出来：只报「没点到」而不报「点到
+    //    了谁」，就无从判断是探针误报还是真被挡住了 —— 而这两种情况的处置
+    //    完全相反（前者要修判据，后者要关遮挡层）。
+    if (sent?.onTarget === false) {
+      console.log(`  ⚠️ 点击没落到目标上，实际命中的是: ` +
+        (sent.hitTopmost ? `${sent.hitTopmost.tag}.${sent.hitTopmost.cls || ''} ` +
+          `CSS(${Math.round(sent.hitTopmost.center?.x ?? 0)},${Math.round(sent.hitTopmost.center?.y ?? 0)}) ` +
+          `文本=「${sent.hitTopmost.text || ''}」` : '(取不到)'));
+      console.log(`  目标元素: ${sent.element?.tag} CSS(${Math.round(sent.element?.center?.x ?? 0)},` +
+        `${Math.round(sent.element?.center?.y ?? 0)}) 文本=「${sent.element?.text || ''}」`);
+    }
     await sleep(2500);
     const post = await cdp.eval(`(() => {
       const ce = document.querySelector('[contenteditable="true"]');
@@ -330,13 +558,36 @@ try {
     sentOk = post.hasMsg === true;
   }
 
-  report.interaction = {
-    typed: typed.ok === true,
-    reactAccepted: mid.sendDisabled === false,
-    sent: sentOk,
+  const hero = screens.find((s) => s.id === 'hero') ?? screens[0];
+  const report = {
+    url: url.replace(/token=[^&]+/, 'token=***'),
+    viewport,
+    dpr: viewport.dpr,
+    probeVersion,
+    screens,
+    // ⚠️ 顶层这几个字段指向 **hero 屏**，是首版单屏脚本的语义，保留下来是为了
+    //    不打断已经依赖它们的用法。要看别的屏请走 `screens[]`。
+    total: hero.total,
+    blocked: hero.blocked,
+    offscreen: hero.offscreen,
+    labelled: hero.labelled,
+    elements: hero.elements,
+    interaction: {
+      typed: typed.ok === true,
+      reactAccepted: mid.sendDisabled === false,
+      sent: sentOk,
+    },
   };
+  const out = join(__dirname, 'ui-map-real-frontend.json');
   writeFileSync(out, JSON.stringify(report, null, 2), 'utf8');
-  console.log(`\n已更新 ${out}`);
+  console.log(`\n已写出 ${out}`);
+  console.log(`视口: ${JSON.stringify(report.viewport)}`);
+  console.log(`\n══ 图谱总览（${screens.length} 屏）══`);
+  for (const s of screens) {
+    console.log(`  ${s.verified === false ? '❌' : '✅'} ${s.title.padEnd(24)} ` +
+      `标签 ${String(s.labelled).padStart(3)} 个  被遮挡 ${String(s.blocked).padStart(2)}  屏幕外 ${String(s.offscreen).padStart(2)}` +
+      (s.enter.length ? `  路径: ${s.enter.map((x) => x.target).join(' → ')}` : '  路径: （基态）'));
+  }
 } finally {
   try { child.kill(); } catch { /* ignore */ }
   try { rmSync(profile, { recursive: true, force: true }); } catch { /* ignore */ }
