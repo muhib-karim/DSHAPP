@@ -1,13 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  主界面：WebView（官方 Web GUI）+ 启动过渡层。
+  主界面：Web 视图（官方 Web GUI）+ 启动过渡层。
+
+  ⚠️ 这里是**空容器**而不是直接写 `<WebView>`：本 App 有两个 Web 内核版本
+     （system = 系统 WebView、gecko = 内置 GeckoView），承载控件由
+     `WebHostFactory` 在运行期决定（见 com.dsh.android.web.WebHost），
+     布局里放不下写死的控件类型。
 
   启动层的设计意图（配色与图标同源，见 AGENTS.md 的图标一节）：
     · 深色底 + 径向渐变，中心比四周略亮，把视线收到头像上
     · 圆形头像徽章居中，外围旋转光环 + 真实进度环
     · 文案两行：阶段名 + 补充说明，字号/字距克制
 
-  ⚠️ overlay 是**不透明**的，且盖在 WebView 之上。收尾时必须走淡出动画
+  ⚠️ overlay 是**不透明**的，且盖在 Web 视图之上。收尾时必须走淡出动画
      （见 MainActivity.hideOverlay），直接 setVisibility(GONE) 会出现硬切。
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
@@ -15,8 +20,8 @@
     android:layout_height="match_parent"
     android:background="#0F1115">
 
-    <WebView
-        android:id="@+id/webView"
+    <FrameLayout
+        android:id="@+id/webContainer"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 

@@ -39,7 +39,60 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
+
+        // Web 内核是不是**随 APK 打包**的（gecko flavor 覆盖成 true）。
+        // 用途只有一个但很关键：`EngineManager.ensureWebViewCompat()` 是给**设备上
+        // 的系统 WebView 太旧**准备的降级（按 chrome74 重编译前端 bundle）。内置内核
+        // 的版本在编译期就定了（GeckoView 140），永远不可能"过旧"，跑降级只会白白把
+        // 前端换成语法受限的版本 —— 所以那一整套在 gecko 版必须整个跳过。
+        buildConfigField("boolean", "BUILT_IN_WEB_ENGINE", "false")
     }
+
+    // ══ 两个 Web 内核版本共存 ══════════════════════════════════════════
+    //
+    // system = 系统 WebView 内核（原有版本，行为与 0.2.6 完全一致）
+    // gecko  = 内置 GeckoView 内核（不依赖设备上的系统 WebView）
+    //
+    // ⚠️ **代价**：一旦有 flavor，构建任务就带上 flavor 名了 ——
+    //   `:app:assembleDebug` 变成 `:app:assembleSystemDebug` / `:app:assembleGeckoDebug`。
+    //
+    // ⚠️ **两个 flavor 的 applicationId 必须都恰好 15 字符**，原因见 defaultConfig
+    //   里那条注释（Termux ELF 的等长原地重写）。`com.dsh.android` 与
+    //   `com.dsh.webview` 都是 15 字符，对应 `/data/data/<包名>/` = 27 字节。
+    //   `TermuxBootstrap.ELF_ROOT_REPLACEMENT` 已改为从 `BuildConfig.APPLICATION_ID`
+    //   派生，改这里不需要再同步改 Kotlin 常量。
+    flavorDimensions += "webengine"
+    productFlavors {
+        create("system") {
+            dimension = "webengine"
+            // applicationId 继承 defaultConfig，产物与原有版本逐字节同源。
+        }
+        create("gecko") {
+            dimension = "webengine"
+            applicationId = "com.dsh.webview"
+            // 两个包会同时存在于设备上（applicationId 不同 ⇒ 可共存），
+            // 版本号带后缀才能在系统「应用信息」里分辨出装的是哪一个。
+            versionNameSuffix = "-gecko"
+            // 内核随 APK 分发 ⇒ 不需要也不应该跑「按 chrome74 降级前端」那一套。
+            buildConfigField("boolean", "BUILT_IN_WEB_ENGINE", "true")
+        }
+    }
+
+    /**
+     * 内核实现放在 flavor 源集里，不是 `main`。
+     *
+     * ⚠️ 这是**必须**的：`GeckoWebHost` 依赖 `org.mozilla.geckoview.*`，而那个
+     *   依赖只挂在 `geckoImplementation` 上。放进 `main` 会让 system flavor 也去
+     *   编译它 ⇒ `Unresolved reference: geckoview`，两个包一起构建失败。
+     *
+     * 布局（AGP 按约定自动收集 `src/<flavor>/java` 与 `src/<flavor>/assets`，
+     * 不需要显式声明 sourceSets）：
+     *
+     *   main/java/.../web/   → WebHost.kt、PageBridge.kt（纯接口，无内核依赖）
+     *   system/java/.../web/ → SystemWebHost.kt、WebHostFactory.kt
+     *   gecko/java/.../web/  → GeckoWebHost.kt、WebHostFactory.kt
+     *   gecko/assets/        → dsh-bridge 扩展（只有 gecko 需要）
+     */
 
     signingConfigs {
         // ⚠️ 这把钥匙是发行版的终身身份，与 debug 签名**互相独立**。
@@ -100,6 +153,12 @@ android {
 
     buildFeatures {
         viewBinding = true
+        // TermuxBootstrap.ELF_ROOT_REPLACEMENT 从 BuildConfig.APPLICATION_ID 派生 ——
+        // 两个 flavor 的包名不同（com.dsh.android / com.dsh.webview），而 ELF 里的
+        // 替换串必须**恰好 27 字节**且与真实包名一致，写死一个就会让另一个 flavor
+        // 静默跳过路径重写（症状是 dpkg/node 全线 Permission denied）。
+        // AGP 8.0 起 buildConfig 默认为 false，必须显式打开。
+        buildConfig = true
     }
 }
 
@@ -110,4 +169,20 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.8.7")
     implementation("com.google.android.material:material:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // 内置内核版：GeckoView（Mozilla 自维护的 Gecko 引擎，随 APK 分发、不依赖
+    // 设备上的系统 WebView）。只有 gecko flavor 才需要它。
+    //
+    // ⚠️ 必须用 `-arm64-v8a` 那个变体而不是 `geckoview`：前者只含 arm64 的
+    //   libxul.so（86 MB），后者是全 ABI 的 omni 包（230 MB），而本工程
+    //   `abiFilters` 只有 arm64-v8a —— 引 omni 会把用不到的几个 ABI 一起打进 APK。
+    // ⚠️ 仓库在 settings.gradle.kts 里单独声明（google()/mavenCentral() 都没有）。
+    // ⚠️ 版本选择不是「越新越好」，是**被本工程的构建工具链锁死的**：
+    //   157（当前 release）硬依赖 `androidx.core:core:1.19.0`（要求 AGP 9.1.0+）
+    //   与 `androidx.media3:*:1.11.0`（要求 compileSdk 36）；146 依赖 core 1.17.0
+    //   （要求 AGP 8.9.1+）。本工程是 AGP 8.8.2 + compileSdk 35，三者都装不下：
+    //     Dependency 'androidx.core:core:1.17.0' requires Android Gradle plugin 8.9.1 or higher
+    //   140 依赖 core 1.16.0（minAGP 8.6.0 / minCompileSdk 35，均满足），是能在
+    //   当前工具链下直接构建的最高版本。要再往上就得先升 AGP，那是另一件事。
+    "geckoImplementation"("org.mozilla.geckoview:geckoview-arm64-v8a:140.0.20250707120347")
 }

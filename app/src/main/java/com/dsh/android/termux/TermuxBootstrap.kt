@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.system.Os
 import android.util.Log
+import com.dsh.android.BuildConfig
 import com.dsh.android.termux.util.AppLogger
 import com.dsh.android.termux.util.AtomicTextFile
 import kotlinx.coroutines.Dispatchers
@@ -1396,8 +1397,18 @@ DPkg::options { "--instdir=$instdir"; };
          * move). If you ever change this, re-derive the byte count, do not
          * eyeball it. Longer is impossible without breaking the ELF; shorter
          * would clip a NUL and corrupt any string that shares the suffix.
+         *
+         * ⚠️ **从 `BuildConfig.APPLICATION_ID` 派生，不写死。** 本工程出两个
+         * flavor，包名不同（`com.dsh.android` / `com.dsh.webview`，都是 15 字符）。
+         * 写死其中一个，另一个 flavor 会把二进制里的路径重写成**别的应用**的
+         * 私有目录 —— 那里既不存在也不可读，症状是 `dpkg: Permission denied` /
+         * `CANNOT LINK EXECUTABLE`，且 [installDebFixHook] 的等长断言**不会**报错
+         * （长度是对的，只是内容错了），非常难查。
+         *
+         * `check(...)` 在 [installDebFixHook] 里仍然守着 27 字节这条不变量：
+         * 谁把包名改成非 15 字符，启动时立刻抛，而不是静默产出坏环境。
          */
-        private const val ELF_ROOT_REPLACEMENT = "/data/data/com.dsh.android/"
+        private val ELF_ROOT_REPLACEMENT: String = "/data/data/${BuildConfig.APPLICATION_ID}/"
 
         /** Plain-text files larger than this are left alone (they are data, not scripts). */
         private const val MAX_TEXT_BYTES = 2L * 1024 * 1024

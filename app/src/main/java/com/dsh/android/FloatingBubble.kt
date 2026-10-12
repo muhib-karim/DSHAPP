@@ -15,12 +15,15 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -33,14 +36,34 @@ import kotlin.math.roundToInt
  * 于是官方界面看不见了 —— 既不知道 AI 跑到哪一步，也没法中途喊停或补一句话。
  * 通知栏能显示状态，但点一下就跳走，没法交互。
  *
- * ## 形态
+ * ## 形态（三种，共用一个 window，靠 visibility 切换，不重建 View）
  *
- * 两种形态共用一个 window（靠 visibility 切换，不重建 View）：
+ * | 形态 | 触发 | 内容 |
+ * |---|---|---|
+ * | **收起** | 默认 | 球（尺寸/形状/底色/头像由插件配置）+ 状态圆点 |
+ * | **贴边** | 把球**往屏幕外拖**后松手 | 只剩一条薄片贴在那一侧的边缘 |
+ * | **展开** | 点球 / 点贴边薄片 | 可拖动、可缩放的面板，含**完整会话转录** + 输入框 |
  *
- * - **收起**：56dp 圆形按钮 + 一个状态圆点（实心绿=在跑，空心灰=空闲）。
- * - **展开**：300dp 面板 —— 当前动作 / 会话标题 / 最近输出（可滚动）/ 输入框 + 发送。
+ * ## 本轮升级的五件事（用户明确要求）
  *
- * 后续要做"桌宠"形态时，替换 [circleView] 里的内容即可，其余逻辑不用动。
+ * ① **状态横条无变化 2 秒后自动消失** —— 见 [scheduleStatusAutoHide]。原来是常驻的，
+ *    只要 AI 在跑就一直挂着，屏幕上永远有一块东西。现在只有**内容真的变化**才
+ *    重新计时，2 秒内没有新内容就淡出。
+ *
+ * ② **拖出屏幕自动贴边折叠** —— 见 [enterEdge] / [onTouchUp]。判定用**未经夹取的
+ *    原始坐标**（`rawX`），因为夹取逻辑会把越界量吃掉，用夹取后的值永远判不出来。
+ *
+ * ③ **展开显示完整转录** —— 见 [applyTranscript]。原实现只有一个 TextView 显示
+ *    「最后一条助手正文的前 400 字」，用户在自己的悬浮窗里**看不到自己发过什么、
+ *    也看不到 AI 调了哪些工具**。现在由 [ChatTranscript] 驱动逐条渲染：用户消息、
+ *    助手完整回复、每一次工具调用、错误，全都在。
+ *
+ * ④ **面板可拖动、可缩放** —— 拖动走顶栏（[R.id.panelHeader]），缩放走底部手柄
+ *    （[R.id.panelResize]）。位置与尺寸都落盘，下次开还是那样。
+ *
+ * ⑤ **插件可改外观** —— 见 [applyAppearance] 与 [BubbleAppearance]。任何页面内的
+ *    插件都能 `window.DSHAndroid.bubbleApply('{"shape":"square","size":72}')`
+ *    即时改变悬浮球，配置落盘、重启仍在。
  *
  * ## 三个必须知道的平台事实
  *
@@ -50,43 +73,52 @@ import kotlin.math.roundToInt
  * `BadTokenException: permission denied for window type 2038`。所以 [show] 先查
  * [canDrawOverlays]，不满足就直接放弃（由设置页的引导卡负责引导用户去开）。
  *
- * ### ② 输入框要用 TYPE_APPLICATION_OVERLAY + FLAG_ALT_FOCUSABLE_IM
+ * ### ② 输入框要用 TYPE_APPLICATION_OVERLAY，且展开态不能带 FLAG_NOT_FOCUSABLE
  *
  * 悬浮窗默认**抢不到输入法焦点**：`FLAG_NOT_FOCUSABLE` 让整个 window 收不到按键，
  * 而带上它之后 `EditText` 又永远弹不出键盘。正确组合是：
  *
  * ```
  * type    = TYPE_APPLICATION_OVERLAY (API 26+) / TYPE_PHONE (更低)
- * flags   = FLAG_NOT_TOUCH_MODAL | FLAG_ALT_FOCUSABLE_IM   ← 注意**不含** NOT_FOCUSABLE
+ * flags   = FLAG_NOT_TOUCH_MODAL + 展开态去掉 NOT_FOCUSABLE   ← 见 applyFocusFlags
  * ```
  *
- * `FLAG_ALT_FOCUSABLE_IM` 的语义是「有输入法时才可聚焦」——它让 window 平时不抢焦点
- * （下层 App 照常收按键），但点输入框时能拉起键盘。这是悬浮窗输入框的标准解法。
- *
- * ⚠️ 拖动时要把 `FLAG_NOT_TOUCH_MODAL` 加上并**同时**设 `FLAG_NOT_FOCUSABLE`，
- * 否则手势会被输入法层截走。本实现改用「按下即 setFlags 切一次」的做法，
- * 见 [applyTouchFlags]。
+ * ⚠️ 展开态**不能**设 `FLAG_ALT_FOCUSABLE_IM` —— 那正是键盘弹不出来的原因
+ *   （该标志的语义是「把 NOT_FOCUSABLE 对输入法的含义取反」）。详见 [applyFocusFlags]。
  *
  * ### ③ 拖动必须用绝对坐标，不能用 getRawX 的差值
  *
  * `WindowManager.updateViewLayout` 的 x/y 是相对**屏幕**的左上角，而 `getRawX()`
  * 是相对屏幕的触点。用 `rawX - downRawX` 得到的是位移量，必须**累加到按下时的
- * window 坐标**上。直接拿 `rawX` 当 x 会让气泡瞬移到手指位置（左下角对齐触点），
- * 这是最容易踩的坑。
+ * window 坐标**上。直接拿 `rawX` 当 x 会让气泡瞬移到手指位置，这是最容易踩的坑。
  *
  * ## 状态来源
  *
- * 复用既有通道：`client.js` 的 `mpReportStatus()` → `DSHAndroid.onStatus()`
- * → [EngineService.updateStatus]。实测 App 退到后台后 WebView 的 `setInterval`
- * **照常运行**（按 HOME 后 12 秒走满 12 拍），所以状态是实时的，不需要另建引擎订阅。
+ * 两条通道，都由 `client.js` 推送：
+ *
+ * | 通道 | 入口 | 消费者 |
+ * |---|---|---|
+ * | [EngineStatus]（≤400 字，高频） | `mpReportStatus()` → [onStatus] | 通知栏 + 状态横条 |
+ * | [ChatTranscript]（完整，变化才推） | `mpReportTranscript()` → [onTranscript] | 展开面板 |
+ *
+ * 实测 App 退到后台后 WebView 的 `setInterval` **照常运行**（按 HOME 后 12 秒走满
+ * 12 拍），所以两条都是实时的，不需要另建引擎订阅。
  */
 class FloatingBubble(private val context: Context) {
 
     companion object {
         private const val TAG = DshApplication.TAG
 
-        /** 收起态直径（dp）。56 是 Material 的 FAB 标准尺寸，手指好点。 */
-        private const val CIRCLE_DP = 56
+        /** 状态横条自动消失的默认时长（ms）。插件可用 `statusAutoHideMs` 覆盖。 */
+        private const val STATUS_AUTO_HIDE_MS = 2000
+
+        /**
+         * 贴边态薄片的宽度（dp）。
+         *
+         * 取 6：够窄（不挡下层应用）、够宽（手指点得到）。实测 4dp 在 xxhdpi 上
+         * 只有 12px，容易点不中。
+         */
+        private const val EDGE_WIDTH_DP = 6
 
         /**
          * 贴边后距屏幕边缘的留白（dp）。
@@ -105,10 +137,30 @@ class FloatingBubble(private val context: Context) {
         /** 判定"点击"而非"拖动"的位移阈值（dp）。与系统 ViewConfiguration 同量级。 */
         private const val TAP_SLOP_DP = 6
 
-        /** 位置持久化。只存 x/y 两个整数，不值得上 DataStore。 */
-        private const val PREFS = "dsh_bubble"
+        /**
+         * 判定"拖出屏幕"的越界阈值（dp）。
+         *
+         * 取球宽的一半：**明显往外拖**才触发贴边。阈值太小会让正常的边缘吸附
+         * 误判成贴边（用户只是想把球放到边上，结果球变成了一条缝）。
+         */
+        private const val EDGE_OVERSHOOT_DP = 28
+
+        /** 转录区最小高度（dp）。再矮就看不见内容了。 */
+        private const val TRANSCRIPT_MIN_DP = 72
+
+        /** 面板最小宽度（dp）。 */
+        private const val PANEL_MIN_WIDTH_DP = 180
+
+        /** 位置与外观持久化。都是小整数/小 JSON，不值得上 DataStore。 */
+        private const val PREFS = BubbleAppearance.PREFS
         private const val KEY_X = "x"
         private const val KEY_Y = "y"
+
+        /** 展开面板的宽度（px）落盘 key；0/缺失表示用外观配置里的值。 */
+        private const val KEY_PANEL_W = "panel_w"
+
+        /** 转录区高度（px）落盘 key。 */
+        private const val KEY_TRANSCRIPT_H = "transcript_h"
 
         /**
          * 气泡是否应当显示。
@@ -116,11 +168,26 @@ class FloatingBubble(private val context: Context) {
          * 由 `MainActivity` 在 `onStart`/`onStop` 里设置 —— 只有**退到后台**才显示，
          * 前台时 App 内已有完整界面，气泡纯属碍事。
          *
+         * ⚠️ 例外：插件把 `state` 设成 `expanded` / `collapsed` 时，**前台也显示**。
+         *   那是插件在明确要求「把这个悬浮窗摆出来」，如果前台一律不收，插件就没法
+         *   让用户看到自己改的效果 —— 而"让 AI 改悬浮窗"正是这条通道存在的理由。
+         *   默认的 `auto` 保持既有行为（只在后台显示）。
+         *
          * ⚠️ 做成进程级单例而不是每个 Activity 一份：`MainActivity` 转屏会重建，
-         * 但气泡应当连续存在，不该闪一下。
+         *   但气泡应当连续存在，不该闪一下。
          */
         @Volatile
         private var instance: FloatingBubble? = null
+
+        /**
+         * application context。
+         *
+         * ⚠️ 必须自己存一份：插件可能在**没有 Activity** 的时候下发配置
+         *   （App 在后台、Activity 已销毁），而那时只有 [instance] 里的 context 可用，
+         *   但 instance 可能为 null。存 application context 不泄漏。
+         */
+        @Volatile
+        private var appContext: Context? = null
 
         /**
          * 用户是否在设置里开了气泡。默认**关**。
@@ -142,6 +209,24 @@ class FloatingBubble(private val context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(context)
             else true
 
+        /**
+         * 由 `MainActivity.onCreate` 调用一次，把 application context 记下来。
+         *
+         * ⚠️ **必须有这个入口，不能只在 [onAppBackground] 里赋值。** 真机实测踩到过：
+         *   用户在前台（气泡还没显示过）时插件下发配置，[applyAppearance] 拿到的
+         *   `appContext` 是 null ⇒ 直接 `return false`，配置**静默丢弃**。
+         *   症状是「插件调了 bubbleApply，返回 false，什么也没发生」——
+         *   而 App 一切到后台就又能用了，看起来像随机失效。
+         */
+        fun attach(context: Context) {
+            val ctx = context.applicationContext
+            appContext = ctx
+            // 插件上次把形态设成了 expanded / collapsed（不是 auto）时，重启后也要
+            // 摆出来 —— 否则「重启 App 后依然生效」这句承诺就只对外观成立、对形态
+            // 不成立。`auto` 走 else 分支什么都不做，保持既有行为。
+            main.post { reconcileVisibility(ctx, BubbleAppearance.load(ctx)) }
+        }
+
         /** App 退到后台 → 显示气泡（前提：用户开了开关且已授权）。 */
         fun onAppBackground(context: Context) {
             if (!isEnabled(context)) return
@@ -150,6 +235,11 @@ class FloatingBubble(private val context: Context) {
                 return
             }
             val ctx = context.applicationContext
+            appContext = ctx
+            if (BubbleAppearance.load(ctx).state == BubbleAppearance.STATE_HIDDEN) {
+                Log.i(TAG, "插件要求隐藏悬浮球，不显示")
+                return
+            }
             main.post {
                 if (instance?.isShown == true) return@post
                 // 半路残留的实例（addView 失败、或转屏把 Activity 拆了）先收干净，
@@ -159,8 +249,17 @@ class FloatingBubble(private val context: Context) {
             }
         }
 
-        /** App 回到前台 → 收起气泡。 */
+        /**
+         * App 回到前台 → 收起气泡。
+         *
+         * ⚠️ 插件显式指定了形态（`state != auto`）时**不收** —— 见 [instance] 的说明。
+         */
         fun onAppForeground() {
+            val ctx = appContext ?: return
+            if (BubbleAppearance.load(ctx).state != BubbleAppearance.STATE_AUTO) {
+                Log.i(TAG, "插件已指定悬浮球形态，回到前台也不收起")
+                return
+            }
             main.post {
                 instance?.hide()
                 instance = null
@@ -178,6 +277,107 @@ class FloatingBubble(private val context: Context) {
         fun onStatus(status: EngineStatus) {
             val cur = instance ?: return
             main.post { cur.applyStatus(status) }
+        }
+
+        /**
+         * 会话转录更新入口。由页面侧 `mpReportTranscript()` 推送。
+         *
+         * ⚠️ 与 [onStatus] 一样可能在任意线程被调用（JS 桥线程），内部切主线程。
+         */
+        fun onTranscript(json: String) {
+            val cur = instance ?: return
+            val transcript = ChatTranscript.parse(json) ?: return
+            main.post { cur.applyTranscript(transcript) }
+        }
+
+        /**
+         * 插件下发外观配置。**这是「让 AI 改悬浮窗」的唯一入口。**
+         *
+         * @param json 见 [BubbleAppearance] 的字段表；未知字段忽略、非法值退回原值。
+         * @return 是否已接受（不代表视图已刷新 —— 那是下一帧的事）。
+         */
+        fun applyAppearance(json: String): Boolean {
+            val ctx = appContext ?: return false
+            val next = BubbleAppearance.merge(json, BubbleAppearance.load(ctx), ctx)
+            // 自定义头像单独落盘：base64 有几百 KB，不适合进 SharedPreferences。
+            //
+            // ⚠️ **落盘后必须把内存里的 data URI 换成文件标记。** 视图判定用的是
+            //   `usesCustomAvatar`（即 `avatar == AVATAR_FILE`），data URI 不匹配 ⇒
+            //   下发自定义头像的那一帧**不显示**它，要等下次 `load()` 才生效，
+            //   表现为「AI 换了头像但没反应，重启才看见」。
+            //   换掉还能顺带避免几百 KB 的字符串一直挂在实例上。
+            var merged = next
+            if (next.avatar.startsWith("data:image/")) {
+                merged = if (BubbleAppearance.writeAvatar(ctx, next.avatar) != null) {
+                    next.copy(avatar = BubbleAppearance.AVATAR_FILE)
+                } else {
+                    // 图不是有效位图（writeAvatar 已记日志）：只把头像退回改之前的值，
+                    // 不能留一个指向不存在文件的引用 —— 那会让球变成一块空白。
+                    next.copy(avatar = BubbleAppearance.load(ctx).avatar)
+                }
+            }
+            BubbleAppearance.save(ctx, merged)
+            Log.i(TAG, "插件下发悬浮球外观: state=${merged.state} shape=${merged.shape} size=${merged.size}")
+            main.post {
+                instance?.applyAppearance(merged)
+                reconcileVisibility(ctx, merged)
+            }
+            return true
+        }
+
+        /** 读回当前外观配置（JSON 文本）。插件据此做「读取-修改-写回」。 */
+        fun currentAppearanceJson(): String {
+            val ctx = appContext ?: return "{}"
+            val a = BubbleAppearance.load(ctx)
+            return JSONObject().apply {
+                put("state", a.state)
+                put("shape", a.shape)
+                put("size", a.size)
+                put("cornerRadius", a.cornerRadius)
+                put("opacity", a.opacity.toDouble())
+                put("bg", a.bg)
+                put("bg2", a.bg2)
+                put("border", a.border)
+                put("borderWidth", a.borderWidth)
+                put("avatar", if (a.usesCustomAvatar) "custom" else a.avatar)
+                put("panelWidth", a.panelWidth)
+                put("panelHeight", a.panelHeight)
+                put("panelBg", a.panelBg)
+                put("panelText", a.panelText)
+                put("panelAccent", a.panelAccent)
+                put("statusAutoHideMs", a.statusAutoHideMs)
+                put("edgeSnap", a.edgeSnap)
+            }.toString()
+        }
+
+        /**
+         * 按插件要求的形态决定要不要显示/隐藏窗口。
+         *
+         * 只在 [applyAppearance] 之后调 —— 它的语义是「配置变了，把窗口状态跟上去」。
+         */
+        private fun reconcileVisibility(ctx: Context, a: BubbleAppearance) {
+            if (!isEnabled(ctx) || !canDrawOverlays(ctx)) return
+            when (a.state) {
+                BubbleAppearance.STATE_HIDDEN -> {
+                    instance?.hide()
+                    instance = null
+                }
+                BubbleAppearance.STATE_EXPANDED -> {
+                    if (instance?.isShown != true) {
+                        instance?.hide()
+                        instance = FloatingBubble(ctx).also { it.show() }
+                    }
+                    instance?.expand()
+                }
+                BubbleAppearance.STATE_COLLAPSED -> {
+                    if (instance?.isShown != true) {
+                        instance?.hide()
+                        instance = FloatingBubble(ctx).also { it.show() }
+                    }
+                    instance?.collapse()
+                }
+                else -> Unit
+            }
         }
 
         /**
@@ -201,9 +401,26 @@ class FloatingBubble(private val context: Context) {
         @Volatile
         var openApp: (() -> Unit)? = null
 
-        /** 主线程 Handler。气泡的一切 UI 操作都必须回到这里。 */
         /** 主线程 Handler，所有对 View / window 的操作都走它。 */
-    private val main = Handler(Looper.getMainLooper())
+        private val main = Handler(Looper.getMainLooper())
+
+        /** 球的默认底色（与 `bubble_circle_bg.xml` 一致）。 */
+        const val DEFAULT_BALL_BG = 0xFFFFFFFF.toInt()
+
+        /** 默认描边（8% 黑，与 XML 里的 `#14000000` 一致）。 */
+        const val DEFAULT_BORDER = 0x14000000
+
+        /** 默认面板底色。 */
+        const val DEFAULT_PANEL_BG = 0xFFFFFFFF.toInt()
+
+        /** 默认正文色。 */
+        const val DEFAULT_TEXT = 0xFF1A1D21.toInt()
+
+        /** 默认强调色（与「发送」按钮的 `#3B6FE0` 一致）。 */
+        const val DEFAULT_ACCENT = 0xFF3B6FE0.toInt()
+
+        /** 运行中状态点的颜色（原实心绿）。 */
+        const val DEFAULT_RUNNING = 0xFF34C759.toInt()
     }
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -211,18 +428,39 @@ class FloatingBubble(private val context: Context) {
 
     private var root: View? = null
     private var circleView: View? = null
+    private var avatarView: ImageView? = null
     private var panelView: View? = null
     private var dotView: View? = null
     private var panelDot: View? = null
     private var panelAction: TextView? = null
     private var panelTitle: TextView? = null
-    private var panelBody: TextView? = null
     private var panelScroll: ScrollView? = null
+    private var panelTranscript: LinearLayout? = null
     private var panelInput: EditText? = null
     private var panelStop: View? = null
+    private var panelHeader: View? = null
+    private var panelResize: View? = null
+    private var panelSend: TextView? = null
+
+    /** 贴边态薄片与它上面的小点。 */
+    private var edgeView: View? = null
+    private var edgeDot: View? = null
 
     /** 当前是否展开。 */
     private var expanded = false
+
+    /** 是否处于贴边态。 */
+    private var edgeCollapsed = false
+
+    /**
+     * 贴边在哪一侧：-1 = 左，+1 = 右。
+     *
+     * ⚠️ 必须记住而不是每帧重算：薄片贴着左边时它的中心在屏幕左侧，
+     *   重算会得到「离左边更近」，看似等价；但薄片**宽度只有 6dp**，
+     *   用户点它之后要弹回完整球，弹到哪一侧得看用户当初往哪边拖的，
+     *   不能靠"现在离哪边近"倒推（球比薄片宽得多，结论会反）。
+     */
+    private var edgeSide = 1
 
     /** 是否已 addView（避免重复添加 / 重复移除）。 */
     private var attached = false
@@ -231,6 +469,15 @@ class FloatingBubble(private val context: Context) {
     private var curX = 0
     private var curY = 0
 
+    /**
+     * 拖动中**未经夹取**的 window 坐标（px）。
+     *
+     * ⚠️ 这是「拖出屏幕自动贴边」判定的**唯一依据**。用 [curX]/[curY] 判不出来 ——
+     *   它们已经被 [clampInto] 夹进可见区域，越界量在那一步就丢了，永远为 0。
+     */
+    private var rawX = 0
+    private var rawY = 0
+
     /** 拖动状态。 */
     private var dragging = false
     private var downRawX = 0f
@@ -238,6 +485,11 @@ class FloatingBubble(private val context: Context) {
     private var downWinX = 0
     private var downWinY = 0
     private var moved = false
+
+    /** 缩放状态。 */
+    private var resizing = false
+    private var downWidth = 0
+    private var downHeight = 0
 
     private val density = context.resources.displayMetrics.density
     private fun dp(v: Int) = (v * density).roundToInt()
@@ -248,6 +500,26 @@ class FloatingBubble(private val context: Context) {
     /** 最近一次状态，展开面板时用它填充。 */
     private var lastStatus: EngineStatus? = null
 
+    /** 最近一次转录。展开时用它填充（球形态下不渲染，省一次 View 树重建）。 */
+    private var lastTranscript: ChatTranscript? = null
+
+    /** 转录脏标记：球形态下收到新转录只置位，展开时才真正重建 View。 */
+    private var transcriptDirty = true
+
+    /** 已渲染的转录指纹，用来跳过重复渲染（状态每秒推一次，无脑重建会一直重排）。 */
+    private var transcriptFingerprint = ""
+
+    /**
+     * 当前 [panelTranscript] 里逐行对应的 role 序列。
+     *
+     * 流式输出时每秒要重渲染好几次，用来判断能不能**复用已有行**（只改文本）：
+     * role 序列一致 ⇒ 复用，避免 `removeAllViews()` 造成的整块闪烁。
+     */
+    private var renderedRoles: List<String> = emptyList()
+
+    /** 当前外观配置。所有尺寸/颜色/形状都从这里取。 */
+    private var appearance: BubbleAppearance = BubbleAppearance()
+
     // ══ 收起态的状态气泡（球上方那个小标签）══════════════════════════════
     //
     // 独立 window。理由见 layout/bubble_status.xml 的头注释：塞进球的 window
@@ -255,6 +527,18 @@ class FloatingBubble(private val context: Context) {
     private var statusRoot: View? = null
     private var statusDot: View? = null
     private var statusText: TextView? = null
+
+    /** 状态横条自动消失的计时器。 */
+    private val statusHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 状态横条当前显示的「内容指纹」。
+     *
+     * ⚠️ 自动消失的**判据就是它变不变**：内容变了才重新计时。用户要的是
+     *   「没有变化时 2 秒后自动消失」，所以状态每秒刷新但文字相同**不算**变化，
+     *   计时器继续跑，2 秒后照样消失。见 [scheduleStatusAutoHide]。
+     */
+    private var statusKey = ""
 
     /**
      * 键盘高度变了（展开态把面板顶上去，保证输入框露在键盘之上）。
@@ -291,9 +575,6 @@ class FloatingBubble(private val context: Context) {
     private var preExpandX = 0
     private var preExpandY = 0
 
-    /** 状态气泡当前显示的文字，用于去重（内容没变就不重复 setText/移动）。 */
-    private var statusShown = ""
-
     /** 防重入守卫：`positionStatusBubble` 会改 layoutParams，可能再触发 layout 回调。 */
     private var positioning = false
 
@@ -329,40 +610,62 @@ class FloatingBubble(private val context: Context) {
             return
         }
 
+        appearance = BubbleAppearance.load(context)
+
         val view = LayoutInflater.from(context).inflate(R.layout.bubble_window, null)
         root = view
         circleView = view.findViewById(R.id.bubbleCircle)
+        avatarView = view.findViewById(R.id.bubbleAvatar)
         panelView = view.findViewById(R.id.bubblePanel)
         dotView = view.findViewById(R.id.bubbleDot)
         panelDot = view.findViewById(R.id.panelDot)
         panelAction = view.findViewById(R.id.panelAction)
         panelTitle = view.findViewById(R.id.panelTitle)
-        panelBody = view.findViewById(R.id.panelBody)
         panelScroll = view.findViewById(R.id.panelScroll)
+        panelTranscript = view.findViewById(R.id.panelTranscript)
         panelInput = view.findViewById(R.id.panelInput)
         panelStop = view.findViewById(R.id.panelStop)
+        panelHeader = view.findViewById(R.id.panelHeader)
+        panelResize = view.findViewById(R.id.panelResize)
+        panelSend = view.findViewById(R.id.panelSend)
+        edgeView = view.findViewById(R.id.bubbleEdge)
+        edgeDot = view.findViewById(R.id.edgeDot)
 
         paintDot(dotView, running = false)
         paintDot(panelDot, running = false, small = true)
+        paintDot(edgeDot, running = false, small = true)
 
         // 位置：优先用上次记住的；没有就贴右侧中部
         val screenW = context.resources.displayMetrics.widthPixels
         val screenH = context.resources.displayMetrics.heightPixels
-        curX = prefs.getInt(KEY_X, screenW - dp(CIRCLE_DP) - dp(EDGE_MARGIN_DP))
+        val sidePx = dp(appearance.size)
+        curX = prefs.getInt(KEY_X, screenW - sidePx - dp(EDGE_MARGIN_DP))
         curY = prefs.getInt(KEY_Y, (screenH * 0.42f).roundToInt())
+
+        applyAppearanceToViews()
+        restorePanelSize()
         clampInto(curX, curY).let { curX = it.first; curY = it.second }
 
         installTouch(circleView!!)
+        installEdgeTouch(edgeView!!)
+        installPanelDrag(panelHeader!!)
+        installPanelResize(panelResize!!)
         installPanelActions(view)
 
         val params = baseParams().apply { x = curX; y = curY }
         try {
             wm.addView(view, params)
             attached = true
-            Log.i(TAG, "气泡已显示: ($curX, $curY)")
+            Log.i(TAG, "气泡已显示: ($curX, $curY) shape=${appearance.shape} size=${appearance.size}")
             // 主动拉一次当前状态：气泡是刚创建的，错过了之前所有的推送，
             // 不拉的话会停在"空闲"直到下一次状态变化（可能几十秒后）。
             EngineService.currentStatus()?.let { applyStatus(it) }
+            // 插件要求的初始形态（非 auto 时生效）。
+            when (appearance.state) {
+                BubbleAppearance.STATE_EXPANDED -> expand()
+                BubbleAppearance.STATE_COLLAPSED -> Unit
+                else -> Unit
+            }
         } catch (t: Throwable) {
             // 最常见的是没权限（BadTokenException）。不致命，只是没气泡。
             Log.w(TAG, "添加气泡失败: ${t.message}")
@@ -378,9 +681,192 @@ class FloatingBubble(private val context: Context) {
         runCatching { wm.removeViewImmediate(v) }
         root = null
         circleView = null
+        avatarView = null
         panelView = null
         panelInput = null
+        edgeView = null
         expanded = false
+        edgeCollapsed = false
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 外观（插件可控）
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 应用一份外观配置。
+     *
+     * ⚠️ 全程 try/catch：气泡是锦上添花，一份写错的配置不能让它消失。
+     */
+    fun applyAppearance(next: BubbleAppearance) {
+        appearance = next
+        try {
+            applyAppearanceToViews()
+            clampInto(curX, curY).let { moveTo(it.first, it.second) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "应用悬浮球外观失败: ${t.message}")
+        }
+    }
+
+    /** 把 [appearance] 刷到各个 View 上。 */
+    private fun applyAppearanceToViews() {
+        val side = dp(appearance.size)
+        val dm = context.resources.displayMetrics
+
+        // ── 球：尺寸、形状、底色、描边 ─────────────────────────────────
+        circleView?.let { c ->
+            (c.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.width = side
+                lp.height = side
+                c.layoutParams = lp
+            }
+            c.background = ballBackground()
+            // 状态点跟着球缩放：球小到 24dp 时 14dp 的点会占掉一大半
+            dotView?.let { d ->
+                val dotPx = (appearance.size * 0.25f).roundToInt().coerceIn(8, 18)
+                (d.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                    lp.width = dp(dotPx)
+                    lp.height = dp(dotPx)
+                    d.layoutParams = lp
+                }
+            }
+        }
+
+        // ── 头像：内置 / 不显示 / 自定义图片 ───────────────────────────
+        avatarView?.let { iv ->
+            when {
+                appearance.avatar == BubbleAppearance.AVATAR_NONE -> {
+                    iv.visibility = View.GONE
+                }
+                appearance.usesCustomAvatar -> {
+                    val bmp = BubbleAppearance.readAvatar(context, side)
+                    if (bmp != null) {
+                        iv.setImageBitmap(bmp)
+                        iv.visibility = View.VISIBLE
+                    } else {
+                        // 图片文件丢了（用户清了数据）—— 退回内置头像而不是留白。
+                        iv.setImageResource(R.drawable.bubble_avatar)
+                        iv.visibility = View.VISIBLE
+                    }
+                }
+                else -> {
+                    iv.setImageResource(R.drawable.bubble_avatar)
+                    iv.visibility = View.VISIBLE
+                }
+            }
+        }
+
+        // ── 贴边薄片：高度跟随球，宽度固定 ─────────────────────────────
+        edgeView?.let { e ->
+            (e.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.width = dp(EDGE_WIDTH_DP)
+                lp.height = side
+                e.layoutParams = lp
+            }
+            e.background = edgeBackground()
+        }
+
+        // ── 整体不透明度 ───────────────────────────────────────────────
+        root?.alpha = appearance.opacity.coerceIn(0.2f, 1f)
+
+        // ── 面板：宽度、配色 ───────────────────────────────────────────
+        panelView?.let { p ->
+            val w = prefs.getInt(KEY_PANEL_W, 0).takeIf { it > 0 }
+                ?: appearance.effectivePanelWidth(dm.widthPixels, density)
+            (p.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.width = w.coerceIn(dp(PANEL_MIN_WIDTH_DP), dm.widthPixels)
+                p.layoutParams = lp
+            }
+            p.background = panelBackground()
+        }
+
+        applyPanelColors()
+
+        // ── 状态横条宽度上限随球走 ─────────────────────────────────────
+        statusText?.maxWidth = statusMaxWidthPx
+    }
+
+    /** 球的底：形状 + 底色/渐变 + 描边，全部由 [appearance] 决定。 */
+    private fun ballBackground(): GradientDrawable {
+        val d = GradientDrawable()
+        when (appearance.shape) {
+            BubbleAppearance.SHAPE_CIRCLE -> d.shape = GradientDrawable.OVAL
+            BubbleAppearance.SHAPE_SQUARE -> {
+                d.shape = GradientDrawable.RECTANGLE
+                d.cornerRadius = 0f
+            }
+            else -> {
+                d.shape = GradientDrawable.RECTANGLE
+                d.cornerRadius = dp(appearance.cornerRadius).toFloat()
+            }
+        }
+        val c1 = colorOr(appearance.bg, DEFAULT_BALL_BG)
+        if (appearance.bg2.isNotEmpty()) {
+            d.colors = intArrayOf(c1, colorOr(appearance.bg2, c1))
+            d.orientation = GradientDrawable.Orientation.TOP_BOTTOM
+        } else {
+            d.setColor(c1)
+        }
+        val bw = if (appearance.borderWidth > 0) dp(appearance.borderWidth) else dp(1)
+        val bc = if (appearance.border.isNotEmpty()) colorOr(appearance.border, DEFAULT_BORDER) else DEFAULT_BORDER
+        d.setStroke(bw, bc)
+        return d
+    }
+
+    /** 贴边薄片的底：窄圆角条，颜色跟随球的底色。 */
+    private fun edgeBackground(): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = dp(3).toFloat()
+        setColor(colorOr(appearance.bg, DEFAULT_BALL_BG))
+        setStroke(dp(1), if (appearance.border.isNotEmpty()) colorOr(appearance.border, DEFAULT_BORDER) else DEFAULT_BORDER)
+    }
+
+    /** 面板的底：圆角 + 底色 + 淡描边。 */
+    private fun panelBackground(): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = dp(20).toFloat()
+        setColor(colorOr(appearance.panelBg, DEFAULT_PANEL_BG))
+        setStroke(dp(1), DEFAULT_BORDER)
+    }
+
+    /**
+     * 面板内的文字与强调色。
+     *
+     * ⚠️ 正文色要**逐处设**：`panelAction` / `panelTitle` 等是独立 TextView，
+     *   没有统一的父级可以设 textColor。漏一处就会出现"面板换了深色底、
+     *   标题还是黑的"这种半截效果。
+     */
+    private fun applyPanelColors() {
+        val text = colorOr(appearance.panelText, DEFAULT_TEXT)
+        val accent = colorOr(appearance.panelAccent, DEFAULT_ACCENT)
+        panelAction?.setTextColor(text)
+        panelTitle?.setTextColor(text)
+        panelInput?.setTextColor(text)
+        panelSend?.let { s ->
+            s.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(accent)
+            }
+        }
+        // 转录区已渲染的行也要跟着换色 —— 否则插件改配色后要等下一次转录变化才生效。
+        //
+        // ⚠️ 必须连 `renderedRoles` 一起清掉：增量分支是"role 序列一致就复用旧行、
+        //   只改文本"，而换配色改的正是**样式**。只清指纹的话这里会走复用，
+        //   颜色永远换不过来。
+        transcriptFingerprint = ""
+        renderedRoles = emptyList()
+        if (expanded) renderTranscript()
+    }
+
+    /** 颜色串 → int；空串或非法时退回 [fallback]。 */
+    private fun colorOr(value: String, fallback: Int): Int {
+        if (value.isEmpty()) return fallback
+        return try {
+            Color.parseColor(value)
+        } catch (t: Throwable) {
+            fallback
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -394,9 +880,10 @@ class FloatingBubble(private val context: Context) {
      *
      * ⚠️ **只在收起态显示**：展开态的面板里已经有同一份信息，再挂一个标签
      *   会重复，而且面板比球宽得多，标签会横在面板上方很怪。
+     *   贴边态同理（薄片只有 6dp 宽，标签会把它整个盖住）。
      */
     private fun showStatusBubble(text: String, running: Boolean) {
-        if (text.isEmpty() || expanded) {
+        if (text.isEmpty() || expanded || edgeCollapsed) {
             hideStatusBubble()
             return
         }
@@ -433,28 +920,58 @@ class FloatingBubble(private val context: Context) {
                 positionStatusBubble()
                 v.animate().alpha(1f).setDuration(120).start()
             }
+            // 刚创建时 statusKey 是空串，下面必然走到「内容变了」分支，计时器由此启动。
         }
 
-        // 内容没变就不动 —— 状态每秒刷新一次，无脑 setText 会一直触发重排，
-        // 表现为标签文字轻微抖动。
-        if (statusShown != text) {
-            statusShown = text
+        // ⚠️ 内容**真的变了**才重置自动消失计时器。
+        //
+        // 这正是用户要的语义：「工具调用状态横条没有变化时 两秒后自动消失」。
+        // 状态是每 5 秒（外加 DOM 变化）推一次的，如果每次推送都重置计时器，
+        // 横条就会永远挂着 —— 那正是改之前的行为，也是用户抱怨的点。
+        val key = "$text\u0000$running"
+        val changed = key != statusKey
+        if (changed) {
+            statusKey = key
             statusText?.text = text
             paintDot(statusDot, running, small = true)
-        } else if (running) {
-            // 文案没变但运行态变了（比如从"空闲"变成"思考中"又变回来），
-            // 点色也要跟上。
-            paintDot(statusDot, running, small = true)
+            scheduleStatusAutoHide()
         }
         positionStatusBubble()
     }
 
+    /**
+     * 排一次「内容无变化就自动消失」的计时。
+     *
+     * ⚠️ 只在内容变化时调用（见 [showStatusBubble]）。`statusAutoHideMs <= 0`
+     *   表示插件要求常驻，此时不排计时器。
+     */
+    private fun scheduleStatusAutoHide() {
+        statusHandler.removeCallbacks(statusHideRunnable)
+        val ms = appearance.statusAutoHideMs
+        if (ms <= 0) return
+        statusHandler.postDelayed(statusHideRunnable, ms.toLong())
+    }
+
+    /**
+     * 状态横条自动消失。
+     *
+     * ⚠️ 做成字段而不是每次 new：`removeCallbacks` 要靠同一个实例才能取消。
+     */
+    private val statusHideRunnable = Runnable {
+        if (statusRoot == null) return@Runnable
+        // 淡出而不是瞬移：横条就在用户视野边缘，突然消失会让人以为界面出问题了。
+        statusRoot?.animate()?.alpha(0f)?.setDuration(160)?.withEndAction {
+            hideStatusBubble()
+        }?.start() ?: hideStatusBubble()
+    }
+
     private fun hideStatusBubble() {
+        statusHandler.removeCallbacks(statusHideRunnable)
         val v = statusRoot ?: return
         statusRoot = null
         statusDot = null
         statusText = null
-        statusShown = ""
+        statusKey = ""
         runCatching { wm.removeViewImmediate(v) }
     }
 
@@ -492,7 +1009,7 @@ class FloatingBubble(private val context: Context) {
         positioning = true
         try {
             val dm = context.resources.displayMetrics
-            val circleW = root?.width?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+            val circleW = circleWidth()
 
             // 标签还没量过尺寸时（刚 addView）先按屏幕内夹一次，量完会再调一次。
             val labelW = v.width.takeIf { it > 0 } ?: 0
@@ -504,7 +1021,7 @@ class FloatingBubble(private val context: Context) {
             val labelH = v.height.takeIf { it > 0 } ?: 0
             val above = curY - statusGapPx - labelH
             p.y = if (labelH > 0 && above < dp(TOP_MARGIN_DP)) {
-                curY + circleH() + statusGapPx
+                curY + circleHeight() + statusGapPx
             } else {
                 above
             }
@@ -514,8 +1031,13 @@ class FloatingBubble(private val context: Context) {
         }
     }
 
-    /** 球的当前高度（量过就用实测值，否则退回标称直径）。 */
-    private fun circleH(): Int = root?.height?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+    /** 球的当前宽度（量过就用实测值，否则退回配置里的尺寸）。 */
+    private fun circleWidth(): Int = root?.width?.takeIf { !expanded && !edgeCollapsed && it > 0 }
+        ?: dp(appearance.size)
+
+    /** 球的当前高度（同上）。 */
+    private fun circleHeight(): Int = root?.height?.takeIf { !expanded && !edgeCollapsed && it > 0 }
+        ?: dp(appearance.size)
 
     private fun baseParams() = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -545,7 +1067,7 @@ class FloatingBubble(private val context: Context) {
      *
      * | 形态 | 标志 | 效果 |
      * |---|---|---|
-     * | 收起 | `NOT_FOCUSABLE` | 不抢焦点，下层应用照常收按键，也不弹键盘 |
+     * | 收起 / 贴边 | `NOT_FOCUSABLE` | 不抢焦点，下层应用照常收按键，也不弹键盘 |
      * | 展开 | 去掉 `NOT_FOCUSABLE` | 可聚焦 ⇒ 点输入框能拉起键盘 |
      *
      * ⚠️ 两态都要保留 `FLAG_NOT_TOUCH_MODAL`：它让窗口**之外**的触摸照常传给
@@ -577,11 +1099,22 @@ class FloatingBubble(private val context: Context) {
             WindowManager.LayoutParams.TYPE_PHONE
 
     // ══════════════════════════════════════════════════════════════════
-    // 拖动 + 点击 + 边缘吸附
+    // 拖动 + 点击 + 边缘吸附 + 拖出屏幕贴边
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * 给一个 View 装「拖动 + 点击」手势。
+     *
+     * @param target 手势载体（球的 circleView）。
+     * @param onTap 未移动就松手时的动作。
+     * @param allowEdgeCollapse 松手时是否允许因"拖出屏幕"而进入贴边态。
+     */
     @SuppressLint("ClickableViewAccessibility")
-    private fun installTouch(target: View) {
+    private fun installTouch(
+        target: View,
+        onTap: () -> Unit = { expand() },
+        allowEdgeCollapse: Boolean = true,
+    ) {
         target.setOnTouchListener { _, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -589,6 +1122,8 @@ class FloatingBubble(private val context: Context) {
                     downRawY = ev.rawY
                     downWinX = curX
                     downWinY = curY
+                    rawX = curX
+                    rawY = curY
                     dragging = true
                     moved = false
                     true
@@ -601,7 +1136,9 @@ class FloatingBubble(private val context: Context) {
                     if (!moved && (abs(dx) > tapSlop || abs(dy) > tapSlop)) moved = true
                     if (!moved) return@setOnTouchListener true
                     // ⚠️ 位移量累加到**按下时的 window 坐标**上，不能直接用 rawX/rawY
-                    val (nx, ny) = clampInto(downWinX + dx.roundToInt(), downWinY + dy.roundToInt())
+                    rawX = downWinX + dx.roundToInt()
+                    rawY = downWinY + dy.roundToInt()
+                    val (nx, ny) = clampInto(rawX, rawY)
                     moveTo(nx, ny)
                     true
                 }
@@ -610,10 +1147,9 @@ class FloatingBubble(private val context: Context) {
                     val wasDrag = moved
                     dragging = false
                     if (!wasDrag) {
-                        // 没移动 ⇒ 当成点击：收起态展开、展开态无操作
-                        if (ev.actionMasked == MotionEvent.ACTION_UP) onTapped(target)
+                        if (ev.actionMasked == MotionEvent.ACTION_UP) onTap()
                     } else {
-                        snapToEdge()
+                        onTouchUp(allowEdgeCollapse)
                     }
                     true
                 }
@@ -621,6 +1157,30 @@ class FloatingBubble(private val context: Context) {
                 else -> false
             }
         }
+    }
+
+    /**
+     * 拖动松手后的落位。
+     *
+     * 两种结局：
+     * 1. **拖出了屏幕**（越界量超过 [EDGE_OVERSHOOT_DP]）→ 贴边折叠（[enterEdge]）。
+     * 2. 否则吸附到最近的左右边缘（原有行为）。
+     *
+     * ⚠️ 判定必须用 [rawX]（未夹取）而不是 [curX]（已夹取）。夹取会把越界量抹掉，
+     *   用 curX 判的结果永远是"没越界"，贴边永远不触发。
+     */
+    private fun onTouchUp(allowEdgeCollapse: Boolean) {
+        val dm = context.resources.displayMetrics
+        val w = root?.width?.takeIf { it > 0 } ?: dp(appearance.size)
+        val overshootLeft = -rawX
+        val overshootRight = rawX + w - dm.widthPixels
+        val overshoot = maxOf(overshootLeft, overshootRight)
+
+        if (allowEdgeCollapse && appearance.edgeSnap && overshoot >= dp(EDGE_OVERSHOOT_DP)) {
+            enterEdge(if (overshootLeft > overshootRight) -1 else 1)
+            return
+        }
+        snapToEdge()
     }
 
     private fun moveTo(x: Int, y: Int) {
@@ -638,8 +1198,8 @@ class FloatingBubble(private val context: Context) {
     /** 夹进可见区域（考虑状态栏与底部手势条）。 */
     private fun clampInto(x: Int, y: Int): Pair<Int, Int> {
         val v = root
-        val w = v?.width?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
-        val h = v?.height?.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+        val w = v?.width?.takeIf { it > 0 } ?: dp(appearance.size)
+        val h = v?.height?.takeIf { it > 0 } ?: dp(appearance.size)
         return clampInto(x, y, w, h)
     }
 
@@ -670,7 +1230,7 @@ class FloatingBubble(private val context: Context) {
     private fun snapToEdge() {
         val dm = context.resources.displayMetrics
         val v = root ?: return
-        val w = v.width.takeIf { it > 0 } ?: dp(CIRCLE_DP)
+        val w = v.width.takeIf { it > 0 } ?: dp(appearance.size)
         val targetX = if (curX + w / 2 < dm.widthPixels / 2) dp(EDGE_MARGIN_DP)
         else dm.widthPixels - w - dp(EDGE_MARGIN_DP)
         val (_, ty) = clampInto(targetX, curY)
@@ -700,8 +1260,114 @@ class FloatingBubble(private val context: Context) {
         handler.post(tick)
     }
 
-    private fun onTapped(target: View) {
-        if (target === circleView) expand() else Unit
+    // ══════════════════════════════════════════════════════════════════
+    // 贴边折叠态
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 进入贴边态：球与面板都收起来，只在 [side] 那一侧留一条薄片。
+     *
+     * 触发条件是「用户把球往屏幕外拖」（见 [onTouchUp]），不是「拖到边缘」——
+     * 后者是原有的吸附行为，球仍然完整可见。
+     *
+     * ⚠️ 位置必须**贴住屏幕边**（x = 0 或 screenW - edgeW），不能沿用球的坐标：
+     *   薄片只有 6dp 宽，沿用球的 x 会让它浮在半空中。
+     */
+    private fun enterEdge(side: Int) {
+        val dm = context.resources.displayMetrics
+        edgeSide = side
+        expanded = false
+        edgeCollapsed = true
+        hideStatusBubble()
+        applyFocusFlags(focusable = false)
+        panelInput?.let {
+            it.setText("")
+            it.clearFocus()
+        }
+        panelView?.visibility = View.GONE
+        circleView?.visibility = View.GONE
+        edgeView?.visibility = View.VISIBLE
+
+        val edgeW = dp(EDGE_WIDTH_DP)
+        val x = if (side < 0) 0 else (dm.widthPixels - edgeW)
+        val (nx, ny) = clampInto(x, curY, edgeW, dp(appearance.size))
+        moveTo(nx, ny)
+        prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
+        Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny")
+    }
+
+    /**
+     * 退出贴边态，弹回完整球。
+     *
+     * ⚠️ 位置按 [edgeSide] 算，不是按薄片当前坐标 —— 薄片只有 6dp，它贴左边时
+     *   中心在屏幕最左，直接用它的 x 会让球有一半在屏幕外。
+     */
+    private fun exitEdge() {
+        if (!edgeCollapsed) return
+        val dm = context.resources.displayMetrics
+        edgeCollapsed = false
+        edgeView?.visibility = View.GONE
+        circleView?.visibility = View.VISIBLE
+
+        val sidePx = dp(appearance.size)
+        val x = if (edgeSide < 0) dp(EDGE_MARGIN_DP) else dm.widthPixels - sidePx - dp(EDGE_MARGIN_DP)
+        val (nx, ny) = clampInto(x, curY, sidePx, sidePx)
+        moveTo(nx, ny)
+        prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
+        Log.i(TAG, "气泡已从贴边态弹出: side=$edgeSide x=$nx y=$ny")
+    }
+
+    /** 贴边薄片的触摸：只处理点击（拖动它没有意义 —— 它已经贴在边上了）。 */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun installEdgeTouch(target: View) {
+        target.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = ev.rawX
+                    downRawY = ev.rawY
+                    downWinX = curX
+                    downWinY = curY
+                    rawX = curX
+                    rawY = curY
+                    dragging = true
+                    moved = false
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (!dragging) return@setOnTouchListener false
+                    val dx = ev.rawX - downRawX
+                    val dy = ev.rawY - downRawY
+                    if (!moved && (abs(dx) > tapSlop || abs(dy) > tapSlop)) moved = true
+                    if (!moved) return@setOnTouchListener true
+                    rawX = downWinX + dx.roundToInt()
+                    rawY = downWinY + dy.roundToInt()
+                    val (nx, ny) = clampInto(rawX, rawY)
+                    moveTo(nx, ny)
+                    true
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val wasDrag = moved
+                    dragging = false
+                    if (!wasDrag) {
+                        // 点它只把球弹回来，**不**直接展开面板。
+                        //
+                        // ⚠️ 用户实测反馈：贴边收起后点一下，期望先看到悬浮球，结果面板
+                        //   直接铺开，观感是"球没了、被聊天窗口顶掉"。展开是球的下一步
+                        //   动作，不该由这条 6dp 细条代劳。
+                        if (ev.actionMasked == MotionEvent.ACTION_UP) exitEdge()
+                    } else {
+                        // 拖动薄片本身没意义，但用户可能是想把它挪个位置 —— 直接
+                        // 弹回完整球，让他继续正常使用。
+                        exitEdge()
+                    }
+                    true
+                }
+
+                else -> false
+            }
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -712,11 +1378,16 @@ class FloatingBubble(private val context: Context) {
         if (expanded) return
         // ⚠️ **展开前先记住收起态的位置。**
         //
-        // 展开时为了把 900px 宽的面板夹进屏幕，`curX` 会被改掉（贴右边时
+        // 展开时为了把 260dp 宽的面板夹进屏幕，`curX` 会被改掉（贴右边时
         // 从 912 变成 180）。收起时如果只做一次 clamp，球就会停在**面板的左上角**
         // 而不是展开前的位置 —— 用户看到的是"点一下收起，球跑别处去了"。
         preExpandX = curX
         preExpandY = curY
+        // 贴边态点开时先弹回完整球，否则收起会回到一条缝。
+        if (edgeCollapsed) {
+            edgeCollapsed = false
+            edgeView?.visibility = View.GONE
+        }
         expanded = true
         circleView?.visibility = View.GONE
         panelView?.visibility = View.VISIBLE
@@ -725,6 +1396,8 @@ class FloatingBubble(private val context: Context) {
         // 展开态面板里已有同一份信息，收起态那个标签要让位。
         hideStatusBubble()
         lastStatus?.let { applyStatus(it) }
+        // 转录在球形态下是"脏"的（没渲染），展开时补一次。
+        if (transcriptDirty) renderTranscript()
         // 展开后重新夹一次：面板比圆大得多，原来贴边的位置会露到屏幕外
         root?.post {
             val (nx, ny) = clampInto(curX, curY)
@@ -743,17 +1416,166 @@ class FloatingBubble(private val context: Context) {
         }
         panelView?.visibility = View.GONE
         circleView?.visibility = View.VISIBLE
-        // 回到收起态，状态标签重新露面。
+        // 回到收起态，状态标签重新露面（内容与之前相同，所以会重新计时 2 秒）。
+        statusKey = ""
         lastStatus?.let { refreshStatusBubble(it) }
         // 回到展开前的位置（不是面板左上角）。
         //
         // ⚠️ 这里**不能**用 `clampInto(curX, curY)`：那个重载读的是 `root` 当前尺寸，
-        //   而此刻布局还没重测完，读到的可能仍是展开态的 900×798，算出来的夹取范围
-        //   是错的。收起态尺寸是恒定的 56dp，直接按它算。
+        //   而此刻布局还没重测完，读到的可能仍是展开态的 300×500，算出来的夹取范围
+        //   是错的。收起态尺寸是恒定的（appearance.size），直接按它算。
         root?.post {
-            val side = dp(CIRCLE_DP)
+            val side = dp(appearance.size)
             val (nx, ny) = clampInto(preExpandX, preExpandY, side, side)
             moveTo(nx, ny)
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 面板拖动 + 缩放
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 面板拖动：手势载体是顶栏。
+     *
+     * ⚠️ 复用 [installTouch] 而不是另写一套：拖动逻辑（绝对坐标累加、点击/拖动
+     *   判别、夹取）完全一样，只有"点击"的语义不同（顶栏点一下没有动作）。
+     */
+    private fun installPanelDrag(header: View) {
+        installTouch(header, onTap = { /* 顶栏点一下不做任何事 */ }, allowEdgeCollapse = false)
+    }
+
+    /**
+     * 面板缩放：拖底部手柄。
+     *
+     * 竖直方向改**转录区高度**（面板其余部分是固定高度），水平方向改面板宽度。
+     *
+     * ⚠️ 只改转录区高度、不改面板总高：面板是 `wrap_content`，改内容高度它自己会
+     *   长高。反过来（直接给面板定高）会让输入框与顶栏被挤掉 —— 用户拖一下就把
+     *   发送按钮拖没了，那是灾难。
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun installPanelResize(grip: View) {
+        grip.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = ev.rawX
+                    downRawY = ev.rawY
+                    downWidth = panelView?.width ?: dp(appearance.panelWidth)
+                    downHeight = panelScroll?.height ?: dp(200)
+                    resizing = true
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (!resizing) return@setOnTouchListener false
+                    val dm = context.resources.displayMetrics
+                    val dx = (ev.rawX - downRawX).roundToInt()
+                    val dy = (ev.rawY - downRawY).roundToInt()
+
+                    // 宽度：夹在 [最小宽, 屏幕宽] 之内
+                    val maxW = dm.widthPixels
+                    val newW = (downWidth + dx).coerceIn(dp(PANEL_MIN_WIDTH_DP), maxW)
+                    panelView?.let { p ->
+                        (p.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                            if (lp.width != newW) {
+                                lp.width = newW
+                                p.layoutParams = lp
+                            }
+                        }
+                    }
+
+                    // 高度：只改转录区
+                    val maxH = (dm.heightPixels - dp(220)).coerceAtLeast(dp(TRANSCRIPT_MIN_DP))
+                    val newH = (downHeight + dy).coerceIn(dp(TRANSCRIPT_MIN_DP), maxH)
+                    panelScroll?.let { s ->
+                        (s.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+                            if (lp.height != newH) {
+                                lp.height = newH
+                                s.layoutParams = lp
+                            }
+                        }
+                    }
+                    // 面板变宽/变高后可能露出屏幕，拖完前先夹一次位置
+                    val (nx, ny) = clampInto(curX, curY)
+                    if (nx != curX || ny != curY) moveTo(nx, ny)
+                    true
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (!resizing) return@setOnTouchListener false
+                    resizing = false
+                    persistPanelSize()
+                    true
+                }
+
+                else -> false
+            }
+        }
+    }
+
+    /** 把当前面板宽度与转录区高度落盘（下次开还是这个尺寸）。 */
+    private fun persistPanelSize() {
+        val w = panelView?.width ?: 0
+        val h = panelScroll?.height ?: 0
+        prefs.edit()
+            .putInt(KEY_PANEL_W, if (w > 0) w else 0)
+            .putInt(KEY_TRANSCRIPT_H, if (h > 0) h else 0)
+            .apply()
+        // 顺手把「面板总高」写回外观配置：插件读 bubbleAppearance() 时能看到用户
+        // 手动调过的大小，而不是它当初设的那个值。
+        val total = panelView?.height ?: 0
+        if (total > 0) {
+            appearance = appearance.copy(panelHeight = (total / density).roundToInt())
+            BubbleAppearance.save(context, appearance)
+        }
+        Log.i(TAG, "面板尺寸已保存: ${w}px × ${h}px（转录区）")
+    }
+
+    /** 恢复上次保存的面板尺寸。 */
+    private fun restorePanelSize() {
+        val dm = context.resources.displayMetrics
+        prefs.getInt(KEY_PANEL_W, 0).takeIf { it > 0 }?.let { w ->
+            panelView?.let { p ->
+                (p.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                    lp.width = w.coerceIn(dp(PANEL_MIN_WIDTH_DP), dm.widthPixels)
+                    p.layoutParams = lp
+                }
+            }
+        }
+        prefs.getInt(KEY_TRANSCRIPT_H, 0).takeIf { it > 0 }?.let { h ->
+            panelScroll?.let { s ->
+                (s.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+                    lp.height = h
+                    s.layoutParams = lp
+                }
+            }
+        }
+        // 插件设过 panelHeight（且用户没手动调过）时以插件为准。
+        if (prefs.getInt(KEY_TRANSCRIPT_H, 0) <= 0 && appearance.panelHeight > 0) {
+            panelView?.post { applyConfiguredPanelHeight() }
+        }
+    }
+
+    /**
+     * 按插件配置的 `panelHeight`（面板**总高**）反推转录区高度。
+     *
+     * ⚠️ 必须 post 到布局之后：固定部分（顶栏 + 标题 + 输入行 + 手柄）的实际高度
+     *   只有量过才知道，配置里给的是总高。差值就是转录区该占的高度。
+     */
+    private fun applyConfiguredPanelHeight() {
+        val total = appearance.effectivePanelHeight(
+            context.resources.displayMetrics.heightPixels, density,
+        )
+        if (total <= 0) return
+        val p = panelView ?: return
+        val s = panelScroll ?: return
+        val fixed = p.height - s.height
+        if (fixed <= 0) return
+        val target = (total - fixed).coerceAtLeast(dp(TRANSCRIPT_MIN_DP))
+        (s.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+            lp.height = target
+            s.layoutParams = lp
         }
     }
 
@@ -888,6 +1710,7 @@ class FloatingBubble(private val context: Context) {
         try {
             paintDot(dotView, status.running)
             paintDot(panelDot, status.running, small = true)
+            paintDot(edgeDot, status.running, small = true)
             refreshStatusBubble(status)
 
             // 「停止」只在 AI 真在跑时出现。常驻的话用户会去点它 ——
@@ -907,16 +1730,6 @@ class FloatingBubble(private val context: Context) {
                     it.visibility = View.VISIBLE
                 } else {
                     it.visibility = View.GONE
-                }
-            }
-
-            // 正文：只在内容真变了时才 setText + 滚到底 —— 否则用户手动往上翻
-            // 会被每秒一次的刷新强行拽回底部。
-            val body = status.body
-            panelBody?.let { tv ->
-                if (tv.text?.toString() != body) {
-                    tv.text = body.ifEmpty { "（暂无输出）" }
-                    panelScroll?.post { panelScroll?.fullScroll(View.FOCUS_DOWN) }
                 }
             }
         } catch (t: Throwable) {
@@ -961,30 +1774,30 @@ class FloatingBubble(private val context: Context) {
      * 把它从背景里"抠"出来 —— 与系统通知角标同一种手法。
      *
      * ⚠️ 白边用 `LayerDrawable` 套两层 Oval 实现，**不用 `<layer-list>` 资源**：
-     * 这里本来就要动态改色，做成资源反而要多传参数。白边层是外层（稍大），
-     * 颜色层是内层，靠 `setLayerInset` 缩进去。
+     *   这里本来就要动态改色，做成资源反而要多传参数。白边层是外层（稍大），
+     *   颜色层是内层，靠 `setLayerInset` 缩进去。
      *
      * ⚠️ 只换 background，**绝不碰 layoutParams**：`dotView` 在 FrameLayout 里、
-     * `panelDot`/`statusDot` 在 LinearLayout 里，两者的 LayoutParams 类型不同，
-     * 强行赋一个 FrameLayout.LayoutParams 会 `ClassCastException`。
-     * 尺寸本来就写死在 XML（14dp / 8dp / 6dp），这里不需要管。
+     *   `panelDot`/`statusDot`/`edgeDot` 在 LinearLayout/FrameLayout 里，
+     *   两者的 LayoutParams 类型不同，强行赋一个 FrameLayout.LayoutParams 会
+     *   `ClassCastException`。尺寸由 XML 与 [applyAppearanceToViews] 管。
      */
     private fun paintDot(v: View?, running: Boolean, small: Boolean = false) {
         if (v == null) return
-        // 小点（6~8dp）用 1dp 描边，大点（14dp）用 2dp —— 同样 2dp 在 8dp 的圆上
+        // 小点（4~8dp）用 1dp 描边，大点（14dp）用 2dp —— 同样 2dp 在 8dp 的圆上
         // 会糊成一坨，看不出是空心。
         val strokePx = if (small) dp(1) else dp(2)
         val fill = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             if (running) {
-                setColor(0xFF34C759.toInt())
+                setColor(colorOr(appearance.panelAccent, DEFAULT_RUNNING))
             } else {
                 setColor(Color.TRANSPARENT)
                 setStroke(strokePx, 0xFFB9BFC7.toInt())
             }
         }
         if (small) {
-            // 面板里的小点直接贴在浅色面板上，不需要白边
+            // 面板/薄片里的小点直接贴在浅色底上，不需要白边
             v.background = fill
             return
         }
@@ -996,6 +1809,239 @@ class FloatingBubble(private val context: Context) {
         v.background = LayerDrawable(arrayOf(border, fill)).apply {
             setLayerInset(1, inset, inset, inset, inset)
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 会话转录渲染（展开面板的核心内容）
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 收到一份新的转录。
+     *
+     * ⚠️ 球形态下**不渲染**，只置脏标记 —— 面板不可见时重建几十个 View 是白费，
+     *   而转录在 AI 跑动时每几秒就会推一次。展开时（[expand]）会补渲染。
+     */
+    private fun applyTranscript(transcript: ChatTranscript) {
+        lastTranscript = transcript
+        transcriptDirty = true
+        if (expanded) renderTranscript()
+    }
+
+    /**
+     * 把转录渲染成消息行列表。
+     *
+     * ## 为什么要按指纹跳过
+     *
+     * 状态通道每 5 秒推一次，转录通道在 DOM 变化时推得更密。如果每次都清空重建
+     * 整个 View 树，用户会看到消息在闪、滚动位置也守不住。指纹相同就直接返回。
+     *
+     * ## 滚动位置
+     *
+     * 重建后如果用户**本来就在底部**，自动滚到底（流式输出时这是他要的）；
+     * 如果他往上翻了在看历史，就**不要**动 —— 强行拽回底部是最恼人的行为。
+     */
+    private fun renderTranscript() {
+        val container = panelTranscript ?: return
+        val t = lastTranscript ?: return
+        transcriptDirty = false
+
+        val fp = t.items.joinToString("\u0001") { "${it.role}|${it.running}|${it.text}" }
+        if (fp == transcriptFingerprint) return
+        transcriptFingerprint = fp
+
+        val scroll = panelScroll
+        // 判定"重建前是否贴着底部"，重建后再决定要不要跟到底
+        val wasAtBottom = scroll?.let { s ->
+            val child = s.getChildAt(0)
+            child == null || s.scrollY + s.height >= child.height - dp(24)
+        } ?: true
+
+        // ── 增量更新 ──
+        //
+        // 流式输出期间这条路径每秒要走好几次（页面侧节流 250ms），全量
+        // `removeAllViews()` + 重建会让整块内容闪一下，正好把"流式"的观感毁掉。
+        // 所以：**前缀 role 序列一致就复用已有 view，只改文本**；role 序列变了
+        // （用户插话、条目整体前移）才退回全量重建。
+        //
+        // 复用之所以安全：同一个 role ⇒ 同一套样式（对齐 / 底色 / 字号），
+        // 复用时不需要也不应该重设样式。
+        val reuseCount = if (
+            t.items.isNotEmpty() &&
+            container.childCount == renderedRoles.size &&
+            renderedRoles.size <= t.items.size &&
+            t.items.take(renderedRoles.size).map { it.role } == renderedRoles
+        ) renderedRoles.size else -1
+
+        if (reuseCount < 0) {
+            container.removeAllViews()
+            renderedRoles = emptyList()
+        }
+
+        val inflater = LayoutInflater.from(context)
+        for (i in t.items.indices) {
+            val item = t.items[i]
+            if (i < reuseCount) {
+                updateItemText(container.getChildAt(i), item)
+            } else {
+                container.addView(renderItem(inflater, item))
+            }
+        }
+        if (t.items.isEmpty() && container.childCount == 0) {
+            container.addView(
+                makeEmptyHint(),
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        renderedRoles = t.items.map { it.role }
+
+        if (wasAtBottom) {
+            scroll?.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    /**
+     * 复用已有行时只更新文本（见 [renderTranscript] 的增量分支）。
+     *
+     * ⚠️ 标签走 [roleLabel]，与 [renderItem] 同源 —— 两处各写一份的话，
+     *   改文案时必然漂移成"新建的行和复用的行长得不一样"。
+     */
+    private fun updateItemText(row: View, item: ChatTranscript.Item) {
+        val roleView = row.findViewById<TextView>(R.id.msgRole) ?: return
+        val bodyView = row.findViewById<TextView>(R.id.msgBody) ?: return
+        if (bodyView.text?.toString() != item.text) bodyView.text = item.text
+        val label = roleLabel(item)
+        if (roleView.text?.toString() != label) roleView.text = label
+    }
+
+    /** 一条消息的角色标签。用户消息不显示（蓝色气泡本身就是标志）。 */
+    private fun roleLabel(item: ChatTranscript.Item): String = when (item.role) {
+        ChatTranscript.Role.TOOL -> if (item.running) "工具调用 · 进行中" else "工具调用"
+        ChatTranscript.Role.ERROR -> "错误"
+        ChatTranscript.Role.REASONING -> if (item.running) "AI 思考 · 进行中" else "AI 思考"
+        ChatTranscript.Role.ASSISTANT -> if (item.running) "AI · 正在输出" else "AI"
+        else -> item.role
+    }
+
+    /** 转录为空时的提示。空面板会让人以为界面坏了。 */
+    private fun makeEmptyHint(): TextView = TextView(context).apply {
+        text = "（这个会话还没有内容）"
+        textSize = 12f
+        setTextColor(colorOr(appearance.panelText, DEFAULT_TEXT) and 0x00FFFFFF or 0x66000000)
+        gravity = Gravity.CENTER
+        setPadding(0, dp(12), 0, dp(12))
+    }
+
+    /**
+     * 渲染一条消息。
+     *
+     * 五种角色的排版：
+     *
+     * | role | 对齐 | 底色 | 文字 | 角色标签 |
+     * |---|---|---|---|---|
+     * | user | 右 | 强调色 | 白 | 不显示（蓝泡本身就是标志） |
+     * | assistant | 左 | 白 | 深 | 「AI」 |
+     * | tool | 左 | 浅灰 | 深灰 | 「工具调用」+ 运行中标记 |
+     * | error | 左 | 浅红 | 深红 | 「错误」 |
+     * | other | 左 | 白 | 深 | 原始 role |
+     *
+     * ⚠️ 左右对齐靠**行容器 gravity**，不是 margin：两者共用同一个 XML 模板，
+     *   只有 gravity 与背景不同。
+     * ⚠️ 正文 **不设 maxLines**：这里就是要看完整内容，行数多靠外层 ScrollView 滚。
+     */
+    private fun renderItem(inflater: LayoutInflater, item: ChatTranscript.Item): View {
+        val row = inflater.inflate(R.layout.bubble_msg, panelTranscript, false) as LinearLayout
+        val roleView = row.findViewById<TextView>(R.id.msgRole)
+        val bodyView = row.findViewById<TextView>(R.id.msgBody)
+
+        val accent = colorOr(appearance.panelAccent, DEFAULT_ACCENT)
+        val textColor = colorOr(appearance.panelText, DEFAULT_TEXT)
+
+        // 气泡宽度上限：面板宽度的 84%，留出左右各自的边距 —— 否则用户消息
+        // （右对齐）会一直顶到面板最左边，跟助手消息糊在一起分不清。
+        val panelW = panelView?.width?.takeIf { it > 0 }
+            ?: appearance.effectivePanelWidth(context.resources.displayMetrics.widthPixels, density)
+        val maxBubble = (panelW * 0.84f).roundToInt()
+
+        when (item.role) {
+            ChatTranscript.Role.USER -> {
+                row.gravity = Gravity.END
+                roleView.visibility = View.GONE
+                bodyView.background = bubbleShape(accent, dp(14))
+                bodyView.setTextColor(Color.WHITE)
+                bodyView.maxWidth = maxBubble
+                bodyView.text = item.text
+            }
+
+            ChatTranscript.Role.TOOL -> {
+                row.gravity = Gravity.START
+                roleView.visibility = View.VISIBLE
+                roleView.text = roleLabel(item)
+                roleView.setTextColor(0xFF8A9099.toInt())
+                bodyView.background = bubbleShape(0xFFEDEFF2.toInt(), dp(10))
+                bodyView.setTextColor(0xFF3A4048.toInt())
+                bodyView.maxWidth = maxBubble
+                bodyView.textSize = 11.5f
+                bodyView.text = item.text
+            }
+
+            ChatTranscript.Role.ERROR -> {
+                row.gravity = Gravity.START
+                roleView.visibility = View.VISIBLE
+                roleView.text = roleLabel(item)
+                roleView.setTextColor(0xFFE5484D.toInt())
+                bodyView.background = bubbleShape(0xFFFDECEC.toInt(), dp(10))
+                bodyView.setTextColor(0xFF8A1F22.toInt())
+                bodyView.maxWidth = maxBubble
+                bodyView.text = item.text
+            }
+
+            ChatTranscript.Role.ASSISTANT -> {
+                row.gravity = Gravity.START
+                roleView.visibility = View.VISIBLE
+                roleView.text = roleLabel(item)
+                roleView.setTextColor(0xFF8A9099.toInt())
+                bodyView.background = bubbleShape(0xFFFFFFFF.toInt(), dp(12))
+                bodyView.setTextColor(textColor)
+                bodyView.maxWidth = maxBubble
+                bodyView.text = item.text
+            }
+
+            ChatTranscript.Role.REASONING -> {
+                // 思考：灰底 + 深灰字 + 小一号，与正文（白底深字）一眼可分。
+                // 不隐藏 —— 用户明确要求「微博里能看到的回复内容全部都要有」。
+                row.gravity = Gravity.START
+                roleView.visibility = View.VISIBLE
+                roleView.text = roleLabel(item)
+                roleView.setTextColor(0xFF8A9099.toInt())
+                bodyView.background = bubbleShape(0xFFF2F3F5.toInt(), dp(10))
+                bodyView.setTextColor(0xFF5A6068.toInt())
+                bodyView.textSize = 12f
+                bodyView.maxWidth = maxBubble
+                bodyView.text = item.text
+            }
+
+            else -> {
+                row.gravity = Gravity.START
+                roleView.visibility = View.VISIBLE
+                roleView.text = item.role
+                roleView.setTextColor(0xFF8A9099.toInt())
+                bodyView.background = bubbleShape(0xFFFFFFFF.toInt(), dp(12))
+                bodyView.setTextColor(textColor)
+                bodyView.maxWidth = maxBubble
+                bodyView.text = item.text
+            }
+        }
+        return row
+    }
+
+    /** 消息气泡的底：纯色 + 圆角。 */
+    private fun bubbleShape(color: Int, radiusPx: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = radiusPx.toFloat()
+        setColor(color)
     }
 
     val isShown: Boolean get() = attached

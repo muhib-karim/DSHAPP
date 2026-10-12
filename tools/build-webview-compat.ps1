@@ -79,7 +79,23 @@ param(
     #     否则 mobileui 那棵树的戳对得上、会被跳过，插件继续是旧的。
     # v6：修复 68 补上真正生效的那一层（原型层拦截 `type=password`）。
     #     仍然必须 bump —— 改的还是 mobile-ui 源码。
-    [string]$CompatVersion = "6",
+    # v7：悬浮球升级 —— mobile-ui 新增转录采集（mpCollectTranscript/mpReportTranscript）。
+    #     同 v4/v5/v6 的道理：改的是 mobile-ui 源码，`mobileui/lib/client.js` 的降级
+    #     产物随之变化，不 bump 会命中「两戳都一致 → 整体跳过」，
+    #     那棵树继续被**旧**降级产物覆盖 ⇒ 悬浮窗拿不到转录，展开面板永远是空的。
+    # v8：转录文本剔除官方时间戳（mpTranscriptVisibleText 去掉 `[data-clock]` 子树）。
+    #     同 v7：改的还是 mobile-ui 源码，不 bump 的话设备上那棵树不会被覆盖，
+    #     用户消息尾部会一直粘着「01:14」。
+    # v9：转录选择器补上工具行 —— 判据由 `[data-tool]` 改成
+    #     `[data-chat-flow-kind="tool-call"]`（前者在本页面恒为 0，工具调用一条都采不到），
+    #     并补上 `steering`。同 v7/v8：改的还是 mobile-ui 源码，不 bump 的话
+    #     设备上那棵树继续被旧降级产物覆盖 ⇒ 面板里永远看不到「工具调用」行。
+    # v10：转录改为近流式 + 思考与正文分项。改了 `mpScheduleTranscript` 的节流
+    #     （1500ms → 250ms）与 `mpCollectTranscript`（按 `data-chat-group-part`
+    #     把 reasoning 发成独立的 `reasoning` 角色）。同 v7/v8/v9：改的还是
+    #     mobile-ui 源码，不 bump 的话设备上那棵树不会被覆盖 ⇒
+    #     面板仍是一坨一坨地出、思考与正文仍糊在一起。
+    [string]$CompatVersion = "10",
 
     [string]$EngineBin,
     [string]$OutZip

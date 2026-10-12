@@ -3212,6 +3212,7 @@ window.__ModuleLoader__.load({
 				mpEnsureRefreshItem();
 				mpPatchTrajectoryTiming();
 				mpScheduleStatus();   // 通知栏状态：跟着 DOM 变化走（内部 1s 节流）
+				mpScheduleTranscript();   // 悬浮窗转录：同一批 DOM 变化，内部 1.5s 节流
 				document.querySelectorAll('[role="dialog"][aria-modal="true"]').forEach(setupSettingsDialog);
 			}, 300);
 		});
@@ -3387,6 +3388,10 @@ window.__ModuleLoader__.load({
 		let mpStatusTimer = 0;
 		let mpStatusPending = false;
 		let mpLastStatusJson = "";
+		// 转录通道（见 mpCollectTranscript）：节流比 status 宽，指纹不变则一个字节都不发。
+		let mpTranscriptTimer = 0;
+		let mpTranscriptPending = false;
+		let mpLastTranscriptJson = "";
 
 		function mpIsEngineRunning() {
 			// 文案判据（引擎版本与界面语言在本 App 里都固定）。
@@ -3484,6 +3489,202 @@ window.__ModuleLoader__.load({
 				mpStatusPending = false;
 				mpReportStatus();
 			}, 1000);
+		}
+
+		// ══ 悬浮窗展开态的转录通道 ══════════════════════════════════════════
+		// 用途：原生侧悬浮球展开后要显示**完整**的对话 —— 用户消息、助手完整回复、
+		//   每一次工具调用。通知栏那条 status 通道的 body 被刻意压到 400 字，
+		//   体量差一个数量级，所以单独开一条（原生侧对应 ChatTranscript.kt）。
+		//
+		// ⚠️ 选择器一律用**属性**而不是类名：`data-chat-flow-kind`（官方 chat.js 的
+		//   chatNode() 生成）与 `data-tool` / `data-state`（官方 tool.js 的 ToolRow
+		//   写死）是稳定契约，而 `hWmORq_root` / `Sixlwa_bubble` 这类 CSS Module
+		//   哈希类名每次官方发版都可能变。类名只用于"取文本时收窄"，取不到就退回
+		//   整个节点 —— 退化的结果是"多带一点噪音"，而不是"内容全丢"。
+		const MP_TRANSCRIPT_MAX_ITEMS = 80;
+		const MP_TRANSCRIPT_MAX_CHARS = 2000;
+		// ⚠️ 工具行的判据是 `[data-chat-flow-kind="tool-call"]`，**不是** `[data-tool]`。
+		//   真机实测（CDP 读真实会话 DOM）：一次 bash 工具调用渲染出的是
+		//   `<div data-chat-flow-kind="tool-call" data-turn-process-member="true"
+		//     data-turn-process-hidden="true" hidden="until-found">`，
+		//   而全文档 `[data-tool]` 命中数**恒为 0** —— `data-tool` 是
+		//   `dsh-client-ui-tool` 的标记，本页面走的不是那套渲染器。
+		//   只认 `data-tool` 的后果是「工具调用一条都采不到」，正是本通道上线后
+		//   一直没见过的现象。
+		// ⚠️ 工具行即使被折叠（`hidden="until-found"`）也照样采：`textContent`
+		//   对 hidden 元素仍可读，而用户要的正是「展开面板能看到调了哪些工具」，
+		//   恰恰是折叠态下最需要补的信息。
+		const MP_TRANSCRIPT_SELECTOR = [
+			'[data-chat-flow-kind="user"]',
+			'[data-chat-flow-kind="steering"]',
+			'[data-chat-flow-kind="assistant-step"]',
+			'[data-chat-flow-kind="tool-call"]',
+			'[data-chat-flow-kind="turn-error"]',
+			"[data-tool]",
+		].join(",");
+
+		/** 压成单行并按 code point 截断（按 UTF-16 切会把 emoji 切成半个）。 */
+		function mpTranscriptText(raw, limit) {
+			const flat = String(raw === null || raw === undefined ? "" : raw)
+				.replace(/\s+/g, " ").trim();
+			const cps = Array.from(flat);
+			return cps.length > limit ? cps.slice(0, limit - 1).join("") + "…" : flat;
+		}
+
+		/**
+		 * 取节点的文本，**剔除元数据与按钮子树**。
+		 *
+		 * ⚠️ 为什么必须剔除（真机实测）：官方把时间戳与操作按钮放在同一条消息的尾部
+		 *   （`.xzv4MW_actions` 里一个 `.xzv4MW_timeStart` 加一个含 svg 的复制按钮），
+		 *   直接取 `textContent` 会得到「只回复两个字：通了01:14」—— 时间戳粘在用户
+		 *   原话后面，看起来像用户自己打的字。
+		 *
+		 * ⚠️ 判据用 **`[data-clock]` + `button`/`svg` 标签**，不用那个哈希类名：
+		 *   `data-clock` 是官方写死的元数据标记（`start` = 时间戳、`end` = 时间戳 +
+		 *   用量），实测页面里两处都有；而"消息尾部的操作按钮"永远是 button。
+		 *   类名随官方发版会变，属性不会。取不到就退回原文（多带点噪音，不丢内容）。
+		 */
+		function mpTranscriptVisibleText(el) {
+			try {
+				const clone = el.cloneNode(true);
+				const junk = clone.querySelectorAll("[data-clock], button, svg");
+				for (let i = 0; i < junk.length; i++) junk[i].remove();
+				return clone.textContent || "";
+			} catch (e) {
+				return el.textContent || "";
+			}
+		}
+
+		/** 会话标题（与状态通道同源，两处共用免得正则漂移）。 */
+		function mpConversationTitle() {
+			return (document.title || "").replace(/\s*—\s*DeepSeek Harness\s*$/, "").trim();
+		}
+
+		function mpCollectTranscript() {
+			const items = [];
+			// 限定在消息视图内：轨迹页/设置页里也可能有 `[data-tool]` 之类的节点，
+			// 不加限定会把别的界面的内容混进对话里。取不到容器就退回整个文档。
+			const root = document.querySelector(".wSkVaW_viewArea") || document;
+			let nodes = [];
+			try { nodes = root.querySelectorAll(MP_TRANSCRIPT_SELECTOR); }
+			catch (e) { nodes = []; }
+
+			// 引擎是否在跑（与状态通道同源），以及最后一个助手节点 —— 只有它
+			// 可能是"正在输出"的那一条。
+			const engineRunning = mpIsEngineRunning();
+			let lastAssistantStep = null;
+			for (const el of nodes) {
+				if (el.getAttribute("data-chat-flow-kind") === "assistant-step") lastAssistantStep = el;
+			}
+
+			for (const el of nodes) {
+				const tool = el.getAttribute("data-tool");
+				if (tool) {
+					const state = el.getAttribute("data-state") || "";
+					items.push({
+						role: "tool",
+						// 工具行的可见文本已经含标题（如「运行 bash」）与状态文案，
+						// 直接用；为空才退回工具名，保证面板上至少看得见调了哪个工具。
+						text: mpTranscriptText(mpTranscriptVisibleText(el), MP_TRANSCRIPT_MAX_CHARS) || tool,
+						running: state === "running",
+					});
+					continue;
+				}
+				const kind = el.getAttribute("data-chat-flow-kind");
+
+				// 工具调用（真机实测形状，见选择器处的注释）：
+				//   `data-sample` = 工具名（`bash`），`data-state` = `ok`/`running`，
+				//   可见文本 = 标题 + 摘要（「运行命令 Echo TOOL_OK to test output」）。
+				// ⚠️ 两个属性都长在**内层** `[data-sample]` 节点上，不在
+				//   `[data-chat-flow-kind]` 那个外层 div 上 —— 直接读 el 会全空。
+				if (kind === "tool-call") {
+					const inner = el.querySelector("[data-sample]") || el;
+					const sample = inner.getAttribute("data-sample") || "";
+					const state = inner.getAttribute("data-state") || "";
+					const body = mpTranscriptText(mpTranscriptVisibleText(inner), MP_TRANSCRIPT_MAX_CHARS);
+					items.push({
+						role: "tool",
+						text: body || sample || "工具调用",
+						running: state === "running",
+					});
+					continue;
+				}
+
+				// assistant-step 的**思考**与**正文**是两个并列节点，靠
+				// `data-chat-group-part` 区分（真机实测：`reasoning` / `response`）。
+				// ⚠️ 不区分时两者都发成 `assistant`，面板上标签同为「AI」、样式也
+				//   一模一样，用户看到的就是"思考与正文糊在一起、同时冒出来"。
+				const part = kind === "assistant-step"
+					? (el.getAttribute("data-chat-group-part") || "")
+					: "";
+
+				let body = el;
+				if (kind === "assistant-step") {
+					// 收窄到 AssistantMarkdown 的正文容器。官方 AssistantMarkdown 对
+					// tool-call 块是直接 `break` 跳过的（不渲染进 body），所以这里取到
+					// 的是纯正文，不会把工具标题混进助手回复里。
+					body = el.querySelector(".hWmORq_root") || el;
+				}
+				const text = mpTranscriptText(mpTranscriptVisibleText(body), MP_TRANSCRIPT_MAX_CHARS);
+				if (!text) continue;
+				// 只有"引擎在跑"且"这是最后一条助手节点"才算正在输出 —— 后面的
+				// 节点一出现，前一个自然就不再是运行中。
+				const live = engineRunning && kind === "assistant-step" && el === lastAssistantStep;
+				if (kind === "user") items.push({ role: "user", text: text, running: false });
+				// steering = 用户在回合进行中追加的指令，按用户消息显示。
+				else if (kind === "steering") items.push({ role: "user", text: text, running: false });
+				else if (kind === "assistant-step") {
+					items.push({
+						role: part === "reasoning" ? "reasoning" : "assistant",
+						text: text,
+						running: live,
+					});
+				}
+				else if (kind === "turn-error") items.push({ role: "error", text: text, running: false });
+			}
+
+			return {
+				title: mpConversationTitle(),
+				running: mpIsEngineRunning(),
+				// 只留最后 MAX 条：面板要看的是当前进展，早期历史可以丢。
+				items: items.length > MP_TRANSCRIPT_MAX_ITEMS
+					? items.slice(items.length - MP_TRANSCRIPT_MAX_ITEMS)
+					: items,
+			};
+		}
+
+		function mpReportTranscript() {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.onTranscript !== "function") return;
+			let json;
+			try { json = JSON.stringify(mpCollectTranscript()); } catch (e) { return; }
+			// 指纹不变就一条都不发：这条通道体量比 status 大两个数量级，
+			// 无脑重推会白白占用原生侧的 JSON 解析与面板重绘。
+			if (json === mpLastTranscriptJson) return;
+			mpLastTranscriptJson = json;
+			try { bridge.onTranscript(json); } catch (e) { /* 原生侧异常不影响页面 */ }
+		}
+
+		// 节流 250ms：用户要求面板里"看得见流式输出"，所以这里必须跟着 DOM 的
+		// 逐字变化走。原来的 1.5s 会让整段回复攒成两三坨跳出来 —— 观感就是
+		// "没有流式、一次全出"。
+		//
+		// ⚠️ 成本可控的依据：`mpReportTranscript()` 带指纹去重，**内容没变一个
+		//   字节都不发**，所以节流只决定"最多多快发一次"，不决定实际发送量。
+		//   DOM 的 characterData 变化本身就已经是逐 token 的节奏。
+		function mpScheduleTranscript() {
+			if (mpTranscriptPending) return;
+			mpTranscriptPending = true;
+			mpTranscriptTimer = window.setTimeout(() => {
+				mpTranscriptPending = false;
+				mpReportTranscript();
+			}, 250);
+		}
+
+		function mpInstallTranscriptBridge() {
+			mpReportTranscript();
+			const t = window.setInterval(mpReportTranscript, 5000);   // 兜底：DOM 静默变化时也能纠正
+			return () => window.clearInterval(t);
 		}
 
 		function mpInstallStatusBridge() {
@@ -5887,6 +6088,7 @@ window.__ModuleLoader__.load({
 			document.addEventListener("click", onPanelRowClick, true);   /* 修复 66 */
 			const disposePressFeedback = setupPressFeedback();
 			const disposeStatusBridge = mpInstallStatusBridge();
+			const disposeTranscriptBridge = mpInstallTranscriptBridge();
 			const disposeImePrejudge = setupImePrejudge();   /* 修复 65 */
 			mo.observe(document.body, { childList: true, subtree: true, characterData: true });
 			// 启动爆发：apply() 执行时 React 尚未挂载，而 observer 有 300ms 节流，
@@ -5919,6 +6121,7 @@ window.__ModuleLoader__.load({
 				document.removeEventListener("click", onSessionRowClick, true);
 				disposePressFeedback();
 				disposeStatusBridge();
+				disposeTranscriptBridge();
 				disposeImePrejudge();
 				window.clearInterval(t);
 				window.clearInterval(mpBootBurstTimer);

@@ -23,6 +23,7 @@ APK
  ├─ assets/adb-wireless-arm64.zip  Termux 官方 adb（无线调试配对要 TLS-PSK，Node 的 tls 不支持）
  ├─ assets/dsh-android-shell.mjs   uid 2000 执行通道（直连 adbd）
  ├─ assets/shell-tool.zip          uid 2000 特权工具插件（注册 `shell` 工具）
+ ├─ assets/bubble-tool.zip         悬浮球控制工具插件（注册 `bubble` 工具，见 ⑫.3）
  ├─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片（补**运行时 API**）
  └─ assets/webview-compat.zip      按 chrome74 降级编译的前端 bundle（补**语法**，见 ⑯）
 
@@ -31,7 +32,10 @@ APK
  ├─ engine/         引擎解包目录（含 .stamp 版本戳）
  ├─ home/.dsh/      DSH_HOME：配置、凭据、会话、profiles/web/
  │   ├─ mobile-ui/dsh-android-mobile/  移动端 UI 插件（**刻意放在 pnpm 管辖之外**）
- │   └─ shell-tool/dsh-android-shell/  uid 2000 特权工具插件（同上，刻意在 pnpm 之外）
+ │   ├─ shell-tool/dsh-android-shell/  uid 2000 特权工具插件（同上，刻意在 pnpm 之外）
+ │   ├─ bubble-tool/dsh-android-bubble/  悬浮球控制工具插件（同上，见 ⑫.3）
+ │   ├─ bubble-cmd.json               悬浮球命令信箱：插件写、原生 250ms 轮询读（见 ⑫.3）
+ │   └─ bubble-result.json            同上，回执方向（原生写、插件读）
  ├─ dsh-android-shell.mjs  uid 2000 执行通道（每次启动覆盖写）
  ├─ liblinkcompat.so  link 转译层（每次启动从资产覆盖写）
  ├─ libboosandbox.so  沙箱写拦截器（每次启动从资产覆盖写）
@@ -67,11 +71,20 @@ Termux 官方二进制把 `/data/data/com.termux/files`（27 字节）烤进 ELF
 
 ## 构建与验证
 
+⚠️ **本工程有两个 Web 内核 flavor（`system` / `gecko`），构建任务名带 flavor**，
+产物也落在带 flavor 的子目录里。细节见 ⑦.7。
+
 ```powershell
 # 构建（workdir = 本目录）
 $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
-.\gradlew.bat :app:assembleDebug --console=plain
-# 产物：app\build\outputs\apk\debug\app-debug.apk（约 117 MB）
+
+.\gradlew.bat :app:assembleSystemDebug --console=plain
+# 产物：app\build\outputs\apk\system\debug\app-system-debug.apk（约 138 MB）
+
+.\gradlew.bat :app:assembleGeckoDebug --console=plain
+# 产物：app\build\outputs\apk\gecko\debug\app-gecko-debug.apk（约 224 MB）
+
+.\gradlew.bat :app:assembleDebug --console=plain   # 两个都出
 ```
 
 环境：AGP 8.8.2 / Kotlin 2.0.21 / Gradle 8.13 / JDK 17 / compileSdk 35 / minSdk 26。
@@ -80,14 +93,26 @@ $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
 - 工程路径含中文（`1-项目代码\安卓开发`），靠 `gradle.properties` 里的
   `android.overridePathCheck=true` 放行，别删。
 - 构建需经代理（`gradle.properties` 里的 `127.0.0.1:7897`）。
+- ⚠️ **gecko 包约 224 MB**（GeckoView 的 arm64 native 库就占 ~90 MB），比 system 版
+  大 86 MB。这是「内核随包分发」的必然代价，不是配置错误。
 
 ### 发行版（release）
 
 ```powershell
 $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
-.\gradlew.bat :app:assembleRelease --console=plain
-# 产物：app\build\outputs\apk\release\app-release.apk（约 127 MB，已签名）
+
+.\gradlew.bat :app:assembleSystemRelease --console=plain
+# 产物：app\build\outputs\apk\system\release\app-system-release.apk（已签名）
+
+.\gradlew.bat :app:assembleGeckoRelease --console=plain
+# 产物：app\build\outputs\apk\gecko\release\app-gecko-release.apk（已签名）
+
+.\gradlew.bat :app:assembleRelease --console=plain   # 两个都出
 ```
+
+⚠️ **两个 release 包的 `applicationId` 不同**（`com.dsh.android` / `com.dsh.webview`），
+所以**可以同装一台机器**、各自独立的数据目录。但**同一个 flavor 下 debug 与 release
+会互斥**（共用 applicationId、签名不同）—— 换装要先卸载 ⇒ 数据全丢，自用机保持 debug 不动。
 
 **debug 是自用包、release 是发给别人的包，两把钥匙互相独立。**
 
@@ -122,6 +147,19 @@ $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
 里面已有的包用 `DSH<versionName>.apk` 命名（如 `DSH0.1.0.apk`）。**同名会冲突，
 所以每次发布都在版本号后面加个后缀**，例如 `DSH0.1.0-pool.apk`（内置号池版）、
 `DSH0.1.0-fixport.apk`。后缀随意，能区分就行。
+
+##### 两个内核版本一起发
+
+从 0.2.6 起有 **system / gecko 两个 flavor**，所以一次发布要传**两个包**，
+后缀必须能区分是哪一个：
+
+| flavor | 上传时改成的名字 | 说明 |
+|---|---|---|
+| system | `DSH<versionName>.apk` | 老包沿用原命名，绝大多数人装这个 |
+| gecko | `DSH<versionName>-webview.apk` | 内置 Web 内核版，体积大一倍 |
+
+⚠️ **两个包互不冲突、可以同时装**（applicationId 不同），所以**不能**把其中一个
+挪进「历史版本」—— 它们不是新旧关系，是**并列的两个版本**。根目录里同时留住两个。
 
 **必须走 Git 自带的 bash**（Windows 自带的 `bash.exe` 是 WSL，环境不对）：
 
@@ -679,7 +717,8 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-49`） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（`1.0.0-53`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（见 ⑯） |
+| `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.12`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -693,6 +732,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `boosandbox.bin` / `boo-sandbox-run.bin` | 无需改（每次启动覆盖写） |
 | `dsh-android-shell.mjs` | 无需改（每次启动覆盖写） |
 | `shell-tool.zip` | 无需改（每次启动解包覆盖写） |
+| `bubble-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.3） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
 
@@ -774,6 +814,146 @@ mimeType, _ -> handleDownload(...) }`，`handleDownload()` 在**本进程内**�
 
 把 zip 拉回 PC 用 `ZipFile` 打开 → 1 个条目 `session.v4.jsonl`（1457 B），
 魔数 `PK\x03\x04` ✅。
+
+### ⑦.7 内置 Web 内核版（productFlavor `gecko`）—— 不依赖系统 WebView
+
+同一个工程出**两个可共存的 APK**：
+
+| flavor | applicationId | Web 内核 | 说明 |
+|---|---|---|---|
+| `system` | `com.dsh.android` | 设备系统 WebView | 原有行为，**一字未改** |
+| `gecko` | `com.dsh.webview` | 打进 APK 的 GeckoView | 新增，不依赖系统 WebView |
+
+```powershell
+.\gradlew.bat :app:assembleSystemDebug   # app\build\outputs\apk\system\debug\app-system-debug.apk
+.\gradlew.bat :app:assembleGeckoDebug    # app\build\outputs\apk\gecko\debug\app-gecko-debug.apk
+.\gradlew.bat :app:assembleDebug         # 两个都出
+```
+
+⚠️ **第二个包名必须也恰好 15 字符**（硬约束①）：`com.dsh.webview` = 15 ✅。
+`TermuxBootstrap.ELF_ROOT_REPLACEMENT` 已改成**从 `BuildConfig.APPLICATION_ID` 推导**，
+所以两个 flavor 各自把 ELF 里的 `/data/data/...` 改写成**自己的**私有目录 ——
+写死的话另一个 flavor 会把二进制改成别的应用的路径，必炸。
+
+⚠️ **两个包的数据目录互相独立**：会话、凭据、工作区**不共享**。这是共存的代价。
+
+⚠️ **内核实现必须放在 flavor 源集里**（`app/src/system/java`、`app/src/gecko/java`），
+**不能放 `main`** —— `GeckoWebHost` 引用 `org.mozilla.geckoview.*`，而该依赖只挂在
+`geckoImplementation` 上，放 `main` 会让 system flavor 编译不过。
+
+#### 为什么是 GeckoView，以及为什么是 140
+
+- 唯一有**官方预编译 Maven 产物**的可嵌入内核。腾讯 X5/TBS 的**内核是运行时下载的**，
+  违背「内置」这一条。
+- **157 / 146 用不了**：它们的传递依赖要 AGP 9.1.0（`androidx.core:core:1.19.0`）
+  与 compileSdk 36（`media3:1.11.0`），当前 AGP 8.8.2 / compileSdk 35 接不住。
+  升 AGP 是另一件事，本轮没做。**140.0.20250707120347** 可用。
+- 仓库要加 Mozilla 的 maven（`settings.gradle.kts`，限定 group 免得拖慢解析）：
+  `https://maven.mozilla.org/maven2/`。
+
+#### GeckoView 与 WebView 的 API 差异（写代码前必读）
+
+| 能力 | WebView | GeckoView |
+|---|---|---|
+| 注入 JS 到页面 | `evaluateJavascript` | **没有**；必须 `pageWindow.eval(源码)` |
+| JS ↔ 原生 | `addJavascriptInterface` | **没有**；走 WebExtension native messaging |
+| console 转发 | `onConsoleMessage` | **没有**；在页面世界包 `console.*` |
+| 下载 | `setDownloadListener` | **没有**；见下 |
+| 读 cookie | `CookieManager.getCookie` | **没有 API**（只有 cookie 横幅那几个方法） |
+| targetSdk 依赖 | 内核随系统 | **不依赖**，与系统 WebView 版本无关 |
+
+所以 `main` 里的宿主只认 `WebHost` 接口（`app/src/main/java/com/dsh/android/web/WebHost.kt`），
+两个 flavor 各给一份实现。
+
+#### 桥（bridge）的实现要点
+
+- 扩展在 `app/src/gecko/assets/dsh-bridge/`（MV2，`manifest.json` + `content.js`，
+  **没有 background**）。
+- ⚠️ **GeckoView 不实现 `browser.tabs`**，所以 content script 必须**自己**
+  `browser.runtime.connectNative('browser')`；manifest 的 permissions 要有
+  `["nativeMessaging","nativeMessagingFromContent","geckoViewAddons"]`。
+- ⚠️ 原生侧必须用 **`session.webExtensionController.setMessageDelegate(...)`**，
+  不是 `extension.setMessageDelegate(...)` —— **content script 的消息只认前者**。
+- ⚠️ **content script 跑在隔离世界**，往页面世界塞东西只有一条可行的路：
+
+  ```js
+  pageWindow.eval(源码字符串)(exportFunction(fn, pageWindow), …)
+  ```
+  | 写法 | 结果 |
+  |---|---|
+  | `pageWindow.DSHAndroid = {...}` | 页面读到的是 Xray wrapper，**Permission denied** |
+  | `cloneInto(obj, pageWindow)` | `Permission denied to pass a Function via structured clone`（结构化克隆**不能传函数**） |
+  | `exportFunction(fn, pageWindow)` | ✅（**第二个参数不能省**，省了抛 `Function requires at least 2 arguments`） |
+
+  对象必须在**页面世界**构造（`eval` 那段源码），要调的原生函数以参数形式喂进去。
+- ⚠️ `post()` 发出的消息 `type` **必须是 `'invoke'`**：原生按 `type` 分派，漏了不报错、
+  **静默丢弃**，表现为「所有动作（含 onUiReady）都到不了原生」。
+- ⚠️ 扩展 manifest 的 `version` **改了 `content.js` 就必须加**，否则 GeckoView 打
+  `Addon with ID … already installed, older version will be disabled` 并**继续用旧包**。
+
+#### 文件选择（⑦ 的 gecko 版）
+
+⚠️ **必须返回一个未完成的 `GeckoResult<PromptResponse>`**。返回 `null` 不是「稍后再说」，
+而是「本 delegate 不处理」—— 内核立刻按默认行为取消，此后 `prompt.confirm(...)` 的
+结果**再也送不回内核**。真机症状：选择器能弹出，选完文件**永远不落进 Web**。
+
+⚠️ `FilePrompt.confirm(Context, Uri[])` **只接受 `file://`**，给 `content://` 会报
+`NS_ERROR_FILE_UNRECOGNIZED_PATH`（Mozilla bug 1591640 / 1875732）。
+所以 `GeckoWebHost.toLocalFile()` 先把 `content://` **拷进 `cacheDir`** 再 confirm
+（用 `cacheDir` 而不是 `filesDir`：这是一次性上传暂存，让系统能回收）。
+
+真机验收：
+
+```
+文件选择请求（type=2，多选=true）
+所选文件已落盘: 1791728591132--31edd527-w5.png（33375 字节，源 content://…）
+文件选择完成：1 个（已落盘到本地）
+```
+
+#### 下载（⑦.5 的 gecko 版）—— 踩了两条死路才找到正解
+
+`/api/session.export` 是**纯 cookie 鉴权**，而 GeckoView **没有任何读 cookie 的 API**，
+cookie 存在内核自己的 `files/mozilla/<profile>/cookies.sqlite` 里、**不写进** WebView
+的 cookie jar。于是：
+
+| 路 | 结果 |
+|---|---|
+| 页面报 URL → **宿主**用 `HttpURLConnection` 代发 | **必然 401**（宿主持不到 cookie） |
+| 页面报 URL → 用 `GeckoSession.Loader` 让**内核**发导航 | **真机 403 forbidden**，且**错误页把整个 GUI 顶掉了** |
+| ✅ 在**页面世界**用 `fetch` 拉，base64 分块经桥回传 | 通 |
+
+第二条路的两个教训要记住：
+1. 引擎的准入检查（`dsh-client-connection` 的 `isTrustedApiRequest`，看
+   host / `sec-fetch-site` / `origin`）对**原生发起的导航**与**页面发起的 fetch**
+   给的不是同一组取值，前者会被判 403；
+2. **任何非 attachment 的响应都会被内核当主文档渲染** —— 一次失败就把界面顶掉，
+   比功能不可用严重得多。
+
+第三条路之所以对：**与 GUI 平时调 API 完全同源同头**，且响应是数据不是导航，
+失败最多是一次 fetch 报错。
+
+⚠️ 分块消息**每条都自带 url 与文件名**，不另发「开始」消息 —— 单独的开场消息被
+内核 messaging 拒过一次（logcat 只有 `Invalid event data property args`，原生收不到，
+而分块本身能通），结果是分块到了却没有进行中的下载、整批丢弃。
+
+⚠️ 落盘由宿主做（`callbacks.onDownloadStream(DownloadStream(url, filename, body))`），
+内核侧不碰文件系统；`MainActivity.handleDownloadStream()` 在 IO 线程读流写文件。
+
+#### ⚠️ 三个「静默炸掉整个文件」的注释陷阱（都踩过，且症状极难查）
+
+1. **Kotlin 块注释会嵌套**：KDoc 里写 `files/mozilla/*/cookies.sqlite`、`/api/*`
+   会打开一个嵌套注释，**吞掉文件后半段**，报一连串莫名其妙的
+   `Unresolved reference`（`WebHostCallbacks`、`DownloadStream`、`GECKO_MAJOR`…）
+   外加 `Unclosed comment`。**提到路径一律用 `「」` 包裹**。
+2. **JS 的 `//` 注释里出现 `/*`**（例如写 `/api/*`）同样提前闭合块注释，
+   症状是 **content script 整体不执行**。
+3. **模板字符串里出现反引号**（`PAGE_SHIM_SOURCE` / `BRIDGE_INSTALLER_SOURCE` 的内容）
+   会**提前终止模板**，症状同样是 content script 完全不执行。
+
+三者都**不会被 `node --check` 全部抓到**（第 3 种的典型表现是 `node --check` 通过、
+运行时整个脚本站点级失效）。诊断依据永远是 logcat 里的
+`W Web Content: [JavaScript Error: ...]` **和** `E GeckoConsole`（DSH tag 下看不到）。
+建议的机械校验：见 `tools/scan-bridge.js`（扫注释里的 `/*` 与模板内的反引号）。
 
 ### ⑧ `sharp` 没有 android 预编译二进制 —— 装 wasm32 变体
 
@@ -1836,16 +2016,20 @@ targetSdk = 28 走 legacy 模型，不需要 `MANAGE_EXTERNAL_STORAGE`。
 于是官方界面看不见了 —— 既不知道 AI 跑到哪一步，也没法中途喊停或补一句话。
 通知栏能显示状态，但点一下就跳走，**没法交互**。
 
-实现：`FloatingBubble.kt`（原生 View，约 1000 行）+ `bubble_window.xml` /
-`bubble_status.xml`。**由 `MainActivity.onStart/onStop` 控制只在后台显示** ——
+实现：`FloatingBubble.kt`（原生 View，约 1960 行）+ `bubble_window.xml` /
+`bubble_status.xml` / `bubble_msg.xml`。**由 `MainActivity.onStart/onStop` 控制只在后台显示** ——
 前台时官方界面本来就在，气泡是多余的遮挡。所以**要看到气泡必须按 HOME**。
 
-两种形态共用一个 window（靠 `visibility` 切换，**不重建 View**）：
+⚠️ 例外：插件把 `state` 显式设成 `expanded` / `collapsed`（非 `auto`）时，
+前台也保持显示 —— 见 ⑫.2「悬浮窗接进 DSH 插件生态」。
+
+三种形态共用一个 window（靠 `visibility` 切换，**不重建 View**）：
 
 | 形态 | 内容 |
 |---|---|
 | 收起 | 56dp 圆形头像按钮 + 14dp 状态圆点（实心绿=在跑，空心灰=空闲） |
-| 展开 | 300dp 面板：当前动作 / 会话标题 / 最近输出（可滚动）/ 输入框 + 发送/停止 |
+| 贴边 | 6dp 薄片贴在屏幕边缘（把球拖出屏幕时自动进入，点一下弹回并展开） |
+| 展开 | 面板：当前动作 / 会话标题 / **完整会话转录**（可滚动）/ 输入框 + 发送/停止 / 底部署缩手柄 |
 
 #### ⚠️ 状态圆点会掉出圆外 —— 父容器是**矩形裁剪**
 
@@ -1969,6 +2153,337 @@ Huawei CDY-TN90 实测**偏移 115 px**：`屏幕 y = 窗口 y + 115`。
 WebView 视口是 360×764 CSS px、dpr 3，所以真实点击坐标是
 `physX = cssX * 3`、`physY = 108 + cssY * 3`。拿窗口坐标直接去 `input tap`
 会点在偏上 115px 的地方 —— 本次调试中真的被它误导过。
+
+### ⑫.1 悬浮球的四项交互契约（拖出屏幕贴边 / 状态条 2 秒自隐 / 面板拖动缩放 / 完整转录）
+
+四项都是**原生侧**的事，页面侧一行都不用改（只有「完整转录」要页面侧**采集并上报**，
+见 ⑫.2）。四条各自的判据都写在这里，改之前先读。
+
+#### ① 状态横条「内容没变 2 秒就消失」
+
+`STATUS_AUTO_HIDE_MS = 2000`。关键在**判据是内容的指纹，不是"收到推送"这个事件**：
+
+```kotlin
+val key = "$text\u0000$running"     // scheduleStatusAutoHide 的入参
+if (key == statusKey) return         // 指纹没变 ⇒ 一条都不重排定时器
+```
+
+页面每 5 秒推一次**完全相同**的状态（`mpReportStatus()`），如果按"收到就重置计时"
+实现，横条会**永远不消失**。按指纹判定后，同样的内容推一百次也只在**第一次**计时
+2 秒后消失 —— 这正是「没有变化时 2 秒后自动消失」的字面语义。
+
+- `statusAutoHideMs <= 0`（插件把 `statusAutoHideMs` 设成 0 或负数）= **永不自动隐藏**。
+- 内容**变了**（换了动作/从跑变空闲）= 指纹变 = 重新计时 2 秒，横条重新出现。
+- 展开态不显示横条（面板顶栏已有同一份信息），收起时 `statusKey` 清零让它重新计时。
+
+#### ② 拖出屏幕 → 贴边折叠；点一下弹回
+
+判定必须用**未夹取的 `rawX`**：
+
+```kotlin
+val overshoot = maxOf(-rawX, rawX + w - dm.widthPixels)
+if (allowEdgeCollapse && appearance.edgeSnap && overshoot >= dp(EDGE_OVERSHOOT_DP)) enterEdge(...)
+```
+
+⚠️ **不能用 `curX`** —— 拖动过程中每一帧都经过 `clampInto()`，越界量早就被抹平了，
+拿夹取后的值判定，`overshoot` **恒为 0**，贴边永远不触发。这是本轮最容易写错的一处。
+
+- `EDGE_OVERSHOOT_DP = 28`：手指再多拖 28dp 才算「想把它扔出屏幕」，避免误触。
+- 贴边态是**独立薄片** `bubbleEdge`（`EDGE_WIDTH_DP = 6`），不是把球缩窄 ——
+  球的 56dp 是安装面积的语义，缩窄会让它变得点不到。
+- 薄片触摸只认点击（拖动它没意义，拖了就当作"想拿回来"直接 `exitEdge()`）。
+- `appearance.edgeSnap = false` 可以**关掉**这个行为（松手只会吸附到最近的左右边缘）。
+
+#### ③ 展开面板：完整转录 + 可拖动 + 可缩放
+
+- **拖动**：把手是 `panelHeader`（顶栏）。⚠️ 消息列表自己会滚、输入框要收文字，
+  只有顶栏这一块不会跟手势打架。
+- **缩放**：把手是面板**最底部独立一行** `panelResize`（28dp 高，只有右端画 grip）。
+  ⚠️ 刻意不做成右下角悬浮小方块 —— 那个位置正好压在「发送」按钮上，实测点发送的
+  右半边会被判成 resize。做成独立一行后这条上没有任何其它可交互元素。
+- 竖直只改**转录区高度**（`panelScroll`），水平改面板宽度：面板是 `wrap_content`，
+  改内容高度它自己会长高。**反过来直接给面板定高会让输入框与顶栏被挤掉** ——
+  用户拖一下就把发送按钮拖没了。
+- 松手落盘（`KEY_PANEL_W` / `KEY_TRANSCRIPT_H`），下次展开仍是这个尺寸；
+  插件的 `panelHeight` 是**面板总高**，由 `applyConfiguredPanelHeight()` 扣掉实测的
+  固定 chrome 反推转录区高度，**必须 post 到布局之后**执行（早跑会读到 0）。
+
+#### ⚠️⚠️ `attach()` 不能省：插件在前台下发配置会被静默吞掉
+
+`appContext` 原先**只在 `onAppBackground()` 里赋值**。后果是插件在 App **前台**调
+`bubbleApply()` 时，`applyAppearance()` 里那句 `val ctx = appContext ?: return false`
+直接返回 —— **改了没反应，切到后台又好了**（因为切后台那一下才把 `appContext` 填上）。
+真机上表现为「插件下发失败」，但日志里能看到 `插件下发悬浮球配置: ...` 已经打印。
+
+修法：`MainActivity.onCreate` 里调一次 `FloatingBubble.attach(this)`，它存
+`applicationContext` 并 `post { reconcileVisibility(...) }`。后者顺带把「App 被杀后
+重启，插件设的形态丢失」也一并修好（用持久化的 appearance 重新摆位）。
+
+⇒ **任何新的插件侧入口都要先确认 `appContext` 已经就位**，别假设它一定是非空的。
+
+### ⑫.2 悬浮窗接进 DSH 插件生态 —— 页面里的插件就能改悬浮球
+
+目标：**让 AI 改悬浮窗像改自己的 web 界面一样简单** —— 写个插件、
+`window.DSHAndroid.bubbleApply(...)` 一行，悬浮球就变样，原生侧零改动。
+
+```
+插件(client.js) ──window.DSHAndroid.bubbleApply(json)──> 页面桥
+                                                        ├─ system: @JavascriptInterface（同步）
+                                                        └─ gecko : native messaging（异步）
+                                                              ↓ PageBridge
+                                                    MainActivity.StatusBridge
+                                                              ↓
+                                                    FloatingBubble.applyAppearance()
+                                                              ↓
+                                                    BubbleAppearance.merge + 落盘 + 重绘
+```
+
+#### 三个页面侧方法（两个 flavor 都暴露，方法名完全一致）
+
+| 方法 | 语义 |
+|---|---|
+| `bubbleApply(json): Boolean` | 合并下发外观字段。返回 `true` = **已接受**，不代表视图已重绘 |
+| `bubbleAppearance(): String` | 读回当前外观 JSON（同步），供插件做「读-改-写」 |
+| `onTranscript(json)` | 上报会话转录（原生侧自己切主线程，页面不用管） |
+
+页面侧另有 `bubbleState()` / `rootState()` 等既有方法，见 `PageBridge` 接口
+（现共 **16 个**；`GeckoWebHost` 里那句「13 个方法」的注释是旧文案）。
+
+#### 外观字段一览（`BubbleAppearance`）
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `state` | `auto` / `expanded` / `collapsed` / `hidden` | `auto` = 老行为（只在后台显示）；其余三态**前台也保持** |
+| `shape` | `circle` / `square` / `rounded` | 球的形状 |
+| `size` | dp | 球边长（默认 56） |
+| `cornerRadius` | dp | `rounded` 的圆角 |
+| `opacity` | 0–1 | 整体不透明度 |
+| `bg` / `bg2` | `#RRGGBB` / `#AARRGGBB` | 底色 / 渐变第二色（留空 = 纯色） |
+| `border` / `borderWidth` | 色 / dp | 描边 |
+| `avatar` | `default` / `none` / data-URI | 头像（`none` = 露出底色） |
+| `panelWidth` / `panelHeight` | dp | 展开面板尺寸（`panelHeight` = **总高**，0 = 自适应内容） |
+| `panelBg` / `panelText` / `panelAccent` | 色 | 面板配色 |
+| `statusAutoHideMs` | ms | 状态横条自动隐藏（≤0 = 永不隐藏） |
+| `edgeSnap` | bool | 是否启用「拖出屏幕自动贴边」 |
+
+`merge()` 是**逐字段**合并：只写想改的字段，其余保持原值。落盘在
+`SharedPreferences("dsh_bubble")` 的 `appearance` 键；头像字节落
+`filesDir/bubble-avatar.bin`（`readAvatar`/`writeAvatar`，上限
+`MAX_AVATAR_BASE64 = 700_000`）。
+
+#### ⚠️⚠️ 自定义头像必须能用**落盘标记**读回来（踩过的静默丢数据 bug）
+
+`avatar` 字段在**两条路径上不是同一个值**，这是本处最容易漏的地方：
+
+| 时点 | 值 |
+|---|---|
+| 插件下发 | `data:image/png;base64,…`（几百 KB） |
+| `save()` 落盘 | **`bubble-avatar.bin`**（只留文件名标记，base64 单独落盘） |
+
+`avatarOf()` 的合法值白名单原本只写了 `default` / `none` / `data:image/…`，
+于是**回读时把 `bubble-avatar.bin` 判成非法值退回 `default`**。两个后果：
+
+1. **自定义头像重启即丢** —— 图片文件还在 `filesDir`，但配置里再没人引用它；
+2. `bubbleAppearance()` 的回读值与 `bubbleApply()` 的下发值**不一致**，
+   插件做「读-改-写」时会把头像悄悄洗掉（读回 `default`，写回 `default`）。
+
+修法：白名单补上 `AVATAR_FILE`，并**核对文件真的存在**（用户清数据后不能留悬空引用）。
+`merge()` / `avatarOf()` 因此各多一个可空 `context` 参数（纯解析场景传 null = 当作文件在）。
+
+同一处的第二个坑：**下发 data URI 那一帧不显示自定义头像**。视图判定走
+`usesCustomAvatar`（即 `avatar == AVATAR_FILE`），而 `applyAppearance` 拿到的是 data URI。
+所以 `writeAvatar()` 成功后必须**把内存里的 data URI 换成文件标记**，否则表现为
+「AI 换了头像但没反应，重启才看见」。落盘失败（不是有效位图）时退回改动前的头像值，
+不能留一个指向不存在文件的引用。
+
+真机验收（system 包）：下发 1×1 PNG 的 data URI → 立刻回读 `avatar:"custom"`
+（修复前是 `default`）→ `am force-stop` 重启后仍是 `custom` → 读-改-写只动 `size`
+时 `avatar` 保持 `custom` → 显式传 `default` 能切回内置、再传标记能切回自定义。
+
+#### ⚠️ 新增桥方法要**三处一起改**，漏一处是静默失败
+
+`system` 与 `gecko` 的内核实现分别在 flavor 源集里，**没有共享基类**，所以每个新方法都要：
+
+1. `app/src/main/java/com/dsh/android/web/PageBridge.kt` —— 接口声明；
+2. `app/src/system/java/.../SystemWebHost.kt` —— `@JavascriptInterface fun xxx(...)`；
+3. `app/src/gecko/java/.../GeckoWebHost.kt` —— `dispatchInvoke()` 里加分支
+   **并调 `pushSnapshot()`**（页面侧是**同步读快照**，不推送的话插件读回的是旧值）；
+4. `app/src/gecko/assets/dsh-bridge/content.js` —— 在页面世界暴露同名函数，
+   **并 bump `manifest.json` 的 `version`**（否则 GeckoView 继续用旧扩展）。
+
+⚠️ gecko 侧的 `BRIDGE_INSTALLER_SOURCE` 是**模板字符串**：里面出现反引号会提前
+终止模板，症状是整段 content script 不执行（见 ⑦.7 的三个注释陷阱）。
+
+#### 转录通道：为什么另开一条路，不加进通知栏那条
+
+状态通道（`mpReportStatus`）的正文上限 400 字，只够放"当前在做什么"。完整转录
+（用户消息 + 每条助手回复 + 每次工具调用）**大两个数量级**，混进同一条通道会把
+通知栏那条挤爆。
+
+所以另开 `onTranscript`：页面侧 `mpCollectTranscript()` 采集 → `mpReportTranscript()`
+**指纹去重**（内容没变一条都不发）→ `mpScheduleTranscript()` 1500ms 节流 →
+另有 5000ms 兜底轮询。上限 `MP_TRANSCRIPT_MAX_ITEMS = 80` /
+`MP_TRANSCRIPT_MAX_CHARS = 2000`（超出保留**最后** 80 条 —— 面板要看的是当前进展）。
+
+采集范围限定 `.wSkVaW_viewArea`（取不到退回 `document`），按 selector 逐节点取文本。
+
+⚠️ **工具行的判据是 `[data-chat-flow-kind="tool-call"]`，不是 `[data-tool]`。**
+这一点踩过：`data-tool` 是 `dsh-client-ui-tool` 的标记，而本页面渲染工具行的是另一套，
+真机全文档 `[data-tool]` 命中数**恒为 0** —— 只认它的后果是「工具调用一条都采不到」，
+而其它条目都正常，所以很容易误判成"没有工具调用"而不是"选择器错了"。
+真实形状（CDP 读活会话）：
+
+```html
+<div data-chat-flow-kind="tool-call" data-turn-process-member="true"
+     data-turn-process-hidden="true" hidden="until-found">
+  <div class="ztWv_q_callRow">
+    <div class="CY-8Ka_card">
+      <div class="CY-8Ka_root" data-sample="bash" data-state="ok" data-expandable="true">
+        …「运行命令」+ 摘要「Echo TOOL_OK to test output」…
+```
+
+⚠️ **`data-sample`（工具名）与 `data-state` 长在内层 `[data-sample]` 节点上**，
+不在 `[data-chat-flow-kind]` 那个外层 div 上 —— 直接读外层会全空。
+`data-state` 取值 `ok` / `running`（后者映射成面板上的"运行中"）。
+
+⚠️ **工具行处在折叠态（`hidden="until-found"`）也要采**：`textContent` 对 hidden
+元素仍可读，而用户要的正是「展开面板能看到调了哪些工具」，折叠时恰恰最需要补这条。
+
+完整选择器（`MP_TRANSCRIPT_SELECTOR`）：
+
+```
+[data-chat-flow-kind="user"],
+[data-chat-flow-kind="steering"],
+[data-chat-flow-kind="assistant-step"],
+[data-chat-flow-kind="tool-call"],
+[data-chat-flow-kind="turn-error"],
+[data-tool]
+```
+
+⚠️ **`steering` 是用户在回合进行中追加的指令**，按用户消息显示（官方 chat.js 定义了这个
+kind，但默认视图里不出现，所以要显式列进选择器才采得到）。
+
+⚠️ **`turn-process` 与 `turn-tail` 刻意不采**：前者是「已完成，用时 9秒」那个折叠按钮
+（纯耗时摘要，不是对话内容），后者是「用量 13.3K tok / 01:15」的页脚。两者都不属于
+"微博里能看到的回复内容"，采进来只会让面板多两行噪音。
+
+原生侧 `ChatTranscript.parse()` **永不抛异常**（畸形 JSON 只是解析成
+空列表），畸形输入不能让悬浮球崩掉。
+
+⚠️ **取文本必须先剔除元数据子树**（`mpTranscriptVisibleText()`）：官方把时间戳与
+复制按钮放在同一条消息尾部，直接取 `textContent` 会得到
+`只回复两个字：通了01:14` —— 时间戳粘在用户原话后面，看起来像用户自己打的字。
+判据用 **`[data-clock]` 属性 + `button`/`svg` 标签**，不用哈希类名
+（`xzv4MW_actions` 这种会随官方发版变，属性不会）。取不到就退回原文
+（多带点噪音，不丢内容）。
+
+⚠️ 助手回复**收窄到 `.hWmORq_root`**：官方 `AssistantMarkdown` 对 tool-call 块是
+直接 `break` 跳过的（不渲染进 body），所以这里取到的是纯正文，不会把工具标题混进
+助手回复里。这个前提一旦变了（官方改成渲染进 body），助手条目就会掺进工具标题。
+
+#### 验收（真机，system flavor / CDPY-TN90 / Android 10）
+
+四条必改行为逐条实测通过：
+
+| 行为 | 判据 |
+|---|---|
+| 状态条 2 秒自隐 | 推状态后 0.7s 截图有横条，3.7s 截图已消失 |
+| 拖出屏幕贴边 | `adb shell input swipe` 拖出右边界 → 日志 `气泡已贴边折叠: side=1 x=1062 y=963`，窗口 `Requested w=18` |
+| 点贴边条弹回 | 日志 `气泡已从贴边态弹出: side=1 x=888 y=963`，随后 `expand()` 到面板态 |
+| 面板拖动 | 拖顶栏 → `mAttrs` 由 `(120,963)` 变 `(120,628)` |
+| 面板缩放 | 拖底手柄 → `Requested w=960 h=1062` → `623 x 1436`，落盘 `panel_w=623` / `transcript_h=867`；收起再展开仍是 `722 x 1384`（持久化生效） |
+| 插件改外观 | `bubbleApply({"shape":"rounded","size":64})` → 返回 `true`，日志 `插件下发悬浮球外观: ...` + `气泡已显示: (888, 963) shape=rounded size=64` |
+| 完整转录 | 面板里同时有用户消息、助手回复（含思考）、**工具调用行**，颜色/对齐正确 |
+| 工具调用行 | 真机发一条「用 bash 工具执行 echo TOOL_OK」→ 面板出现「工具调用 / 运行命令 Echo TOOL_OK to test output」。⚠️ 判据是 `[data-chat-flow-kind="tool-call"]`，`[data-tool]` 在本页面恒为 0（见上） |
+| 时间戳剔除 | 面板用户条目为 `只回复两个字：通了`（无 `01:14`） |
+
+gecko flavor 同样实测通过：`bubbleApply` 走 native messaging 生效（面板被插件改过的大小
+与配色在 gecko 包上原样重现），转录经桥到达原生 —— **这条只能走 native messaging，
+没有第二条路，所以它的通过本身就证明了 gecko 桥的三个新分支都是通的**。
+
+⚠️ **`input tap` 的 y 坐标要按 `mFrame` 算，不是 `mAttrs` 的 y**：实测 `mAttrs` 给
+`y=963`，而 `mFrame` 是 `[888,1071]` —— 差 108px（状态栏）。按 `mAttrs` 点会**点在球
+上方 108px 处**，表现为「点了没反应」，很容易误判成触摸逻辑坏了。取坐标一律用：
+
+```powershell
+adb shell dumpsys window windows | Select-String 'APPLICATION_OVERLAY|mFrame='
+```
+
+⚠️ gecko 包**没开 WebView 远程调试**（`dsh-bridge` 走的是 native messaging，
+`/proc/net/unix` 里只有 `gecko-crash-helper-pipe`），所以 gecko 侧不能靠 CDP 探针验证，
+只能靠**预置 `shared_prefs/dsh_bubble.xml` + 重启**观察行为。
+
+### ⑫.3 `bubble` 工具 —— 让**模型自己**改悬浮窗（补上可发现性那一段）
+
+⑫.2 那条链对**页面侧插件**是通的，但对**模型**是关着的：
+
+| 谁 | 能不能改悬浮窗 | 为什么 |
+|---|---|---|
+| 页面侧插件（`client.js`） | ✅ | 浏览器里直接摸到 `window.DSHAndroid` |
+| **模型（AI）** | ❌ | 它的工具跑在 **Node 进程**里，那里没有 `window` |
+
+所以「让 AI 改悬浮窗像改自己的 web 界面一样简单」在**可发现性**上是假的 ——
+模型既不知道有这个能力，也没有任何途径触达它。⑫.3 补的就是这一段：
+注册一个独立工具 `bubble`，并给它一条回原生的通道。
+
+```
+模型 ──调用 bubble 工具──> dsh-android-bubble（Node 插件，跑在引擎进程）
+                                │ 写 $DSH_HOME/bubble-cmd.json
+                                ↓
+                    BubbleCommandBridge（原生，250ms 轮询）
+                                ↓ FloatingBubble.applyAppearance()
+                                │ 写 $DSH_HOME/bubble-result.json
+                                ↑
+模型 <──工具返回──────────────┘
+```
+
+| 件 | 位置 |
+|---|---|
+| 插件源码 | `mobile-ui-plugin/dsh-android-bubble/` |
+| 打包产物 | `assets/bubble-tool.zip`（解到 `$DSH_HOME/bubble-tool/dsh-android-bubble/`） |
+| overlay | `$DSH_HOME/bubble-tool.patch.yml`（`ensureBubbleTool()` + `writeBubbleToolPatch()`） |
+| 原生通道 | `BubbleCommandBridge.kt`（`EngineManager.start()` 里 `BubbleCommandBridge.start(dshHome)`） |
+
+#### 为什么是文件信箱，不是 socket / Binder
+
+引擎 node 是 App 进程的**子进程**，同域、共享 app 私有目录，文件是最短的那条路。
+本项目已有同构先例（`adb-wireless-port`：Kotlin 写、Node 读），这里只是把方向反过来。
+不选 AF_UNIX 抽象命名空间：Android 的 app 域对命名管道的策略随版本变，
+而文件在两个方向上都已经验过。
+
+⚠️ **请求带自增 `id`，回执按 id 配对。** 没有它，「两个工具调用并发、后一个的回执
+被前一个读走」会让模型拿到张冠李戴的结果。缺 `id` 的请求原生侧**直接丢弃并删文件**
+（否则会卡住一个永远等不到答案的工具调用）。
+
+⚠️ **原生侧先写回执、再删请求文件。** 反过来的话插件会超时 —— 它区分不了
+「还没处理」与「回执丢了」。
+
+⚠️ **回执文件由插件在发命令前主动删掉**（不是写空对象）：写空对象会让「解析失败」
+与「还没处理」两种状态混在一起，只能靠 id 分辨，多一处出错的机会。
+
+⚠️ **超时不返回成功。** 原生侧可能只是慢（引擎刚启动、主线程正忙），但返回 `ok`
+会让模型以为改成功了。超时文案明确要求它用 `action:"get"` 复查。
+
+⚠️ **`avatarFile` 在插件侧读**，不把路径交给原生：原生按自己的沙箱跑、拿不到工作区
+路径，而插件与 `read` 工具同进程同权限。读取失败**明确报错**，不静默退回内置头像
+（那样用户会看到球变成默认头像却没有任何提示）。
+
+⚠️ **`DSH_HOME` 缺失/不存在时不注册工具。** 注册一个必然失败的工具比不注册更糟 ——
+模型会反复重试。
+
+#### 验收（真机，system flavor）
+
+| 步骤 | 判据 |
+|---|---|
+| 插件挂载 | `已安装悬浮球控制工具插件 dsh-android-bubble (15707 字节)` + `已写入悬浮球控制工具 overlay: bubble-tool.patch.yml` + 启动命令行里出现 `--patch .../bubble-tool.patch.yml` |
+| 信箱启动 | `悬浮球命令信箱已启动: /data/.../files/home/.dsh/bubble-cmd.json` |
+| 通道往返（不经模型） | 手写 `{"id":1,"action":"get"}` 落进 `bubble-cmd.json` → 回执含完整外观 JSON，且请求文件被删 |
+| 写入生效 | 手写 `{"id":2,"action":"set","fields":{"size":120,"shape":"square"}}` → 回执 `ok:true`，日志 `插件下发悬浮球外观: state=collapsed shape=square size=120`，`dumpsys` 的 `Requested w=360 h=360`（120dp × density 3.0） |
+| **模型端到端** | 在官方 composer 里发「用 bubble 工具把悬浮球改成圆形、金黄色底 #FFC107、大小 90」→ 落盘 `shape=circle` / `size=90` / `bg=#FFC107`，日志同款一行，窗口 `Requested w=270 h=270` |
+
+⚠️ 手写命令文件的坑：**PowerShell 里用 `adb shell "run-as ... sh -c 'printf ...'"` 转义
+嵌套引号会被 PS 解析器吃掉**。稳妥做法是先在 PC 落一个 `.json`（`-Encoding ascii`），
+`adb push` 到 `/sdcard`，再 `run-as cp` 进私有目录。
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
@@ -3012,7 +3527,7 @@ MutationObserver 保留作兜底 + 摘 `autocomplete="new-password"`。
 
 ⚠️ 改的是 `mobile-ui.zip` 内容 ⇒ **必须同时改两处版本戳**，否则老设备静默不更新：
 `EngineManager.MOBILE_UI_VERSION`（→ `1.0.0-49`）与
-`tools/build-webview-compat.ps1` 的 `-CompatVersion`（→ `6`，并重跑脚本）。
+`tools/build-webview-compat.ps1` 的 `-CompatVersion`（→ `9`，并重跑脚本）。
 降级产物会**覆盖**源文件，这是「改了没生效」最常见的陷阱（见 ⑯）。
 
 ## 调试真机

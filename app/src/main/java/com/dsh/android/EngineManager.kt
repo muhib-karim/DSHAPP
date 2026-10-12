@@ -383,6 +383,14 @@ class EngineManager private constructor(private val context: Context) {
      *    新纳入的那部分**永远不生效**（静默，最难查的那种）。
      */
     private fun ensureWebViewCompat() {
+        // 内置内核版整个跳过：这一整套的存在理由是「设备上的系统 WebView 太旧」，
+        // 而内置内核的版本在编译期就定了（GeckoView 140），永远不可能过旧。
+        // 跑了反而有害 —— 前端会被换成按 chrome74 降级、砍掉语法糖的版本。
+        if (BuildConfig.BUILT_IN_WEB_ENGINE) {
+            Log.i(TAG, "内置 Web 内核版：不需要 WebView 降级前端，跳过")
+            return
+        }
+
         val dist = File(engineDir, "node_modules/@deepseek-ai/dsh-web-frontend/dist")
         if (!dist.isDirectory) {
             Log.w(TAG, "引擎尚未解包，跳过 WebView 降级资产")
@@ -2875,6 +2883,80 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出悬浮球控制工具插件（`bubble-tool.zip` → `$DSH_HOME/bubble-tool/dsh-android-bubble/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `bubble` 的**独立工具**，模型可以据此
+     * 改悬浮窗的状态、大小、形状、配色、面板与头像 —— 也就是把原先只有**页面侧**
+     * 插件够得着的那条能力，接到模型的工具列表里。
+     *
+     * ⚠️ **为什么解到 `$DSH_HOME/bubble-tool/` 而不是 profile 的 `node_modules`**：
+     * 与 [ensureMobileUi] / [ensurePrivilegedPlugin] 同一个坑 —— 那个目录归 pnpm 管，
+     * 而本包不在 profile 的 `dependencies` 里，用户每装一次插件就会被挪进
+     * `node_modules/.ignored/`。
+     *
+     * 与 `shell-tool` 一样**不做版本戳**：包很小（单文件），每次启动覆盖写。
+     */
+    private fun ensureBubbleTool() {
+        val target = File(dshHome, "$BUBBLE_TOOL_DIR/$BUBBLE_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(BUBBLE_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装悬浮球控制工具插件 $BUBBLE_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 bubble 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装悬浮球控制工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载悬浮球控制工具的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writePrivilegedPatch] / [writeRootPatch] 同构。**没有「能力探测」这一步**：
+     * 悬浮球不需要任何特权（用户开了开关并授权悬浮窗就够），所以只要文件在就挂载 ——
+     * 真正能不能显示由 `FloatingBubble` 自己在运行时判断，工具照常返回它读到的状态。
+     */
+    private fun writeBubbleToolPatch(): File? {
+        val patch = File(dshHome, BUBBLE_TOOL_PATCH)
+        val entry = File(dshHome, "$BUBBLE_TOOL_DIR/$BUBBLE_TOOL_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "悬浮球控制工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载悬浮球控制工具插件：注册一个独立的 `bubble` 工具，
+                # 让模型能改悬浮窗的状态/大小/形状/配色/头像。
+                - insert:
+                    - id: $BUBBLE_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入悬浮球控制工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入悬浮球控制工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出无线调试用的 adb 工具链（`adb-wireless-arm64.zip` → `filesDir/adbwire/`）。
      *
      * ## 为什么需要一个 adb 二进制
@@ -3843,6 +3925,15 @@ class EngineManager private constructor(private val context: Context) {
         ensurePrivilegedPlugin()
         val privPatch = writePrivilegedPatch(privRunner != null)
         shellToolMounted = privPatch != null
+        // 悬浮球控制工具：把「改悬浮窗」接到模型的工具列表里。
+        // ⚠️ 必须早于引擎启动（overlay 要在 profile 解析前落盘），且**与特权无关**——
+        //   悬浮球不需要任何身份，只要求用户开过开关并授权过悬浮窗。
+        ensureBubbleTool()
+        val bubblePatch = writeBubbleToolPatch()
+        // 悬浮球命令信箱：`bubble` 工具把命令写进 `$DSH_HOME/bubble-cmd.json`，
+        // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
+        // 信箱还没人守，命令会一直等不到回执。
+        BubbleCommandBridge.start(dshHome)
         // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」。
         // ⚠️ 判据用**挂载结果**（`privPatch != null`）而不是 `privRunner != null`：
         //   前者才是「`shell` 工具真的注册了」。见 ensurePrivilegedPrompt 的 @param。
@@ -3913,6 +4004,10 @@ class EngineManager private constructor(private val context: Context) {
             // root 特权工具：同样是 overlay，注册成独立的 `root` 工具
             if (rootPatch != null) {
                 add("--patch"); add(rootPatch.absolutePath)
+            }
+            // 悬浮球控制工具：同样是 overlay，注册成独立的 `bubble` 工具
+            if (bubblePatch != null) {
+                add("--patch"); add(bubblePatch.absolutePath)
             }
             // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
             // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
@@ -4808,8 +4903,16 @@ class EngineManager private constructor(private val context: Context) {
          *      的连接重算**（实测 blur+focus 也刷不动）。本版改为在
          *      `HTMLInputElement.prototype` 层拦截 `type=password`，让 DOM 里
          *      从头到尾没出现过 password。真机实测 inputType 0xe1 → 0x80a1。
+         * −54：悬浮球转录改为**近流式**并把思考与正文分开。两处改动：
+         *      ① `mpScheduleTranscript` 节流 1500ms → 250ms（1.5s 会把整段回复
+         *         攒成两三坨跳出来，观感就是"没有流式、一次全出"）；
+         *      ② `mpCollectTranscript` 按 `data-chat-group-part` 把 `reasoning`
+         *         节点发成独立的 `reasoning` 角色（原来与 `response` 都发成
+         *         `assistant`，面板上两条标签样式全一样 ⇒ 看着就是"糊在一起"）。
+         *      ⚠️ 必须同时 bump `tools/build-webview-compat.ps1 -CompatVersion`，
+         *      否则设备上那棵降级过的 mobile-ui 树不会被覆盖（见 ⑯）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-50"
+        private const val MOBILE_UI_VERSION = "1.0.0-54"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -4954,6 +5057,25 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 与 [SHELL_TOOL_DIR] 同理，刻意在 pnpm 管辖之外。 */
         private const val ROOT_TOOL_DIR = "root-tool"
+
+        // ── 悬浮球控制工具 ───────────────────────────────────────────
+        //
+        // 与 shell / root 那两个**同一套做法**（独立工具 + 刻意在 pnpm 管辖之外），
+        // 差别只在能力本身：那两个给的是别的身份，这个给的是**改悬浮窗**。
+        //
+        // 为什么需要它：悬浮球的外观接口只有**页面侧**插件够得着
+        // （`window.DSHAndroid.bubbleApply()`），而模型跑在 Node 进程里，那里没有
+        // `window` —— 于是「让 AI 改悬浮窗」在可发现性上是空的。这个插件把同一条
+        // 能力注册成一个 `bubble` 工具，并靠 [BubbleCommandBridge] 的文件信箱
+        // 把命令送回原生。详见 `mobile-ui-plugin/dsh-android-bubble/lib/index.js`。
+
+        /** 注册 `bubble` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val BUBBLE_TOOL_ASSET = "bubble-tool.zip"
+        private const val BUBBLE_TOOL_PACKAGE = "dsh-android-bubble"
+        private const val BUBBLE_TOOL_PATCH = "bubble-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
+        private const val BUBBLE_TOOL_DIR = "bubble-tool"
 
         /**
          * 无线调试（Android 11+）用的 adb 工具链。

@@ -1,0 +1,732 @@
+package com.dsh.android.web
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Color
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Base64
+import android.util.Log
+import android.view.View
+import com.dsh.android.DshApplication
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.File
+import java.io.OutputStream
+import org.json.JSONArray
+import org.json.JSONObject
+import org.mozilla.geckoview.AllowOrDeny
+import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoRuntime
+import org.mozilla.geckoview.GeckoRuntimeSettings
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoSessionSettings
+import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebExtension
+
+/**
+ * `gecko` flavor：用**内置**的 GeckoView 承载界面，不依赖设备上的系统 WebView。
+ *
+ * ## 它解决了什么
+ *
+ * system 版把界面的渲染完全押在设备的系统 WebView 上，于是有两个绕不开的后果：
+ *
+ * 1. **旧内核白屏**：官方前端用了 Chromium 94 的 `class static block`，内核 83
+ *    这类设备在**解析阶段**就失败，整份 chunk 一行都不执行 ⇒ 一片白屏。
+ *    现在的对策是把 bundle 按 chrome74 降级重编（见 AGENTS.md ⑯），代价是
+ *    `:is()` / `:where()` / `:has()` / `color-mix()` / `dvh` 这些**CSS** 在旧内核上
+ *    是未知语法、整条规则被丢弃 ⇒ 「能打开但界面乱」。
+ * 2. **用户没得选**：内核版本由设备/ROM 决定，App 无法升级它。
+ *
+ * 内置 GeckoView 后这两条都不存在：内核随 APK 分发，版本确定（见 [engineMajor]），
+ * 前端跑的是**未降级**的官方 bundle，CSS 也不用降级。
+ *
+ * ## 代价（必须知情）
+ *
+ * `libxul.so` 单文件 136.8 MB，APK 从 138 MB 涨到 **222.9 MB**。这是 Gecko 引擎
+ * 的固有体积，没有裁剪余地（能裁的话就不是「官方预编译产物」了）。
+ *
+ * ## 三个结构性差异（与 system 版对比）
+ *
+ * | | system | gecko |
+ * |---|---|---|
+ * | JS 执行 | `evaluateJavascript(js, cb)` | **无等价 API** ⇒ 走扩展，见 [evaluateJavascript] |
+ * | 原生桥 | `addJavascriptInterface`（同步） | native messaging（异步）⇒ 见 [com.dsh.android.web.PageBridge] |
+ * | 首帧 | `postVisualStateCallback` | `ContentDelegate.onFirstComposite` |
+ * | 控制台 | `WebChromeClient.onConsoleMessage` | **无回调** ⇒ content script 里包 console |
+ * | 下载 | `setDownloadListener` | **无回调** ⇒ content script 里包 `HTMLAnchorElement.click` |
+ * | 文件选择 | `onShowFileChooser` | `PromptDelegate.onFilePrompt` |
+ */
+@SuppressLint("SetJavaScriptEnabled")
+class GeckoWebHost(
+    private val context: Context,
+    private val callbacks: WebHostCallbacks,
+) : WebHost {
+
+    private val geckoView = GeckoView(context)
+    private val session = GeckoSession()
+
+    /**
+     * 进程级 Gecko Runtime（Gecko 的主进程连接、WebExtension 控制器都挂在它上面）。
+     *
+     * ⚠️ **必须是进程级单例**：`GeckoRuntime.create()` 每次都新建一个，而 Activity
+     *   重建（转屏、深浅色切换）会重跑本类的 init —— 不共用的话每转一次屏就泄漏
+     *   一个 runtime 及其整个内容进程。`getDefault()` 在首次 create 之后就返回同一实例。
+     */
+    private val runtime: GeckoRuntime =
+        GeckoRuntime.getDefault(context) ?: createRuntime(context)
+
+    /** 最近一次发起加载的 URL（见 [WebHost.currentUrl] 的语义说明）。 */
+    private var lastLoadedUrl: String? = null
+
+    /** 是否已经提交过首帧（见 [awaitFirstFrame]）。 */
+    private var painted = false
+
+    /** 已等在首帧上的动作。 */
+    private var pendingPaintAction: (() -> Unit)? = null
+
+    /** 原生 → 扩展 的端口；扩展握手成功后才有值。 */
+    private var port: WebExtension.Port? = null
+
+    /** 已经发出、还没收到结果的 eval 请求：id → 回调。 */
+    private val pendingEvals = mutableMapOf<Long, (String?) -> Unit>()
+
+    /** eval 请求号，单调递增。 */
+    private var nextEvalId = 1L
+
+    /** 等待扩展握手的动作（端口没通之前发消息会丢，必须排队）。 */
+    private val pendingUntilReady = ArrayDeque<() -> Unit>()
+
+    override val view: View get() = geckoView
+
+    override val currentUrl: String? get() = lastLoadedUrl
+
+    /**
+     * 内核主版本号。
+     *
+     * ⚠️ **与 system 版的语义不同**：那里读的是设备上装了什么内核（可能 83），
+     *   这里读的是**打进 APK 的 GeckoView 版本**（编译期确定，实测 140）。
+     *   所以 gecko 版永远不可能「内核过旧」—— 宿主里的版本拦截分支不会触发，
+     *   这是刻意的（见 `MainActivity.observeEngine`）。
+     */
+    override val engineMajor: Int = GECKO_MAJOR
+
+    override val engineLabel: String = "GeckoView $GECKO_VERSION（内置）"
+
+    init {
+        geckoView.setBackgroundColor(Color.parseColor("#0F1115"))
+
+        session.settings.apply {
+            setAllowJavascript(true)
+            setUserAgentMode(GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
+            setSuspendMediaWhenInactive(true)
+        }
+
+        // 本地引擎的 URL 是 http://127.0.0.1，不是 https。
+        //
+        // ⚠️ 这个开关在 **Runtime** 上而不是 session 上（`GeckoSessionSettings` 里
+        //   根本没有它 —— 写了会 Unresolved reference）。之所以不只在
+        //   [createRuntime] 的 builder 里设：`getDefault()` 命中的是**已存在**的
+        //   runtime，它的 builder 早就跑完了，只有在这里改 pref 才生效。
+        runtime.settings.setAllowInsecureConnections(GeckoRuntimeSettings.ALLOW_ALL)
+
+        session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                // ⚠️ 与 system 版的 `onPageFinished` 对齐：只在**成功**时上报。
+                //   失败时页面上什么都不会有，上报「DOM 就绪」会把启动层引向
+                //   错误的方向（它之后会等 onUiReady，而那个永远不来）。
+                //
+                // ⚠️ 回调签名里没有 URL 参数（WebView 的 onPageFinished 有），
+                //   用 [lastLoadedUrl] —— 本 App 只加载一个地址，且它就是
+                //   `observeEngine` 里刚设过的那个。
+                if (success) callbacks.onPageFinished(lastLoadedUrl.orEmpty())
+            }
+        }
+
+        session.contentDelegate = object : GeckoSession.ContentDelegate {
+            /**
+             * 首帧提交 —— 与 WebView 的 `postVisualStateCallback` 同一个语义，
+             * 也是「像素真的可以显示了」的唯一可靠信号。
+             *
+             * ⚠️ 启动层必须等它才收起：DOM 就绪到像素上屏之间有约 1.6 秒落差
+             *   （system 版真机实测），提前收会让用户看到闪白。
+             */
+            override fun onFirstComposite(session: GeckoSession) {
+                if (painted) return
+                painted = true
+                val action = pendingPaintAction
+                pendingPaintAction = null
+                action?.invoke()
+            }
+
+            /** 关窗请求：本 App 单页，直接忽略（不要让内核把会话关掉）。 */
+            override fun onCloseRequest(session: GeckoSession) = Unit
+        }
+
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            /**
+             * 外链交给系统浏览器。
+             *
+             * ⚠️ 与 system 版 `shouldOverrideUrlLoading` 的策略一致：只有本地引擎
+             *   的 URL 留在内核里。
+             *
+             * ⚠️ 返回类型是 `GeckoResult<AllowOrDeny>` —— **不是** LoadRequest。
+             *   `null` 表示「不接管，按默认放行」；拦下来要显式回
+             *   `AllowOrDeny.DENY`（回 ALLOW 与回 null 等效）。
+             *   注意 `LoadRequest` 上没有 `dispose()`，也不该在回调里改它。
+             */
+            override fun onLoadRequest(
+                session: GeckoSession,
+                request: GeckoSession.NavigationDelegate.LoadRequest,
+            ): GeckoResult<AllowOrDeny>? {
+                val url = request.uri
+                if (url.startsWith(LOCAL_ENGINE_PREFIX) || url.startsWith("about:")) return null
+                callbacks.onExternalUrl(url)
+                // 已交给系统浏览器，内核这边必须拒绝这次导航，
+                // 否则页面会被替换成外链（然后就再也回不来了）。
+                return GeckoResult.deny()
+            }
+        }
+
+        /**
+         * 文件选择。
+         *
+         * ⚠️ 与 system 版 `onShowFileChooser` 是**同一个缺口**：不实现它，页面里
+         *   点「+」→「文件」静默无反应。
+         * ⚠️ 必须回 `null` 表示取消，**不能**回空数组 —— 空数组会被页面解读成
+         *   「选了 0 个文件」并触发一次空提交。
+         *
+         * ## ⚠️⚠️ 必须返回一个**未完成**的 `GeckoResult`（这里踩过一次）
+         *
+         * `PromptDelegate` 的契约是「返回 `GeckoResult<PromptResponse>`，异步里
+         * `complete` 它」。**返回 `null` 不是"稍后再说"，而是"本 delegate 不处理
+         * 这个 prompt"** —— GeckoView 随即按默认行为把 prompt 收尾（对文件选择就是
+         * 取消），此后 `prompt.confirm(...)` 生成的 `PromptResponse` **再也送不回
+         * Gecko**（`isComplete()` 已是 true，且没有任何通道）。
+         *
+         * 症状极具迷惑性：**系统选择器照常弹出**（那是我们自己 `launch` 的
+         * Intent，与 prompt 无关），用户也能正常选中文件，但选中后文件永远进不了
+         * 页面 —— 没有任何报错，日志也干净。第一版就是这么写的。
+         *
+         * ## ⚠️⚠️ `confirm()` **只吃 `file://`**，`content://` 必须自己落盘
+         *
+         * 这是第二处坑，比第一处隐蔽得多。`FilePrompt.confirm(Context, Uri[])` 内部
+         * 对每个 URI 调 `getFile()`，而它**只认 `file://`**；拿到 `content://` 就
+         * 返回 null，只在 Gecko 侧的日志里留一行 WARN：
+         *
+         * ```
+         * W GeckoViewFilePickerDelegate: Error resolving files from file picker:
+         *   [Exception... "File error: Unrecognized path"
+         *    nsresult: "0x80520001 (NS_ERROR_FILE_UNRECOGNIZED_PATH)"
+         *    location: "JS frame :: resource://gre/modules/FilePickerDelegate.sys.mjs"
+         * ```
+         *
+         * 而 `ACTION_GET_CONTENT` 回的**恰恰就是** `content://`
+         * （`content://com.android.providers.media.documents/document/image%3A888`）。
+         *
+         * ⚠️ 这是 GeckoView 的**已知未实现项**，不是我们用错了：WebView/Chromium 会
+         *   走 `ContentResolver.openFileDescriptor` 读 content URI，GeckoView 的
+         *   file picker 这条路**没有**做（Mozilla bug 1591640 / 1875732）。它对
+         *   `content://` 的支持只加在**导航与 PDF** 上（content 协议处理器），
+         *   文件选择器这条路径没被覆盖。
+         *
+         * 所以这里自己把内容复制进 `cacheDir` 再用 `file://` 交回去。`cacheDir`
+         * 是 app 私有目录，Gecko 内容进程读得到（同 uid）。
+         */
+        session.promptDelegate = object : GeckoSession.PromptDelegate {
+            override fun onFilePrompt(
+                session: GeckoSession,
+                prompt: GeckoSession.PromptDelegate.FilePrompt,
+            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                Log.i(DshApplication.TAG, "文件选择请求（type=${prompt.type}，多选=${prompt.type == FILE_PROMPT_MULTIPLE}）")
+                // ⚠️ 挂起返回：prompt 一直等这个 result，直到用户选完或取消。
+                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                callbacks.fileChooser.launch(prompt.type == FILE_PROMPT_MULTIPLE) { uris ->
+                    try {
+                        if (uris == null || uris.isEmpty()) {
+                            Log.i(DshApplication.TAG, "文件选择已取消")
+                            result.complete(prompt.dismiss())
+                        } else {
+                            // ⚠️ 复制是 IO，必须离开主线程：`fileChooser.launch` 的
+                            //   回调在主线程（Activity result），复制大图会 ANR。
+                            // ⚠️ 写成 `Thread({ ... }, "name")` 而不是 `Thread { ... }`：
+                            //   Kotlin 的尾随 lambda 语法会把 `Thread { }` 当成整个调用，
+                            //   后面的 `, "name"` 就成了语法错误（编译实测）。
+                            Thread({
+                                val local = uris.mapNotNull { toLocalFile(it) }
+                                geckoView.post {
+                                    try {
+                                        if (local.isEmpty()) {
+                                            // 一个都没复制成功 ⇒ 当取消处理。回空数组会被
+                                            // 页面解读成「选了 0 个文件」并触发空提交。
+                                            Log.w(DshApplication.TAG, "文件选择：全部复制失败，按取消处理")
+                                            result.complete(prompt.dismiss())
+                                            return@post
+                                        }
+                                        Log.i(DshApplication.TAG, "文件选择完成：${local.size} 个（已落盘到本地）")
+                                        result.complete(prompt.confirm(context, local.toTypedArray()))
+                                    } catch (t: Throwable) {
+                                        Log.e(DshApplication.TAG, "文件选择结果回传失败", t)
+                                        runCatching { result.completeExceptionally(t) }
+                                    }
+                                }
+                            }, "dsh-file-picker-copy").start()
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(DshApplication.TAG, "文件选择结果回传失败", t)
+                        runCatching { result.completeExceptionally(t) }
+                    }
+                }
+                return result
+            }
+        }
+
+        session.open(runtime)
+        geckoView.setSession(session)
+
+        installBridgeExtension()
+    }
+
+    /**
+     * 把选择器回传的 URI 变成 Gecko 认得的 `file://` 文件。
+     *
+     * ⚠️ **必须这么做**：`FilePrompt.confirm()` 内部的 `getFile()` 只支持 `file://`，
+     *   而 `ACTION_GET_CONTENT` 回的是 `content://`。详见 [onFilePrompt] 的说明。
+     *
+     * 返回值约定：`null` = 这个文件没法用（调用方据此决定是否整体按取消处理）。
+     *
+     * ⚠️ 复制到 `cacheDir` 而不是 `filesDir`：这些是**一次性的上传中转文件**，
+     *   放缓存目录才能让系统在空间不足时回收，也不必自己管清理。文件名保留原扩展名
+     *   （页面与引擎都会按扩展名判类型），前缀加随机串避免同名覆盖。
+     *
+     * ⚠️ 不能把 `content://` 直接拼成 `file://` —— 那不是"转换"，只是换个 scheme，
+     *   Gecko 依然打不开（DocumentsProvider 背后根本没有对应的路径）。
+     */
+    private fun toLocalFile(uri: Uri): Uri? {
+        return try {
+            // file:// 原样放行（部分选择器会回 file URI）。
+            if (uri.scheme == "file") return uri
+
+            val name = displayName(uri) ?: "picked"
+            val dir = File(context.cacheDir, FILE_PICKER_DIR).apply { mkdirs() }
+            val target = File(dir, "${System.currentTimeMillis()}-${name.hashCode().toString(16)}-$name")
+
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            } ?: run {
+                Log.w(DshApplication.TAG, "打不开所选文件的输入流: $uri")
+                return null
+            }
+            Log.i(DshApplication.TAG, "所选文件已落盘: ${target.name}（${target.length()} 字节，源 $uri）")
+            Uri.fromFile(target)
+        } catch (t: Throwable) {
+            // 单个文件失败不该把整次选择作废（多选时其余仍可用）。
+            Log.w(DshApplication.TAG, "复制所选文件失败: $uri", t)
+            null
+        }
+    }
+
+    /** 取 URI 的显示名（用于给临时文件保留扩展名）。 */
+    private fun displayName(uri: Uri): String? {
+        return try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+                // ⚠️ 显示名可能含路径分隔符（恶意或异常的 provider），只取最后一段。
+                ?.substringAfterLast('/')
+                ?.takeIf { it.isNotBlank() }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 正在接收的下载：页面世界 fetch 完，经桥分块传回来。
+     *
+     * ⚠️ 为什么不在原生侧发起请求：见 content.js 的说明（宿主拿不到 cookie ⇒ 401；
+     *   内核导航 ⇒ 真机 403 且错误页覆盖界面）。页面世界 fetch 与 GUI 平时调
+     *   「/api/」完全同源，是唯一必然通过准入检查的通路。
+     *
+     * ⚠️ 分块是必须的：native messaging 只能传 JSON，二进制走 base64。
+     */
+    private class IncomingDownload(val url: String, val filename: String) : Closeable {
+        val sink: OutputStream = ByteArrayOutputStream()
+        override fun close() {
+            (sink as? ByteArrayOutputStream)?.close()
+        }
+    }
+
+    private var incomingDownload: IncomingDownload? = null
+
+    /**
+     * 收一次分块，返回是否全部收完。
+     *
+     * ⚠️ 落盘交给宿主（`callbacks.onDownloadStream`）：`DownloadStream.body` 是
+     *   `InputStream`，宿主在 IO 线程读它并写文件，内核这边不碰文件系统。
+     */
+    private fun appendDownloadChunk(base64: String) {
+        val dl = incomingDownload
+        if (dl == null) {
+            Log.w(DshApplication.TAG, "收到下载分块但没有进行中的下载，已丢弃")
+            return
+        }
+        val bytes = try {
+            Base64.decode(base64, Base64.DEFAULT)
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "下载分块 base64 解码失败", t)
+            return
+        }
+        dl.sink.write(bytes)
+    }
+
+    /** 从 URL 末段猜文件名（页面没给 `download` 属性时的兜底）。 */
+    private fun urlFilename(url: String): String {
+        // ⚠️ URL 末段可能带 query（`?sessionId=...&includeDescendants=true`），
+        //   直接 substringAfterLast('/') 会把 query 一起吃进文件名。
+        val path = url.substringBefore('?').substringBefore('#')
+        return path.substringAfterLast('/').takeIf { it.isNotBlank() } ?: "dsh-download"
+    }
+
+    /** 下载收尾：把攒好的字节交给宿主落盘。 */
+    private fun finishDownload() {
+        val dl = incomingDownload ?: return
+        incomingDownload = null
+        val body = ByteArrayInputStream((dl.sink as ByteArrayOutputStream).toByteArray())
+        callbacks.onDownloadStream(
+            DownloadStream(url = dl.url, filename = dl.filename, body = body)
+        )
+    }
+
+    /**
+     * 装桥扩展。
+     *
+     * ⚠️ 必须用 `session.webExtensionController.setMessageDelegate(...)`
+     *   而不是 `extension.setMessageDelegate(...)`：**content script 发出的消息
+     *   只认前者**（后者只接 background 的消息）。这是 mozilla/geckoview#220
+     *   里官方给的绕法，写错了表现为「content script 的消息永远收不到」。
+     */
+    private fun installBridgeExtension() {
+        runtime.webExtensionController
+            .ensureBuiltIn(EXTENSION_LOCATION, EXTENSION_ID)
+            .accept(
+                { extension ->
+                    // ⚠️ `ensureBuiltIn` 的成功回调参数在 Java 侧是 `WebExtension`，
+                    //   但 Kotlin 按平台类型推断成可空 —— 真到这一步它一定非空，
+                    //   拿不到就只能算失败，别硬传 null 进去（会 NPE 在 Gecko 内部）。
+                    if (extension == null) {
+                        Log.e(DshApplication.TAG, "GeckoView 桥扩展返回空引用")
+                        return@accept
+                    }
+                    session.webExtensionController.setMessageDelegate(extension, messageDelegate, NATIVE_APP)
+                    Log.i(DshApplication.TAG, "GeckoView 桥扩展已安装: ${extension.metaData?.version}")
+                    // ⚠️ 这里**不能**把 pendingUntilReady 放出去：委托挂上只代表
+                    //   「原生能收消息了」，端口要等 content script 页面加载后自己
+                    //   connectNative 才会来（见 onConnect）。这里只记录日志。
+                    Log.i(DshApplication.TAG, "GeckoView 桥等待 content script 连接…")
+                },
+                { error ->
+                    // 扩展装不上 ⇒ 桥不存在 ⇒ 页面侧全部走「无桥」降级分支。
+                    // 这是**功能性**失败而不是致命失败：界面能开，但设置页里的
+                    // 气泡/root/无线调试三块不可用。必须明确记日志。
+                    Log.e(DshApplication.TAG, "GeckoView 桥扩展安装失败", error)
+                },
+            )
+    }
+
+    /** 端口就绪后，把排队等端口的动作放出去。 */
+    private fun flushPendingUntilReady() {
+        val queued = pendingUntilReady.toList()
+        pendingUntilReady.clear()
+        queued.forEach { it() }
+    }
+
+    /**
+     * 原生 ↔ 扩展 的消息通道。
+     *
+     * ⚠️ **content script 直连原生**（不是经 background 中转）：GeckoView 没有实现
+     *   `browser.tabs`，background 无法把消息发回 content script，而「原生 → 页面」
+     *   的两个方向（推快照、[evaluateJavascript]）恰恰都要走那条路。所以
+     *   content script 自己 `connectNative`，原生侧用
+     *   `session.webExtensionController.setMessageDelegate` 接 —— **不能**用
+     *   `extension.setMessageDelegate`，后者只接 background 的消息
+     *   （mozilla/geckoview#220）。
+     *
+     * 消息类型（与 `assets/dsh-bridge/content.js` 一一对应）：
+     * - `hello`       content script 报到（收到它才把首份快照推过去）
+     * - `invoke`      页面动作 → 原生（[PageBridge] 的 16 个方法）
+     * - `evalResult`  页面执行完 JS 的结果
+     */
+    private val messageDelegate = object : WebExtension.MessageDelegate {
+        override fun onConnect(connectedPort: WebExtension.Port) {
+            // ⚠️ 端口可能被**换掉**（页面刷新、扩展重载都会重连）：这里直接覆盖，
+            //   旧端口的 onDisconnect 里再判断"是不是当前那个"。
+            port = connectedPort
+            connectedPort.setDelegate(object : WebExtension.PortDelegate {
+                override fun onPortMessage(message: Any, p: WebExtension.Port) {
+                    handleExtensionMessage(message)
+                }
+
+                override fun onDisconnect(p: WebExtension.Port) {
+                    if (port === p) port = null
+                    Log.w(DshApplication.TAG, "GeckoView 桥端口已断开，等待扩展重连")
+                }
+            })
+            Log.i(DshApplication.TAG, "GeckoView 桥端口已建立")
+            // ⚠️ 立刻推一次快照：content script 是**先**装桥**再** connectNative 的，
+            //   它 connect 之前页面侧读到的还是初始空值。这里推一份让页面尽快拿到真值。
+            pushSnapshot()
+            // 端口通了，把之前排队等端口的动作放出去（`evaluateJavascript` 在页面
+            // 加载完成前被调用时会排在这里）。
+            flushPendingUntilReady()
+        }
+    }
+
+    /** 处理扩展发来的消息。 */
+    private fun handleExtensionMessage(message: Any) {
+        val json = message as? JSONObject ?: return
+        when (json.optString("type")) {
+            "hello" -> {
+                // content script 报到：把快照推过去，页面随后的同步读取才有值。
+                Log.i(DshApplication.TAG, "GeckoView 桥已握手（content script 报到）")
+                pushSnapshot()
+            }
+            "invoke" -> {
+                val call = json.optString("call")
+                val args = json.optJSONArray("args") ?: JSONArray()
+                dispatchInvoke(call, args)
+            }
+            "evalResult" -> {
+                val id = json.optLong("id", -1L)
+                val result = if (json.isNull("result")) null else json.optString("result", "null")
+                pendingEvals.remove(id)?.invoke(result)
+            }
+            "log" -> {
+                // ⚠️ content script 的 console **不进 logcat**（见 content.js 的 log()），
+                //   所以它把诊断经端口回传，由原生代打。没有这条通道，「桥没装上」
+                //   这类功能性失败在日志里是完全静默的。
+                Log.i(DshApplication.TAG, json.optString("text"))
+            }
+        }
+    }
+
+    /**
+     * 把页面动作派发给 [PageBridge]。
+     *
+     * ⚠️ 全部切到主线程执行：这些动作会碰 View、发通知、读写 SharedPreferences，
+     *   而 `onPortMessage` 跑在 Gecko 的线程上。切线程也顺带避免了「JS 线程被
+     *   阻塞」这类在 system 版里必须小心处理的问题。
+     */
+    private fun dispatchInvoke(call: String, args: JSONArray) {
+        val b = callbacks.bridge
+        geckoView.post {
+            try {
+                when (call) {
+                    "onStatus" -> b.onStatus(args.optString(0))
+                    "onImeWillShow" -> b.onImeWillShow()
+                    "startWirelessPairing" -> b.startWirelessPairing()
+                    "cancelWirelessPairing" -> b.cancelWirelessPairing()
+                    "onUiReady" -> b.onUiReady()
+                    "reportWebError" -> b.reportWebError(args.optString(0))
+                    "switchToTcpMode" -> b.switchToTcpMode()
+                    "bubbleSetEnabled" -> b.bubbleSetEnabled(args.optBoolean(0))
+                    "bubbleRequestOverlay" -> b.bubbleRequestOverlay()
+                    "rootRecheck" -> b.rootRecheck()
+                    // 会话转录：与 onStatus 同一条路，只是体量大得多（见 ChatTranscript）。
+                    "onTranscript" -> b.onTranscript(args.optString(0))
+                    // 插件下发悬浮球外观。**改完必须重推快照** —— 页面侧读的是
+                    // 缓存（native messaging 只能异步），不重推的话插件调完
+                    // bubbleApply 再读 bubbleAppearance 会拿到旧值。
+                    "bubbleApply" -> {
+                        b.bubbleApply(args.optString(0))
+                        pushSnapshot()
+                    }
+                    // 页面侧不会主动调这两个（它们走快照推送），但留个兜底：
+                    // 收到就当「页面想要最新值」，推一次快照。
+                    "bubbleState", "bubbleAppearance", "rootState" -> pushSnapshot()
+                    // console / download 是 content script 自己发起的，见下。
+                    "console" -> callbacks.onConsole(args.optString(0))
+                    // 下载：页面世界 fetch → base64 分块 → 这里攒起来 → 宿主落盘。
+                    //
+                    // ⚠️ **不要**在这条路上用 GeckoSession.Loader 起导航：真机实测
+                    //   引擎的准入检查会回 403，而**任何非 attachment 的响应都会被
+                    //   内核当主文档渲染**，一次失败就把整个 GUI 顶掉。页面世界
+                    //   fetch 与 GUI 平时调 API 同源同头，是唯一稳的通路。
+                    //
+                    // ⚠️ 每条分块都带 url 与文件名，**不依赖单独的「开始」消息**：
+                    //   那条开场消息被内核的 messaging 校验拒过一次（logcat 只有
+                    //   Invalid event data property args），结果是分块到了却没有
+                    //   进行中的下载、整批被丢弃。元信息随第一条分块到达，
+                    //   这条链路就没有「必须先收到某条消息」的隐含依赖。
+                    "downloadChunk" -> {
+                        if (incomingDownload == null) {
+                            val url = args.optString(1)
+                            val name = args.optString(2).takeIf { it.isNotBlank() }
+                                ?: urlFilename(url)
+                            incomingDownload = IncomingDownload(url, name)
+                            Log.i(DshApplication.TAG, "收到下载开始: $name ($url)")
+                        }
+                        appendDownloadChunk(args.optString(0))
+                    }
+                    "downloadEnd" -> finishDownload()
+                    "downloadError" -> {
+                        // 页面侧拿不到数据（401/403/网络）。必须明确记日志：
+                        // 这条路径失败了页面什么都不会显示，不记就完全无痕。
+                        Log.w(DshApplication.TAG, "下载失败: ${args.optString(0)} —— ${args.optString(1)}")
+                        incomingDownload?.close()
+                        incomingDownload = null
+                    }
+                    else -> Log.w(DshApplication.TAG, "未知的桥调用: $call")
+                }
+            } catch (t: Throwable) {
+                // ⚠️ 桥的异常绝不能冒泡到 Gecko 的消息循环：那会让端口断掉，
+                //   页面侧此后全部走「无桥」分支。
+                Log.w(DshApplication.TAG, "处理桥调用 $call 失败", t)
+            }
+        }
+    }
+
+    /**
+     * 把只读快照推给页面。
+     *
+     * 这是页面侧**同步**读取（`bridge.rootState()`）的基石：native messaging 只能
+     * 异步，所以值必须先缓存到页面侧，读取才能是同步的。见 content.js 的说明。
+     *
+     * 推送时机：端口建立时、扩展每次重新握手时、以及任何可能改变这三个值的
+     * 动作之后（由 [refreshSnapshot] 触发）。
+     */
+    private fun pushSnapshot() {
+        val msg = JSONObject()
+            .put("type", "snapshot")
+            .put("root", callbacks.bridge.rootState())
+            .put("bubble", callbacks.bridge.bubbleState())
+            // 悬浮球外观也要进快照：页面侧 `bubbleAppearance()` 是**同步**读取，
+            // 而 native messaging 只能异步 —— 与 root/bubble 同一套缓存语义。
+            .put("appearance", callbacks.bridge.bubbleAppearance())
+            .put("pairingEnabled", callbacks.bridge.pairingNotificationsEnabled())
+        postToExtension(msg)
+    }
+
+    /** 往扩展发一条消息；端口没通时排队等握手（快照丢了页面就会读到空值）。 */
+    private fun postToExtension(msg: JSONObject) {
+        val p = port
+        if (p == null) {
+            pendingUntilReady.addLast { postToExtension(msg) }
+            return
+        }
+        try {
+            p.postMessage(msg)
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "向桥扩展发送消息失败", t)
+        }
+    }
+
+    override fun loadUrl(url: String) {
+        lastLoadedUrl = url
+        session.loadUri(url)
+    }
+
+    /**
+     * 在页面里执行 JS。
+     *
+     * ## 为什么这么绕（这是与 system 版最大的结构性差异）
+     *
+     * GeckoView **没有** `evaluateJavascript`。官方文档明确说：
+     * 「The GeckoView API, however, doesn't offer such an API」，要求改用
+     * WebExtension。所以路径是：
+     *
+     * ```
+     *   原生 ──port.postMessage({type:'eval'})──▶ background.js
+     *        ──tabs.sendMessage──▶ content.js ──window.eval──▶ 结果原路返回
+     * ```
+     *
+     * ⚠️ **必须用 `window.eval` 而不是 `eval`**：content script 在隔离世界里，
+     *   普通 `eval` 拿不到页面脚本定义的东西（`window.__DSH_MOBILE_BACK__` 就
+     *   是页面侧的插件挂的），会永远返回「桥不存在」。
+     *
+     * ⚠️ 结果编码与 WebView 对齐为 **JSON 文本**，宿主侧解析逻辑两边共用。
+     *
+     * ⚠️ 回调**不保证被调用**（端口断了、页面已销毁）。契约与 [WebHost.evaluateJavascript]
+     *   一致，调用方必须有兜底分支。
+     */
+    override fun evaluateJavascript(script: String, callback: ((String?) -> Unit)?) {
+        val id = nextEvalId++
+        if (callback != null) pendingEvals[id] = callback
+        postToExtension(
+            JSONObject()
+                .put("type", "eval")
+                .put("id", id)
+                .put("script", script)
+        )
+    }
+
+    override fun awaitFirstFrame(action: () -> Unit) {
+        if (painted) { action(); return }
+        pendingPaintAction = action
+    }
+
+    override fun destroy() {
+        pendingPaintAction = null
+        pendingEvals.clear()
+        pendingUntilReady.clear()
+        port = null
+        runCatching { session.close() }
+        geckoView.releaseSession()
+    }
+
+    private companion object {
+        /** 本地引擎的 URL 前缀；其余一律当外链。 */
+        const val LOCAL_ENGINE_PREFIX = "http://127.0.0.1"
+
+        /** 桥扩展在 APK assets 里的位置（`resource://android/` 指向 APK 根）。 */
+        const val EXTENSION_LOCATION = "resource://android/assets/dsh-bridge/"
+
+        /**
+         * 文件选择的「多选」类型。
+         *
+         * ⚠️ `FilePrompt.Type` 是个**纯常量持有类**（构造函数 protected），所以
+         *   从 Kotlin 写 `FilePrompt.Type.MULTIPLE` 会因「无法实例化」而报
+         *   `None of the following candidates is applicable` —— 直接把值抄在这里。
+         *   与 javap 出的 `MULTIPLE = 2` / `SINGLE = 1` / `FOLDER = 3` 对齐。
+         */
+        const val FILE_PROMPT_MULTIPLE = 2
+
+        /** 扩展 id，必须与 `assets/dsh-bridge/manifest.json` 里的一致。 */
+        const val EXTENSION_ID = "dsh-bridge@dsh.android"
+
+        /** 原生应用标识，必须与 background.js 里 `connectNative` 的参数一致。 */
+        const val NATIVE_APP = "browser"
+
+        /**
+         * 打进 APK 的 GeckoView 版本。
+         *
+         * ⚠️ 必须与 `app/build.gradle.kts` 的 `geckoImplementation` 依赖版本一致。
+         *   写在这里是为了让 [engineMajor] / [engineLabel] 不依赖运行时反射
+         *   （GeckoView 没有公开的「读自己版本」API）。改依赖版本时同步改这两处。
+         */
+        const val GECKO_VERSION = "140.0.20250707120347"
+        const val GECKO_MAJOR = 140
+
+        /**
+         * 文件选择的临时中转目录（`cacheDir` 下）。
+         *
+         * ⚠️ 必须落在 app 私有目录：Gecko 的内容进程与宿主同 uid，读得到；放外部
+         *   存储则要额外处理权限与作用域存储，没必要。
+         */
+        const val FILE_PICKER_DIR = "file-picker"
+    }
+}
+
+/**
+ * 建 GeckoRuntime。
+ *
+ * ⚠️ 用 `GeckoRuntime.getDefault()` 优先，拿不到才 `create()`：Runtime 是**进程级
+ *   单例**，每次 Activity 重建都 create 一个会泄漏（它持有 Gecko 主进程的连接）。
+ *   `getDefault` 在第一次 `create` 之后就返回同一个实例。
+ */
+private fun createRuntime(context: Context): GeckoRuntime {
+    val settings = GeckoRuntimeSettings.Builder()
+        // 页面要能打 console（转发由 content script 做，见 content.js）。
+        .consoleOutput(true)
+        .build()
+    return GeckoRuntime.create(context, settings)
+}

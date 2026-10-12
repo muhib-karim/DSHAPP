@@ -20,16 +20,8 @@ import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.URLUtil
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -38,6 +30,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.dsh.android.databinding.ActivityMainBinding
+import com.dsh.android.web.DownloadRequest
+import com.dsh.android.web.DownloadStream
+import com.dsh.android.web.PageBridge
+import com.dsh.android.web.WebHost
+import com.dsh.android.web.WebHostCallbacks
+import com.dsh.android.web.createWebHost
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -47,14 +45,28 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * 主界面：启动内置引擎，然后把 DSH 自带的 Web GUI 加载进 WebView。
+ * 主界面：启动内置引擎，然后把 DSH 自带的 Web GUI 加载进 Web 视图。
  *
  * 刻意不自绘聊天 UI —— 直接复用 DSH 官方前端，保证功能与桌面端一致。
+ *
+ * ⚠️ 承载界面的是 [WebHost]，**不是写死的 WebView**：本 App 出两个版本 ——
+ *   `system`（系统 WebView 内核）与 `gecko`（内置 GeckoView 内核）。两者的差异
+ *   （JS 执行、原生桥、首帧、控制台、下载、文件选择）全部收在 [WebHost] 后面，
+ *   本类只对着接口写一次。选哪个由 flavor 的 `WebHostFactory` 决定。
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var engine: EngineManager
+
+    /**
+     * 当前 flavor 的 Web 内核宿主（system = 系统 WebView / gecko = 内置 GeckoView）。
+     *
+     * ⚠️ `lateinit` 而不是 `by lazy`：它必须在 `onCreate` 里、`setupWebView()`
+     *   之前建好（那时 `binding` 已就绪），而 `by lazy` 会在第一次访问时才建，
+     *   时序上不可控。
+     */
+    private lateinit var web: WebHost
 
     /** 资产版本戳：改了引擎内容就改这里，App 会重新解包。 */
     private val assetStamp = "0.2.0-rc.2-1"
@@ -190,13 +202,10 @@ class MainActivity : AppCompatActivity() {
     /** 是否已有一个等待首帧的回调在飞，避免重复注册。 */
     private var paintPending = false
 
-    /** `postVisualStateCallback` 的请求号，单调递增即可（它只是个标识）。 */
-    private var paintRequestId = 0L
-
-    /** 等待 WebView 首帧的兜底超时（见 [awaitWebViewPainted]）。 */
+    /** 等待 Web 内核首帧的兜底超时（见 [awaitWebViewPainted]）。 */
     private val paintTimeoutRunnable = Runnable {
         if (!webViewPainted) {
-            Log.w(DshApplication.TAG, "等待 WebView 首帧超时，仍收起启动动画")
+            Log.w(DshApplication.TAG, "等待 Web 内核首帧超时，仍收起启动动画")
             webViewPainted = true
             paintPending = false
             hideOverlay()
@@ -258,10 +267,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setWebViewBottomMargin(px: Int) {
-        val lp = binding.webView.layoutParams
+        val lp = web.view.layoutParams
         if (lp is ViewGroup.MarginLayoutParams && lp.bottomMargin != px) {
             lp.bottomMargin = px
-            binding.webView.layoutParams = lp
+            web.view.layoutParams = lp
         }
     }
 
@@ -337,6 +346,10 @@ class MainActivity : AppCompatActivity() {
         detectWebViewVersion()
         setupBackNavigation()
         installBubbleBridge()
+        // ⚠️ 必须在这里就绪：插件可能**在 App 前台**下发悬浮球外观，而那时
+        //   onAppBackground 还没跑过。不提前记 context 的话 bubbleApply 会静默返回
+        //   false（真机实测踩到），表现为"插件改了没反应"。
+        FloatingBubble.attach(this)
         observeEngine()
         observeImeInsets()   // 修复 65：键盘高度自学习 + 预判交接
         // 前台服务要在引擎启动前拉起：它同时是「进程不被回收」和 WakeLock 的持有者，
@@ -445,122 +458,82 @@ class MainActivity : AppCompatActivity() {
      *   也不能因为一次读取失败就把本来能用的设备挡在门外。
      */
     private fun detectWebViewVersion() {
-        val pkg = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()
-        val version = pkg?.versionName.orEmpty()
-        webViewMajor = version.substringBefore('.').toIntOrNull() ?: 0
+        // ⚠️ 在 gecko flavor 里读到的**不是**设备上装的内核，而是打进 APK 的
+        //   GeckoView 版本（编译期确定）。所以那里永远不可能「内核过旧」——
+        //   版本拦截分支不会触发，这正是内置内核要解决的问题本身。
+        webViewMajor = web.engineMajor
         Log.i(
             DshApplication.TAG,
-            "WebView 内核: ${pkg?.packageName} $version" +
-                "（官方 bundle 门槛 $MIN_WEBVIEW_MAJOR，降级后 $MIN_WEBVIEW_MAJOR_COMPAT）",
+            "Web 内核: ${web.engineLabel}（主版本 $webViewMajor；" +
+                "官方 bundle 门槛 $MIN_WEBVIEW_MAJOR，降级后 $MIN_WEBVIEW_MAJOR_COMPAT）",
         )
     }
 
-    private fun setupWebView() = with(binding.webView) {
-        settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            allowFileAccess = false
-            allowContentAccess = false
-            // 引擎跑在 http://127.0.0.1，属于非安全上下文，
-            // 需要允许混合内容，否则部分 API 被浏览器策略拦掉。
-            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-            cacheMode = WebSettings.LOAD_DEFAULT
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            setSupportZoom(false)
-            builtInZoomControls = false
-            textZoom = 100
-        }
-        setBackgroundColor(Color.parseColor("#0F1115"))
-
-        webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(
-                view: WebView,
-                request: WebResourceRequest,
-            ): Boolean {
-                val url = request.url.toString()
-                // 只允许留在本地引擎里；外链交给系统浏览器
-                return if (url.startsWith("http://127.0.0.1")) {
-                    false
-                } else {
+    /**
+     * 建 Web 内核宿主并装进布局。
+     *
+     * 内核相关的全部装配（JS 开关、桥、外链策略、文件选择、下载、控制台）
+     * 都在 [WebHost] 的实现里；这里只负责把它挂到容器上，并把**与内核无关**的
+     * 宿主行为（DOM 就绪上报、外链交给系统、控制台转发到同一个 TAG）接起来。
+     */
+    private fun setupWebView() {
+        web = createWebHost(
+            this,
+            WebHostCallbacks(
+                bridge = StatusBridge(),
+                onPageFinished = { url ->
+                    Log.i(DshApplication.TAG, "Web 界面加载完成: $url")
+                    // DOM 到了，但移动端 UI 插件仍在激活（实测还有约 1.7s）——
+                    // 这段宿主本来完全感知不到，上报给启动层，动画才不会提前收尾。
+                    engine.notifyPageLoaded()
+                },
+                onConsole = { line ->
+                    Log.i(DshApplication.TAG, "[web] $line")
+                },
+                onExternalUrl = { url ->
                     runCatching {
-                        startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, request.url))
-                    }
-                    true
-                }
-            }
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                    }.onFailure { Log.w(DshApplication.TAG, "无法打开外部链接: $url", it) }
+                },
+                fileChooser = { multiple, onResult -> launchFileChooser(multiple, onResult) },
+                onDownload = { req -> handleDownload(req) },
+                onDownloadStream = { stream -> handleDownloadStream(stream) },
+            ),
+        )
+        binding.webContainer.addView(
+            web.view,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+    }
 
-            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                Log.i(DshApplication.TAG, "WebView 加载完成: $url")
-                // DOM 到了，但移动端 UI 插件仍在激活（实测还有约 1.7s）——
-                // 这段宿主本来完全感知不到，上报给启动层，动画才不会提前收尾。
-                engine.notifyPageLoaded()
-            }
+    /**
+     * 拉起系统的文件选择器，把结果交回内核。
+     *
+     * ⚠️ 这里是**内核无关**的那一半（两个 flavor 共用）：构造 Intent、处理
+     *   「没有应用能响应」、把结果翻译成 `Array<Uri>`。内核相关的那一半
+     *   （WebView 的 `onShowFileChooser` / GeckoView 的 `onFilePrompt`）在各自
+     *   的 [WebHost] 实现里。
+     *
+     * ⚠️ **三条路径都必须回调**（成功 / 取消 / 拉起失败），漏掉任何一条都会让
+     *   页面永久卡在「等待选择」状态。取消必须回 `null` 而不是空数组 ——
+     *   空数组会被页面解读成「选了 0 个文件」并触发一次空提交。
+     */
+    private fun launchFileChooser(multiple: Boolean, onResult: (Array<Uri>?) -> Unit) {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            if (multiple) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
-
-        // 插件用它把「AI 当前在干什么」推给通知栏（见 EngineService.updateStatus）。
-        addJavascriptInterface(StatusBridge(), "DSHAndroid")
-
-        webChromeClient = object : WebChromeClient() {
-            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                Log.i(DshApplication.TAG, "[web] ${msg.message()} @${msg.lineNumber()}")
-                return true
-            }
-
-            /**
-             * 文件选择器接管。
-             *
-             * ⚠️ **必须实现**：WebView 的默认实现直接 `callback.onReceiveValue(null)`，
-             * 页面侧完全无感 —— 症状就是用户反馈的「点『文件』静默一点反应都没有」。
-             * WebView 自身不弹任何选择器，必须由宿主 App 拉起。
-             */
-            override fun onShowFileChooser(
-                webView: WebView,
-                filePathCallback: ValueCallback<Array<Uri>>,
-                fileChooserParams: FileChooserParams,
-            ): Boolean {
-                // 上一次还没回调完就再来一次时，必须先把它收掉，
-                // 否则 WebView 会一直挂着等这个 callback（表现为后续选择器全部失效）。
-                filePathCallbackRef?.onReceiveValue(null)
-                filePathCallbackRef = filePathCallback
-
-                val intent = runCatching { fileChooserParams.createIntent() }.getOrElse {
-                    Log.w(DshApplication.TAG, "构造文件选择 Intent 失败", it)
-                    filePathCallbackRef = null
-                    filePathCallback.onReceiveValue(null)
-                    return false
-                }
-                // 官方建议：允许一次选取多个（页面里那个 input 是 multiple）。
-                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE)
-                return try {
-                    fileChooserLauncher.launch(intent)
-                    true
-                } catch (e: ActivityNotFoundException) {
-                    // 设备上没有能响应 ACTION_GET_CONTENT 的应用 —— 如实记日志并归还 callback，
-                    // 否则页面会永远停在"等待选择"状态。
-                    Log.w(DshApplication.TAG, "没有可用的文件选择器", e)
-                    filePathCallbackRef = null
-                    filePathCallback.onReceiveValue(null)
-                    false
-                }
-            }
-        }
-
-        /**
-         * 下载接管。
-         *
-         * ⚠️ **必须实现**：与 `onShowFileChooser` 同一类缺口 —— WebView 自己不会下载，
-         * 默认实现直接丢弃，页面侧完全无感。症状是「下载 Session 日志」弹窗显示
-         * 「浏览器正在下载 Session ZIP 文件」，但文件根本没落地。
-         *
-         * 页面侧触发方式（`dsh-session-log-export` 的 `downloadUrl()`）是
-         * `document.createElement("a")` + `anchor.download` + `anchor.click()`，
-         * 最终落到 WebView 的下载回调，所以这里就是唯一的接缝。
-         */
-        setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-            handleDownload(url, userAgent, contentDisposition, mimeType)
+        fileChooserResultSink = onResult
+        try {
+            fileChooserLauncher.launch(intent)
+        } catch (e: ActivityNotFoundException) {
+            Log.w(DshApplication.TAG, "没有可用的文件选择器", e)
+            fileChooserResultSink = null
+            onResult(null)
         }
     }
 
@@ -575,12 +548,44 @@ class MainActivity : AppCompatActivity() {
      * 所以这里在**本进程内**取字节：`CookieManager` 拿得到 HttpOnly cookie
      * （它本来就是给宿主用的），自家的 `HttpURLConnection` 也没有那个 header 限制。
      */
-    private fun handleDownload(
-        url: String,
-        userAgent: String?,
-        contentDisposition: String?,
-        mimeType: String?,
-    ) {
+    /**
+     * 把**内核已经代发**的响应体落盘（gecko 版专用，见 [DownloadStream]）。
+     *
+     * ⚠️ 与 [handleDownload] 的关键差别是**这里不需要、也拿不到 cookie**：
+     *   请求已经由 Gecko 发完了，响应体就是授权后的结果。这正是 gecko 版
+     *   存在的理由 —— GeckoView 没有任何读取 cookie 的 API，宿主代发这条路
+     *   在那里走不通。
+     *
+     * ⚠️ 读流必须在 IO 线程：`WebResponse.body` 是内核那边挂过来的管道，
+     *   在主线程上读会把 UI 卡住（大文件尤其明显）。
+     */
+    private fun handleDownloadStream(stream: DownloadStream) {
+        val filename = stream.filename.ifBlank { "dsh-download" }
+        val target = downloadTargetDir()
+        Toast.makeText(this, "开始下载 $filename", Toast.LENGTH_SHORT).show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                val file = File(target, filename)
+                stream.body.use { input -> file.outputStream().use { input.copyTo(it) } }
+                file
+            }
+            withContext(Dispatchers.Main) {
+                result
+                    .onSuccess { file ->
+                        Log.i(DshApplication.TAG, "Session 日志已保存: ${file.absolutePath} (${file.length()} 字节)")
+                        Toast.makeText(this@MainActivity, "已保存到 ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                    }
+                    .onFailure { e ->
+                        Log.w(DshApplication.TAG, "下载失败: ${stream.url}", e)
+                        Toast.makeText(this@MainActivity, "下载失败：${e.message}", Toast.LENGTH_LONG).show()
+                    }
+            }
+        }
+    }
+
+    private fun handleDownload(req: DownloadRequest) {
+        val url = req.url
         // 只接管本地引擎的下载；外链仍交给系统浏览器（与 shouldOverrideUrlLoading 一致）。
         if (!url.startsWith("http://127.0.0.1")) {
             runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
@@ -589,8 +594,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 优先用 Content-Disposition 里的文件名（引擎给的是 dsh-session-<id>.zip）。
-        val filename = URLUtil.guessFileName(url, contentDisposition, mimeType)
-        val cookie = CookieManager.getInstance().getCookie(url).orEmpty()
+        val filename = URLUtil.guessFileName(url, req.contentDisposition, req.mimeType)
+        val cookie = cookieForDownload(url)
         val target = downloadTargetDir()
         Toast.makeText(this, "开始下载 $filename", Toast.LENGTH_SHORT).show()
 
@@ -601,7 +606,7 @@ class MainActivity : AppCompatActivity() {
                     connectTimeout = 15_000
                     readTimeout = 60_000
                     if (cookie.isNotEmpty()) setRequestProperty("Cookie", cookie)
-                    userAgent?.takeIf { it.isNotEmpty() }?.let { setRequestProperty("User-Agent", it) }
+                    req.userAgent?.takeIf { it.isNotEmpty() }?.let { setRequestProperty("User-Agent", it) }
                     setRequestProperty("Referer", "http://127.0.0.1:3080/")
                 }
                 try {
@@ -631,6 +636,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 取下载要带的 cookie。
+     *
+     * ⚠️ 走 `CookieManager` 而不是内核无关的 HTTP 客户端：`/api/session.export` 用
+     *   **HttpOnly cookie** 鉴权（真机实测带 cookie 200 / 不带 401），而 `CookieManager`
+     *   本来就是把 HttpOnly cookie 交给宿主的那个口子。
+     *
+     * ⚠️ 两个内核共用**同一个** `CookieManager`（Android 的 cookie jar 是进程级、
+     *   按 URL 索引的，与渲染内核无关）—— 所以 gecko flavor 里这里照样拿得到
+     *   GeckoView 写进去的 cookie。实测依据见真机验证日志。
+     */
+    private fun cookieForDownload(url: String): String =
+        runCatching { CookieManager.getInstance().getCookie(url).orEmpty() }.getOrDefault("")
+
+    /**
      * 下载落地目录。
      *
      * 有存储权限时写公共「下载」目录（用户能在文件管理器里直接找到）；
@@ -649,8 +668,13 @@ class MainActivity : AppCompatActivity() {
         return getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
     }
 
-    /** 当前挂起的文件选择回调；null 表示没有等待中的选择。 */
-    private var filePathCallbackRef: ValueCallback<Array<Uri>>? = null
+    /**
+     * 当前挂起的文件选择结果接收者；null 表示没有等待中的选择。
+     *
+     * ⚠️ 由 `launchFileChooser` 装、由 `fileChooserLauncher` 的回调消费，
+     *   **一次性**：消费前必须取出并置空，否则第二次点击不会响应。
+     */
+    private var fileChooserResultSink: ((Array<Uri>?) -> Unit)? = null
 
     // ══ 系统返回键 ══════════════════════════════════════════════════════
     //
@@ -707,10 +731,9 @@ class MainActivity : AppCompatActivity() {
      *   反过来，插件没起来时页面里也确实没有任何自建层级需要关，退出是对的。
      */
     private fun queryPageBack() {
-        val wv = binding.webView
         if (backQueryPending) return
         backQueryPending = true
-        wv.evaluateJavascript(BACK_PROBE_JS) { result ->
+        web.evaluateJavascript(BACK_PROBE_JS) { result ->
             backQueryPending = false
             // 页面回 "true" ⇒ 已消费；其余（"false" / "null" / 异常）一律退到后台。
             val consumed = result != null && result.trim('"') == "true"
@@ -724,16 +747,19 @@ class MainActivity : AppCompatActivity() {
     /**
      * 页面 → 原生 的状态通道，暴露成 `window.DSHAndroid`。
      *
-     * 只有本地引擎会被加载进这个 WebView（`shouldOverrideUrlLoading` 把外链全丢给系统
-     * 浏览器），所以不存在"第三方页面拿到这个接口"的风险。
+     * 只有本地引擎会被加载进这个 Web 视图（外链全丢给系统浏览器），所以不存在
+     * "第三方页面拿到这个接口"的风险。
      *
-     * ⚠️ 方法**运行在 WebView 的 JS 线程**上，不能碰 View；通知交给
-     * `EngineService.updateStatus()`（内部只走 NotificationManager），
-     * 底色则 `runOnUiThread` 切回主线程再设。
+     * ⚠️ **两个 flavor 共用这一份实现**：怎么把它暴露给页面（WebView 的
+     *   `addJavascriptInterface` / GeckoView 的 WebExtension）由各自的
+     *   [WebHost] 负责，本类只实现能力。
+     *
+     * ⚠️ 在 system 版里这些方法**运行在 WebView 的 JS 线程**上，不能碰 View；
+     *   通知交给 `EngineService.updateStatus()`（内部只走 NotificationManager），
+     *   底色则 `runOnUiThread` 切回主线程再设。gecko 版由 [WebHost] 统一切主线程。
      */
-    private inner class StatusBridge {
-        @android.webkit.JavascriptInterface
-        fun onStatus(json: String) {
+    private inner class StatusBridge : PageBridge {
+        override fun onStatus(json: String) {
             val status = EngineStatus.parse(json) ?: return
             EngineService.updateStatus(this@MainActivity, status)
             // 只在底色真变了时才切主线程，避免每次状态刷新都白 post 一个任务
@@ -749,8 +775,7 @@ class MainActivity : AppCompatActivity() {
          *
          * ⚠️ 运行在 WebView 的 JS 线程，`onImeWillShow()` 内部会切主线程。
          */
-        @android.webkit.JavascriptInterface
-        fun onImeWillShow() {
+        override fun onImeWillShow() {
             this@MainActivity.onImeWillShow()
         }
 
@@ -763,15 +788,13 @@ class MainActivity : AppCompatActivity() {
          *
          * 运行在 WebView 的 JS 线程，所以只做「发一条通知」这种轻量动作。
          */
-        @android.webkit.JavascriptInterface
-        fun startWirelessPairing() {
+        override fun startWirelessPairing() {
             Log.i(DshApplication.TAG, "设置页请求配对无线调试")
             AdbPairingNotifier.start(this@MainActivity)
         }
 
         /** 设置页取消配对（撤掉那条带输入框的通知）。 */
-        @android.webkit.JavascriptInterface
-        fun cancelWirelessPairing() {
+        override fun cancelWirelessPairing() {
             AdbPairingNotifier.cancel(this@MainActivity)
         }
 
@@ -785,8 +808,7 @@ class MainActivity : AppCompatActivity() {
          *
          * 返回 Boolean（`@JavascriptInterface` 支持基本类型）。
          */
-        @android.webkit.JavascriptInterface
-        fun pairingNotificationsEnabled(): Boolean =
+        override fun pairingNotificationsEnabled(): Boolean =
             AdbPairingNotifier.notificationsEnabled(this@MainActivity)
 
         /**
@@ -798,8 +820,7 @@ class MainActivity : AppCompatActivity() {
          * ⚠️ 运行在 WebView 的 JS 线程；`notifyUiReady` 只推一个 StateFlow，
          *   真正的收起动作由 `lifecycleScope` 在主线程做。
          */
-        @android.webkit.JavascriptInterface
-        fun onUiReady() {
+        override fun onUiReady() {
             Log.i(DshApplication.TAG, "插件已激活（onUiReady）")
             engine.notifyUiReady()
         }
@@ -814,8 +835,7 @@ class MainActivity : AppCompatActivity() {
          * ⚠️ 运行在 WebView 的 JS 线程，只写一个 volatile 字段，不碰 View。
          * ⚠️ 只记第一条：启动失败时后续错误多半是连锁反应。
          */
-        @android.webkit.JavascriptInterface
-        fun reportWebError(message: String) {
+        override fun reportWebError(message: String) {
             if (webError.isNotEmpty()) return
             webError = message
             Log.w(DshApplication.TAG, "页面脚本错误: $message")
@@ -830,8 +850,7 @@ class MainActivity : AppCompatActivity() {
          * ⚠️ 不能直接在 JS 线程里做：它最多要等约 6 秒（切换 + 轮询端口就绪），
          * 会卡住 WebView 的 JS 线程。
          */
-        @android.webkit.JavascriptInterface
-        fun switchToTcpMode() {
+        override fun switchToTcpMode() {
             Log.i(DshApplication.TAG, "设置页请求切到固定 TCP 端口")
             val app = applicationContext
             Thread {
@@ -859,8 +878,7 @@ class MainActivity : AppCompatActivity() {
          * `granted` 与 `enabled` 是**两个独立的事实**：用户可能已经授权但没开开关，
          * 也可能开了开关但授权被系统撤销了。分开报，设置页才能给出正确的下一步。
          */
-        @android.webkit.JavascriptInterface
-        fun bubbleState(): String = try {
+        override fun bubbleState(): String = try {
             JSONObject()
                 .put("enabled", FloatingBubble.isEnabled(this@MainActivity))
                 .put("granted", FloatingBubble.canDrawOverlays(this@MainActivity))
@@ -871,8 +889,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         /** 开关气泡。关掉时立刻收起已显示的窗口，不用等下次切后台。 */
-        @android.webkit.JavascriptInterface
-        fun bubbleSetEnabled(enabled: Boolean) {
+        override fun bubbleSetEnabled(enabled: Boolean) {
             Log.i(DshApplication.TAG, "设置页切换悬浮气泡: $enabled")
             FloatingBubble.setEnabled(this@MainActivity, enabled)
             if (!enabled) FloatingBubble.hideNow()
@@ -885,8 +902,7 @@ class MainActivity : AppCompatActivity() {
          *   `requestPermissions` 对它无效），只能把用户送到这个设置页手动开。
          *   个别 ROM 没有这个 Activity，所以要 catch 后回落到应用详情页。
          */
-        @android.webkit.JavascriptInterface
-        fun bubbleRequestOverlay() {
+        override fun bubbleRequestOverlay() {
             Log.i(DshApplication.TAG, "设置页请求悬浮窗授权")
             runOnUiThread {
                 val pkgUri = Uri.parse("package:$packageName")
@@ -906,6 +922,45 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        // ══ 悬浮球：转录通道 + 插件外观接口 ══════════════════════════════
+        //
+        // 这两个是「把悬浮窗接进 DSH 生态」的接缝：任何页面内的插件都能直接调，
+        // 不需要原生侧为它改一行代码。
+        //
+        // ⚠️ 走 JS 桥而不是宿主半的 HTTP 路由：气泡是**窗口**（WindowManager 的
+        //   TYPE_APPLICATION_OVERLAY），只有持有 View 层级的那一侧能操作它；
+        //   Node 侧连 View 是什么都看不到。
+
+        /**
+         * 会话转录上报。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程上，`FloatingBubble.onTranscript()` 内部自己
+         *   切主线程 —— 这里不能碰 View。
+         */
+        override fun onTranscript(json: String) {
+            FloatingBubble.onTranscript(json)
+        }
+
+        /**
+         * 插件下发悬浮球外观配置。
+         *
+         * 用法（页面里任何插件都可以）：
+         *
+         * ```js
+         * window.DSHAndroid.bubbleApply(JSON.stringify({ shape: 'square', size: 72 }))
+         * ```
+         *
+         * ⚠️ 返回 Boolean 而不是 String：调用方只关心"接受了吗"。
+         *   真正的应用是**下一帧**的事，返回值不代表视图已刷新。
+         */
+        override fun bubbleApply(json: String): Boolean {
+            Log.i(DshApplication.TAG, "插件下发悬浮球配置: ${json.take(200)}")
+            return FloatingBubble.applyAppearance(json)
+        }
+
+        /** 读回当前外观配置（JSON 文本），供插件做「读取-修改-写回」。 */
+        override fun bubbleAppearance(): String = FloatingBubble.currentAppearanceJson()
 
         // ══ root（uid 0）：设置页的状态显示与重新检测 ══════════════════════
         //
@@ -930,8 +985,7 @@ class MainActivity : AppCompatActivity() {
          * `at` 是结论的落盘时刻（毫秒）：一个 23 小时前的结论与刚测出来的不是
          * 一回事，界面要能表达这个差别，所以时间戳必须一起给出去。
          */
-        @android.webkit.JavascriptInterface
-        fun rootState(): String = try {
+        override fun rootState(): String = try {
             val snap = RootAccess.snapshot(this@MainActivity)
             JSONObject()
                 .put("known", snap != null)
@@ -962,8 +1016,7 @@ class MainActivity : AppCompatActivity() {
          *   的 `recheckRoot()`）。所以**不能**同步等它跑完 —— 那样就退回了上面那个
          *   卡页面的问题。
          */
-        @android.webkit.JavascriptInterface
-        fun rootRecheck() {
+        override fun rootRecheck() {
             Log.i(DshApplication.TAG, "设置页请求重新检测 root")
             val app = applicationContext
             Thread {
@@ -991,8 +1044,8 @@ class MainActivity : AppCompatActivity() {
             Log.w(DshApplication.TAG, "忽略非法页面底色: $bg")
             return
         }
-        binding.webView.setBackgroundColor(color)
-        // 根容器一起改：覆盖层隐藏与 WebView 首次绘制之间露出的就是它
+        web.view.setBackgroundColor(color)
+        // 根容器一起改：覆盖层隐藏与 Web 视图首次绘制之间露出的就是它
         binding.root.setBackgroundColor(color)
         // 窗口底色也跟上：DecorView 与 WebView 是两层独立的合成，窗口缩小时
         // 两层各自的 Surface 更新并不同步，只改一层仍可能露出一帧旧色
@@ -1042,19 +1095,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 文件选择结果。`resultCode`/`data` 一律要回给 WebView —— **成功、取消、失败
+     * 文件选择结果。`resultCode`/`data` 一律要回给内核 —— **成功、取消、失败
      * 三条路径都必须回调**，漏掉任何一条都会让页面永久卡在等待状态。
+     *
+     * ⚠️ 结果先落到 [fileChooserResultSink]（由 `launchFileChooser` 装），
+     *   因为这个回调本身不知道是哪个内核发起的请求。
      */
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        val callback = filePathCallbackRef ?: return@registerForActivityResult
-        filePathCallbackRef = null
-        callback.onReceiveValue(parseFileChooserResult(result.resultCode, result.data))
+        val sink = fileChooserResultSink ?: return@registerForActivityResult
+        fileChooserResultSink = null
+        sink(parseFileChooserResult(result.resultCode, result.data))
     }
 
     /**
-     * 把 Activity 结果翻译成 WebView 要的 `Array<Uri>`。
+     * 把 Activity 结果翻译成内核要的 `Array<Uri>`。
      *
      * 取消（`RESULT_CANCELED`）必须回 `null`，而不是空数组 —— 空数组会让页面
      * 以为"选了 0 个文件"并触发一次空提交。
@@ -1116,9 +1172,9 @@ class MainActivity : AppCompatActivity() {
                         // ⚠️ 这里**不能**收起 overlay：引擎就绪只代表 HTTP 服务起来了，
                         //   页面还没加载、插件更没激活。实测后面还有约 3.8 秒。
                         showOverlay("正在加载界面…", hint = "渲染 Web GUI")
-                        if (binding.webView.url != state.url) {
+                        if (web.currentUrl != state.url) {
                             Log.i(DshApplication.TAG, "加载 Web GUI: ${state.url}")
-                            binding.webView.loadUrl(state.url)
+                            web.loadUrl(state.url)
                             // ⚠️ 计时必须**从这一刻**起算，不能放在 onCreate。
                             //   引擎启动本身要 7~10 秒（首次还要先解包 15 秒），
                             //   从 onCreate 起算会让兜底在引擎还没起来时就触发，
@@ -1191,10 +1247,11 @@ class MainActivity : AppCompatActivity() {
      * 旧代码在 `onUiReady` 里立刻收起启动层，于是这 1.6 秒里屏幕上是启动页或空白，
      * 用户看到的就是"动画结束后闪过几帧白屏"。
      *
-     * `postVisualStateCallback` 的语义正是「这一帧已经提交、可以显示了」，
-     * 它比 `onPageFinished`、比任何 DOM 信号都更贴近"用户真的看到了"。
+     * `postVisualStateCallback`（system 版）与 `ContentDelegate.onFirstComposite`
+     * （gecko 版）的语义正是「这一帧已经提交、可以显示了」，它比 `onPageFinished`、
+     * 比任何 DOM 信号都更贴近"用户真的看到了"。
      *
-     * ⚠️ 回调**不保证一定触发**（WebView 被销毁、渲染进程崩溃时不会来），
+     * ⚠️ 回调**不保证一定触发**（内核被销毁、渲染进程崩溃时不会来），
      *   所以配一个 [PAINT_TIMEOUT_MS] 兜底 —— 宁可早收也不能不收，
      *   启动层永久盖住界面是最糟的失败方式。
      *
@@ -1210,22 +1267,17 @@ class MainActivity : AppCompatActivity() {
                 webViewPainted = true
                 paintPending = false
                 overlayHandler.removeCallbacks(paintTimeoutRunnable)
-                Log.i(DshApplication.TAG, "WebView 已提交首帧，收起启动动画")
+                Log.i(DshApplication.TAG, "Web 内核已提交首帧，收起启动动画")
                 action()
             }
         }
 
         // 兜底：到点无条件执行（正常路径实测约几十毫秒内就会回调）
         overlayHandler.postDelayed(paintTimeoutRunnable, PAINT_TIMEOUT_MS)
-        // ⚠️ 第一个参数是 requestId，回调会原样带回 —— 它只是个标识，
-        //   不是 layerType（写成 LAYER_TYPE_* 会让人误以为有语义）。
-        paintRequestId++
-        binding.webView.postVisualStateCallback(
-            paintRequestId,
-            object : WebView.VisualStateCallback() {
-                override fun onComplete(requestId: Long) = done()
-            },
-        )
+        // ⚠️ 「等首帧」的机制在两个内核里完全不同（WebView 是
+        //   `postVisualStateCallback`、GeckoView 是 `onFirstComposite`），
+        //   所以交给 [WebHost] 实现 —— 本类不再关心是哪一个。
+        web.awaitFirstFrame { done() }
     }
 
     /**
@@ -1382,10 +1434,9 @@ class MainActivity : AppCompatActivity() {
      * 同步点按钮会点到 disabled 的那个，表现为"文字进去了但没发出去"。
      */
     private fun sendToComposer(text: String): Boolean {
-        val wv = binding.webView
         val quoted = JSONObject.quote(text)
 
-        wv.evaluateJavascript(BUBBLE_INSERT_JS.replace(BUBBLE_TEXT_SLOT, quoted)) { result ->
+        web.evaluateJavascript(BUBBLE_INSERT_JS.replace(BUBBLE_TEXT_SLOT, quoted)) { result ->
             Log.i(DshApplication.TAG, "气泡注入结果: $result")
             // ⚠️ 找不到 composer 时必须让用户知道。静默失败的话，气泡会把输入框
             //   清空、看起来"发出去了"，而 App 里其实一个字都没进去。
@@ -1395,7 +1446,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         bubbleHandler.postDelayed({
-            wv.evaluateJavascript(BUBBLE_SEND_JS) { result ->
+            web.evaluateJavascript(BUBBLE_SEND_JS) { result ->
                 Log.i(DshApplication.TAG, "气泡发送结果: $result")
             }
         }, BUBBLE_SEND_DELAY_MS)
@@ -1412,7 +1463,7 @@ class MainActivity : AppCompatActivity() {
      * 页面侧会先验主按钮此刻是不是「停止生成」—— 不是就拒绝，避免把草稿误发出去。
      */
     private fun stopComposerRun(): Boolean {
-        binding.webView.evaluateJavascript(BUBBLE_STOP_JS) { result ->
+        web.evaluateJavascript(BUBBLE_STOP_JS) { result ->
             Log.i(DshApplication.TAG, "气泡停止结果: $result")
             if (result != null && result.contains("NOT_RUNNING")) {
                 Toast.makeText(this, "AI 当前没在运行", Toast.LENGTH_SHORT).show()
@@ -1426,12 +1477,16 @@ class MainActivity : AppCompatActivity() {
         imeHandler.removeCallbacks(imeRestoreRunnable)
         overlayHandler.removeCallbacks(overlayTimeoutRunnable)
         overlayHandler.removeCallbacks(paintTimeoutRunnable)
-        // ⚠️ 必须清掉：WebView 随 Activity 一起销毁，留着这些闭包会让气泡
+        // ⚠️ 必须清掉：Web 视图随 Activity 一起销毁，留着这些闭包会让气泡
         //   对着一具"尸体"调 evaluateJavascript（静默无效，用户以为发成功了）。
         FloatingBubble.sendText = null
         FloatingBubble.stopRun = null
         FloatingBubble.openApp = null
         bubbleHandler.removeCallbacksAndMessages(null)
+        // ⚠️ 内核的销毁各不一样（WebView 要 destroy()，GeckoView 要关 session、
+        //   拆 WebExtension），交给 [WebHost]。必须在 super 之前 ——
+        //   super.onDestroy() 之后 binding 里的视图树已经被拆掉。
+        if (::web.isInitialized) web.destroy()
         super.onDestroy()
     }
 
