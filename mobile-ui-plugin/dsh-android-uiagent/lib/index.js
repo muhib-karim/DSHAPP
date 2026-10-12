@@ -337,9 +337,12 @@ function render(args, reply) {
 			lines.push(`  ⚠️ 有遮挡层盖住界面（${reply.blocked ?? 0} 个元素当前点不动）:`);
 			lines.push(`    ${fmtElement(reply.overlay)}`);
 			lines.push(`    ${reply.warning ?? ''}`);
-			lines.push(`    先关掉它（用 overlay 动作看它里面有哪些按钮），再操作下面的元素。`);
+			// ⚠️ 别写成「看遮挡层里面有哪些按钮」：官方前端的弹窗是遮罩与内容
+			//   **平级**的（`_root_ > [_mask_, _dialog_]`），`overlay` 报的因此是
+			//   「此刻真正能点的」而不是「里面的」—— 照那句理解会找不到按钮。
+			lines.push(`    先关掉它（用 overlay 动作看此刻真正能点的是哪几个），再操作下面的元素。`);
 		} else if ((reply.blocked ?? 0) > 0) {
-			lines.push(`  ⚠️ 其中 ${reply.blocked} 个被上层元素盖住，现在点不动（见各元素的 blockedBy）。`);
+			lines.push(`  ⚠️ 其中 ${reply.blocked} 个被上层元素盖住，现在点不动（见元素行上的「被遮挡←」。）。`);
 		}
 		if (list.length === 0) {
 			lines.push('  （没有匹配的元素。界面可能还在加载，或 filter 太窄。）');
