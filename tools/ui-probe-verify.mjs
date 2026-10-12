@@ -264,7 +264,55 @@ async function main() {
 		check('遮挡被识别：onTarget:false', tapMasked.onTarget === false, tapMasked.onTarget);
 		check('告知了实际接收点击的元素', typeof tapMasked.hitTopmost?.sel === 'string' && tapMasked.hitTopmost.sel.includes('mask'),
 			tapMasked.hitTopmost);
+
+		// ── 遮挡识别（本轮新增的核心能力）─────────────────────────────
+		//
+		// ⚠️ 这一组断言锁的是一个**真实踩过的坑**：官方前端首启会弹「预览版说明」
+		//    对话框（全屏遮罩 + z-index:1000），底下 16 个按钮在 DOM 里看着完全
+		//    正常（有尺寸、opacity 为 1），第一版探针因此把它们全报成可用 ——
+		//    模型挨个点、界面纹丝不动且拿不到任何提示。
+		check('tap 被遮挡时给出 hint 指路', typeof tapMasked.hint === 'string' && tapMasked.hint.length > 0,
+			tapMasked.hint);
+		check('tap 被遮挡时回报 overlay 层', !!tapMasked.overlay && tapMasked.overlay.sel.includes('mask'),
+			tapMasked.overlay);
+
+		const dumpMasked = await call({ action: 'dump', limit: 50 });
+		check('dump 顶层报出遮挡层（overlay）', !!dumpMasked.overlay && dumpMasked.overlay.sel.includes('mask'),
+			dumpMasked.overlay);
+		check('dump 给出可读的遮挡警告', typeof dumpMasked.warning === 'string' && dumpMasked.warning.length > 0,
+			dumpMasked.warning);
+		check('dump 统计了被遮挡的元素数', typeof dumpMasked.blocked === 'number' && dumpMasked.blocked > 0,
+			dumpMasked.blocked);
+		const sendEl = dumpMasked.elements.find((e) => (e.text || '') === '发送');
+		check('每个元素带 covered 标记', sendEl?.covered === true, sendEl?.covered);
+		check('每个被遮挡的元素指明 blockedBy', !!sendEl?.blockedBy && String(sendEl.blockedBy.sel).includes('mask'),
+			sendEl?.blockedBy);
+
+		const dumpOnlyClickable = await call({ action: 'dump', limit: 50, clickableOnly: true });
+		check('clickableOnly 滤掉了被遮挡的元素',
+			!dumpOnlyClickable.elements.some((e) => (e.text || '') === '发送'),
+			dumpOnlyClickable.elements.map((e) => e.text));
+
+		const ovAction = await call({ action: 'overlay' });
+		check('overlay 动作报出 present:true', ovAction.present === true, ovAction.present);
+		check('overlay 动作报出遮挡层是谁', ovAction.layer?.sel?.includes('mask') === true, ovAction.layer);
+		check('overlay 动作列出此刻真正能点的元素',
+			Array.isArray(ovAction.clickable) && ovAction.clickable.every((e) => e.covered !== true),
+			ovAction.clickable?.map((e) => e.text));
+
+		const waitCovered = await call({ action: 'wait', text: '发送', clickable: true });
+		check('wait clickable:true 不把被遮挡的元素算作等到了', waitCovered.satisfied === false,
+			waitCovered.satisfied);
+		const waitVisible = await call({ action: 'wait', text: '发送' });
+		check('wait 默认仍只看可见性（不传 clickable 时行为不变）', waitVisible.satisfied === true,
+			waitVisible.satisfied);
+
 		await cdp.eval('window.hideMask()');
+		const ovGone = await call({ action: 'overlay' });
+		check('遮罩移除后 overlay 报 present:false', ovGone.present === false, ovGone.present);
+		const dumpClean = await call({ action: 'dump', limit: 50 });
+		check('遮罩移除后 dump 不再报遮挡', !dumpClean.overlay && dumpClean.blocked === 0,
+			{ overlay: dumpClean.overlay, blocked: dumpClean.blocked });
 
 		console.log('\n── type（React 受控输入）─────────────────────');
 		await cdp.eval('window.__reactState = { value: "", onChangeCalls: 0 }; window.__events = []');
@@ -351,10 +399,13 @@ async function main() {
 			await cdp.eval("document.body.getAttribute('style')"));
 
 		console.log('\n── 幂等装填 ──────────────────────────────────');
+		// ⚠️ 版本号从**源码**读，不要在这里硬编码 —— 探针改语义就要升版，
+		//    写死的话每次升版都会让这条本来正确的用例变成失败（踩过一次）。
+		const expectV = Number(/var VERSION = (\d+)/.exec(fs.readFileSync(PROBE, 'utf8'))?.[1]);
 		const v1 = await cdp.eval('window.__DSH_UI_PROBE__.__v');
 		await call({ action: 'ping' });
 		const v2 = await cdp.eval('window.__DSH_UI_PROBE__.__v');
-		check('重复调用不会重复装填（版本号稳定）', v1 === v2 && v1 === 1, { v1, v2 });
+		check('重复调用不会重复装填（版本号稳定）', v1 === v2 && v1 === expectV, { v1, v2, expectV });
 	} finally {
 		try { cdp?.ws.close(); } catch { /* 忽略 */ }
 		chrome.kill();

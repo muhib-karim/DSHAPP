@@ -52,7 +52,7 @@ function (CMD) {
   'use strict';
 
   /** 探针版本。**改了本文件的语义就要 +1** —— 页面上的旧探针靠它判断要不要换。 */
-  var VERSION = 1;
+  var VERSION = 2;
 
   /** 结果里单个元素的文本/类名截断长度（防超大 JSON 撑爆 IPC）。 */
   var MAX_TEXT = 120;
@@ -87,12 +87,16 @@ function (CMD) {
   }
 
   /**
-   * 元素是否**真的能被用户看到**。
+   * 元素**自身**是否可见（有尺寸、没被隐藏、能接指针事件）。
    *
    * ⚠️ 只看 `getBoundingClientRect()` 的尺寸是不够的：React 里大量用了
    *   `visibility:hidden` / `opacity:0` 做过渡，这类元素有尺寸但看不见，
    *   而**看不见的元素点了不会有任何反应** —— 那正是「AI 说点了但没生效」的
    *   头号原因。所以尺寸、visibility、display、opacity 四样都查。
+   *
+   * ⚠️ **本函数只查元素自身，不查「有没有别的东西盖在它上面」** —— 后者由
+   *   `blocker()` 负责。两者必须分开：一个元素完全可能「自己看着很正常，
+   *   但被全屏弹窗盖住」，那种情况下它 `isVisible` 为 true 而真机上点不动。
    */
   function isVisible(el) {
     if (!el || !el.getBoundingClientRect) return false;
@@ -104,6 +108,58 @@ function (CMD) {
     if (parseFloat(st.opacity) === 0) return false;
     if (st.pointerEvents === 'none') return false;
     return true;
+  }
+
+  /**
+   * 取某个视口坐标上的**最上层**元素。
+   *
+   * ⚠️ `elementFromPoint` 对**视口外**的坐标返回 `null`，而那不是「被遮挡」，
+   *   是「没显示在屏幕上」—— 两者必须分开，否则列表里滚出屏幕的元素会被
+   *   全部误报成遮挡，把真正的问题淹掉。
+   *
+   * ⚠️ `pointer-events:none` 的元素会被内核自动跳过，这正是我们要的：
+   *   它们不接事件，也就挡不住点击。
+   */
+  function topAt(x, y) {
+    try {
+      if (x < 0 || y < 0) return null;
+      if (x > (window.innerWidth || 0) || y > (window.innerHeight || 0)) return null;
+      return document.elementFromPoint(x, y);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 两个元素是否有祖先/后代关系（这种「压住」是正常的，不算遮挡）。 */
+  function related(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return !!((a.contains && a.contains(b)) || (b.contains && b.contains(a)));
+  }
+
+  /**
+   * 元素是否**被别的东西盖住**（真机手指点不到它）。返回遮挡者，没被挡则 null。
+   *
+   * ⚠️ 这是本探针最重要的一条判据，也是第一版最大的缺口：只查元素自身样式
+   *   会把「被全屏弹窗盖住的按钮」报成可用 —— 它有尺寸、`opacity` 是 1、
+   *   `visibility` 是 visible，**看上去完全正常**，但真机上点它只会点到底下
+   *   那层遮罩。模型于是挨个点、界面纹丝不动、还拿不到任何提示，
+   *   只能猜「是不是选择器写错了」。
+   *
+   *   实测的典型案例：官方前端首启会弹「预览版说明」对话框（`z-index:1000`
+   *   加一层覆盖全屏的 `_mask_`），此时探针会枚举出 16 个「可见」按钮，
+   *   而它们**一个都点不动**；那个弹窗的按钮文案是「继续」，不认识它就关不掉。
+   *
+   * 判据与 `clickEl` 里的 `onTarget` 必须同源 —— 否则「dump 说能用」与
+   * 「tap 说没点到」会互相矛盾，模型无从判断该信哪个。
+   */
+  function blocker(el) {
+    if (!el || !el.getBoundingClientRect) return null;
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    var top = topAt(r.left + r.width / 2, r.top + r.height / 2);
+    if (!top || related(top, el)) return null;
+    return top;
   }
 
   /** 元素是否在视口内（`dump` 里标记用，不参与过滤）。 */
@@ -270,9 +326,13 @@ function (CMD) {
    * 把一个元素描述成可回传的普通对象。
    *
    * ⚠️ 这里**只放原始类型** —— 返回 DOM 节点会让 JSON 序列化整个废掉。
+   *
+   * ⚠️ `covered` / `blockedBy` 是**必须**带上的：没有它们，调用方拿到的是一份
+   *   「看着都能点」的清单，而真机上可能一个都点不动（见 `blocker()`）。
    */
   function describe(el, index) {
     var r = el.getBoundingClientRect();
+    var b = blocker(el);
     return {
       ref: 'e' + index,
       sel: cssPath(el),
@@ -287,22 +347,33 @@ function (CMD) {
         y: Math.round((r.top + r.height / 2) * 100) / 100
       },
       inViewport: inViewport(r),
+      // 「盖住了」与「盖它的是谁」成对出现：只报 true 而不报是谁，模型还得再查一轮。
+      covered: !!b,
+      blockedBy: b ? {
+        sel: cssPath(b),
+        tag: b.tagName.toLowerCase(),
+        cls: trunc(b.getAttribute && b.getAttribute('class') || '', MAX_CLASS),
+        text: labelOf(b)
+      } : null,
       enabled: !(el.disabled === true || (el.getAttribute && el.getAttribute('aria-disabled') === 'true')),
       checked: typeof el.checked === 'boolean' ? el.checked : null,
       value: typeof el.value === 'string' ? trunc(el.value, MAX_TEXT) : null
     };
   }
 
-  /** `dump` 用的候选收集（去重 + 可见性过滤 + 排序 + 截断）。 */
+  /** `dump` 用的候选收集（去重 + 可见性过滤 + 遮挡标注 + 排序 + 截断）。 */
   function collect(opts) {
     opts = opts || {};
     var limit = typeof opts.limit === 'number' && opts.limit > 0 ? Math.min(opts.limit, MAX_ELEMENTS) : DEFAULT_LIMIT;
     var needle = (opts.filter == null ? '' : String(opts.filter)).toLowerCase();
     var includeHidden = opts.includeHidden === true;
+    // 「只要现在真能点的」—— 模型在弹窗挡着时最需要的开关
+    var clickableOnly = opts.clickableOnly === true;
 
     var found = toArray(document.querySelectorAll(INTERACTIVE));
     var seen = [];
     var out = [];
+    var blocked = 0;
 
     for (var i = 0; i < found.length; i++) {
       var el = found[i];
@@ -311,11 +382,13 @@ function (CMD) {
       if (!includeHidden && !isVisible(el)) continue;
 
       var d = describe(el, out.length);
+      if (d.covered) blocked++;
+      if (clickableOnly && d.covered) continue;
       if (needle) {
         var hay = (d.text + ' ' + d.testid + ' ' + d.cls + ' ' + d.sel + ' ' + d.role).toLowerCase();
         if (hay.indexOf(needle) < 0) continue;
       }
-      d._score = score(el);
+      d._score = score(el) + (d.covered ? 0 : 1000); // 真能点的排前面
       out.push(d);
       if (out.length >= MAX_ELEMENTS) break;
     }
@@ -324,7 +397,85 @@ function (CMD) {
     out.sort(function (a, b) { return b._score - a._score; });
     var trimmed = out.slice(0, limit);
     for (var j = 0; j < trimmed.length; j++) delete trimmed[j]._score;
-    return { matched: out.length, elements: trimmed };
+    return { matched: out.length, elements: trimmed, blocked: blocked, scanned: seen.length };
+  }
+
+  /**
+   * 从 `el` 向上找「覆盖视口大部分区域」的那层壳。
+   *
+   * ⚠️ 遮挡层几乎总是「一个覆盖全屏的容器 + 里面的实际内容」。采样点命中的
+   *   往往是**内容**（弹窗里的一段文字、一个按钮），它自己的 rect 很小 ——
+   *   直接拿命中元素判面积会得出「没有遮挡」，而实际上全屏都被盖住了。
+   *   往上找到那层壳，才能正确回答「现在谁盖着屏幕」。
+   */
+  function fullScreenAncestor(el) {
+    var vw = window.innerWidth || 0;
+    var vh = window.innerHeight || 0;
+    if (vw <= 0 || vh <= 0) return null;
+    var cur = el;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      var r = cur.getBoundingClientRect();
+      if (r.width * r.height >= vw * vh * 0.5) {
+        var st = window.getComputedStyle(cur);
+        if (st && (st.position === 'fixed' || st.position === 'absolute')) return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * 当前有没有**全屏级别的遮挡层**？有的话它是谁？
+   *
+   * ⚠️ 这是「现在这个界面能不能操作」的总开关。有全屏弹窗时，底下所有按钮都
+   *   点不动，而它们各自的 `covered` 会指向同一个遮罩 —— 把遮罩单独报出来，
+   *   模型一眼就知道「先关掉它」，而不是对着十几条 `covered:true` 发愣。
+   *
+   * ⚠️ **必须多点采样**。第一版只取视口中心一个点，结果命中弹窗里的文字，
+   *   `fullScreenAncestor` 还没加时更是直接判成「没有遮挡」—— 于是出现了
+   *   `overlay` 说「没有遮挡层」而同一时刻 `dump` 说「15 个元素被遮挡」的
+   *   自相矛盾。两个字段对同一件事给出相反答案，比缺字段更糟。
+   */
+  function overlay() {
+    var vw = window.innerWidth || 0;
+    var vh = window.innerHeight || 0;
+    if (vw <= 0 || vh <= 0) return null;
+
+    // 中心 + 四角内缩 + 四边中点，共 9 点：既能覆盖全屏层，又能避开单点落在
+    // 弹窗内容（或页面上某个恰好很大的普通元素）上的偶然。
+    var pts = [
+      [0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85],
+      [0.5, 0.06], [0.5, 0.94], [0.06, 0.5], [0.94, 0.5]
+    ];
+
+    var tally = [];
+    for (var i = 0; i < pts.length; i++) {
+      var hit = topAt(Math.round(vw * pts[i][0]), Math.round(vh * pts[i][1]));
+      if (!hit || hit === document.body || hit === document.documentElement) continue;
+      var layer = fullScreenAncestor(hit);
+      if (!layer) continue;
+      var at = -1;
+      for (var j = 0; j < tally.length; j++) if (tally[j].el === layer) { at = j; break; }
+      if (at >= 0) tally[at].n++;
+      else tally.push({ el: layer, n: 1 });
+    }
+    if (tally.length === 0) return null;
+
+    tally.sort(function (a, b) { return b.n - a.n; });
+    // 只在**多数**采样点都被它挡住时才认定是遮挡层。少数点命中说明那只是
+    // 页面上某个恰好很大的普通元素，不是「盖住了整个界面」。
+    if (tally[0].n < 5) return null;
+
+    var el = tally[0].el;
+    return {
+      sel: cssPath(el),
+      tag: el.tagName.toLowerCase(),
+      cls: trunc(el.getAttribute && el.getAttribute('class') || '', MAX_CLASS),
+      text: labelOf(el),
+      rect: rectOf(el),
+      hits: tally[0].n,
+      samples: pts.length
+    };
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -506,19 +657,48 @@ function (CMD) {
    * 这条做法是 React 官方测试工具（react-dom/test-utils 的
    * `setNativeValue`）用的同一招，不是偏方。
    */
+  /**
+   * 写进去的内容是否**真的在**元素里了。
+   *
+   * ⚠️ 判据是「**包含**」而不是「完全相等」：`contenteditable` 的富文本编辑器
+   *   （官方 composer 就是 Lexical）会把文本包进 `<p><span data-lexical-text>`，
+   *   严格相等会把一次**成功**的写入误报成失败。
+   */
+  function applied(el, want) {
+    var got = readText(el);
+    if (want === '') return got === '';
+    return got.indexOf(want) >= 0;
+  }
+
   function setValue(el, text) {
     var s = String(text == null ? '' : text);
     if (el.isContentEditable) {
       try { el.focus(); } catch (e) { /* 不可聚焦 */ }
-      // contenteditable 走 execCommand：它产生的 input 事件是「真的」，
-      // React 会当作用户输入处理。老 API，但在所有 WebView 上都还在。
+
+      // ⚠️ **`execCommand('insertText')` 的生效是异步的**，这是本函数最容易搞错的
+      //   一点，实测过两轮才量清楚：
+      //
+      //     t=0ms   调用 execCommand → 返回 true
+      //     t=0ms   同步读 textContent / innerText → **都还是空的**
+      //     t=700ms 再读 → 内容已落地（`<p><span data-lexical-text>…</span></p>`）
+      //
+      //   官方 composer 是 Lexical，它把插入排进自己的 update cycle，所以
+      //   **同步读必然为空**。第一版拿「同步读 == 期望值」当成功判据，于是
+      //   每一次都判定失败、再走 `el.textContent = s` 兜底 —— 而那个兜底会把
+      //   Lexical 精心维护的 `<p><span>` 结构拍成裸文本，破坏编辑器内部模型。
+      //   表面上「内容进去了」，实际是两条路都在写同一个元素。
+      //
+      //   所以：**返回 true 就相信它**，不做同步覆盖；只有它返回 false 或抛异常
+      //   时才用兜底。落地的复核交给调用方在下一轮 `find`/`text` 里做
+      //   （见 `type` 结果里的 `applied` 字段说明）。
       var ok = false;
       try { ok = document.execCommand('insertText', false, s); } catch (e) { ok = false; }
-      if (!ok) {
-        el.textContent = s;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      return ok ? 'execCommand' : 'textContent';
+      if (ok) return 'execCommand(异步生效)';
+
+      // 兜底：`execCommand` 不可用（老内核/非聚焦）时才走这条。
+      el.textContent = s;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return applied(el, s) ? 'textContent' : 'textContent(未生效)';
     }
 
     var proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
@@ -529,6 +709,21 @@ function (CMD) {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return 'native-setter';
+  }
+
+  /**
+   * 读一个可编辑元素的当前文本。
+   *
+   * ⚠️ `contenteditable` 用 `textContent` 而不是 `innerText`：赋值走的就是
+   *   `textContent`，而 `innerText` 是**布局相关**的（元素不可见/未布局时返回
+   *   空串）。用 `innerText` 做校验会出现「刚写进去、校验说不相等」的假失败
+   *   —— `how` 报 `textContent(未生效)` 而发送键明明已经变可用（踩过）。
+   *   校验与被校验的必须是同一个量。
+   */
+  function readText(el) {
+    if (!el) return '';
+    if (el.isContentEditable) return String(el.textContent || '');
+    return typeof el.value === 'string' ? el.value : '';
   }
 
   /** 按键。React 的 Enter 提交走 `keydown`，所以三个都发。 */
@@ -615,11 +810,46 @@ function (CMD) {
     // ── dump：把界面上的按钮全列出来（带精确位置）────────────────────
     if (action === 'dump') {
       var got = collect(cmd);
-      return ok({
+      var ov = overlay();
+      var out2 = {
         viewport: viewportInfo(),
         matched: got.matched,
         count: got.elements.length,
+        scanned: got.scanned,
+        blocked: got.blocked,
         elements: got.elements
+      };
+      // ⚠️ 有全屏遮挡层时，**必须**在顶层把这件事说出来。否则模型拿到的是一份
+      //   看起来正常的清单（元素有尺寸、opacity 为 1），挨个点却全部无效 ——
+      //   这正是「AI 说点过了但界面没动」的现场。
+      if (ov) {
+        out2.overlay = ov;
+        out2.warning = '当前有覆盖视口大部分区域的遮挡层，它下面的按钮都点不动。' +
+          '先关掉它（通常是弹窗里的某个按钮）再操作。';
+      }
+      return ok(out2);
+    }
+
+    // ── overlay：现在有没有遮挡层、它是什么、此刻真正能点什么 ────────
+    if (action === 'overlay') {
+      var layer = overlay();
+      // ⚠️ 不要试图回答「遮挡层**里面**有哪些按钮」—— 实测官方前端的弹窗结构是
+      //   `_root_ > [_mask_（全屏空遮罩）, _dialog_（真内容）]`，也就是**按钮是
+      //   遮罩的兄弟节点，不是后代**。按后代找会得到「0 个可点元素」，而屏幕
+      //   上明明有个「继续」可以点。
+      //
+      //   模型真正要问的是「**现在我能点什么**」，所以直接回答那个：列出当前
+      //   **没有被遮挡**的可交互元素。这在任何 DOM 结构下都成立。
+      var live = collect({ limit: 30, clickableOnly: true });
+      if (!layer) {
+        return ok({ present: false, clickable: live.elements, count: live.elements.length });
+      }
+      return ok({
+        present: true,
+        layer: layer,
+        clickable: live.elements,
+        count: live.elements.length,
+        blocked: live.blocked
       });
     }
 
@@ -642,12 +872,23 @@ function (CMD) {
       }
       var info = describe(t, 0);
       var res = clickEl(t);
-      return ok({
+      var out = {
         element: info,
         dispatched: res.dispatched,
         hitTopmost: res.hit,
-        onTarget: res.onTarget
-      });
+        onTarget: res.onTarget,
+        covered: !!res.hit && !res.onTarget,
+        blockedBy: res.onTarget ? null : res.hit
+      };
+      // ⚠️ 被遮挡时**把话说明白**。这是本探针最该省下的一轮来回：模型点不动时
+      //   最想知道的是「谁挡着、我该先点谁」，而不是自己去猜选择器写错了没有。
+      if (!res.onTarget) {
+        out.hint = '点击被上层元素吃掉了，目标没收到事件。先处理挡在前面的元素' +
+          (res.hit && res.hit.text ? '（它的文案是「' + res.hit.text + '」）' : '') +
+          '，或用 overlay 动作查看当前遮挡层。';
+        out.overlay = overlay();
+      }
+      return ok(out);
     }
 
     // ── type：往输入框写字 ─────────────────────────────────────────
@@ -664,10 +905,24 @@ function (CMD) {
       var how = setValue(inp, cmd.value == null ? '' : cmd.value);
       var submitted = null;
       if (cmd.enter === true) submitted = pressKey(inp, 'Enter', cmd);
+      // ⚠️ 用 `readText` 而不是 `inp.value`：`contenteditable` 元素的 `value` 是
+      //   `undefined`，于是这里**恒报 null**，而输入框里明明已经有字了 ——
+      //   调用方拿到 `ok:true, value:null` 完全无法判断到底写进去没有（踩过）。
+      //
+      // ⚠️ 但 `value` 对 `contenteditable` **不能**当成「写成功了」的证据：
+      //   `execCommand` 是异步生效的（见 `setValue`），**同步读必然为空**。
+      //   所以这里只报「当时读到的值」，是否真的落地由 `applied` 表达 ——
+      //   它的语义是「同步可确认已写入」，为 null 表示「异步写入已发出，
+      //   请在下一步用 find/text 复核」，**不是失败**。
+      var actual = readText(inp);
+      var wanted = cmd.value == null ? '' : String(cmd.value);
+      var confirmed = applied(inp, wanted);
+      var async = how.indexOf('execCommand') === 0;
       return ok({
         element: describe(inp, 0),
         how: how,
-        value: typeof inp.value === 'string' ? trunc(inp.value, MAX_TEXT) : null,
+        value: trunc(actual, MAX_TEXT),
+        applied: confirmed ? true : (async ? null : false),
         submitted: submitted
       });
     }
@@ -738,6 +993,9 @@ function (CMD) {
       var hit = cmd.sel || cmd.text || cmd.testid || cmd.aria ? locate(cmd) : null;
       var needVisible = cmd.visible !== false;
       var satisfied = !!(hit && (!needVisible || isVisible(hit)));
+      // ⚠️ 被遮挡的元素**不算「等到了」**：调用方等它出现是为了点它，而它现在
+      //   点不动。报 satisfied 会让「等 → 点」这条路在弹窗场景下静默失败。
+      if (satisfied && cmd.clickable === true && blocker(hit)) satisfied = false;
       return ok({
         satisfied: satisfied,
         element: hit ? describe(hit, 0) : null
@@ -754,6 +1012,8 @@ function (CMD) {
         hash: location.hash,
         readyState: document.readyState,
         focused: document.activeElement ? describe(document.activeElement, 0) : null,
+        overlay: overlay(),
+        blocked: got2.blocked,
         top: got2.elements,
         scrollable: (function () {
           var s = findScrollable(null);
@@ -763,7 +1023,8 @@ function (CMD) {
     }
 
     return fail('未知 action: ' + action, {
-      known: ['ping', 'dump', 'find', 'tap', 'type', 'key', 'scroll', 'text', 'html', 'wait', 'info']
+      known: ['ping', 'dump', 'find', 'tap', 'type', 'key', 'scroll', 'text', 'html',
+        'wait', 'info', 'overlay']
     });
   }
 

@@ -70,7 +70,7 @@ const WAIT_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 80;
 
 /** 全部合法 action，与页面探针的分派表必须一致。 */
-const ACTIONS = ['ping', 'info', 'dump', 'find', 'tap', 'type', 'key', 'scroll', 'text', 'html', 'wait', 'reload'];
+const ACTIONS = ['ping', 'info', 'dump', 'find', 'tap', 'type', 'key', 'scroll', 'text', 'html', 'wait', 'overlay', 'reload'];
 
 /**
  * 模型可见的工具描述 —— **这是本插件最要紧的一段文本**。
@@ -114,7 +114,10 @@ Every element carries \`rect\`/\`center\` in **CSS viewport pixels** and, when t
 - The UI is a chat app: the composer input and its send button are the usual targets. \`dump\` with \`filter:"composer"\` finds them fast.
 - After tapping something that opens a panel/menu, follow with \`wait\` (e.g. \`{action:"wait", text:"确认"}\`) before tapping inside it — the panel animates in and is not immediately clickable.
 - \`dump\` only returns **visible** elements by default. Pass \`includeHidden:true\` to also see hidden ones (useful to diagnose "the button exists but I cannot click it").
-- If \`tap\` reports \`onTarget:false\`, something is covering the element (a modal backdrop or loading mask) — read \`hitTopmost\` to see what actually received the click.
+- ⚠️ **A button can be visible and still unclickable.** When something covers it (a modal backdrop, a loading mask, an open drawer's scrim), a real touch lands on the cover, not on the button. Every element therefore carries \`covered\` and \`blockedBy\`; \`dump\` also reports \`overlay\` + \`blocked\` counts and a \`warning\` when a full-screen cover is present. **When \`covered\` is true, do not tap — deal with the cover first.** A common case: on a fresh profile the official frontend opens a "预览版说明" dialog whose button reads **「继续」**; until you tap it, all 16 buttons behind it are dead.
+- \`{action:"overlay"}\` answers "what is covering the screen right now, and which buttons are actually live?" — it returns the cover plus the clickable elements **inside** it. Reach for it whenever \`covered\`/\`onTarget:false\` shows up.
+- \`{action:"dump", clickableOnly:true}\` drops everything currently covered, so you get only what a finger could really hit.
+- If \`tap\` reports \`onTarget:false\`, something is covering the element (a modal backdrop or loading mask) — read \`hitTopmost\`/\`blockedBy\` to see what actually received the click, and the returned \`hint\` says what to do next.
 - Results include \`ok:false\` with an \`error\` when the element was not found or was not visible. **Always check \`ok\`** and report the failure instead of assuming the click worked.`;
 
 /**
@@ -131,11 +134,11 @@ function pickTarget(args) {
 	const out = {};
 	const passthrough = [
 		'sel', 'testid', 'aria', 'text', 'exact',
-		'filter', 'limit', 'includeHidden',
+		'filter', 'limit', 'includeHidden', 'clickableOnly',
 		'dy', 'dx', 'to', 'container',
 		'value', 'clear', 'enter', 'key',
 		'ctrl', 'shift', 'alt', 'meta',
-		'visible',
+		'visible', 'clickable',
 	];
 	for (const key of passthrough) {
 		if (args[key] !== undefined) out[key] = args[key];
@@ -327,12 +330,48 @@ function render(args, reply) {
 	if (action === 'dump') {
 		const list = reply.elements ?? [];
 		lines.push(`✓ 找到 ${reply.matched ?? list.length} 个可交互元素，返回前 ${list.length} 个（视口 ${fmtViewport(reply.viewport)}）`);
+		// ⚠️ 遮挡警告必须排在元素清单**之前**：模型最容易犯的错是扫一眼清单就
+		//   开始挨个 tap。清单本身看着完全正常（元素都有尺寸），只有这一行能
+		//   拦住它。
+		if (reply.overlay) {
+			lines.push(`  ⚠️ 有遮挡层盖住界面（${reply.blocked ?? 0} 个元素当前点不动）:`);
+			lines.push(`    ${fmtElement(reply.overlay)}`);
+			lines.push(`    ${reply.warning ?? ''}`);
+			lines.push(`    先关掉它（用 overlay 动作看它里面有哪些按钮），再操作下面的元素。`);
+		} else if ((reply.blocked ?? 0) > 0) {
+			lines.push(`  ⚠️ 其中 ${reply.blocked} 个被上层元素盖住，现在点不动（见各元素的 blockedBy）。`);
+		}
 		if (list.length === 0) {
 			lines.push('  （没有匹配的元素。界面可能还在加载，或 filter 太窄。）');
 		}
 		for (const el of list) lines.push(`  ${fmtElement(el)}`);
 		lines.push('');
 		lines.push('用返回的 sel 或 text 做 tap/type 的定位条件。');
+		return lines.join('\n');
+	}
+
+	// ── overlay：现在谁盖着屏幕、此刻真正能点什么 ────────────────────
+	if (action === 'overlay') {
+		const live = reply.clickable ?? [];
+		if (!reply.present) {
+			lines.push(`✓ 当前没有遮挡层，界面可以正常操作。`);
+			if (live.length > 0) {
+				lines.push(`  现在能点的是这 ${live.length} 个:`);
+				for (const el of live) lines.push(`    ${fmtElement(el)}`);
+			}
+			return lines.join('\n');
+		}
+		lines.push('✓ 当前有遮挡层:');
+		lines.push(`  ${fmtElement(reply.layer)}`);
+		// ⚠️ 报「此刻真正能点的」而不是「遮挡层里面的」：官方前端的弹窗是
+		//   遮罩与内容**平级**（`_root_ > [_mask_, _dialog_]`），按后代找会得到
+		//   0 个，而屏幕上明明有个「继续」能点。
+		if (live.length === 0) {
+			lines.push('  当前没有任何可点元素（可能是纯加载蒙层，等它自己消失）。');
+		} else {
+			lines.push(`  此刻只有这 ${live.length} 个元素是真能点的 —— 先处理它们:`);
+			for (const el of live) lines.push(`    ${fmtElement(el)}`);
+		}
 		return lines.join('\n');
 	}
 
@@ -349,8 +388,9 @@ function render(args, reply) {
 		lines.push(`✓ 已点击 ${el ? `「${el.text || el.sel}」` : ''}`);
 		if (el) lines.push(`  ${fmtElement(el)}`);
 		if (reply.onTarget === false) {
-			lines.push(`  ⚠️ 点击被上层元素接收（元素可能被遮挡，或实际命中的是遮罩）:`);
+			lines.push(`  ⚠️ 点击被上层元素接收（元素被遮挡，真机手指会点到那层而不是它）:`);
 			if (reply.hitTopmost) lines.push(`    ${fmtElement(reply.hitTopmost)}`);
+			if (reply.hint) lines.push(`    ${reply.hint}`);
 		}
 		lines.push(`  事件: ${(reply.dispatched ?? []).join(', ')}`);
 		lines.push(`  提示: 界面变化是异步的 —— 若这一步应打开面板，接着用 wait 等它出现。`);
@@ -360,7 +400,19 @@ function render(args, reply) {
 	if (action === 'type') {
 		lines.push(`✓ 已写入输入框（方式: ${reply.how}）`);
 		if (reply.element) lines.push(`  ${fmtElement(reply.element)}`);
-		lines.push(`  当前值: ${JSON.stringify(reply.value ?? '')}`);
+		lines.push(`  当时读到的值: ${JSON.stringify(reply.value ?? '')}`);
+		// ⚠️ `applied` 是三态，别把它当布尔用：
+		//   true  = 同步已确认写入；
+		//   null  = 写入已发出但**异步生效**（contenteditable/Lexical 就是这样，
+		//           同步读必然为空），**不是失败** —— 下一步复核即可；
+		//   false = 真的没写进去。
+		if (reply.applied === false) {
+			lines.push(`  ⚠️ 内容没有真正写进去（期望 ${JSON.stringify(args.value ?? '')}）。`);
+			lines.push(`    若目标是 contenteditable，先 tap 点一下它再 type；或改用 key 动作逐字输入。`);
+		} else if (reply.applied === null) {
+			lines.push(`  ℹ️ 写入是异步生效的（富文本编辑器），此刻还读不到内容属正常。`);
+			lines.push(`    下一步用 find/text 复核它，或直接检查「发送」按钮是否已从禁用变可用。`);
+		}
 		if (reply.submitted) lines.push(`  已按下 Enter（事件: ${reply.submitted.join(', ')}）`);
 		return lines.join('\n');
 	}
@@ -449,6 +501,12 @@ function fmtElement(el) {
 	if (el.enabled === false) flags.push('已禁用');
 	if (el.checked !== null && el.checked !== undefined) flags.push(el.checked ? '已选中' : '未选中');
 	if (el.inViewport === false) flags.push('不在视口内');
+	// ⚠️ 「被盖住」必须直接写在元素这一行上。只在 dump 顶部报一次是不够的：
+	//   模型是逐行扫这个清单的，遮挡信息跟元素分离时它会对被挡的那几条照点不误。
+	if (el.covered) {
+		const by = el.blockedBy;
+		flags.push(by ? `被遮挡←${by.cls || by.tag || by.sel}` : '被遮挡');
+	}
 	if (flags.length > 0) parts.push(`(${flags.join('，')})`);
 	return parts.join(' · ');
 }
@@ -478,7 +536,7 @@ function uiTool(home) {
 				action: {
 					type: 'string',
 					enum: ACTIONS,
-					description: 'What to do. "dump" lists interactive elements with positions; "tap" clicks one; "type" fills an input; "scroll" scrolls; "text" reads visible text; "info" summarises the current screen; "wait" blocks until an element appears; "ping" checks the probe is alive; "find"/"html" inspect one element; "reload" reloads a broken Web view.',
+					description: 'What to do. "dump" lists interactive elements with positions; "tap" clicks one; "type" fills an input; "scroll" scrolls; "text" reads visible text; "info" summarises the current screen; "wait" blocks until an element appears; "ping" checks the probe is alive; "find"/"html" inspect one element; "overlay" reports what is currently covering the screen and which buttons inside it are live; "reload" reloads a broken Web view.',
 				},
 				sel: { type: 'string', description: 'CSS selector for the target element. Most precise — copy it from a previous dump.' },
 				testid: { type: 'string', description: 'Target by data-testid.' },
@@ -488,6 +546,7 @@ function uiTool(home) {
 				filter: { type: 'string', description: 'For action:"dump" — only return elements whose text/testid/class/selector contains this substring. Great for narrowing to e.g. "composer".' },
 				limit: { type: 'number', description: 'For dump/text — max results (dump default 60, max 300).' },
 				includeHidden: { type: 'boolean', description: 'For dump — also list hidden elements. Useful to diagnose "the button exists but cannot be clicked".' },
+				clickableOnly: { type: 'boolean', description: 'For dump — drop every element that is currently covered by something else, leaving only what a real finger could hit right now.' },
 				value: { type: 'string', description: 'The text to write into the input, for action:"type". (`value`, not `text` — `text` is the element locator.)' },
 				clear: { type: 'boolean', description: 'For action:"type" — empty the input before writing.' },
 				enter: { type: 'boolean', description: 'For action:"type" — also press Enter after writing.' },
@@ -501,6 +560,7 @@ function uiTool(home) {
 				dx: { type: 'number', description: 'For action:"scroll" — horizontal pixels to scroll.' },
 				container: { type: 'string', description: 'For action:"scroll" — CSS selector of the scroll container. Omit to auto-detect the main scrollable area.' },
 				visible: { type: 'boolean', description: 'For action:"wait" — require the element to be visible (default true). Pass false to wait for it to disappear.' },
+				clickable: { type: 'boolean', description: 'For action:"wait" — also require the element NOT to be covered by anything, i.e. wait until it is genuinely tappable.' },
 			},
 		},
 		async execute(args) {

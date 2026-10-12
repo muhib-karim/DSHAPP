@@ -3072,6 +3072,144 @@ React 18 用根级事件委托，缺前置事件时某些组件的状态机不�
 这个字段等于没有**，而工具文档还写着「onTarget:false 说明被遮挡」。判据必须直接看
 命中元素本身。
 
+#### ⚠️⚠️ 「看得见」不等于「点得动」—— 遮挡识别是这套工具最要紧的一环
+
+**这是「AI 说点过了但界面没动」的头号成因**，实测在官方前端上撞到：
+
+全新 profile 首次打开会弹**「预览版说明」对话框**（`z-index:1000` + 一层覆盖全屏的
+`_mask_`），关掉它紧接着又是**「API 密钥」**向导。这两个弹窗盖着的时候，底下 16 个按钮
+在 DOM 里**看着完全正常** —— 有尺寸、`opacity` 是 1、`visibility` 是 visible、
+`pointer-events` 是 auto。第一版 `isVisible()` 只查元素**自身**样式，于是把它们全部
+报成可用；模型挨个 `tap`、界面纹丝不动，而拿到的只有 `onTarget:false` 一句，**完全
+不知道是谁挡着、下一步该干嘛**。
+
+所以「精确」不只是坐标对，还必须包含**此刻它能不能被点到**。回执里三处都带上：
+
+| 字段 | 在哪 | 含义 |
+|---|---|---|
+| `covered` / `blockedBy` | 每个元素 | 它现在被谁盖住（`blockedBy` 直接给出遮挡者的选择器/类名） |
+| `overlay` / `blocked` / `warning` | `dump` 顶层 | 有没有全屏遮挡层、多少元素点不动、一句可读的警告 |
+| `present` / `layer` / `clickable` | `overlay` 动作 | 遮挡层是谁 + **此刻真正能点的是哪几个** |
+
+判据与 `clickEl()` 里的 `onTarget` **同源**（都走 `blocker()`）—— 否则「dump 说能用」
+与「tap 说没点到」会互相矛盾，模型无从判断该信哪个。
+
+⚠️ **遮挡层要往上找壳**。遮挡层几乎总是「一个覆盖全屏的容器 + 里面的实际内容」，
+采样点命中的往往是**内容**（弹窗里的一段文字），它自己的 rect 很小 —— 直接拿命中元素
+判面积会得出「没有遮挡」。`fullScreenAncestor()` 就是干这个的。
+
+⚠️ **必须多点采样**。第一版只取视口中心一个点，结果出现
+**`overlay` 报「没有遮挡层」而同一时刻 `dump` 报「15 个元素被遮挡」**的自相矛盾 ——
+两个字段对同一件事给出相反答案，比缺字段更糟。现在取 9 个点（中心 + 四角内缩 + 四边
+中点），**过半数**被同一层挡住才认定是遮挡层。
+
+⚠️ **不要试图回答「遮挡层里面有哪些按钮」**。实测官方弹窗的结构是
+`_root_ > [_mask_（全屏空遮罩）, _dialog_（真内容）]` —— **按钮是遮罩的兄弟节点，
+不是后代**。按后代找会得到「0 个可点元素」，而屏幕上明明有个「继续」能点。
+模型真正要问的是「**现在我能点什么**」，`overlay` 因此直接列**当前没有被遮挡**的
+可交互元素，这在任何 DOM 结构下都成立。
+
+#### ⚠️⚠️ `execCommand` 写 contenteditable 是**异步生效**的
+
+官方 composer 是 **Lexical**。实测时间线（这是量了两轮才搞清的）：
+
+```
+t=0ms    调用 execCommand('insertText') → 返回 true
+t=0ms    同步读 textContent / innerText → **都还是空的**
+t=700ms  再读 → 内容已落地（<p><span data-lexical-text>…</span></p>）
+```
+
+所以**同步读必然为空**，拿「同步读 == 期望值」当成功判据会**每一次都误判失败**，
+然后走 `el.textContent = s` 兜底 —— 而那个兜底会把 Lexical 精心维护的 `<p><span>`
+结构拍成裸文本，破坏编辑器内部模型。表面上「内容进去了」，实际是两条路在写同一个元素。
+
+正确做法：**`execCommand` 返回 true 就相信它**，不做同步覆盖；`textContent` 只作
+「`execCommand` 不可用/抛异常」时的兜底。
+
+`type` 的 `applied` 字段因此是**三态**，别当布尔用：
+
+| 值 | 含义 |
+|---|---|
+| `true` | 同步已确认写入 |
+| `null` | 写入已发出、**异步生效中**（contenteditable 就是这样）—— **不是失败** |
+| `false` | 真的没写进去 |
+
+⚠️ 校验与赋值必须用**同一个量**：赋值走 `textContent`、校验却用 `innerText`
+（布局相关，元素未布局时返回空串）会出现「刚写进去、校验说不相等」的假失败。
+判据用「**包含**」而不是严格相等 —— 富文本会把文本包进 `<p><span>`。
+
+#### ⚠️ 验收判据必须是「业务状态真的变了」
+
+拿错判据会让人去修一个**根本没坏**的东西。两个反例都实测踩过：
+
+| 错误判据 | 为什么无效 |
+|---|---|
+| `document.querySelectorAll('*').length` 变化 | 抽屉靠 CSS `transform`/`opacity` 显隐，**节点数一个都不增** |
+| `.mp-drawer-mask` 存在/可见 | 它是 `mpMask()` **懒建且常驻**的，建完就不删；存在 ≠ 抽屉开着 |
+
+而「点汉堡展开抽屉」在**空会话页（Hero）根本不是有效判据**：此时官方侧栏尚未渲染
+（`.pI_x6G_sidebarCol` 不存在），`mpToggleDrawer()` 里 `mpOfficialToggle()` 返回
+`null`、`if (btn) btn.click()` 不执行 → 点汉堡本来就没反应。那是 mobile-ui 插件在
+Hero 页的缺陷（见 `client.js` 修复 31 的注释），探针如实报 `onTarget:true` **没有说谎**。
+
+**有效判据**（`tools/ui-map-real-frontend.mjs` 用的就是这条）：走 composer 全链路 ——
+`type` 写入 → **发送按钮从 `disabled:true` 变 `false`**（证明 React 真的认账了）→
+`tap` 发送 → **消息文本出现在界面上**。三步任何一步失败都说明探针没真的驱动到应用。
+
+#### 怎么用（模型的正确姿势）
+
+**第 0 步永远是「清场」**：`{"action":"overlay"}` 看有没有遮挡层。有就先点掉它，
+再 `overlay` 一次确认没了 —— 官方首启向导是**多步**的，只关一次会停在第二个弹窗上。
+
+```
+overlay → 有遮挡层？→ 点「此刻能点的」里那个按钮 → 再看 overlay → 直到 present:false
+```
+
+然后才是正常流程：
+
+1. `{"action":"dump"}` 先看界面上有什么（返回每个元素的位置、文本、选择器、`covered`）；
+2. 用 `sel`（首选，从刚才的 dump 里复制）或 `text` / `aria` / `testid` 定位；
+3. `{"action":"tap","text":"发送"}`；**`covered:true` 的元素别点**，先处理遮挡；
+4. 界面变化是异步的 —— 接着 `{"action":"wait","text":"确认","clickable":true}` 等面板出现；
+5. **永远先看 `ok` 字段**，`ok:false` 要如实报失败，不能假设点成功了。
+
+其它动作：`type`（写输入框，`enter:true` 附带回车）、`key`（发按键）、
+`scroll`（`to:"bottom"` 跳到底）、`text`（读可见文本）、`info`（一眼看当前界面）、
+`find` / `html`（看单个元素）、`ping`（探针是否活着）、`reload`（界面白了就重载）。
+`dump` 可加 `clickableOnly:true` 只看现在真能点的。
+
+#### PC 侧自动化验收（不需要真机）
+
+设备上装的是别处签名的包、无法 `install -r`（会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），
+而卸载会清掉 `filesDir` 下的整个 Termux 环境与 `$DSH_HOME`。所以验收走
+**真实 Chrome + 真实 DOM**（`--headless=new` + CDP，Node 24 自带 `WebSocket`，零依赖）：
+
+```powershell
+node tools\ui-probe-verify.mjs        # 探针行为，78 项断言（真实 DOM，含 React 受控输入模拟）
+node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端
+```
+
+`ui-map-real-frontend.mjs` 需要一份**独立实例**（别碰用户正在用的那个 GUI）：
+
+```powershell
+# ⚠️ --patch 是**启动器**参数，必须在子命令**之前**；且必须配 --profile
+dsh.cmd --profile web --patch "<隔离目录>\mobile-ui.patch.yml" --no-open --port 31999
+node tools\ui-map-real-frontend.mjs "http://127.0.0.1:31999/?token=..."
+```
+
+| 覆盖 | 判据 |
+|---|---|
+| `dump` / `find` | 找到 React 的 `role=button`、CSS 中心坐标、`includeHidden`、`filter`、`limit` |
+| `tap` | 五个事件按序派发 + **页面计数器真的 +1** + 遮挡识别 |
+| **遮挡识别** | `covered`/`blockedBy`、`dump` 顶层 `overlay`+`warning`+`blocked`、`clickableOnly` 过滤、`overlay` 动作的 `present`/`layer`/`clickable`、`wait clickable:true` 不把被遮挡的算作等到了、遮罩移除后全部复位 |
+| `type` | **React 的 onChange 真的被触发、拿到的值正确**（模拟实例级 value 拦截器） |
+| `scroll` / `key` / `text` / `info` / `html` | 容器真的滚动、按键送达、文本可读 |
+| 健壮性 | 未知 action 不崩、返回值可 JSON 序列化、**不污染页面**、幂等装填 |
+
+⚠️ 这套 PC 侧验收的价值已经**三次**兑现：`onTarget` 判据恒为 true、`overlay` 单点采样
+自相矛盾、`execCommand` 异步生效被误判成失败 —— 三个都是**真机上只会表现为
+「AI 说点过了但界面没动」**的缺陷，在这里被断言抓出来。
+
 #### ⚠️ 并发调用必须串行化
 
 原生只有**一个**轮询线程 + **一个**命令文件。两条命令同时写进去，后一条**覆盖**前一条：
@@ -3095,40 +3233,6 @@ React 18 用根级事件委托，缺前置事件时某些组件的状态机不�
 当成「输入内容」处理、**转手就把 `text` 删了** —— 所有按文本定位的 tap/find/wait
 全部报「找不到元素」，而报错文案完全指不到真因。现在两边字段名一致、**原样透传**，
 中间没有任何翻译层，也就没有再搞错的机会。
-
-#### 怎么用（模型的正确姿势）
-
-1. `{"action":"dump"}` 先看界面上有什么（返回每个元素的位置、文本、选择器）；
-2. 用 `sel`（首选，从刚才的 dump 里复制）或 `text` / `aria` / `testid` 定位；
-3. `{"action":"tap","text":"发送"}`；
-4. 界面变化是异步的 —— 接着 `{"action":"wait","text":"确认"}` 等面板出现，再点里面；
-5. **永远先看 `ok` 字段**，`ok:false` 要如实报失败，不能假设点成功了。
-
-其它动作：`type`（写输入框，`enter:true` 附带回车）、`key`（发按键）、
-`scroll`（`to:"bottom"` 跳到底）、`text`（读可见文本）、`info`（一眼看当前界面）、
-`find` / `html`（看单个元素）、`ping`（探针是否活着）、`reload`（界面白了就重载）。
-
-#### PC 侧自动化验收（不需要真机）
-
-设备上装的是别处签名的包、无法 `install -r`（会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），
-而卸载会清掉 `filesDir` 下的整个 Termux 环境与 `$DSH_HOME`。所以验收走
-**真实 Chrome + 真实 DOM**（`--headless=new` + CDP，Node 24 自带 `WebSocket`，零依赖）：
-
-```powershell
-node tools\ui-probe-verify.mjs      # 探针行为，63 项断言（真实 DOM，含 React 受控输入模拟）
-```
-
-| 覆盖 | 判据 |
-|---|---|
-| `dump` / `find` | 找到 React 的 `role=button`、CSS 中心坐标、`includeHidden`、`filter`、`limit` |
-| `tap` | 五个事件按序派发 + **页面计数器真的 +1** + 遮挡识别 |
-| `type` | **React 的 onChange 真的被触发、拿到的值正确**（模拟实例级 value 拦截器） |
-| `scroll` / `key` / `text` / `info` / `html` | 容器真的滚动、按键送达、文本可读 |
-| 健壮性 | 未知 action 不崩、返回值可 JSON 序列化、**不污染页面**、幂等装填 |
-
-⚠️ `onTarget` 那条断言曾经失败并**暴露了探针的真实缺陷**（见上文）——
-PC 侧验收的价值就在这里：真机上你只会看到「AI 说点过了但界面没动」。
-
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
