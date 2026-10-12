@@ -735,6 +735,18 @@ function render(args, reply) {
 		const el = reply.element;
 		lines.push(`✓ 已点击 ${el ? `「${el.text || el.sel}」` : ''}`);
 		if (el) lines.push(`  ${fmtElement(el)}`);
+		// ⚠️ **必须把「点着了没有」明说出来**，因为 `ok:true` 完全不能表达它：
+		//   tap 有三种「执行成功但没点着」的情形（遮挡 / 屏幕外 / 面板之下），
+		//   三种都返回 `ok:true`。而模型拿到一句光秃秃的「✓ 已点击」之后，
+		//   无从判断下一步该不该信这次点击 —— 真机上就出现过模型点完直接往下走、
+		//   而界面纹丝不动的情况。
+		//
+		//   所以 `onTarget === true` 时也要**主动给一句确认**，而不是只在失败时说话。
+		//   这行的措辞刻意用「事件送达目标」，不写成「点击生效」：事件送达 ≠ 界面响应，
+		//   后者要靠下一步 dump 看。
+		if (reply.onTarget === true && !reply.offscreen) {
+			lines.push(`  ✓ 事件已送达目标元素本身（onTarget:true）—— 不是被上层吃掉的点击。`);
+		}
 		// ⚠️ 「屏幕外」必须排在遮挡判断**之前**、且**独立成支**：它的
 		//   `onTarget` 是 true（事件确实发到了目标元素上），走不进下面那个
 		//   `onTarget === false` 的分支 —— 而它恰恰是「点了没反应」的第二种成因。
@@ -750,9 +762,16 @@ function render(args, reply) {
 			if (reply.panel) {
 				lines.push(`  ⚠️ 该元素在当前面板**下面**（面板是「${reply.panel.cls || reply.panel.tag}」），` +
 					`所以点不到 —— 它不在你现在的屏幕上。`);
-			} else {
+			} else if (reply.hitTopmost) {
 				lines.push(`  ⚠️ 点击被上层元素接收（元素被遮挡，真机手指会点到那层而不是它）:`);
-				if (reply.hitTopmost) lines.push(`    ${fmtElement(reply.hitTopmost)}`);
+				lines.push(`    ${fmtElement(reply.hitTopmost)}`);
+			} else {
+				// ⚠️ 第三态：`onTarget:false` 但**没有任何元素**接到事件。这时说
+				//   「被上层接收」是错的 —— 没有上层。真实成因是事件落到了空白处
+				//   （元素刚被重渲染掉、或坐标处本来就没有东西）。
+				//   第一版把它并进「被遮挡」分支，模型会照着去查 overlay 白费一轮。
+				lines.push(`  ⚠️ 点击没有落到任何元素上（onTarget:false，且没有上层元素接收）。` +
+					`多半是元素在点击瞬间被重渲染掉了 —— 用 dump 确认它还在，再点一次。`);
 			}
 			if (reply.hint) lines.push(`    ${reply.hint}`);
 		}
@@ -764,6 +783,11 @@ function render(args, reply) {
 	if (action === 'type') {
 		lines.push(`✓ 已写入输入框（方式: ${reply.how}）`);
 		if (reply.element) lines.push(`  ${fmtElement(reply.element)}`);
+		// ⚠️ 报出 `cleared` 是为了让「清空到底做没做」可见。`clear:true` 对
+		//   `contenteditable`（官方 composer 是 Lexical）**不能**靠写空串实现 ——
+		//   真机上那是 no-op，旧内容会留下、新内容被追加在后面，而回执里的
+		//   `value` 是一长串拼接结果，模型完全看不出是自己没清掉。
+		if (reply.cleared) lines.push(`  已先清空原内容（方式: ${reply.cleared}）`);
 		lines.push(`  当时读到的值: ${JSON.stringify(reply.value ?? '')}`);
 		// ⚠️ `applied` 是三态，别把它当布尔用：
 		//   true  = 同步已确认写入；

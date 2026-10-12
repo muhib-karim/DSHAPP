@@ -35,6 +35,15 @@ const CDP = process.env.UIPROBE_CDP ?? 'http://127.0.0.1:19222/json/list';
 const source = readFileSync(PROBE, 'utf8');
 console.log(`探针源码: ${PROBE}  ${Buffer.byteLength(source)} 字节`);
 
+// ⚠️ 版本号**从源码里读**，不写死。写死的后果是「改探针必须记得改这里」——
+//   而漏改的表现是「本脚本报失败，但真机上一切正常」，最容易被误判成资产没生效。
+const EXPECT_VERSION = Number(/var VERSION = (\d+);/.exec(source)?.[1]);
+if (!Number.isInteger(EXPECT_VERSION)) {
+	console.error('✗ 没能从 ui-probe.js 里解析出 VERSION');
+	process.exit(1);
+}
+console.log(`源码声明 VERSION = ${EXPECT_VERSION}`);
+
 const list = await (await fetch(CDP)).json();
 // 只挑真正的页面：扩展后台页 / worker 的视口是 0，查不到元素。
 const page = list.find((t) => t.type === 'page' && /^https?:/.test(t.url));
@@ -97,7 +106,7 @@ try {
   process.exit(1);
 }
 ok(ping.ok === true, `ping 返回 ok（v=${ping.v}）`, JSON.stringify(ping).slice(0, 200));
-ok(ping.v === 5, `探针版本 5（实际 ${ping.v}）`);
+ok(ping.v === EXPECT_VERSION, `探针版本与源码一致（源码 ${EXPECT_VERSION}，真机 ${ping.v}）`);
 ok(ping.viewport && ping.viewport.w > 0, `读到视口 ${JSON.stringify(ping.viewport)}`);
 ok(typeof ping.interactive === 'number' && ping.interactive > 0,
   `认出 ${ping.interactive} 个可交互元素`);

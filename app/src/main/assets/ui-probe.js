@@ -52,7 +52,7 @@ function (CMD) {
   'use strict';
 
   /** 探针版本。**改了本文件的语义就要 +1** —— 页面上的旧探针靠它判断要不要换。 */
-  var VERSION = 5;
+  var VERSION = 6;
 
   /** 结果里单个元素的文本/类名截断长度（防超大 JSON 撑爆 IPC）。 */
   var MAX_TEXT = 120;
@@ -652,6 +652,27 @@ function (CMD) {
         bySel('[title="' + want.replace(/"/g, '\\"') + '"]');
     }
     if (!el && spec.text) el = byText(spec.text, spec.exact === true);
+    // ⚠️ `role` 是**最后**的兜底，不是首选。它存在的理由是官方 composer：
+    //   那个输入框是个 `contenteditable` 的 div，`text` 取到的是**占位符**
+    //   （「发消息或创建任务, / 调用指令, @ 文件或对话」），而占位符会随文案
+    //   改版而变 —— 实测就因为文案变了导致 `{action:'type', text:'描述你想要构建的内容'}`
+    //   报「找不到输入元素」。`role` 是从 `role="textbox"` 读的，比文案稳。
+    //
+    //   放在最后是因为它最**不精确**：一屏里可能有多个 `textbox`（搜索框 + composer），
+    //   所以它能用，但不如 `sel`/`aria` 精确 —— 文档里也按这个顺序推荐。
+    if (!el && spec.role) {
+      var wantRole = String(spec.role);
+      var cands = document.querySelectorAll(INTERACTIVE);
+      for (var ri = 0; ri < cands.length; ri++) {
+        if (roleOf(cands[ri]) === wantRole && isVisible(cands[ri])) { el = cands[ri]; break; }
+      }
+      // 一个可见的都没有时，退回「存在即用」，免得报「找不到」而元素明明在 dump 里。
+      if (!el) {
+        for (var rj = 0; rj < cands.length; rj++) {
+          if (roleOf(cands[rj]) === wantRole) { el = cands[rj]; break; }
+        }
+      }
+    }
     return el;
   }
 
@@ -823,6 +844,68 @@ function (CMD) {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return 'native-setter';
+  }
+
+  /**
+   * 全选一个 `contenteditable` 里的内容（供清空与替换用）。
+   *
+   * ⚠️ **每次都要重建选区**，不能复用上一次的：`execCommand` 会消耗掉选区
+   *   （哪怕返回 `false` 也一样），第二次调用时 `getSelection()` 已经是空的。
+   */
+  function selectAllIn(el) {
+    try { el.focus(); } catch (e) { /* 不可聚焦 */ }
+    try {
+      var sel = window.getSelection();
+      var range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /**
+   * 清空一个 `contenteditable`（官方 composer 是 Lexical）。
+   *
+   * ⚠️ **这是本文件里唯一一处只能靠实测确定写法的地方**，真机（CDY-TN90 /
+   *   Android 10 / 系统 WebView 114）逐个候选量过，结论如下：
+   *
+   *   | 写法 | 结果 |
+   *   |---|---|
+   *   | `insertText('')` | **no-op**（返回 `true` 但内容一字不动） |
+   *   | 全选 + `delete` | **no-op**（返回 `true`，内容不动） |
+   *   | 全选 + `insertText('\n')` | **no-op** |
+   *   | 全选 + `insertText(非空)` | ✅ **整体替换成那一段** |
+   *   | 全选 + 派发 `Backspace` `keydown` | 只删**一个**字符（DOM 选区没被 Lexical 采纳） |
+   *   | ✅ 全选 + `insertText('X')` → 再派发一次 `Backspace` | **清空成功** |
+   *
+   *   也就是说「写空」这条路根本不存在（`execCommand` 对空串是 no-op），
+   *   必须**先把它压成单个字符，再把那一个字符删掉**。
+   *
+   * ⚠️ 为什么不能退化成 `el.textContent = ''`：那会把 Lexical 维护的
+   *   `<p><span data-lexical-text>` 结构拍平，编辑器内部模型与 DOM 就此不一致 ——
+   *   界面上看着空了，但 Lexical 仍记着旧内容，下一次输入会把它吐回来。
+   *   （`setValue` 的注释里记着同一类教训。）
+   *
+   * ⚠️ 删除用的 `Backspace` 必须**走 `pressKey`**：真机实测单独派发
+   *   `KeyboardEvent` 也能删掉，但 Lexical 对 `code`/`keyCode` 都有检查，
+   *   复用已有的 `pressKey` 才不会在两处各写一份按键形状。
+   */
+  function clearEditable(el) {
+    var before = readText(el);
+    if (before === '') return '已是空的';
+    selectAllIn(el);
+    var replaced = false;
+    try { replaced = document.execCommand('insertText', false, 'X'); } catch (e) { replaced = false; }
+    if (!replaced) {
+      // 连替换都不行（非 Lexical 的普通 contenteditable）—— 这时 textContent 是安全的。
+      el.textContent = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return 'textContent';
+    }
+    // 压成单字符后光标就在它后面，一次 Backspace 即可删掉（不必重建选区）。
+    pressKey(el, 'Backspace', {});
+    return 'selectAll+insertText+Backspace';
   }
 
   /**
@@ -1059,7 +1142,12 @@ function (CMD) {
     if (action === 'type') {
       var inp = locate(cmd);
       if (!inp) return fail('找不到输入元素', { spec: cmd });
-      if (cmd.clear === true) setValue(inp, '');
+      // ⚠️ `clear` 必须走 `clearEditable`，不能靠 `setValue(inp, '')` —— 对
+      //   `contenteditable` 来说「写空串」是 **no-op**（见 clearEditable 的表）。
+      //   第一版就是那么写的，症状是「clear:true 报 ok，但输入框里旧内容还在」，
+      //   接着 `type` 把新内容**追加**在旧内容后面，而返回的 `value` 是拼接结果 ——
+      //   模型看到一长串莫名其妙的东西，完全不知道是自己没清掉。
+      var cleared = cmd.clear === true ? clearEditable(inp) : null;
       var how = setValue(inp, cmd.value == null ? '' : cmd.value);
       var submitted = null;
       if (cmd.enter === true) submitted = pressKey(inp, 'Enter', cmd);
@@ -1079,6 +1167,7 @@ function (CMD) {
       return ok({
         element: describe(inp, 0),
         how: how,
+        cleared: cleared,
         value: trunc(actual, MAX_TEXT),
         applied: confirmed ? true : (async ? null : false),
         submitted: submitted
@@ -1087,14 +1176,14 @@ function (CMD) {
 
     // ── key：按键 ──────────────────────────────────────────────────
     if (action === 'key') {
-      var kel = cmd.sel || cmd.text || cmd.aria ? locate(cmd) : null;
+      var kel = cmd.sel || cmd.text || cmd.aria || cmd.role ? locate(cmd) : null;
       var fired = pressKey(kel, String(cmd.key || 'Enter'), cmd);
       return ok({ dispatched: fired, target: kel ? describe(kel, 0) : null });
     }
 
     // ── scroll：滚动 ───────────────────────────────────────────────
     if (action === 'scroll') {
-      var anchor = cmd.sel || cmd.text ? locate(cmd) : null;
+      var anchor = cmd.sel || cmd.text || cmd.role ? locate(cmd) : null;
       var box = cmd.container ? bySel(cmd.container) : findScrollable(anchor);
       var dy = typeof cmd.dy === 'number' ? cmd.dy : 0;
       var dx = typeof cmd.dx === 'number' ? cmd.dx : 0;
@@ -1148,7 +1237,7 @@ function (CMD) {
 
     // ── wait：等条件成立（**单次检查**，重试由原生侧做）─────────────
     if (action === 'wait') {
-      var hit = cmd.sel || cmd.text || cmd.testid || cmd.aria ? locate(cmd) : null;
+      var hit = cmd.sel || cmd.text || cmd.testid || cmd.aria || cmd.role ? locate(cmd) : null;
       var needVisible = cmd.visible !== false;
       var satisfied = !!(hit && (!needVisible || isVisible(hit)));
       // ⚠️ 被遮挡的元素**不算「等到了」**：调用方等它出现是为了点它，而它现在

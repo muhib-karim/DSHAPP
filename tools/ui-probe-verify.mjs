@@ -48,6 +48,11 @@ const SCENE = `<!doctype html>
     <input id="msg" placeholder="输入消息">
     <div role="button" id="btnSend">发送</div>
   </div>
+  <!-- 官方 composer 是 Lexical 的 contenteditable，不是 input。
+       这里放一个同构的富文本容器，专门验「clear 对 contenteditable 生效」。 -->
+  <div id="ce" contenteditable="true" role="textbox"></div>
+  <!-- 一个夹具里独一无二的 role，用来验 role 定位（不与 button/textbox 撞车） -->
+  <div role="switch" id="sw">开关</div>
   <button id="hiddenBtn">隐藏的按钮</button>
   <button id="disabledBtn" disabled>禁用的按钮</button>
 </div>
@@ -87,6 +92,35 @@ const SCENE = `<!doctype html>
     });
   };
   window.installReactTracker(document.getElementById('msg'));
+
+  /**
+   * 复刻 Lexical 对 Backspace 的处理 —— 官方 composer 就是 Lexical。
+   *
+   * ⚠️ 为什么夹具需要这一层：真机上「清空 composer」只能靠
+   *    「全选 + insertText 压成单字符 + Backspace」（insertText('') 与 delete
+   *    在 Lexical 里都是 no-op，真机逐条量过）。而那条路能成的**前提**是
+   *    Lexical 自己监听 keydown 并主动删内容。
+   *
+   *    浏览器对「未受信任的键盘事件」（脚本派发的）**不会**执行默认删除动作，
+   *    所以裸 contenteditable 在 PC 上删不掉 —— 夹具停在裸 contenteditable 的话，
+   *    这条断言在 PC 上永远红，而真机是绿的。那是**夹具与真机不同构**，
+   *    不是探针有问题。这里补的就是这一层，性质与上面的 installReactTracker 相同。
+   *
+   * ⚠️ 本段在模板字符串里，**注释里不能出现反引号**。
+   */
+  window.installLexicalLike = function (node) {
+    node.addEventListener('keydown', function (e) {
+      if (e.key !== 'Backspace') return;
+      var t = node.textContent || '';
+      if (t.length === 0) return;
+      var sel = window.getSelection();
+      var picked = sel ? sel.toString() : '';
+      // 有选区删选区，没有就删最后一个字符 —— 测试场景里光标总在末尾，两者等价。
+      node.textContent = picked.length > 0 ? t.split(picked).join('') : t.slice(0, -1);
+      node.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  };
+  window.installLexicalLike(document.getElementById('ce'));
 
   // 遮挡用：一个覆盖全屏的遮罩，默认不显示
   window.showMask = function () {
@@ -522,6 +556,52 @@ async function main() {
 
 		const typedClear = await call({ action: 'type', sel: '#msg', value: '', clear: true });
 		check('clear:true 能清空', typedClear.ok === true && await cdp.eval("document.getElementById('msg').value") === '');
+
+		// ── clear 对 contenteditable（官方 composer 是 Lexical）────────────
+		//
+		// ⚠️ 这一组是**真机实测倒逼出来的**：真机上 `clear:true` 对 composer 完全无效，
+		//    根因是「往 contenteditable 写空串」是 no-op（`execCommand('insertText','')`
+		//    返回 true 但内容一字不动）。真机解法见 `clearEditable` 的注释表。
+		//    这里能验的是「clear 之后容器真的空了」，**验不了**真机 Lexical 那一层
+		//    的怪癖 —— 那是 Chromium 的 contenteditable 行为，PC 夹具复刻不出来。
+		console.log('\n── type 的 clear 对 contenteditable ─────────');
+		await call({ action: 'type', sel: '#ce', value: '待清空的旧内容' });
+		const ceBefore = await cdp.eval("document.getElementById('ce').textContent");
+		check('先往 contenteditable 写进内容', String(ceBefore).includes('待清空的旧内容'), ceBefore);
+
+		const ceClear = await call({ action: 'type', sel: '#ce', value: '', clear: true });
+		check('clear:true 对 contenteditable 返回 ok', ceClear.ok === true, ceClear.error);
+		check('★ contenteditable 真的被清空了', await cdp.eval("document.getElementById('ce').textContent") === '',
+			await cdp.eval("document.getElementById('ce').textContent"));
+		check('★ 回执里的 cleared 说明用了哪条路径', typeof ceClear.cleared === 'string' && ceClear.cleared.length > 0,
+			ceClear.cleared);
+		check('未设 clear 时 cleared 为 null（不谎报做过清理）', ceBefore !== null && typed.value === '你好世界' && typed.cleared === null,
+			`typed.cleared=${JSON.stringify(typed.cleared)}`);
+
+		// ⚠️ **清空必须真清掉，而不是把新内容接在旧内容后面** —— 这是真机上
+		//    clear 失效时暴露出来的第二个症状（返回的 value 是一长串拼接结果）。
+		await call({ action: 'type', sel: '#ce', value: '旧' });
+		await call({ action: 'type', sel: '#ce', value: '新', clear: true });
+		check('★ clear+写入 之后容器里只有新内容（没有残留拼接）',
+			await cdp.eval("document.getElementById('ce').textContent") === '新',
+			await cdp.eval("document.getElementById('ce').textContent"));
+
+		console.log('\n── role 定位（composer 是 div+role=textbox，没有稳定文案）──');
+		// ⚠️ 真机上官方 composer 的 `text` 取到的是**占位符文案**，会随前端改版而变
+		//    （实测就因为文案改了导致按 text 定位报「找不到输入元素」）。
+		//    `role` 是从 `role="textbox"` 读的，比文案稳 —— 这是它存在的唯一理由。
+		const byRole = await call({ action: 'find', role: 'switch' });
+		check('★ role 能定位到元素（此前 locate 完全不认这个字段）', byRole.ok === true, byRole.error);
+		check('定位到的确实是那个元素', byRole.element?.sel === '#sw', byRole.element?.sel);
+
+		const roleTap = await call({ action: 'tap', role: 'switch' });
+		check('tap 也认 role', roleTap.ok === true, roleTap.error);
+
+		// ⚠️ `role` 排在最后：一屏里可能有多个同 role 元素（搜索框 + composer 都是
+		//    textbox），所以更精确的 sel/aria 必须优先命中。
+		const preciseFirst = await call({ action: 'find', role: 'textbox', sel: '#msg' });
+		check('★ sel 比 role 优先（同 role 多元素时不会定位错）',
+			preciseFirst.element?.sel === '#msg', preciseFirst.element?.sel);
 
 		await cdp.eval('window.__reactState = { value: "", onChangeCalls: 0 }; window.__events = []');
 		const typedEnter = await call({ action: 'type', sel: '#msg', value: 'hi', enter: true });

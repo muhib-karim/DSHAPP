@@ -3534,6 +3534,90 @@ node tools\ui-map-real-frontend.mjs "http://127.0.0.1:31999/?token=..."
 全部报「找不到元素」，而报错文案完全指不到真因。现在两边字段名一致、**原样透传**，
 中间没有任何翻译层，也就没有再搞错的机会。
 
+#### ⚠️ `ok:true` 不表达「点着了」—— 渲染层必须主动报 `onTarget`
+
+`tap` 有三种「执行成功但没点着」的情形，**三种都返回 `ok:true`**：
+
+| 情形 | 探针字段 | 后果 |
+|---|---|---|
+| 被别的元素盖住 | `onTarget:false` + `hitTopmost` | 真机手指点到的是那层 |
+| 中心点在视口外 | `onTarget:true` + `offscreen:true` | 事件发了，但屏幕上没有可点的坐标 |
+| 在面板**下面** | `onTarget:false` + `panel` | 它根本不在当前屏幕上 |
+
+所以 `ok:true` 与「界面会不会动」**没有关系**。渲染层如果只报一句「✓ 已点击」，
+模型无从判断该不该信这次点击 —— 真机上就出现过点完直接往下走、而界面纹丝不动。
+
+**三条渲染规则**（都在 `uiagent-bridge-verify.mjs` ⑦.6x 里有断言）：
+
+1. `onTarget === true` **且非 `offscreen`** 时，必须给一句正向确认
+   （「事件已送达目标元素本身（onTarget:true）」）。⚠️ 措辞刻意是**送达**而不是
+   「点击生效」：事件送达 ≠ 界面响应，后者要靠下一步 `dump` 看，写成「生效」会让
+   模型跳过复核。
+2. `offscreen` **独立成支且排在最前** —— 它的 `onTarget` 是 `true`，走不进
+   `onTarget === false` 的分支，而它恰恰是「点了没反应」的第二种成因。
+3. `onTarget:false` 还要再分**两态**：有 `hitTopmost` 才是「被上层接收」；
+   `hitTopmost` 为空时**根本没有上层元素**（事件落到了空白处，多半是元素在点击瞬间
+   被重渲染掉），说成「被遮挡」会把模型引去查 `overlay` 白费一轮。
+
+#### ⚠️ `clear:true` 对 `contenteditable` **不能**靠写空串实现
+
+官方 composer 是 Lexical（`contenteditable`）。旧实现走 `setValue(inp, '')`，
+而**「写入空字符串」这个操作根本不存在**。真机实测（CDY-TN90 / Android 10 /
+系统 WebView 114）的候选表：
+
+| 写法 | 结果 |
+|---|---|
+| `insertText('')` | **no-op**（返回 `true`，内容一字不变） |
+| 全选 + `delete` | **no-op** |
+| 全选 + `insertText('\n')` | **no-op** |
+| 全选 + `insertText(非空)` | ✅ 整体替换 |
+| 全选 + 派发 `Backspace` `keydown` | 只删**一个**字符（DOM selection 不被 Lexical 认） |
+| ✅ 全选 + `insertText('X')` → 派发 `Backspace` | **清空成功** |
+
+做法是 `clearEditable()`：`selectAllIn()`（每次都要**重建** Range，`execCommand`
+会消耗掉它）→ `insertText('X')` → 派发 `Backspace`。失败则退回
+`el.textContent = ''` + `input` 事件。回执里带 `cleared` 字段说明走的哪条路，
+渲染层要报出来 —— 否则模型分不清「clear 生效了」与「clear 被忽略了」。
+
+⚠️ 症状很有欺骗性：旧内容留下、新内容**追加在后面**，而回执里的 `value` 是一长串
+拼接结果，模型完全看不出是自己没清掉。
+
+#### ⚠️ 别用 `text` 定位 composer —— 它的 `text` 是 placeholder
+
+composer 的 `text` 字段是 **placeholder**（「发消息或创建任务, / 调用指令, @ 文件或对话」），
+**前端改文案就会失配**（实测已从「描述你想要构建的内容…」变过一次），
+报错是「找不到输入元素」，完全指不到真因。
+
+`role:"textbox"` 来自 `role="textbox"`，**稳定**。所以 `locate()` 里加了 `role`
+分支，但它排在 `sel`/`testid`/`aria`/`text` **之后** —— 同 role 的元素可能并存，
+`sel`/`aria` 必须优先。
+
+#### ⚠️ 验证判据必须取自 **DOM**，不能取自模型的回复
+
+真机写动作端到端（`tools/uiagent-device-write.mjs`）第一版让模型「原样贴出 tap 回执」，
+它**只抄了 `fmtElement` 那一行**、把 `onTarget` 那行省了 —— 拿回复当证据会得出
+「渲染层没生效」的错误结论，而真相是模型没抄。
+
+工具结果在聊天界面里是**渲染成 DOM** 的，DOM 里的文本就是模型实际收到的 `message`。
+所以判据是「在页面世界里找含关键字的最深元素、读它的 `innerText`」。
+
+`uiagent-device-write.mjs` 的分工（三个脚本互补，缺一个都推不出「能操作 App」）：
+
+| 脚本 | 验的是 |
+|---|---|
+| `ui-probe-device-check.mjs` | 探针在真机内核上能跑（**只读**） |
+| `uiagent-device-e2e.mjs` | 插件↔原生信箱通、坐标换算对（**只读 dump**） |
+| `uiagent-device-write.mjs` | **写动作**：模型点一下，界面真的变了 |
+
+⚠️ 前两个只调 `dump`，而「让 AI 操作 App」的成败**全在写动作上**，只读全绿推不出
+「点得动」。该脚本的**界面判据**是「侧栏「设置」按钮的 CSS x 从 -190 变成 140」
+（收起时是负值，滑入后为正）—— 不信回执，直接量界面；且**全程可逆**，
+结束时恢复原状并核对（测试不能把用户的界面改掉）。
+
+⚠️ 探针版本号在 `ui-probe-device-check.mjs` 里**从源码正则解析**，不写死。
+写死的后果是「改探针必须记得改这里」，而漏改的表现是「脚本报失败、真机一切正常」，
+最容易被误判成资产没生效。
+
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
 **症状**：手机端对话框的「安装源」下拉只有**一项**（中国大陆镜像源）+ 自定义地址，

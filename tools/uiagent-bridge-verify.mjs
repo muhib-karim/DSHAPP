@@ -441,6 +441,105 @@ section('⑦.6 渲染层：tap 报 offscreen 时不能被 onTarget:true 掩盖�
 	ok(/不会有任何反应|没有可点的坐标/.test(msg), '说清后果是「不会有反应」');
 	ok(!/点击被上层元素接收/.test(msg),
 		'没有误用「被上层元素接收」那句遮挡话术 —— 那会把模型引向 overlay');
+	// ⚠️ 屏幕外时**不能**报「已送达目标」的正向确认 —— 那两句会自相矛盾。
+	ok(!/事件已送达目标元素本身/.test(msg),
+		'★ 屏幕外时不报「事件已送达目标」的正向确认（否则与上面的警告自相矛盾）');
+}
+
+section('⑦.61 渲染层：tap 成功时必须给出「点着了」的正向确认');
+{
+	// ⚠️ 真机实测倒逼出来的：`ok:true` 完全不能表达「点着了没有」——
+	//    tap 有三种「执行成功但没点着」的情形（遮挡 / 屏幕外 / 面板之下），
+	//    三种都返回 `ok:true`。光报一句「✓ 已点击」，模型无从判断该不该信这次点击。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			dispatched: ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'],
+			onTarget: true,
+			offscreen: false,
+			element: { text: '打开导航', tag: 'button', sel: '#nav', rect: { x: 8, y: 8, w: 36, h: 36 } },
+		},
+	});
+	const r = await tool.execute({ action: 'tap', sel: '#nav' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/onTarget:true/.test(msg), '★ 成功点击时明说 onTarget:true（模型据此判断该不该信）');
+	ok(/不是被上层吃掉的点击/.test(msg), '顺带排除「被上层吃掉」这一种失败');
+	// ⚠️ 措辞刻意是「事件送达」而不是「点击生效」：事件送达 ≠ 界面响应，
+	//    后者要靠下一步 dump 看。写成「生效」会让模型跳过复核。
+	ok(!/点击已生效|已经生效|操作成功/.test(msg),
+		'★ 不写成「点击已生效」—— 事件送达不等于界面响应，那会让模型跳过复核');
+}
+
+section('⑦.62 渲染层：onTarget:false 但无上层元素 —— 不能说成「被上层接收」');
+{
+	// ⚠️ 第三态：`onTarget:false` 且 `hitTopmost` 为空。这时**没有上层元素**，
+	//    说「被上层元素接收」是错的。真实成因是事件落到了空白处（元素刚被
+	//    重渲染掉、或坐标处本来就没有东西）。第一版把它并进遮挡分支，
+	//    模型会照着去查 overlay 白费一轮。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			dispatched: ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'],
+			onTarget: false,
+			covered: false,
+			hitTopmost: null,
+			element: { text: '发送', tag: 'button', sel: '#send', rect: { x: 300, y: 470, w: 34, h: 34 } },
+		},
+	});
+	const r = await tool.execute({ action: 'tap', sel: '#send' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/没有落到任何元素上/.test(msg), '★ 说清「点击没有落到任何元素上」');
+	ok(!/被上层元素接收/.test(msg), '★ 不说「被上层元素接收」—— 根本没有上层元素');
+	ok(/重渲染/.test(msg), '给出真实成因（点击瞬间被重渲染掉）');
+}
+
+section('⑦.63 渲染层：type 的 clear 生效时要说出来');
+{
+	// ⚠️ 真机上 `clear:true` 对 composer（Lexical）曾完全无效：`insertText('')`
+	//    是 no-op，旧内容留下、新内容被追加，回执里的 `value` 是一长串拼接结果，
+	//    模型看不出是自己没清掉。修好之后必须把「清过了」报出来，
+	//    否则模型仍无法区分「clear 生效了」与「clear 被忽略了」。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			how: 'execCommand(异步生效)',
+			cleared: 'selectAll+insertText+Backspace',
+			value: 'ONLY_NEW',
+			applied: null,
+			element: { text: '描述你想要构建的内容', tag: 'div', sel: '#ce' },
+		},
+	});
+	const r = await tool.execute({ action: 'type', sel: '#ce', value: 'ONLY_NEW', clear: true });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(/已先清空原内容/.test(msg), '★ clear 生效时明说「已先清空原内容」');
+	ok(/selectAll\+insertText\+Backspace/.test(msg), '报出用的是哪条清空路径');
+}
+
+section('⑦.64 渲染层：没设 clear 时不能谎报清空');
+{
+	// ⚠️ 反向断言：`cleared` 为 null（没设 clear）时**不能**出现「已先清空」。
+	//    谎报清空会让模型以为旧内容没了，进而基于错误前提往下走。
+	const native = startFakeNative(home, {
+		pollMs: 5,
+		replyExtra: {
+			how: 'execCommand(异步生效)',
+			cleared: null,
+			value: '追加在旧内容后面',
+			applied: null,
+			element: { text: '描述你想要构建的内容', tag: 'div', sel: '#ce' },
+		},
+	});
+	const r = await tool.execute({ action: 'type', sel: '#ce', value: '追加在旧内容后面' });
+	native.stop();
+
+	const msg = r.message ?? '';
+	ok(!/已先清空原内容/.test(msg), '★ 没设 clear 时不谎报清空');
 }
 
 section('⑦.65 渲染层：tap 被面板盖住时，说「不在当前屏幕上」而不是「被遮挡」');
