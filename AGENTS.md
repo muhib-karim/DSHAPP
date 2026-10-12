@@ -3403,11 +3403,50 @@ node tools\ui-map-expect-audit.mjs    # 17 屏判据唯一性，退出码非零 
 
 ```powershell
 node tools\ui-probe-verify.mjs            # 探针行为，107 项断言（真实 DOM，含 React 受控输入模拟）
-node tools\uiagent-bridge-verify.mjs      # 插件↔原生信箱契约，111 项断言（真插件代码 + 假原生对端）
+node tools\uiagent-bridge-verify.mjs      # 插件↔原生信箱契约，120 项断言（真插件代码 + 假原生对端）
 node tools\ui-map-expect-audit.mjs        # 17 屏判据唯一性（判据撞车 = goto 假到达）
 node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端，17 屏图谱 + 交互实测
 node tools\build-uiagent-screens.mjs      # 图谱 → 插件内建屏幕表 lib/screens.js
 ```
+
+⚠️ **`uiagent-bridge-verify.mjs` 的 §⑪ 用引擎自己的断言函数验注册契约。**
+`UIAGENT_ENGINE_DIR` 指到引擎的 `node_modules\@deepseek-ai\dsh-tools` 时，
+它 import 引擎导出的 `assertSupportedJsonSchema` / `validateJsonSchemaValue`
+来判 `output.schema`，而不是自己再写一份 —— 自己写的那份会把引擎的约束
+写松，于是「本机绿、真机炸」。未设该变量时跳过并打印提示。
+
+这条是**血换来的**：`ui` 工具曾经**从未注册成功过**，而当时 111 条断言全绿。
+
+##### ⚠️⚠️ 工具注册的硬校验：`output` 声明（缺了整条工具是死的）
+
+引擎的 `ctx.tools.register` 有一道**硬校验**（`dsh-tools/lib/index.js:2881`）：
+`output` 必须是对象、`render` 必须是函数，随后还要过 `assertSupportedJsonSchema`。
+**缺这一块不是降级而是抛错**：
+
+```
+[engine] dsh-android-uiagent (.../lib/index.js): TypeError:
+         tool "ui" must declare output { schema, render, presentationMeta? }
+[engine] dsh: warning: 1 entry did not activate
+```
+
+后果是**工具从未出现在模型的工具列表里** —— 模型看不到、调不到，而插件本身
+「加载成功」的日志照常打印。`ui` 工具就是这样哑了整整一段时间，日志里从来没有
+`uiagent` / `ui-probe` 的任何一行，原因就在这里。
+
+⚠️ **为什么 111 条 PC 断言全绿却漏了它**：那些断言直接调 `tool.execute()`，
+**绕过了 `register`**。凡是「引擎在注册期校验的东西」，直接调 `execute` 都验不到。
+所以 §⑪ 改为 import **引擎自己的** `assertSupportedJsonSchema` /
+`validateJsonSchemaValue` 来判，而不是自己再写一份（自己写的会把约束写松）。
+
+⚠️ `output.schema` 里 **`details` 必须留空 schema**：它的形状随 action 变
+（`dump` 是数组、`tap` 是元素对象、`wait` 带 `satisfied`…），收窄成固定形状会在
+真机上以 `ToolOutputError` 的形式炸在渲染之前。引擎接受的子集是
+`type/oneOf/properties/required/additionalProperties/items/enum/const` + 注解，
+**空 schema `{}` 是合法的**，正是为这种「形状不定」准备的。
+
+⚠️ **为什么本插件手工构造 `output` 而不用 `defineTool`**：`bubble-tool` /
+`root-tool` / `shell-tool` / 本插件都住在 `$DSH_HOME/<tool>/` 下，那里**没有
+`node_modules`**，`import { defineTool }` 解析不到。手工构造是这个布局的必然选择。
 
 ⚠️ **`uiagent-bridge-verify.mjs` 的假原生必须「会演」**：它维护一个「当前在哪一屏」，
 `find`/`wait` **只在当前那一屏**上判判据。第一版写成了「逐屏比对」（拿每一屏自己的
