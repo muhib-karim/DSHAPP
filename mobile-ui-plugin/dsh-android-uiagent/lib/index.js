@@ -41,6 +41,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { ATLAS, findScreen } from './screens.js';
+
 export const name = 'dsh-android-uiagent';
 
 /**
@@ -69,8 +71,32 @@ const WAIT_TIMEOUT_MS = 20000;
 /** 轮询回执的间隔。 */
 const POLL_INTERVAL_MS = 80;
 
-/** 全部合法 action，与页面探针的分派表必须一致。 */
-const ACTIONS = ['ping', 'info', 'dump', 'find', 'tap', 'type', 'key', 'scroll', 'text', 'html', 'wait', 'overlay', 'reload'];
+/**
+ * 交给**页面探针**执行的动作。
+ *
+ * ⚠️ 这份清单必须与 `ui-probe.js` 的分派表一致 —— 探针不认识的 action 会返回
+ *   `未知 action`，而那是**在真机上**才会暴露的错误（PC 侧跑不到）。
+ */
+const PROBE_ACTIONS = ['ping', 'info', 'dump', 'find', 'tap', 'type', 'key', 'scroll', 'text', 'html', 'wait', 'overlay', 'reload'];
+
+/**
+ * 在**插件侧**实现的动作 —— 它们由「多次探针调用 + 内建图谱」组合而成，
+ * 探针本身不认识，所以**绝不能**原样写进 `ui-cmd.json`。
+ *
+ * | 动作 | 做什么 | 为什么要在这边做 |
+ * |---|---|---|
+ * | `map` | 列出内建的 17 屏及各屏按钮 | 纯静态数据，不必碰界面 |
+ * | `where` | 报告**现在在哪一屏** | 要靠图谱的判据逐个比对当前界面 |
+ * | `goto` | 一路点到指定那一屏 | 一条命令要走多步（重载 → 清场 → 逐步 tap） |
+ *
+ * 最后一条尤其是：`goto` 的每一步都依赖上一步的结果（tap 完要等、等不到要重试、
+ * 重试还不行要报告卡在哪一步），而文件信箱是**一问一答**的，没法在中间插入判断。
+ * 所以只能由插件这边驱动多次问答。
+ */
+const LOCAL_ACTIONS = ['map', 'where', 'goto'];
+
+/** 模型可见的全部 action。 */
+const ACTIONS = [...LOCAL_ACTIONS, ...PROBE_ACTIONS];
 
 /**
  * 模型可见的工具描述 —— **这是本插件最要紧的一段文本**。
@@ -83,8 +109,30 @@ const ACTIONS = ['ping', 'info', 'dump', 'find', 'tap', 'type', 'key', 'scroll',
  */
 const DESCRIPTION = `Inspect and operate THIS Android app's user interface — the DSH Web GUI rendered inside the app's WebView. You run in the Node process and have no DOM access, so this tool is your ONLY way to see or touch the app's buttons, inputs and panels.
 
+## ⚡ Fastest path: jump straight to a screen
+
+The app's UI has ~17 named screens (empty session, settings, plugin panel, model picker, session drawer, right sidebar, terminal, …). Each one is in a **built-in atlas** measured against the real frontend, with an exact route and a unique landmark.
+
+- \`{action:"map"}\`: list all screens with their route. Add \`detail:true\` to also get every button of every screen.
+- \`{action:"where"}\`: **answer "which screen am I on right now?"** — tries every screen's landmark against the live page. Use this first when you are unsure of the current state, instead of guessing from a \`dump\`.
+- \`{action:"goto", screen:"<id>"}\`: drive the UI to that screen in one call — reload to a known base state, clear modal covers, collapse panels, then tap along the route and verify arrival. Returns \`ok:false\` with the exact step it got stuck on if it could not arrive.
+
+**Prefer \`goto\` + \`where\` over hand-navigating with \`tap\`.** The frontend persists the session drawer's open state, the right sidebar's open state *and its content page*, and the current session — all **one-way**: once you have opened 工作区文件 or seeded a session, plain \`tap\` sequences can never get back to the empty-session screen. \`goto\` reloads into a clean base state first, which is the only reliable way back.
+
+Typical loop:
+
+\`\`\`
+{action:"where"}                        # 1. where am I?
+{action:"goto", screen:"settings"}      # 2. get where I need to be
+{action:"dump"}                         # 3. read the real, live button positions
+{action:"tap", text:"..."}              # 4. act
+\`\`\`
+
+⚠️ The atlas's coordinates are **reference values** measured on a 360×780 viewport at DPR 3 — a different device will differ. **Always locate by \`text\`/\`aria\` from a fresh \`dump\`, never by the atlas's numbers.**
+
 ## What you can do
 
+- \`map\` / \`where\` / \`goto\`: see above — the screen atlas, current-screen identification, and one-call navigation.
 - \`dump\`: list every interactive element (buttons, links, inputs, tabs…) with its exact on-screen position. **Start here** whenever you need to know what the UI currently looks like.
 - \`tap\`: click an element. Takes a screenshot-free, precise DOM click (fires pointerdown/mousedown/pointerup/mouseup/click, like a real finger).
 - \`type\`: write text into an input, done so React actually notices (native value setter + \`input\` event). Set \`enter:true\` to also press Enter.
@@ -181,6 +229,10 @@ function validate(args) {
 	if (action === 'scroll' && args.to === undefined && args.dy === undefined && args.dx === undefined) {
 		return 'action:"scroll" 需要 to（"bottom"/"top"）或 dy/dx';
 	}
+	if (action === 'goto' && (typeof args.screen !== 'string' || args.screen.trim() === '')) {
+		return 'action:"goto" 需要 screen（目标屏的 id 或标题，例如 "terminal"、"特权权限"）。'
+			+ '用 {action:"map"} 列出全部可选值。';
+	}
 	return '';
 }
 
@@ -250,6 +302,63 @@ function sleep(ms) {
 }
 
 /**
+ * 把一个「定位参数」变成一问，问出它**此刻**在不在。
+ *
+ * ⚠️ **用 `find` 而不是 `wait`，这是性能要求不是风格问题。**
+ *   原生 `runWait()` 会**一直重试到 10 秒上限**，而且**忽略**调用方传的 `timeout`
+ *   （`UiProbeBridge.kt:390` 只用 `WAIT_MAX_MS`）。`where` 要对 17 屏各试一次 ——
+ *   用 `wait` 的话，界面不在任何一屏时就是 **17 × 10 = 170 秒**。
+ *   `find` 是单次检查，17 次往返秒级完成。
+ *
+ * ⚠️ `clickable` 必须**在这边**过滤：`find` 不像 `wait` 那样代劳。
+ *   好在 `describe()` 回传的元素自带 `covered` / `offscreen` 两个字段
+ *   （`ui-probe.js:391-393`），照 `wait` 那行（`ui-probe.js:1159`）的判据写即可。
+ *   漏掉这一层，`hero` 的判据会在**任何**一屏「成立」—— 那个 composer 占位符
+ *   在 12 屏里都存在，只是其中 11 屏被盖住了。
+ *
+ * @param {object} ctx - `{probe}` 问答函数。
+ * @param {object} spec - `{text|aria|sel|testid, exact?, clickable?}`。
+ * @returns {Promise<{ok: boolean, element: object|null}>} 该定位条件此刻是否成立。
+ */
+async function checkExpect(ctx, spec) {
+  if (!spec) return { ok: false, element: null };
+  const reply = await ctx.probe({ action: 'find', ...spec });
+  if (reply?.ok !== true || !reply.element) return { ok: false, element: null };
+  const el = reply.element;
+  if (spec.clickable === true && (el.covered || el.offscreen)) {
+    return { ok: false, element: el };
+  }
+  return { ok: true, element: el };
+}
+
+/**
+ * 判断**现在在哪一屏**。
+ *
+ * 17 屏的判据**互斥**（`tools/ui-map-expect-audit.mjs` 机械保证每屏判据只在
+ * 自己那一屏成立），所以逐个试、命中的那个就是答案。全部不命中时要如实返回
+ * 「认不出」而不是猜一个 —— 猜错的后果是模型对着错误的界面点按钮。
+ *
+ * ⚠️ 逐个试的代价是 17 次页面往返，但**都在原生侧一次 eval 内完成不了**
+ *   （探针的 wait 是单次检查，重试在原生侧）。所以这里只做「一次检查」而不等待：
+ *   判据都要求元素**已经在场**，界面若还在动画中，认不出是正确行为，重试交给调用方。
+ *
+ * @param {object} ctx - `{probe}` 问答函数。
+ * @returns {Promise<object>} `{screen, matches, unknown}`。
+ */
+async function detectScreen(ctx) {
+  const matches = [];
+  for (const s of ATLAS.screens) {
+    const r = await checkExpect(ctx, s.expect);
+    if (r.ok) matches.push({ id: s.id, title: s.title });
+  }
+  return {
+    matches,
+    // 判据互斥 ⇒ 正常情况最多命中一个；命中多个说明图谱或界面有异常，如实报出来
+    screen: matches.length === 1 ? matches[0] : null,
+  };
+}
+
+/**
  * 串行闸门：把并发调用排成一队。
  *
  * ⚠️ **这不是可选优化，是正确性要求。**
@@ -284,6 +393,151 @@ function enqueue(task) {
 }
 
 /**
+ * 「一键到屏」：把界面开到图谱里指定的那一屏。
+ *
+ * ## 为什么不能只做「沿路线点一遍」
+ *
+ * 因为**进去过就回不去**。这个前端会持久化三样东西（见 `ui-map-real-frontend.mjs`
+ * 顶部那张表），全都**单向**：
+ *
+ * 1. 右侧边栏的开关状态 —— 重载后它自己又开着；
+ * 2. 右侧边栏的**内容页** —— 点过「新建终端」，再打开就直接落在终端页，
+ *    启动页那两个入口不再出现；
+ * 3. **当前会话** —— 种过会话就回不到空会话态。
+ *
+ * 所以路线必须**每屏各自从基态重新走**（那是图谱生成时的做法），而「回到基态」
+ * 只能靠 `reload`（重载能清掉 1 和 2），3 清不掉 —— 那正是图谱把
+ * `drawer` / `right-sidebar` / `workfiles` / `terminal` 排在最后的原因。
+ *
+ * 这里的实现**照抄图谱生成器的策略**，一条不差：
+ *
+ * ```
+ * reload → 等页面起来 → 清遮挡层 → 收面板 → 沿路线逐步 tap → 用判据确认
+ * ```
+ *
+ * ## 两处必须与生成器一致的细节
+ *
+ * - **清场用 `overlay` 的 `kind`，不是 `present`**：`present` 把「面板」也算成
+ *   覆盖层（语义是「有没有全屏层」），照着它循环会去关掉**当前屏幕本身**。
+ * - **重试是原地重点，不是重载重来**：抽屉要点两次是 mobile-ui 的时序竞态，
+ *   重载再点会撞上同一个竞态，永远进不去（图谱生成器实测三次全失败）。
+ *
+ * @param {object} ctx - `{probe, log}`。
+ * @param {object} spec - 目标屏（来自 `findScreen`）。
+ * @returns {Promise<object>} 给 render 的结果对象。
+ */
+async function goToScreen(ctx, spec) {
+  const steps = [];
+  const tick = (msg) => steps.push(msg);
+
+  // ① 先看是不是已经在这一屏了 —— 绝大多数调用会命中这一支，
+  //    省掉一次重载（重载要等 2–5 秒，且会打断用户正在看的界面）。
+  const here = await checkExpect(ctx, spec.expect);
+  if (here.ok) {
+    return { ok: true, screen: spec.id, title: spec.title, already: true, steps };
+  }
+
+  // ② 回到基态
+  const rl = await ctx.probe({ action: 'reload' });
+  tick(`重载界面（${rl?.note ?? rl?.error ?? '已触发'}）`);
+  // 重载是异步的，且这里是**没有回调**的原生 reload —— 只能等一个保守的时长。
+  // 等短了会在空白页上点空；等长了拖慢每次 goto。4 秒与图谱生成器的节奏一致。
+  await ctx.sleep(4000);
+
+  // 等探针重新装填（重载后页面世界的 `window.__DSH_UI_PROBE__` 没了）
+  let ready = null;
+  for (let i = 0; i < 10; i++) {
+    ready = await ctx.probe({ action: 'ping' });
+    if (ready?.ok === true) break;
+    await ctx.sleep(800);
+  }
+  tick(ready?.ok === true ? '界面已重新加载' : '⚠️ 界面重载后没能确认探针就绪');
+
+  // ③ 清遮挡层（弹窗）：**按 `kind` 判，不是按 `present`** —— 见函数头注释
+  for (let i = 0; i < 5; i++) {
+    const ov = await ctx.probe({ action: 'overlay' });
+    if (ov?.kind !== 'mask') break;
+    const live = ov.clickable ?? [];
+    const closer = live.find((e) => /继续|知道了|关闭|确定|稍后|跳过/.test(e.text || ''))
+      ?? live[live.length - 1];
+    if (!closer) break;
+    await ctx.probe({ action: 'tap', sel: closer.sel });
+    tick(`关掉遮挡层「${closer.text || closer.sel}」`);
+    await ctx.sleep(700);
+  }
+
+  // ④ 收掉面板：**同样按 `kind` 判**。面板是内容页（工作区文件/终端）的容器，
+  //    不收掉的话下一次打开侧边栏会直接落在那个内容页上，启动页的入口点不到。
+  for (let i = 0; i < 3; i++) {
+    const ov = await ctx.probe({ action: 'overlay' });
+    if (ov?.kind !== 'panel') break;
+    const live = ov.clickable ?? [];
+    // 关闭优先级：内容页自己的「关闭」→ 启动页的「收起侧边栏」→ 泛化的关闭/返回。
+    // ⚠️ 顺序不能反：「收起右侧边栏」**不重置内容页**，光收侧边栏的话下次打开
+    //    还是那个内容页 —— 那正是图谱生成器最初「找不到要点击的元素」的根因。
+    const closer = live.find((e) => /^关闭$/.test(e.text || ''))
+      ?? live.find((e) => /收起.*边栏|收起侧边栏|收起面板/.test(e.text || ''))
+      ?? live.find((e) => /^返回$/.test(e.text || ''))
+      ?? live.find((e) => /关闭|返回/.test(e.text || ''));
+    if (!closer) {
+      tick(`⚠️ 面板「${ov.panel?.cls || ov.panel?.tag}」里找不到关闭按钮，无法回到基态`);
+      break;
+    }
+    await ctx.probe({ action: 'tap', sel: closer.sel });
+    tick(`收掉面板「${closer.text || closer.sel}」`);
+    await ctx.sleep(1600);
+  }
+
+  // ⑤ 沿路线走
+  for (const step of spec.enter) {
+    const label = step.text ?? step.aria ?? step.sel;
+    const r = await ctx.probe({ action: 'tap', ...step });
+    const ok = r?.ok === true && r?.onTarget !== false && r?.offscreen !== true;
+    tick(`tap「${label}」 ${ok ? '✓' : `✗ ${r?.error ?? r?.hint ?? ''}`}`);
+    await ctx.sleep(900);
+
+    // ⑥ 等判据成立 —— 只在**最后一步**等（中间步骤没有判据可用）。
+    //
+    // ⚠️ 这里的 `wait` **不传 `timeout`**：原生 `runWait()` 根本不读它，
+    //   固定轮询到 `WAIT_MAX_MS`（10 秒，`UiProbeBridge.kt:390`）。传一个
+    //   数字只会让读代码的人以为它在生效。
+    //   所以「一次 wait」本身就是「最多等 10 秒」，外面**不该**再套 sleep 循环。
+    const isLast = step === spec.enter[spec.enter.length - 1];
+    if (!isLast) continue;
+
+    let arrived = (await ctx.probe({ action: 'wait', ...spec.expect }))?.satisfied === true;
+    // 等不到 ⇒ **原地重点**（不是重载重来）。重载会撞上同一个时序竞态，
+    // 永远进不去 —— 图谱生成器在会话抽屉上实测三次全失败，就是踩了这个坑。
+    for (let attempt = 2; !arrived && attempt <= 3; attempt++) {
+      const again = await ctx.probe({ action: 'tap', ...step });
+      tick(`↻ 没等到，重点「${label}」（第 ${attempt} 次）ok=${again?.ok}`);
+      await ctx.sleep(1200);
+      arrived = (await ctx.probe({ action: 'wait', ...spec.expect }))?.satisfied === true;
+    }
+    if (!arrived) {
+      return {
+        ok: false, screen: spec.id, title: spec.title, steps,
+        error: `点了「${label}」之后没等到「${JSON.stringify(spec.expect)}」出现，`
+          + '界面可能停在了别的屏。用 action:"where" 看现在到底在哪。',
+      };
+    }
+  }
+
+  // ⑦ 无路线的屏（hero）：清场完靠判据确认（同样只等一次，理由见 ⑥）
+  if (spec.enter.length === 0) {
+    const arrived = (await ctx.probe({ action: 'wait', ...spec.expect }))?.satisfied === true;
+    if (!arrived) {
+      return {
+        ok: false, screen: spec.id, title: spec.title, steps,
+        error: '清场之后也没能回到这一屏（判据不成立）。',
+      };
+    }
+  }
+
+  return { ok: true, screen: spec.id, title: spec.title, already: false, steps };
+}
+
+/**
  * 把回执渲染成模型读得懂的**文本**。
  *
  * ⚠️ 这里刻意不用「把 JSON 原样丢回去」的做法。工具结果是要**被模型读**的，
@@ -302,6 +556,69 @@ function render(args, reply) {
 		lines.push(`✗ 操作失败：${reply.error ?? '未知原因'}`);
 		if (reply.element) lines.push(`  找到的元素: ${fmtElement(reply.element)}`);
 		if (reply.spec) lines.push(`  定位条件: ${JSON.stringify(reply.spec)}`);
+		return lines.join('\n');
+	}
+
+	// ── map：内建的 17 屏图谱 ───────────────────────────────────────
+	if (action === 'map') {
+		lines.push(`✓ 内建图谱 ${ATLAS.screens.length} 屏（每屏按钮表由 PC 侧对真实前端实测生成）`);
+		lines.push(`  这 ${ATLAS.screens.length} 屏的判据**互斥**，所以 where 能唯一确定现在在哪。`);
+		lines.push('');
+		for (const s of ATLAS.screens) {
+			const route = s.enter.length === 0
+				? '（基态）'
+				: s.enter.map((x) => x.text ?? x.aria ?? x.sel).join(' → ');
+			lines.push(`  ${s.id.padEnd(18)} ${s.title}`);
+			lines.push(`    ${' '.repeat(18)} 路线: ${route}`);
+			// ⚠️ 不列全部按钮 —— 17 屏 195 个按钮会把上下文淹没。
+			//   要用具体按钮时用 where 之后接 dump，那时拿到的是**当前屏幕**的。
+			if (reply.detail === true) {
+				for (const [text, cls, x, y, role] of s.els) {
+					lines.push(`    ${' '.repeat(18)}   [${role}] "${text}" CSS(${x},${y})${cls ? ` .${cls}` : ''}`);
+				}
+			}
+		}
+		lines.push('');
+		lines.push('要看某一屏的按钮表: {action:"goto", screen:"<id>"} 之后接 {action:"dump"}。');
+		lines.push('要确认现在在哪: {action:"where"}。');
+		return lines.join('\n');
+	}
+
+	// ── where：现在在哪一屏 ─────────────────────────────────────────
+	if (action === 'where') {
+		if (reply.screen) {
+			lines.push(`✓ 现在在「${reply.screen.title}」（${reply.screen.id}）`);
+			const s = ATLAS.screens.find((x) => x.id === reply.screen.id);
+			if (s) {
+				lines.push(`  这一屏的按钮（图谱实测，共 ${s.els.length} 个）:`);
+				for (const [text, cls, x, y, role] of s.els) {
+					lines.push(`    [${role}] "${text}" CSS(${x},${y})${cls ? ` .${cls}` : ''}`);
+				}
+			}
+		} else if ((reply.matches ?? []).length > 1) {
+			lines.push(`⚠️ 认不准：有 ${reply.matches.length} 屏的判据同时成立 `
+				+ `（${reply.matches.map((m) => m.title).join(' / ')}）。`);
+			lines.push('  图谱的判据本该互斥 —— 这是图谱或前端的异常，请用 dump 直接看界面。');
+		} else {
+			lines.push('✗ 认不出现在在哪一屏。');
+			lines.push('  可能界面还在加载/动画中，也可能这一屏还没被内建图谱覆盖。');
+			lines.push('  用 {action:"dump"} 看当前实际有什么，或 {action:"overlay"} 看有没有弹窗盖着。');
+		}
+		return lines.join('\n');
+	}
+
+	// ── goto：一键到屏 ──────────────────────────────────────────────
+	if (action === 'goto') {
+		if (reply.already) {
+			lines.push(`✓ 已经就在「${reply.title}」（${reply.screen}），没有做任何改动。`);
+		} else {
+			lines.push(`✓ 已开到「${reply.title}」（${reply.screen}）`);
+		}
+		if ((reply.steps ?? []).length > 0) {
+			lines.push('  过程:');
+			for (const s of reply.steps) lines.push(`    ${s}`);
+		}
+		lines.push('  下一步: 用 {action:"dump"} 拿这一屏的实时按钮位置，或 {action:"where"} 复核。');
 		return lines.join('\n');
 	}
 
@@ -578,6 +895,15 @@ function uiTool(home) {
 	/** 请求编号。进程内自增即可 —— 只有本插件会写这个信箱。 */
 	let seq = 0;
 
+	/**
+	 * 向探针问一次（走同一个串行闸门）。
+	 *
+	 * ⚠️ **本地动作必须通过这个函数间接调用探针**，不能自己另开一个
+	 *   `sendCommand` 通道 —— 闸门守卫的是「信箱里同一时刻只有一条命令」，
+	 *   绕过它就等于把并发覆盖的问题放回来。
+	 */
+	const probe = (payload) => enqueue(() => sendCommand(home, ++seq, payload));
+
 	return {
 		name: TOOL_NAME,
 		description: DESCRIPTION,
@@ -589,7 +915,15 @@ function uiTool(home) {
 				action: {
 					type: 'string',
 					enum: ACTIONS,
-					description: 'What to do. "dump" lists interactive elements with positions; "tap" clicks one; "type" fills an input; "scroll" scrolls; "text" reads visible text; "info" summarises the current screen; "wait" blocks until an element appears; "ping" checks the probe is alive; "find"/"html" inspect one element; "overlay" reports what is currently covering the screen and which buttons inside it are live; "reload" reloads a broken Web view.',
+					description: 'What to do. "map" lists the built-in screen atlas; "where" tells you which screen you are on right now; "goto" drives the UI to a named screen (see `screen`); "dump" lists interactive elements with positions; "tap" clicks one; "type" fills an input; "scroll" scrolls; "text" reads visible text; "info" summarises the current screen; "wait" blocks until an element appears; "ping" checks the probe is alive; "find"/"html" inspect one element; "overlay" reports what is currently covering the screen and which buttons inside it are live; "reload" reloads a broken Web view.',
+				},
+				screen: {
+					type: 'string',
+					description: 'For action:"goto" — which screen to open. Accepts an atlas id (e.g. "settings-priv", "terminal") or a screen title / part of one (e.g. "特权权限"). Call {action:"map"} to list them all.',
+				},
+				detail: {
+					type: 'boolean',
+					description: 'For action:"map" — also list every button of every screen (long; the default is just the routes).',
 				},
 				sel: { type: 'string', description: 'CSS selector for the target element. Most precise — copy it from a previous dump.' },
 				testid: { type: 'string', description: 'Target by data-testid.' },
@@ -620,6 +954,41 @@ function uiTool(home) {
 			const bad = validate(args ?? {});
 			if (bad !== '') return { ok: false, message: bad };
 
+			// ── 本地动作：map / where / goto ─────────────────────────────
+			//
+			// ⚠️ 这三条**绝不能**原样写进信箱：探针不认识它们，会回
+			//   「未知 action: map」—— 而那是**真机专属**的错误，PC 侧跑不到。
+			const action = args.action;
+			if (LOCAL_ACTIONS.includes(action)) {
+				const ctx = { probe, sleep };
+
+				if (action === 'map') {
+					const reply = { ok: true, detail: args.detail === true };
+					return { ok: true, message: render(args, reply), details: reply };
+				}
+
+				if (action === 'where') {
+					const r = await detectScreen(ctx);
+					const reply = { ok: true, screen: r.screen, matches: r.matches };
+					return { ok: true, message: render(args, reply), details: reply };
+				}
+
+				// goto：必须先解析目标屏 —— 拼错时如实报「没有这一屏」并把
+				// 可选 id 列出来，而不是猜一个最像的（猜错的代价是模型在
+				// 错误的界面上继续点，而它以为自己到了）。
+				const spec = findScreen(args.screen);
+				if (!spec) {
+					return {
+						ok: false,
+						message: `✗ 图谱里没有「${args.screen ?? ''}」这一屏。\n`
+							+ `  可用: ${ATLAS.screens.map((s) => s.id).join(', ')}\n`
+							+ '  先用 {action:"map"} 看每屏的标题与路线。',
+					};
+				}
+				const reply = await goToScreen(ctx, spec);
+				return { ok: reply.ok === true, message: render(args, reply), details: reply };
+			}
+
 			// ⚠️ **字段原样透传，一个字都不翻译。**
 			//
 			// 第一版在这里做了 `text` ↔ `value` 的翻译，结果制造了一个极隐蔽的
@@ -632,7 +1001,7 @@ function uiTool(home) {
 			// 翻译，也就没有再搞错的机会。
 			// ⚠️ 走串行闸门：原生只有一个轮询线程 + 一个命令文件，并发写会互相覆盖。
 			//   详见 [enqueue] 的注释。
-			const reply = await enqueue(() => sendCommand(home, ++seq, { ...args }));
+			const reply = await probe({ ...args });
 			const text = render(args, reply);
 			return {
 				ok: reply.ok === true,

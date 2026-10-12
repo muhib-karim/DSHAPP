@@ -80,9 +80,24 @@ const SCREENS = [
     id: 'hero',
     title: '空会话（Hero）',
     enter: [],
-    // ⚠️ 判据用「打开导航」这个**基态特有**的悬浮按钮。它是 mobile-ui 在窄屏
-    //    下加的（`body > button`），只在这一屏出现，不会与别的屏撞车。
-    expect: { text: '打开导航' },
+    // ⚠️⚠️ **这一屏没有「独有元素」，判据不能只看文本 —— 这是实测结论。**
+    //
+    //    最初写的是 `{text:'打开导航'}`，注释里还写着「只在这一屏出现」。
+    //    那是**错的**：它是 mobile-ui 塞在 `body > button` 上的常驻悬浮按钮，
+    //    实测 **17 屏全都有**（抽屉那屏只是滑到了 `left:-111`）。用它当判据
+    //    等于没判 —— 任何一屏都满足，`goto('hero')` 会永远报「到了」。
+    //
+    //    其余候选同样不行：「选择新任务使用的 Agent 预设」「搜索会话」这些底座
+    //    元素在 `hero`…`preset-picker` 共 12 屏都在（面板是**盖在** Hero 之上的，
+    //    底层 DOM 一直没被卸载）。
+    //
+    //    所以判据要靠**「可点」这个附加条件**区分：这个占位符在 `hero` 可点，
+    //    在另外 11 屏都存在但**被覆盖层挡住**（`clickable:true` 把「被遮挡」与
+    //    「屏幕外」都算不成立）；其余 5 屏（会话/侧栏那几屏）它根本不存在。
+    //
+    //    ⚠️ 必须配 `exact:true`：只给短名会子串命中那 11 屏的同一个元素，
+    //       判据就变成「覆盖层还在不在」而不是「是不是 Hero」—— 含义不再单一。
+    expect: { text: '描述你想要构建的内容, / 调用指令, @ 文件或对话', exact: true, clickable: true },
   },
   {
     id: 'settings',
@@ -128,7 +143,10 @@ const SCREENS = [
     id: 'settings-priv',
     title: '设置 › 特权权限',
     enter: [{ text: '设置' }, { text: '特权权限' }],
-    expect: { text: '重新检测' },
+    // ⚠️⚠️ **「重新检测」不行**：实测它在 `settings-bubble`（悬浮气泡）那屏
+    //    同样存在（那屏也有个「重新检测」按钮），两屏都成立 ⇒ 等于没判。
+    //    改用只有本屏才有的引导文案（它把 Android 版本写进了按钮名里）。
+    expect: { text: '开启引导（Android 10 用这条）', exact: true },
   },
   {
     id: 'settings-bubble',
@@ -150,7 +168,14 @@ const SCREENS = [
     //    「访问模式」「Agent 预设」两个倒是有 aria-label —— 同一行里三个按钮
     //    的取值口径都不一样，所以**别照着邻居抄**，先 `dump` 看它报的是哪个字段。
     enter: [{ text: '选择模型' }],
-    expect: { text: '推理等级' },
+    // ⚠️⚠️ **「推理等级」不能用，尽管它看着是模型面板独有的。**
+    //    实测它同时出现在「选择模型，当前 DeepSeek-V41-Flash，推理等级 High」
+    //    这个**每屏都在**的触发按钮文案里 —— 于是这一屏的判据在 16 屏成立，
+    //    等于没判。根因是 `byText` 的兜底是**子串包含**，恰好撞上那句长文案。
+    //
+    //    改用 `exact:true` 逼精确相等：模型面板里那个 menuitem 的完整文案就是
+    //    「推理等级 High」，触发按钮那条长句与之不等 —— 17 屏里只有这一屏命中。
+    expect: { text: '推理等级 High', exact: true },
   },
   {
     id: 'access-mode',
@@ -165,7 +190,12 @@ const SCREENS = [
     enter: [{ aria: '选择新任务使用的 Agent 预设' }],
     // 这一屏的选项文本很长（带整段说明），所以判据用**子串**：
     // `byText` 先找完全相等、找不到才退回子串包含，所以给短名即可命中。
-    expect: { text: '极简模式' },
+    //
+    // ⚠️⚠️ **但「极简模式」这个短名会同时命中 `settings › Agent 预设` 屏**
+    //    （那屏有「设为新任务默认: 极简模式」「模式说明: 极简模式」等四个按钮），
+    //    两屏都成立 ⇒ 等于没判。改用**选项自身的完整文案 + 精确相等** ——
+    //    它只在这一屏出现（那屏的按钮文案都是「动词: 极简模式」的形状）。
+    expect: { text: '极简模式 Agent 仅使用终端工具完成任务，适合测试和对比其基础表现。', exact: true },
   },
   // ⚠️⚠️ **顺序是有语义的：`drawer` 必须排在最后几个。**
   //
@@ -284,6 +314,16 @@ const child = spawn(chrome, [
   '--force-device-scale-factor=3',
   'about:blank',
 ], { stdio: 'ignore' });
+
+/** 把一屏的 `expect` 描述成人话，给日志用。 */
+function fmtExpect(ex) {
+  if (!ex) return '(无)';
+  const head = ex.text ?? ex.aria ?? ex.sel;
+  const tags = [];
+  if (ex.exact) tags.push('精确');
+  if (ex.clickable) tags.push('需可点');
+  return `「${head}」${tags.length ? `（${tags.join('+')}）` : ''}`;
+}
 
 let cdp;
 try {
@@ -589,16 +629,32 @@ try {
     // 「真的进去了吗」——最终以 **dump 的实际状态**为准。
     // 只看 tap 的 ok 不够：点了没生效时 ok 照样是 true（遮挡/屏幕外就是这样）。
     // 循环里那次 `wait` 决定「要不要再试一次」，这里决定「记进图谱的是什么」。
+    //
+    // ⚠️ 复核口径必须与**探针的 `wait`** 一致，否则同一份判据两处答案不同，
+    //    而「以 dump 为准」会把 `wait` 那个（更严格的）结果覆盖掉。
+    //    三处对应关系：
+    //      ① `exact:true` → 精确相等，而不是子串包含；
+    //      ② `clickable:true` → 还必须没被遮挡、且中心点在视口内；
+    //      ③ `sel` → 按选择器找，而不是按文本。
     if (spec.expect) {
-      const found = labelled.find((e) =>
-        (spec.expect.text && (e.text || '').includes(spec.expect.text)) ||
-        (spec.expect.aria && e.aria === spec.expect.aria));
+      const ex = spec.expect;
+      const found = labelled.find((e) => {
+        if (ex.sel) return e.sel === ex.sel;
+        if (ex.text) {
+          const t = e.text || '';
+          if (ex.exact === true ? t !== ex.text : !t.includes(ex.text)) return false;
+        } else if (ex.aria) {
+          if (e.aria !== ex.aria) return false;
+        } else return false;
+        if (ex.clickable === true && (e.covered || e.offscreen)) return false;
+        return true;
+      });
       const byDump = !!found;
       if (byDump !== verified) {
         console.log(`  ⚠️ dump 复核与 wait 不一致（wait=${verified} dump=${byDump}），以 dump 为准`);
       }
       verified = byDump;
-      console.log(`  校验: ${verified ? '✅ 已进入' : '❌ 没进去'}（找「${spec.expect.text || spec.expect.aria}」）`);
+      console.log(`  校验: ${verified ? '✅ 已进入' : '❌ 没进去'}（找 ${fmtExpect(ex)}）`);
     }
     if (dump.overlay) console.log(`  ⚠️ 该屏仍有遮挡层: ${dump.warning}`);
 
@@ -615,6 +671,12 @@ try {
     screens.push({
       id: spec.id,
       title: spec.title,
+      // ⚠️ `expect` **必须落进 JSON**，不能只活在生成器里。它是「这一屏真的进去了吗」
+      //   的判据，而 `tap.ok` 单独用不了：点一个点不动的东西仍返回 `ok:true`
+      //   （那正是遮挡/屏幕外两种症状），多屏共有的文案更会让从没进过的屏假通过。
+      //   `tools/build-uiagent-screens.mjs` 把这份判据内建进插件 —— 真机上的模型
+      //   就是靠它知道「我到底在哪一屏」，丢了它 `goto` 就成了盲开车。
+      expect: spec.expect ?? null,
       enter: steps,
       entered,
       verified,

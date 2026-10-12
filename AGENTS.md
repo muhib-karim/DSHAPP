@@ -3325,6 +3325,76 @@ overlay → kind:'mask' 吗？→ 是就点「此刻能点的」里那个按钮 
 `find` / `html`（看单个元素）、`ping`（探针是否活着）、`reload`（界面白了就重载）。
 `dump` 可加 `clickableOnly:true` 只看现在真能点的。
 
+#### ⚡ 一键到屏：`map` / `where` / `goto`（模型的正确姿势）
+
+**别再手点着导航 —— 用三个内建动作。** 图谱（`tools\ui-map-real-frontend.json`）已经
+被**编成插件的一部分**（`lib/screens.js`，由 `tools\build-uiagent-screens.mjs` 从图谱
+生成），所以模型不需要读那个 400 KB 的 JSON，也不需要猜自己在哪：
+
+| 动作 | 干什么 |
+|---|---|
+| `{"action":"map"}` | 列出 17 屏的 id、标题、路线。加 `detail:true` 连每屏的按钮一起列 |
+| `{"action":"where"}` | **回答「我现在在哪一屏」** —— 拿 17 屏的判据逐个比对实时界面，命中即为答案 |
+| `{"action":"goto","screen":"特权权限"}` | 一条命令开到那一屏，返回过程与是否到达 |
+
+`screen` 接受屏 id（`settings-priv`）、完整标题、或标题子串（`特权权限`）。
+
+标准循环：
+
+```
+{action:"where"} → {action:"goto",screen:"..."} → {action:"dump"} → {action:"tap",...}
+先弄清在哪          再开到目标屏              读实时位置          动手
+```
+
+⚠️ **`goto` 之所以必要，是因为这个前端「进去了就回不去」。** 它持久化三样**单向**的
+状态：会话抽屉的开关、右侧边栏的开关**及其内容页**、以及当前会话。一旦点过
+`新建终端` 或种过会话，纯 `tap` 序列**永远回不到**空会话屏（见「前端持久化状态」一节）。
+`goto` 的第一件事是 `reload` 回基态，那是唯一可靠的回退手段。
+
+`goto` 的内部顺序（照抄图谱生成器的策略，一字不差）：
+
+```
+reload → 等探针重新装填 → 关遮挡层（kind=='mask'）→ 收面板（kind=='panel'）→ 沿路线 tap → 用判据确认
+```
+
+两处**不能改**的细节：
+
+- **清场按 `kind` 判，不是 `present`** —— `present` 把面板也算成覆盖层，照它循环会
+  关掉**当前屏幕本身**（与「清场」那一节的 ⚠️ 同源）。
+- **等不到判据时是原地重点，不是重载重来** —— 抽屉要点两次是 mobile-ui 的时序竞态，
+  重载再点会撞上同一个竞态（图谱生成器实测三次全失败）。重试上限 3 次。
+
+第三个动作 `where` 有一条性能上的硬约束：**它用 `find` 探测，不能用 `wait`。**
+原生 `runWait()` 会一直轮询到 **10 秒**上限、且**忽略**调用方传的 `timeout`
+（`UiProbeBridge.kt:390` 只用 `WAIT_MAX_MS`）。17 屏 × 10 秒 = 170 秒，而 `find` 是
+单次检查、秒级完成。代价是 `wait` 代劳的 `clickable` 过滤要**在插件侧自己做**
+（`describe()` 回传的 `covered`/`offscreen` 就是判据，照 `ui-probe.js:1159` 那行写）——
+漏掉这一层，`hero` 的判据会在**任何**一屏「成立」，因为那个 composer 占位符 12 屏都有、
+只是其中 11 屏被盖住了。
+
+⚠️ **三处判据曾静默失效，已修并加了机械审计。** 判据（`expect`）有两个用途：图谱
+生成时校验「真的进去了」，运行时 `where`/`goto` 判断在哪。撞车时**两个用途同时失效，
+且症状都是静默的** —— 图谱那屏「假通过」，`goto`「假到达」（模型于是对着错误界面点
+按钮）。本轮实测抓到 4 处：
+
+| 屏 | 原判据 | 为什么撞车 |
+|---|---|---|
+| `hero` | `打开导航` | mobile-ui 的常驻悬浮按钮，**17 屏全有** |
+| `model-picker` | `推理等级` | 子串命中了每屏都在的长文案「…，推理等级 High」 |
+| `settings-priv` | `重新检测` | `设置 › 悬浮气泡` 那屏也有一个「重新检测」 |
+| `preset-picker` | `极简模式` | 子串命中了 `设置 › Agent 预设` 的「设为新任务默认: 极简模式」 |
+
+**光靠肉眼审不出来**（本轮就先看漏了两处）。所以固化成：
+
+```powershell
+node tools\ui-map-expect-audit.mjs    # 17 屏判据唯一性，退出码非零 = 有撞车
+```
+
+它**复刻探针的匹配语义**（先精确、再子串取第一个、候选集是**全部**元素不过滤遮挡、
+`clickable:true` 才附加遮挡/屏幕外条件），并对**全部元素**跑一遍 —— 与探针口径不一致
+的话结论会反。改完判据要**重跑图谱**让 JSON 跟上，再跑
+`node tools\build-uiagent-screens.mjs` 让插件的内建表跟上。
+
 #### PC 侧自动化验收（不需要真机）
 
 设备上装的是别处签名的包、无法 `install -r`（会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`），
@@ -3333,9 +3403,17 @@ overlay → kind:'mask' 吗？→ 是就点「此刻能点的」里那个按钮 
 
 ```powershell
 node tools\ui-probe-verify.mjs            # 探针行为，107 项断言（真实 DOM，含 React 受控输入模拟）
-node tools\uiagent-bridge-verify.mjs      # 插件↔原生信箱契约，69 项断言（真插件代码 + 假原生对端）
+node tools\uiagent-bridge-verify.mjs      # 插件↔原生信箱契约，111 项断言（真插件代码 + 假原生对端）
+node tools\ui-map-expect-audit.mjs        # 17 屏判据唯一性（判据撞车 = goto 假到达）
 node tools\ui-map-real-frontend.mjs "<带 token 的 URL>"   # 真实官方前端端到端，17 屏图谱 + 交互实测
+node tools\build-uiagent-screens.mjs      # 图谱 → 插件内建屏幕表 lib/screens.js
 ```
+
+⚠️ **`uiagent-bridge-verify.mjs` 的假原生必须「会演」**：它维护一个「当前在哪一屏」，
+`find`/`wait` **只在当前那一屏**上判判据。第一版写成了「逐屏比对」（拿每一屏自己的
+判据比对传来的判据），于是**每一屏都命中** —— `where` 报「17 屏同时成立」、`goto` 的
+「是否已在该屏」永远为真而直接从不到重载那步，8 条断言集体失败。真机上的探针只在
+**当前 DOM** 上查，所以「当前屏」才是正确的模型形状。
 
 图谱结果落在 `tools\ui-map-real-frontend.json`：每屏列出每个按钮的 **CSS 中心坐标 +
 `sel`**，外加 `⛔被遮挡` / `📴屏幕外` 标记。**「按钮在哪」不用猜，查这个文件。**

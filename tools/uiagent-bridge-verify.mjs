@@ -150,6 +150,12 @@ ok(tool?.parameters?.properties?.clickable?.type === 'boolean',
 ok(tool?.parameters?.properties?.additionalProperties === undefined
 	|| tool?.parameters?.additionalProperties === false,
 	'额外字段被禁止（避免模型瞎编参数）');
+ok(actions.includes('map') && actions.includes('where') && actions.includes('goto'),
+	'动作枚举里有本轮新增的 map/where/goto');
+ok(tool?.parameters?.properties?.screen?.type === 'string',
+	'schema 暴露了 screen（goto 的目标屏）');
+ok(tool?.parameters?.properties?.detail?.type === 'boolean',
+	'schema 暴露了 detail（map 是否列按钮）');
 
 // ────────────────────────────────────────────────────────────────────
 section('① id 配对：上一轮的回执不能当本轮答案');
@@ -523,7 +529,225 @@ section('⑨ 未就绪时不该注册（避免模型拿到一个永远失败的�
 }
 
 // ────────────────────────────────────────────────────────────────────
-console.log(`\n${'═'.repeat(52)}`);
+section('⑩ map / where / goto：插件侧的组合动作');
+{
+	// 内建屏幕表就是它们的数据源，直接从生成物里读 —— 「插件里的表和生成物一致」
+	// 本身就是一条要验的事（有人手改过 screens.js 的话，这里会露出来）。
+	const screensMod = await import(pathToFileURL(
+		path.resolve('mobile-ui-plugin/dsh-android-uiagent/lib/screens.js')).href);
+	const atlas = screensMod.ATLAS;
+
+	ok(atlas.screens.length === 17, `内建表有 17 屏（实际 ${atlas.screens.length}）`);
+	ok(atlas.screens.every((s) => s.expect && s.expect.text),
+		'每屏都有 text 判据（没有判据的屏无法被 where 认出来）');
+	ok(atlas.screens.every((s) => Array.isArray(s.enter)),
+		'每屏都有 enter 路线数组');
+
+	/**
+	 * 会「演」的假原生：维护一个「当前在哪一屏」，**只在当前这一屏**上判判据。
+	 *
+	 * ⚠️ 「只在当前屏判」是要害，第一版写错了：当时让 `find` 去**逐屏比对**
+	 *   （拿每一屏自己的判据比对传来的判据），于是**每一屏都命中** ——
+	 *   `where` 报「17 屏同时成立」，`goto` 的「是否已在该屏」则永远为真、
+	 *   直接从不到重载那一步。真机上的原生探针只在**当前 DOM** 上查，
+	 *   所以「当前屏」才是这个模型的正确形状。
+	 */
+	function startStage(home, opts = {}) {
+		const cmdPath = path.join(home, 'ui-cmd.json');
+		const resPath = path.join(home, 'ui-result.json');
+		// 清掉上一节残留的命令/回执 —— 否则新 stage 一启动就把旧命令当成自己的，
+		// 「本地动作不碰信箱」这类断言会被误判成失败。
+		for (const f of [cmdPath, resPath]) { try { fs.unlinkSync(f); } catch {} }
+		const seen = [];
+		let here = opts.start ?? 'hero';   // 当前在哪一屏（按屏 id）
+		let stopped = false;
+
+		/** 判据在**当前屏**上是否成立（复刻探针 `wait`/`find` 的匹配语义）。 */
+		const holds = (spec) => {
+			const s = atlas.screens.find((x) => x.id === here);
+			if (!s || !spec || typeof spec.text !== 'string') return false;
+			const hay = s.expect.text;
+			return spec.exact === true ? hay === spec.text : hay.includes(spec.text);
+		};
+
+		const timer = setInterval(() => {
+			let cmd;
+			try { cmd = JSON.parse(fs.readFileSync(cmdPath, 'utf8')); } catch { return; }
+			if (cmd.id === seen[seen.length - 1]?.id) return;
+			seen.push({ id: cmd.id, action: cmd.action, raw: cmd });
+
+			const reply = { id: cmd.id, ok: true, action: cmd.action };
+			if (cmd.action === 'reload') {
+				// 重载回基态 —— 这正是 `goto` 依赖的行为
+				here = opts.afterReload ?? 'hero';
+			} else if (cmd.action === 'ping') {
+				reply.url = 'http://127.0.0.1:3080/';
+				reply.interactive = 15;
+				reply.viewport = { w: 360, h: 780, dpr: 3 };
+			} else if (cmd.action === 'overlay') {
+				reply.present = false;
+				reply.kind = null;
+			} else if (cmd.action === 'find') {
+				const hit = holds(cmd);
+				reply.ok = hit;
+				reply.element = hit
+					? { tag: 'button', text: atlas.screens.find((x) => x.id === here).expect.text, covered: false, offscreen: false }
+					: null;
+				if (!hit) reply.error = '找不到元素';
+			} else if (cmd.action === 'wait') {
+				reply.satisfied = holds(cmd);
+				reply.attempts = 1;
+				if (!reply.satisfied) reply.error = '等待超时（10000ms）—— 条件始终没有成立';
+			} else if (cmd.action === 'tap') {
+				// 点中某屏的路线步 ⇒ 走到那一屏。简化但**方向正确**：
+				// 路线与屏对不上（生成物坏了）时这里就走不到，goto 会如实失败。
+				// 多个屏共用同一标签（如「设置」）时取**第一个** —— 与真实导航一致：
+				// 点「设置」进的是设置面板，不是某个子页。
+				const label = cmd.text ?? cmd.aria;
+				const dest = atlas.screens.find((s) => s.enter.some((e) => (e.text ?? e.aria) === label));
+				if (dest && !opts.ignoreTaps) here = dest.id;
+				reply.onTarget = true;
+				reply.element = { tag: 'button', text: label ?? null };
+			}
+			try { fs.writeFileSync(resPath, JSON.stringify(reply), 'utf8'); } catch {}
+		}, 5);
+
+		return {
+			seen,
+			get here() { return here; },
+			set here(v) { here = v; },
+			stop() { stopped = true; clearInterval(timer); },
+			get stopped() { return stopped; },
+		};
+	}
+
+	// ── map：纯本地，一个字节都不该写进信箱 ────────────────────────
+	{
+		const stage = startStage(home);
+		const r = await tool.execute({ action: 'map' });
+		// 等一拍，确认没有迟到的信箱写入
+		await sleep(60);
+		stage.stop();
+		ok(r.ok === true, 'map 成功');
+		ok(stage.seen.length === 0,
+			`map 完全不碰信箱（本地动作；实际发了 ${stage.seen.length} 条 —— 发出去的话探针会回「未知 action」）`);
+		ok(/17 屏/.test(r.message ?? ''), 'map 说清了屏数');
+		ok(atlas.screens.every((s) => (r.message ?? '').includes(s.id)),
+			'map 列出了每一屏的 id');
+		ok(!/undefined/.test(r.message ?? ''), 'map 渲染里没有 undefined');
+	}
+
+	// ── map detail：列按钮 ─────────────────────────────────────────
+	{
+		const stage = startStage(home);
+		const r = await tool.execute({ action: 'map', detail: true });
+		stage.stop();
+		ok(stage.seen.length === 0, 'map detail 也不碰信箱');
+		const sample = atlas.screens[1].els[0][0];
+		ok((r.message ?? '').includes(sample),
+			`map detail 列出了具体按钮（找「${sample}」）`);
+	}
+
+	// ── where：认出当前屏 ──────────────────────────────────────────
+	{
+		const stage = startStage(home, { start: 'settings-priv' });
+		const r = await tool.execute({ action: 'where' });
+		stage.stop();
+		ok(stage.seen.every((s) => s.action === 'find'),
+			`where 只用 find 探测（**不能用 wait** —— 原生 wait 固定轮询 10 秒，17 屏就是 170 秒；实际用的: ${[...new Set(stage.seen.map((s) => s.action))].join(',')}）`);
+		ok(r.details?.screen?.id === 'settings-priv',
+			`where 认出了 设置 › 特权权限（实际 ${JSON.stringify(r.details?.screen?.id)}）`);
+		ok(/特权权限/.test(r.message ?? ''), 'where 的文本里报了屏标题');
+		ok(/开启引导/.test(r.message ?? ''), 'where 顺带列出了该屏的按钮');
+	}
+
+	// ── where：认不出时**不猜** ────────────────────────────────────
+	{
+		// 把「当前屏」设成一个不存在的 id ⇒ 所有判据都不成立
+		const stage = startStage(home, { start: '__nope__' });
+		const r = await tool.execute({ action: 'where' });
+		stage.stop();
+		ok(r.details?.screen === null,
+			'认不出时 screen 是 null，而不是硬挑一个最像的（猜错会让模型在错误界面继续点）');
+		ok(/认不出/.test(r.message ?? ''), 'where 如实报「认不出」');
+		ok(/dump/.test(r.message ?? ''), 'where 给了下一步建议');
+	}
+
+	// ── goto：已经在这一屏 ⇒ **不重载** ────────────────────────────
+	{
+		const stage = startStage(home, { start: 'hero' });
+		const r = await tool.execute({ action: 'goto', screen: 'hero' });
+		stage.stop();
+		ok(r.ok === true, 'goto 已在该屏时成功');
+		ok(!stage.seen.some((s) => s.action === 'reload'),
+			`已在该屏时**不重载**（重载要几秒且会打断用户；实际发了 reload=${stage.seen.filter((s) => s.action === 'reload').length} 次）`);
+		ok(/已经就在/.test(r.message ?? ''), 'goto 如实说明「已经就在」，没假装做了什么');
+	}
+
+	// ── goto：走路线过去 ───────────────────────────────────────────
+	{
+		const stage = startStage(home, { start: 'hero' });
+		const r = await tool.execute({ action: 'goto', screen: 'settings-group' });
+		stage.stop();
+		ok(stage.seen.some((s) => s.action === 'reload'), 'goto 先重载回基态');
+		ok(stage.seen.some((s) => s.action === 'tap' && s.raw.text === '设置'),
+			'goto 点了路线第一步「设置」');
+		ok(stage.seen.some((s) => s.action === 'tap' && s.raw.text === '交流群'),
+			'goto 点了路线第二步「交流群」');
+		ok(stage.here === 'settings-group', `假原生真的走到了目标屏（实际 ${stage.here}）`);
+		ok(r.ok === true, 'goto 成功');
+		ok(/交流群/.test(r.message ?? ''), 'goto 的文本里报了屏标题');
+		ok(/过程:/.test(r.message ?? '') && /tick|tap/.test(r.message ?? '') !== false,
+			'goto 报出了过程步骤（模型需要它来判断卡在哪）');
+		ok(!/undefined/.test(r.message ?? ''), 'goto 渲染里没有 undefined');
+	}
+
+	// ── goto：按标题也能查（宽松匹配） ─────────────────────────────
+	{
+		const stage = startStage(home, { start: 'hero' });
+		const r = await tool.execute({ action: 'goto', screen: '交流群' });
+		stage.stop();
+		ok(r.ok === true, 'goto 接受标题子串（「交流群」→ settings-group）');
+		ok(r.details?.screen === 'settings-group',
+			`标题匹配落到正确的屏（实际 ${r.details?.screen}）`);
+	}
+
+	// ── goto：到不了 ⇒ 如实失败并指出卡在哪一步 ────────────────────
+	{
+		// ignoreTaps：假原生的「点」不改变状态 ⇒ 判据永远不成立
+		const stage = startStage(home, { start: 'hero', ignoreTaps: true, afterReload: 'hero' });
+		const r = await tool.execute({ action: 'goto', screen: 'plugins-panel' });
+		stage.stop();
+		ok(r.ok === false, '到不了时 goto 报失败（不能假报成功）');
+		ok(/没等到/.test(r.message ?? ''), 'goto 说明了失败原因是「判据没成立」');
+		ok(/where/.test(r.message ?? ''), 'goto 指出下一步该用 where 看实际在哪');
+		ok(stage.seen.filter((s) => s.action === 'tap').length >= 2,
+			`到不了时**原地重点**（不是重载重来 —— 重载会撞同一个时序竞态；实际 tap ${stage.seen.filter((s) => s.action === 'tap').length} 次）`);
+	}
+
+	// ── goto：屏名拼错 ⇒ 明确报错，且不碰信箱 ──────────────────────
+	{
+		const stage = startStage(home);
+		const r = await tool.execute({ action: 'goto', screen: 'no-such-screen' });
+		await sleep(60);
+		stage.stop();
+		ok(r.ok === false, '未知屏名报失败');
+		ok(stage.seen.length === 0, '未知屏名时一个字节都没写信箱（本地就拦下了）');
+		ok(/可用/.test(r.message ?? ''), '报错里列出了可用的屏 id');
+	}
+
+	// ── goto：缺 screen 参数 ⇒ 校验拦下 ────────────────────────────
+	{
+		const stage = startStage(home);
+		const r = await tool.execute({ action: 'goto' });
+		await sleep(60);
+		stage.stop();
+		ok(r.ok === false && /screen/.test(r.message ?? ''), 'goto 缺 screen 时报错并点名该字段');
+		ok(stage.seen.length === 0, '缺参数时不写信箱');
+	}
+}
+
+
 if (failures.length === 0) {
 	console.log(`全部通过：${pass} 项断言`);
 } else {

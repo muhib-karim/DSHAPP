@@ -11,6 +11,11 @@
     {
       "id": "hero",
       "title": "空会话（Hero）",
+      "expect": {
+        "text": "描述你想要构建的内容, / 调用指令, @ 文件或对话",
+        "exact": true,
+        "clickable": true
+      },
       "enter": [],
       "entered": true,
       "verified": true,
@@ -419,6 +424,9 @@
     {
       "id": "settings",
       "title": "设置面板",
+      "expect": {
+        "text": "通用设置"
+      },
       "enter": [
         {
           "target": "设置",
@@ -1115,6 +1123,9 @@
     {
       "id": "settings-general",
       "title": "设置 › 通用设置",
+      "expect": {
+        "text": "增大字号"
+      },
       "enter": [
         {
           "target": "设置",
@@ -2028,6 +2039,9 @@
     {
       "id": "settings-group",
       "title": "设置 › 交流群",
+      "expect": {
+        "text": "复制群号"
+      },
       "enter": [
         {
           "target": "设置",
@@ -2681,6 +2695,9 @@
     {
       "id": "settings-plugins",
       "title": "设置 › 内置插件",
+      "expect": {
+        "text": "会话插件"
+      },
       "enter": [
         {
           "target": "设置",
@@ -4114,6 +4131,9 @@
     {
       "id": "settings-model",
       "title": "设置 › 模型",
+      "expect": {
+        "text": "添加模型"
+      },
       "enter": [
         {
           "target": "设置",
@@ -5079,6 +5099,9 @@
     {
       "id": "settings-preset",
       "title": "设置 › Agent 预设",
+      "expect": {
+        "text": "新任务默认: 标准模式"
+      },
       "enter": [
         {
           "target": "设置",
@@ -6096,6 +6119,10 @@
     {
       "id": "settings-priv",
       "title": "设置 › 特权权限",
+      "expect": {
+        "text": "开启引导（Android 10 用这条）",
+        "exact": true
+      },
       "enter": [
         {
           "target": "设置",
@@ -6931,6 +6958,9 @@
     {
       "id": "settings-bubble",
       "title": "设置 › 悬浮气泡",
+      "expect": {
+        "text": "怎么用"
+      },
       "enter": [
         {
           "target": "设置",
@@ -7610,6 +7640,9 @@
     {
       "id": "plugins-panel",
       "title": "插件面板",
+      "expect": {
+        "text": "添加插件"
+      },
       "enter": [
         {
           "target": "插件",
@@ -8210,6 +8243,10 @@
     {
       "id": "model-picker",
       "title": "模型选择器",
+      "expect": {
+        "text": "推理等级 High",
+        "exact": true
+      },
       "enter": [
         {
           "target": "选择模型",
@@ -8680,6 +8717,9 @@
     {
       "id": "access-mode",
       "title": "访问模式选择器",
+      "expect": {
+        "text": "完全权限"
+      },
       "enter": [
         {
           "target": "访问模式，当前：工作区内修改",
@@ -9191,6 +9231,10 @@
     {
       "id": "preset-picker",
       "title": "Agent 预设选择器",
+      "expect": {
+        "text": "极简模式 Agent 仅使用终端工具完成任务，适合测试和对比其基础表现。",
+        "exact": true
+      },
       "enter": [
         {
           "target": "选择新任务使用的 Agent 预设",
@@ -9733,6 +9777,9 @@
     {
       "id": "drawer",
       "title": "会话抽屉（左侧栏展开）",
+      "expect": {
+        "text": "收起侧边栏"
+      },
       "enter": [
         {
           "target": "打开导航",
@@ -9746,8 +9793,8 @@
       ],
       "entered": true,
       "verified": true,
-      "total": 29,
-      "labelled": 29,
+      "total": 35,
+      "labelled": 35,
       "blocked": 7,
       "offscreen": 3,
       "elements": [
@@ -10221,6 +10268,162 @@
         },
         {
           "ref": "e18",
+          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(5) > div > span:nth-of-type(4) > span > button",
+          "tag": "button",
+          "role": "button",
+          "text": "会话“图谱种会话”的操作",
+          "testid": "",
+          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
+          "rect": {
+            "x": 197,
+            "y": 352,
+            "w": 16,
+            "h": 16
+          },
+          "center": {
+            "x": 205,
+            "y": 360
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e19",
+          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(5) > div > span:nth-of-type(4) > div > button:nth-of-type(1)",
+          "tag": "button",
+          "role": "button",
+          "text": "归档会话",
+          "testid": "",
+          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
+          "rect": {
+            "x": 223,
+            "y": 352,
+            "w": 16,
+            "h": 16
+          },
+          "center": {
+            "x": 231,
+            "y": 360
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e20",
+          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(5) > div > span:nth-of-type(4) > div > button:nth-of-type(2)",
+          "tag": "button",
+          "role": "button",
+          "text": "置顶会话",
+          "testid": "",
+          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
+          "rect": {
+            "x": 249,
+            "y": 352,
+            "w": 16,
+            "h": 16
+          },
+          "center": {
+            "x": 257,
+            "y": 360
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e21",
+          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(6) > div > span:nth-of-type(4) > span > button",
+          "tag": "button",
+          "role": "button",
+          "text": "会话“图谱种会话”的操作",
+          "testid": "",
+          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
+          "rect": {
+            "x": 197,
+            "y": 386,
+            "w": 16,
+            "h": 16
+          },
+          "center": {
+            "x": 205,
+            "y": 394
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e22",
+          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(6) > div > span:nth-of-type(4) > div > button:nth-of-type(1)",
+          "tag": "button",
+          "role": "button",
+          "text": "归档会话",
+          "testid": "",
+          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
+          "rect": {
+            "x": 223,
+            "y": 386,
+            "w": 16,
+            "h": 16
+          },
+          "center": {
+            "x": 231,
+            "y": 394
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e23",
+          "sel": "div:nth-of-type(2) > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div > span:nth-of-type(6) > div > span:nth-of-type(4) > div > button:nth-of-type(2)",
+          "tag": "button",
+          "role": "button",
+          "text": "置顶会话",
+          "testid": "",
+          "cls": "hIlkoa_iconButton YDXeBa_iconButton",
+          "rect": {
+            "x": 249,
+            "y": 386,
+            "w": 16,
+            "h": 16
+          },
+          "center": {
+            "x": 257,
+            "y": 394
+          },
+          "inViewport": true,
+          "offscreen": false,
+          "covered": false,
+          "blockedBy": null,
+          "enabled": true,
+          "checked": null,
+          "value": ""
+        },
+        {
+          "ref": "e24",
           "sel": "#root > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(3) > div:nth-of-type(2) > div > div > div > button",
           "tag": "button",
           "role": "button",
@@ -10246,7 +10449,7 @@
           "value": ""
         },
         {
-          "ref": "e19",
+          "ref": "e25",
           "sel": "div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > span:nth-of-type(2) > button",
           "tag": "button",
           "role": "button",
@@ -10277,7 +10480,7 @@
           "value": ""
         },
         {
-          "ref": "e20",
+          "ref": "e26",
           "sel": "div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(3) > div > button",
           "tag": "button",
           "role": "button",
@@ -10308,7 +10511,7 @@
           "value": ""
         },
         {
-          "ref": "e21",
+          "ref": "e27",
           "sel": "#root > div > div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > header > button",
           "tag": "button",
           "role": "button",
@@ -10334,7 +10537,7 @@
           "value": ""
         },
         {
-          "ref": "e22",
+          "ref": "e28",
           "sel": "div:nth-of-type(1) > div > div > div > div > div > div > div:nth-of-type(1) > div > div > div:nth-of-type(2) > button",
           "tag": "button",
           "role": "button",
@@ -10365,7 +10568,7 @@
           "value": ""
         },
         {
-          "ref": "e25",
+          "ref": "e31",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(1) > button",
           "tag": "button",
           "role": "button",
@@ -10391,7 +10594,7 @@
           "value": ""
         },
         {
-          "ref": "e26",
+          "ref": "e32",
           "sel": "div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(1) > span > button",
           "tag": "button",
           "role": "button",
@@ -10417,7 +10620,7 @@
           "value": ""
         },
         {
-          "ref": "e27",
+          "ref": "e33",
           "sel": "div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > button",
           "tag": "button",
           "role": "button",
@@ -10448,7 +10651,7 @@
           "value": ""
         },
         {
-          "ref": "e28",
+          "ref": "e34",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(4) > div:nth-of-type(2) > button",
           "tag": "button",
           "role": "button",
@@ -10479,7 +10682,7 @@
           "value": ""
         },
         {
-          "ref": "e24",
+          "ref": "e30",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > div > div:nth-of-type(1) > div:nth-of-type(3) > div > div:nth-of-type(1)",
           "tag": "div",
           "role": "textbox",
@@ -10510,7 +10713,7 @@
           "value": null
         },
         {
-          "ref": "e23",
+          "ref": "e29",
           "sel": "div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(1) > div > div > div > div > div > div > div:nth-of-type(2) > div > button",
           "tag": "button",
           "role": "button",
@@ -10545,6 +10748,9 @@
     {
       "id": "right-sidebar",
       "title": "右侧边栏",
+      "expect": {
+        "text": "新建终端"
+      },
       "enter": [
         {
           "target": "打开右侧边栏",
@@ -11355,6 +11561,9 @@
     {
       "id": "workfiles",
       "title": "右侧边栏 › 工作区文件",
+      "expect": {
+        "text": "重新读取"
+      },
       "enter": [
         {
           "target": "打开右侧边栏",
@@ -12226,6 +12435,9 @@
     {
       "id": "terminal",
       "title": "右侧边栏 › 终端",
+      "expect": {
+        "text": "cmd.exe"
+      },
       "enter": [
         {
           "target": "打开右侧边栏",
