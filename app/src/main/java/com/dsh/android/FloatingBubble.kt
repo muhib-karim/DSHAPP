@@ -1,9 +1,11 @@
 package com.dsh.android
 
 import android.annotation.SuppressLint
+import android.animation.ObjectAnimator
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.os.Build
@@ -15,7 +17,10 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -111,6 +116,16 @@ class FloatingBubble(private val context: Context) {
 
         /** 状态横条自动消失的默认时长（ms）。插件可用 `statusAutoHideMs` 覆盖。 */
         private const val STATUS_AUTO_HIDE_MS = 2000
+
+        /**
+         * AI 推送的宽限期（ms）。
+         *
+         * 推送自己的停留计时器比横条的自动消失计时器**晚这么久**才触发清理：
+         * 两者如果同时到期，谁先跑是不确定的 —— 若清理先跑，它会用引擎状态覆盖
+         * 刚推送的内容，用户看到的是"推送闪了一下就变回工具调用状态"。
+         * 晚一点清，保证推送完整停留。
+         */
+        private const val STATUS_PUSH_GRACE_MS = 400L
 
         /**
          * 贴边态薄片的宽度（dp）。
@@ -325,21 +340,52 @@ class FloatingBubble(private val context: Context) {
             return true
         }
 
-        /** 读回当前外观配置（JSON 文本）。插件据此做「读取-修改-写回」。 */
-        fun currentAppearanceJson(): String {
+        /**
+         * AI 主动往状态气泡推一条消息。
+         *
+         * ⚠️ **不改持久配置**：这是"说一句话"，不是"改外观"。所以它不走
+         *   `applyAppearance`、不落 SharedPreferences —— 否则下次启动气泡上会
+         *   挂着上次推送的旧话。
+         *
+         * ⚠️ 气泡没显示时返回 false 而不是先把它显示出来：`state:"hidden"` 是
+         *   插件明确要求"别出现"，为一条推送打破它是越权。
+         *
+         * @return 是否已推给一个正在显示的悬浮球。
+         */
+        fun pushStatusToActive(text: String, durationMs: Long, sticky: Boolean): Boolean {
+            val cur = instance ?: return false
+            main.post { cur.pushStatus(text, durationMs, sticky) }
+            return true
+        }
+
+        /** 读回当前外观配置（JSON 文本）。插件据此做「读取-修改-写回」。 */        fun currentAppearanceJson(): String {
             val ctx = appContext ?: return "{}"
             val a = BubbleAppearance.load(ctx)
             return JSONObject().apply {
                 put("state", a.state)
                 put("shape", a.shape)
+                // SVG 形状的 path 可能上千字符，读回时截断没意义（插件要靠它判断
+                // "现在是不是同一个形状"），所以原样给。上限由 merge 侧把关。
+                put("shapePath", a.shapePath)
+                put("shapeViewBox", a.shapeViewBox)
                 put("size", a.size)
                 put("cornerRadius", a.cornerRadius)
                 put("opacity", a.opacity.toDouble())
+                put("bgOpacity", a.bgOpacity.toDouble())
+                put("avatarOpacity", a.avatarOpacity.toDouble())
+                put("avatarScale", a.avatarScale.toDouble())
                 put("bg", a.bg)
                 put("bg2", a.bg2)
                 put("border", a.border)
                 put("borderWidth", a.borderWidth)
                 put("avatar", if (a.usesCustomAvatar) "custom" else a.avatar)
+                put("frameCount", a.frameCount)
+                put("frameIntervalMs", a.frameIntervalMs)
+                put("frameLoop", a.frameLoop)
+                put("spriteRows", a.spriteRows)
+                put("spriteCols", a.spriteCols)
+                put("spin", a.spin)
+                put("pulse", a.pulse)
                 put("panelWidth", a.panelWidth)
                 put("panelHeight", a.panelHeight)
                 put("panelBg", a.panelBg)
@@ -446,8 +492,51 @@ class FloatingBubble(private val context: Context) {
     private var edgeView: View? = null
     private var edgeDot: View? = null
 
+    /**
+     * 轮播播放器的当前帧下标。
+     *
+     * ⚠️ 跨 `applyAppearance()` 保留：AI 只改了个颜色时不该让轮播从头开始 ——
+     *   那在用户眼里是"球闪了一下"。
+     */
+    private var frameIndex = 0
+
+    /** 轮播已完成的循环数，用于 `frameLoop`。 */
+    private var frameLoops = 0
+
+    /** 下一次切帧的 Runnable（用来取消）。null = 没有在跑。 */
+    private var frameRunnable: Runnable? = null
+
+    /** 旋转动画是否已在跑（避免重复 start）。 */
+    private var spinning = false
+
+    /** 呼吸动画是否已在跑。 */
+    private var pulsing = false
+
+    /** 正在跑的旋转动画；null = 没在跑。改参数时要先 cancel 它。 */
+    private var spinAnimator: ObjectAnimator? = null
+
+    /** 当前旋转动画的每圈时长与终值，用来判断"配置真的变了没"。 */
+    private var spinDuration = 0L
+    private var spinTo = 0f
+
+    /** 正在跑的呼吸动画（X / Y 各一个，必须同步）。 */
+    private var pulseAnimator: ObjectAnimator? = null
+    private var pulseAnimatorY: ObjectAnimator? = null
+
+    /** 当前呼吸动画的基准缩放，用来判断"配置真的变了没"。 */
+    private var pulseBase = 0f
+
     /** 当前是否展开。 */
     private var expanded = false
+
+    /** AI 主动推送的文案；空串 = 没有推送，横条回到引擎状态。 */
+    private var pushedStatus = ""
+
+    /** 推送是否常驻（不自动消失）。 */
+    private var pushedSticky = false
+
+    /** 推送的停留时长（ms）；0 = 用外观配置里的 `statusAutoHideMs`。 */
+    private var pushedDurationMs = 0L
 
     /** 是否处于贴边态。 */
     private var edgeCollapsed = false
@@ -678,6 +767,26 @@ class FloatingBubble(private val context: Context) {
         val v = root ?: return
         attached = false
         hideStatusBubble()
+        // 停掉轮播与动效：视图都要移除了，继续 postDelayed 只是空转耗电，
+        // 而且回调里会碰到已经 detach 的 ImageView。
+        stopFramePlayer()
+        spinning = false
+        pulsing = false
+        spinAnimator?.cancel()
+        spinAnimator = null
+        spinDuration = 0L
+        spinTo = 0f
+        pulseAnimator?.cancel()
+        pulseAnimatorY?.cancel()
+        pulseAnimator = null
+        pulseAnimatorY = null
+        pulseBase = 0f
+        // 推送标记也要清：下次显示气泡时若还留着旧推送，横条会先冒出一句
+        // 上一轮的旧话，看起来像"卡住了"。
+        statusHandler.removeCallbacks(pushedClearRunnable)
+        pushedStatus = ""
+        pushedSticky = false
+        pushedDurationMs = 0L
         runCatching { wm.removeViewImmediate(v) }
         root = null
         circleView = null
@@ -702,7 +811,21 @@ class FloatingBubble(private val context: Context) {
         appearance = next
         try {
             applyAppearanceToViews()
-            clampInto(curX, curY).let { moveTo(it.first, it.second) }
+            // ⚠️ **按新尺寸夹，不能读 `root.width`。** 这里刚改完 layoutParams，
+            //   布局还没重测，`root.width` 仍是**旧**尺寸（可能是贴边态的 6dp，
+            //   也可能是上一版的小球）。拿它算夹取范围，AI 一把球改大，球就会
+            //   跑出屏幕右/下边缘 —— 用户看到的是"球消失了"。
+            //   收起态尺寸就是 `appearance.size`，直接用它算。展开态不能用球尺寸
+            //   （面板宽得多），交给下面那一帧用真实布局尺寸夹。
+            if (!expanded) {
+                val side = dp(appearance.size)
+                clampInto(curX, curY, side, side).let { moveTo(it.first, it.second) }
+            }
+            // 展开态尺寸由面板决定，要等布局出来才知道；下一帧再夹一次兜住。
+            root?.post {
+                val (nx, ny) = clampInto(curX, curY)
+                moveTo(nx, ny)
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "应用悬浮球外观失败: ${t.message}")
         }
@@ -720,7 +843,13 @@ class FloatingBubble(private val context: Context) {
                 lp.height = side
                 c.layoutParams = lp
             }
+            // 形状层：SVG path 优先，否则退回圆/方/圆角。
             c.background = ballBackground()
+            // 背景层的透明度**单独**作用在背景 drawable 上，与整体 opacity 相乘 ——
+            // 这正是「背景透明、图片不透明」能成立的原因。
+            c.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
+            // 形状可以不是圆的，内容要跟着裁（见 clipToShape 的注释）。
+            clipToShape(c)
             // 状态点跟着球缩放：球小到 24dp 时 14dp 的点会占掉一大半
             dotView?.let { d ->
                 val dotPx = (appearance.size * 0.25f).roundToInt().coerceIn(8, 18)
@@ -732,29 +861,8 @@ class FloatingBubble(private val context: Context) {
             }
         }
 
-        // ── 头像：内置 / 不显示 / 自定义图片 ───────────────────────────
-        avatarView?.let { iv ->
-            when {
-                appearance.avatar == BubbleAppearance.AVATAR_NONE -> {
-                    iv.visibility = View.GONE
-                }
-                appearance.usesCustomAvatar -> {
-                    val bmp = BubbleAppearance.readAvatar(context, side)
-                    if (bmp != null) {
-                        iv.setImageBitmap(bmp)
-                        iv.visibility = View.VISIBLE
-                    } else {
-                        // 图片文件丢了（用户清了数据）—— 退回内置头像而不是留白。
-                        iv.setImageResource(R.drawable.bubble_avatar)
-                        iv.visibility = View.VISIBLE
-                    }
-                }
-                else -> {
-                    iv.setImageResource(R.drawable.bubble_avatar)
-                    iv.visibility = View.VISIBLE
-                }
-            }
-        }
+        // ── 内容层：内置头像 / 自定义图片 / 轮播帧 / 精灵图 ─────────────
+        applyContentLayer(side)
 
         // ── 贴边薄片：高度跟随球，宽度固定 ─────────────────────────────
         edgeView?.let { e ->
@@ -764,10 +872,14 @@ class FloatingBubble(private val context: Context) {
                 e.layoutParams = lp
             }
             e.background = edgeBackground()
+            e.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
         }
 
-        // ── 整体不透明度 ───────────────────────────────────────────────
-        root?.alpha = appearance.opacity.coerceIn(0.2f, 1f)
+        // ── 整体不透明度（与两个分层透明度相乘）─────────────────────────
+        root?.alpha = appearance.opacity.coerceIn(0.05f, 1f)
+
+        // ── 动效层：旋转 / 呼吸 ────────────────────────────────────────
+        applyMotion()
 
         // ── 面板：宽度、配色 ───────────────────────────────────────────
         panelView?.let { p ->
@@ -786,8 +898,256 @@ class FloatingBubble(private val context: Context) {
         statusText?.maxWidth = statusMaxWidthPx
     }
 
-    /** 球的底：形状 + 底色/渐变 + 描边，全部由 [appearance] 决定。 */
-    private fun ballBackground(): GradientDrawable {
+    /**
+     * 内容层（头像 / 轮播帧 / 精灵图）。
+     *
+     * 优先级：**轮播帧 > 自定义头像 > 内置头像**。轮播在跑时不去碰单张头像的
+     * 逻辑，否则两套代码会互相覆盖 `setImageBitmap` 的结果。
+     */
+    private fun applyContentLayer(side: Int) {
+        val iv = avatarView ?: return
+
+        // 内容层的透明度单独作用在 ImageView 上（与整体 opacity 相乘）。
+        iv.alpha = appearance.avatarOpacity.coerceIn(0f, 1f)
+        // 内容缩放：0.2~2.0，>1 会溢出球，由球的裁剪兜住（这正是"图片比球大"想要的效果）。
+        iv.scaleX = appearance.avatarScale
+        iv.scaleY = appearance.avatarScale
+
+        // 轮播帧：先停掉旧的播放器，再按新配置决定要不要重启。
+        stopFramePlayer()
+
+        if (appearance.frameCount > 0 && BubbleFrames.available(context)) {
+            iv.visibility = View.VISIBLE
+            showFrame(frameIndex.coerceIn(0, appearance.frameCount - 1), side)
+            startFramePlayer()
+            return
+        }
+
+        // 内容层整个去掉：`avatar:"none"` 且没有帧 —— 只留背景形状。
+        if (appearance.avatar == BubbleAppearance.AVATAR_NONE) {
+            iv.visibility = View.GONE
+            return
+        }
+
+        if (appearance.usesCustomAvatar) {
+            val bmp = BubbleAppearance.readAvatar(context, side)
+            if (bmp != null) {
+                iv.setImageBitmap(bmp)
+                iv.visibility = View.VISIBLE
+            } else {
+                // 图片文件丢了（用户清了数据）—— 退回内置头像而不是留白。
+                iv.setImageResource(R.drawable.bubble_avatar)
+                iv.visibility = View.VISIBLE
+            }
+        } else {
+            iv.setImageResource(R.drawable.bubble_avatar)
+            iv.visibility = View.VISIBLE
+        }
+    }
+
+    /**
+     * 按形状裁剪球的子视图。
+     *
+     * ⚠️ 只在**非圆/非方**形状（即 SVG path）时才裁：圆和方分别用
+     *   `OVAL`/`RECTANGLE` 的 outline 更省，且裁剪会带来一次离屏绘制。
+     *
+     * ⚠️ 裁剪只在 API 21+ 的 `ViewOutlineProvider` 上有效，而 path 可能非凸
+     *   （星形、心形）—— 非凸 path 在 API 29 及以下无法作为 outline。此时
+     *   **不裁剪**（形状层照常画），代价是内容可能溢出形状边缘。这是刻意的
+     *   降级：宁可"图没被裁"也不要"整个球不显示"。
+     */
+    private fun clipToShape(view: View) {
+        val usePath = appearance.shape == BubbleAppearance.SHAPE_PATH &&
+            appearance.shapePath.isNotEmpty()
+        if (!usePath) {
+            view.clipToOutline = false
+            return
+        }
+        val outline = BubbleShapeDrawable(
+            pathData = appearance.shapePath,
+            viewBox = appearance.shapeViewBox,
+            fillStart = Color.TRANSPARENT,
+            fillEnd = null,
+            strokeColor = Color.TRANSPARENT,
+            strokeWidth = 0f,
+        )
+        view.clipToOutline = true
+        view.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, o: android.graphics.Outline) {
+                outline.setBounds(0, 0, v.width, v.height)
+                outline.getOutline(o)
+            }
+        }
+        view.invalidateOutline()
+    }
+
+    /** 显示轮播的第 [index] 帧。解码失败时保持上一帧，不留白。 */
+    private fun showFrame(index: Int, side: Int) {
+        val iv = avatarView ?: return
+        val bmp = BubbleFrames.loadFrame(context, index, BubbleAppearance.spriteOf(appearance), side)
+        if (bmp != null) iv.setImageBitmap(bmp)
+    }
+
+    /**
+     * 启动轮播。
+     *
+     * ⚠️ 逐帧时长可以各不相同（`frameDurations`），所以用**自递归的 postDelayed**
+     *   而不是 `scheduleAtFixedRate` —— 后者只能等间隔。
+     *
+     * ⚠️ `frameLoop >= 0` 时播完指定轮数就停在最后一帧（不回到第一帧）：
+     *   那是"播一次作为提示"的用法，回到第一帧会让人以为它还在转。
+     */
+    private fun startFramePlayer() {
+        val count = appearance.frameCount
+        if (count <= 1) return
+        val durations = BubbleFrames.durations(context, appearance.frameIntervalMs)
+        val sprite = BubbleAppearance.spriteOf(appearance)
+        val side = dp(appearance.size)
+
+        val step = object : Runnable {
+            override fun run() {
+                // 配置变了（帧数/时长）就退出，由下一次 applyContentLayer 重启。
+                if (appearance.frameCount != count || !expandedSafeForFrames()) return
+                val next = frameIndex + 1
+                if (next >= count) {
+                    frameLoops++
+                    if (appearance.frameLoop in 0 until frameLoops) {
+                        // 播够了：停在最后一帧。
+                        frameRunnable = null
+                        return
+                    }
+                }
+                frameIndex = next % count
+                showFrame(frameIndex, side)
+                val delay = (durations.getOrNull(frameIndex) ?: appearance.frameIntervalMs).toLong()
+                root?.postDelayed(this, delay.coerceAtLeast(20L))
+            }
+        }
+        frameRunnable = step
+        val delay = (durations.getOrNull(frameIndex) ?: appearance.frameIntervalMs).toLong()
+        root?.postDelayed(step, delay.coerceAtLeast(20L))
+    }
+
+    /** 帧播放器是否还该继续（球被移除/隐藏时停掉，别空转耗电）。 */
+    private fun expandedSafeForFrames(): Boolean = attached && root != null
+
+    /** 停掉轮播。幂等。 */
+    private fun stopFramePlayer() {
+        frameRunnable?.let { root?.removeCallbacks(it) }
+        frameRunnable = null
+    }
+
+    /**
+     * 动效层：旋转与呼吸。
+     *
+     * ⚠️ 两者都作用在 `avatarView`（内容层）而不是整个球：转整个球会把形状层
+     *   也转起来，那对非圆形状（星形/心形）是灾难。
+     *
+     * ⚠️ **必须用两个独立的 `ObjectAnimator`，不能用 `view.animate()`。**
+     *   `ViewPropertyAnimator` 对同一个 View 是**单例**，后一次 `.start()` 会
+     *   取消前一次 —— 于是「旋转 + 呼吸」同时打开时只有一个生效，而且看不出
+     *   是谁把谁取消了。`ObjectAnimator` 是独立对象，两个不同属性可以并行。
+     *
+     * ⚠️ 旋转用 `repeatCount = INFINITE` 而不是 `withEndAction` 递归：递归那种
+     *   写法在"动画已在跑"的守卫下会转完一圈就停（守卫把它自己挡住了）。
+     */
+    private fun applyMotion() {
+        val iv = avatarView ?: return
+
+        // ── 旋转 ──────────────────────────────────────────────────────
+        if (appearance.spin != 0) {
+            // 每 360° 的时长 = 360 / 每秒角度。负角度即逆时针。
+            val degPerSec = abs(appearance.spin).coerceAtLeast(1)
+            val duration = (360f / degPerSec * 1000f).toLong().coerceAtLeast(200L)
+            val to = if (appearance.spin > 0) 360f else -360f
+            val changed = spinAnimator == null || spinDuration != duration || spinTo != to
+            if (changed) {
+                spinAnimator?.cancel()
+                // 从 0 转到 ±360：`repeatMode = RESTART` 会把每轮重置回 0，
+                // 所以终值必须正好是一整圈，否则每轮之间会跳一下。
+                spinAnimator = ObjectAnimator.ofFloat(iv, View.ROTATION, 0f, to).apply {
+                    this.duration = duration
+                    repeatCount = ObjectAnimator.INFINITE
+                    repeatMode = ObjectAnimator.RESTART
+                    interpolator = LinearInterpolator()
+                    start()
+                }
+                spinDuration = duration
+                spinTo = to
+                spinning = true
+            }
+        } else if (spinning) {
+            spinAnimator?.cancel()
+            spinAnimator = null
+            spinDuration = 0L
+            spinTo = 0f
+            spinning = false
+            iv.rotation = 0f
+        }
+
+        // ── 呼吸 ──────────────────────────────────────────────────────
+        if (appearance.pulse) {
+            val base = appearance.avatarScale
+            val changed = pulseAnimator == null || pulseBase != base
+            if (changed) {
+                pulseAnimator?.cancel()
+                pulseAnimator = ObjectAnimator.ofFloat(iv, View.SCALE_X, base, base * 1.12f).apply {
+                    this.duration = 700
+                    repeatCount = ObjectAnimator.INFINITE
+                    repeatMode = ObjectAnimator.REVERSE
+                    interpolator = AccelerateDecelerateInterpolator()
+                    start()
+                }
+                // 两个属性（X/Y）必须同步，否则会拉成椭圆。共用一个进度源最简单：
+                // 再建一个只驱动 SCALE_Y 的、时长与相位完全一致的动画。
+                pulseAnimatorY?.cancel()
+                pulseAnimatorY = ObjectAnimator.ofFloat(iv, View.SCALE_Y, base, base * 1.12f).apply {
+                    this.duration = 700
+                    repeatCount = ObjectAnimator.INFINITE
+                    repeatMode = ObjectAnimator.REVERSE
+                    interpolator = AccelerateDecelerateInterpolator()
+                    start()
+                }
+                pulseBase = base
+                pulsing = true
+            }
+        } else if (pulsing) {
+            pulseAnimator?.cancel()
+            pulseAnimatorY?.cancel()
+            pulseAnimator = null
+            pulseAnimatorY = null
+            pulseBase = 0f
+            pulsing = false
+            iv.scaleX = appearance.avatarScale
+            iv.scaleY = appearance.avatarScale
+        }
+    }
+
+    /**
+     * 球的底：形状 + 底色/渐变 + 描边，全部由 [appearance] 决定。
+     *
+     * ⚠️ `shape:"path"` 时返回 [BubbleShapeDrawable]（任意 SVG 形状），否则是
+     *   原来那三种枚举形状的 [GradientDrawable]。两条分支的**描边与渐变语义
+     *   必须一致**，否则 AI 把形状从 `circle` 改成 `path` 时颜色会变样。
+     */
+    private fun ballBackground(): Drawable {
+        val c1 = colorOr(appearance.bg, DEFAULT_BALL_BG)
+        val c2 = if (appearance.bg2.isNotEmpty()) colorOr(appearance.bg2, c1) else null
+        val bw = if (appearance.borderWidth > 0) dp(appearance.borderWidth) else dp(1)
+        val bc = if (appearance.border.isNotEmpty()) colorOr(appearance.border, DEFAULT_BORDER) else DEFAULT_BORDER
+
+        // 任意形状：交给 SVG path 那条路。
+        if (appearance.shape == BubbleAppearance.SHAPE_PATH && appearance.shapePath.isNotEmpty()) {
+            return BubbleShapeDrawable(
+                pathData = appearance.shapePath,
+                viewBox = appearance.shapeViewBox,
+                fillStart = c1,
+                fillEnd = c2,
+                strokeColor = bc,
+                strokeWidth = bw.toFloat(),
+            )
+        }
+
         val d = GradientDrawable()
         when (appearance.shape) {
             BubbleAppearance.SHAPE_CIRCLE -> d.shape = GradientDrawable.OVAL
@@ -800,15 +1160,12 @@ class FloatingBubble(private val context: Context) {
                 d.cornerRadius = dp(appearance.cornerRadius).toFloat()
             }
         }
-        val c1 = colorOr(appearance.bg, DEFAULT_BALL_BG)
-        if (appearance.bg2.isNotEmpty()) {
-            d.colors = intArrayOf(c1, colorOr(appearance.bg2, c1))
+        if (c2 != null) {
+            d.colors = intArrayOf(c1, c2)
             d.orientation = GradientDrawable.Orientation.TOP_BOTTOM
         } else {
             d.setColor(c1)
         }
-        val bw = if (appearance.borderWidth > 0) dp(appearance.borderWidth) else dp(1)
-        val bc = if (appearance.border.isNotEmpty()) colorOr(appearance.border, DEFAULT_BORDER) else DEFAULT_BORDER
         d.setStroke(bw, bc)
         return d
     }
@@ -881,8 +1238,11 @@ class FloatingBubble(private val context: Context) {
      * ⚠️ **只在收起态显示**：展开态的面板里已经有同一份信息，再挂一个标签
      *   会重复，而且面板比球宽得多，标签会横在面板上方很怪。
      *   贴边态同理（薄片只有 6dp 宽，标签会把它整个盖住）。
+     *
+     * @param autoHideMs 覆盖外观配置里的停留时长；null = 用外观配置。
+     *   0 = 常驻（AI 主动推送用得上：「这条别消失」）。
      */
-    private fun showStatusBubble(text: String, running: Boolean) {
+    private fun showStatusBubble(text: String, running: Boolean, autoHideMs: Int? = null) {
         if (text.isEmpty() || expanded || edgeCollapsed) {
             hideStatusBubble()
             return
@@ -928,13 +1288,16 @@ class FloatingBubble(private val context: Context) {
         // 这正是用户要的语义：「工具调用状态横条没有变化时 两秒后自动消失」。
         // 状态是每 5 秒（外加 DOM 变化）推一次的，如果每次推送都重置计时器，
         // 横条就会永远挂着 —— 那正是改之前的行为，也是用户抱怨的点。
-        val key = "$text\u0000$running"
+        //
+        // key 里带上时长：AI 推一条"常驻"的消息时内容可能与引擎状态一致，
+        // 不带时长的话会被判成"没变"而沿用旧的自动消失计时器。
+        val key = "$text\u0000$running\u0000$autoHideMs"
         val changed = key != statusKey
         if (changed) {
             statusKey = key
             statusText?.text = text
             paintDot(statusDot, running, small = true)
-            scheduleStatusAutoHide()
+            scheduleStatusAutoHide(autoHideMs)
         }
         positionStatusBubble()
     }
@@ -942,12 +1305,12 @@ class FloatingBubble(private val context: Context) {
     /**
      * 排一次「内容无变化就自动消失」的计时。
      *
-     * ⚠️ 只在内容变化时调用（见 [showStatusBubble]）。`statusAutoHideMs <= 0`
-     *   表示插件要求常驻，此时不排计时器。
+     * ⚠️ 只在内容变化时调用（见 [showStatusBubble]）。`<= 0` 表示常驻，
+     *   此时不排计时器。
      */
-    private fun scheduleStatusAutoHide() {
+    private fun scheduleStatusAutoHide(override: Int? = null) {
         statusHandler.removeCallbacks(statusHideRunnable)
-        val ms = appearance.statusAutoHideMs
+        val ms = override ?: appearance.statusAutoHideMs
         if (ms <= 0) return
         statusHandler.postDelayed(statusHideRunnable, ms.toLong())
     }
@@ -956,9 +1319,18 @@ class FloatingBubble(private val context: Context) {
      * 状态横条自动消失。
      *
      * ⚠️ 做成字段而不是每次 new：`removeCallbacks` 要靠同一个实例才能取消。
+     *
+     * ⚠️ 消失时**一并清掉 AI 推送标记**：横条都看不见了，这次推送就算结束。
+     *   不清的话下一次引擎状态刷新（每几秒一次）会把它重新显示出来，
+     *   用户看到的是"这条消息消失又冒出来、消失又冒出来"。
      */
     private val statusHideRunnable = Runnable {
         if (statusRoot == null) return@Runnable
+        // 推送已经展示完了 —— 标记与它自己的清理计时器都该撤掉。
+        statusHandler.removeCallbacks(pushedClearRunnable)
+        pushedStatus = ""
+        pushedSticky = false
+        pushedDurationMs = 0L
         // 淡出而不是瞬移：横条就在用户视野边缘，突然消失会让人以为界面出问题了。
         statusRoot?.animate()?.alpha(0f)?.setDuration(160)?.withEndAction {
             hideStatusBubble()
@@ -1748,6 +2120,13 @@ class FloatingBubble(private val context: Context) {
      *   这类短句），要看正文就展开面板。
      */
     private fun refreshStatusBubble(status: EngineStatus) {
+        // AI 主动推的话优先。引擎状态每几秒就推一次，不给它让路的话
+        // 推送会在下一帧就被冲掉 —— 那这个能力等于不存在。
+        val pushed = pushedStatus
+        if (pushed.isNotEmpty()) {
+            showStatusBubble(pushed, status.running, pushedAutoHideMs())
+            return
+        }
         val text = when {
             status.text.isNotEmpty() -> status.text
             status.running -> "思考中…"
@@ -1757,6 +2136,65 @@ class FloatingBubble(private val context: Context) {
             else -> ""
         }
         showStatusBubble(text, status.running)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // AI 主动推送状态消息
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 让 AI 往球上方的状态气泡推一条消息。
+     *
+     * 与引擎状态（[applyStatus]）是**两条独立的通道**：引擎状态是"页面里发生了什么"
+     * 的只读镜像，这个是 AI 主动要说的话。推送期间前者让位（见 [refreshStatusBubble]）。
+     *
+     * @param text 要显示的文案；传空串即取消推送、立刻回到引擎状态。
+     * @param durationMs 停留时长（ms）；≤0 表示用外观配置里的 `statusAutoHideMs`。
+     * @param sticky 常驻，不自动消失（`durationMs` 被忽略）。
+     */
+    fun pushStatus(text: String, durationMs: Long, sticky: Boolean) {
+        statusHandler.removeCallbacks(pushedClearRunnable)
+        val trimmed = text.trim().take(200)
+        if (trimmed.isEmpty()) {
+            pushedStatus = ""
+            pushedSticky = false
+            pushedDurationMs = 0L
+            lastStatus?.let { refreshStatusBubble(it) }
+            return
+        }
+        pushedStatus = trimmed
+        pushedSticky = sticky
+        pushedDurationMs = if (durationMs > 0) durationMs else 0L
+        if (!sticky) {
+            // 时长未知（durationMs ≤ 0）时不排清除：交给 statusAutoHideMs 那套
+            // 自动消失逻辑收尾，免得推送已经消失了推送标记还挂着。
+            if (pushedDurationMs > 0) {
+                statusHandler.postDelayed(pushedClearRunnable, pushedDurationMs + STATUS_PUSH_GRACE_MS)
+            }
+        }
+        // 用当前状态刷新一次：这样即使引擎状态没变（key 相同），推送也能立刻上屏。
+        lastStatus?.let { refreshStatusBubble(it) } ?: run {
+            statusKey = ""
+            showStatusBubble(pushedStatus, false, pushedAutoHideMs())
+        }
+    }
+
+    /** 推送该停留多久（ms）；0 = 常驻（不自动消失）。 */
+    private fun pushedAutoHideMs(): Int = when {
+        pushedSticky -> 0
+        pushedDurationMs > 0 -> pushedDurationMs.toInt()
+        else -> appearance.statusAutoHideMs
+    }
+
+    /** 推送到期：清掉推送标记并回到引擎状态。 */
+    private val pushedClearRunnable = Runnable {
+        pushedStatus = ""
+        pushedSticky = false
+        pushedDurationMs = 0L
+        // ⚠️ 先清 key 再刷新：否则内容相同的引擎状态会被 key 判成"没变"而不上屏，
+        //   横条就一直空着（自动消失已经把它隐藏了，但状态其实还在变）。
+        statusKey = ""
+        lastStatus?.let { refreshStatusBubble(it) }
     }
 
     /** 取首行并限长。标签是单行小标签，多行内容会把球顶得老高。 */

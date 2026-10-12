@@ -122,6 +122,17 @@ object BubbleCommandBridge {
                 appearance = FloatingBubble.currentAppearanceJson()
                 ok = appearance != "{}"
                 message = if (ok) "" else "悬浮球尚未就绪（appContext 未初始化）"
+            } else if (action == "notify") {
+                // AI 主动往球上方的状态气泡推一条消息。
+                //
+                // ⚠️ 与 `set` 是**两条独立通道**：`set` 改的是持久外观（会被
+                //   SharedPreferences 记住），`notify` 只影响这一次显示，不改配置。
+                //   所以这里不调 applyAppearance，也不需要回读 appearance。
+                val text = json.optString("text", "")
+                val durationMs = json.optLong("durationMs", 0L)
+                val sticky = json.optBoolean("sticky", false)
+                ok = FloatingBubble.pushStatusToActive(text, durationMs, sticky)
+                message = if (ok) "" else "悬浮球尚未显示（没有活动的悬浮球实例）"
             } else {
                 // 合并语义在 applyAppearance 内部（它会把字段并到当前配置上），
                 // 所以这里只管把 fields 序列化过去。

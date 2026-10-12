@@ -29,16 +29,49 @@ import java.io.File
  *
  * | 字段 | 类型 | 语义 |
  * |---|---|---|
+ * ## 分层模型（这是「AI 想改什么都能改」的关键）
+ *
+ * 球由**三个独立的层**叠成，每层各有自己的透明度与开关 —— 而不是原来那种
+ * 「一个底 + 一张图」的耦合写法：
+ *
+ * ```
+ *   ┌─ 形状层   shape / shapePath / bg / bg2 / border / bgOpacity
+ *   │    ↑ 可以是一条任意 SVG path（星形、心形、logo 轮廓），也可以是圆/方/圆角
+ *   ├─ 内容层   avatar / frames / avatarOpacity / avatarScale
+ *   │    ↑ 可以是内置头像、自定义图片、**轮播多帧**、**精灵图切片**，或整层去掉
+ *   └─ 动效层   spin / pulse
+ * ```
+ *
+ * 三层的透明度**相乘**关系：[opacity] 是整体，[bgOpacity] 只压背景，
+ * [avatarOpacity] 只压内容。所以「背景透明但图片不透明」= `bgOpacity:0` +
+ * `avatarOpacity:1`，这正是用户点名要的那一种。
+ *
+ * ## 字段一览（全部可选，缺省即保持当前值）
+ *
+ * | 字段 | 类型 | 语义 |
+ * |---|---|---|
  * | `state` | string | `expanded` / `collapsed` / `hidden` / `auto` —— 直接改形态 |
- * | `shape` | string | `circle` / `square` / `rounded` —— 球的形状 |
+ * | `shape` | string | `circle` / `square` / `rounded` / **`path`**（用 `shapePath`） |
+ * | `shapePath` | string | SVG path 的 `d`，如 `M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z` |
+ * | `shapeViewBox` | string | `shapePath` 的坐标系，默认 `0 0 100 100` |
  * | `size` | int(dp) | 球的直径，24~160 |
  * | `cornerRadius` | int(dp) | `rounded` 形状的圆角 |
- * | `opacity` | float | 整体不透明度 0.2~1.0 |
+ * | `opacity` | float | **整体**不透明度 0.05~1.0 |
+ * | `bgOpacity` | float | **只压背景层** 0~1（0 = 背景全透明，露出下层应用） |
+ * | `avatarOpacity` | float | **只压内容层** 0~1 |
+ * | `avatarScale` | float | 内容层相对球的缩放 0.2~2.0（>1 会溢出球，由球裁剪） |
  * | `bg` | `#RRGGBB` | 球的底色（`avatar:'none'` 时才看得见） |
  * | `bg2` | `#RRGGBB` | 与 `bg` 组成竖直渐变；不填则纯色 |
  * | `border` | `#RRGGBB` | 描边色 |
  * | `borderWidth` | int(dp) | 描边宽度 0~8 |
  * | `avatar` | string | `default` / `none` / `data:image/…;base64,…` |
+ * | `frames` | string[] | **轮播帧**：每项一个 data URI。传 `[]` 清空轮播 |
+ * | `frameIntervalMs` | int | 每帧停留时长（ms）20~60000；被 `frameDurations` 覆盖 |
+ * | `frameDurations` | int[] | 逐帧停留时长；长度不足的帧用 `frameIntervalMs` |
+ * | `spriteRows` / `spriteCols` | int | **精灵图网格**：每帧是同一张大图的第 N 格 |
+ * | `frameLoop` | int | 轮播循环次数，-1 = 无限 |
+ * | `spin` | int | 每秒旋转角度（度），正数顺时针，0 = 不转 |
+ * | `pulse` | bool | 呼吸缩放动画 |
  * | `panelWidth` | int(dp) | 展开面板宽 180~（上限 = 屏幕宽 - 16） |
  * | `panelHeight` | int(dp) | 展开面板高 160~（上限 = 屏幕高 - 96） |
  * | `panelBg` | `#RRGGBB` | 面板底色 |
@@ -47,24 +80,38 @@ import java.io.File
  * | `statusAutoHideMs` | int | 状态横条**内容无变化**多久后自动消失，0 = 不自动消失 |
  * | `edgeSnap` | bool | 是否启用「拖出屏幕即贴边折叠」 |
  *
- * ## 两条设计约束
+ * ## 三条设计约束
  *
  * ① **非法值退回默认，未知字段忽略。** 插件写错一个字段不该让悬浮球消失 ——
  *    那是最糟的失败形态（用户看不到任何东西，也没有报错）。
  * ② **图片走 base64 data URI**，因为页面侧拿不到文件系统路径。为防有人塞一张
  *    10MB 的图进来，[MAX_AVATAR_BASE64] 卡住长度，超了直接忽略并记日志。
+ * ③ **帧集不进 SharedPreferences**（那是几十张图的体量），只存元信息；
+ *    帧字节由 [BubbleFrames] 落在 `filesDir/bubble-frames/` 下。见 [save]。
  */
 data class BubbleAppearance(
     val state: String = STATE_AUTO,
     val shape: String = SHAPE_CIRCLE,
+    val shapePath: String = "",
+    val shapeViewBox: String = BubbleShapeDrawable.DEFAULT_VIEW_BOX,
     val size: Int = 44,
     val cornerRadius: Int = 16,
     val opacity: Float = 1f,
+    val bgOpacity: Float = 1f,
+    val avatarOpacity: Float = 1f,
+    val avatarScale: Float = 1f,
     val bg: String = "",
     val bg2: String = "",
     val border: String = "",
     val borderWidth: Int = 0,
     val avatar: String = AVATAR_DEFAULT,
+    val frameCount: Int = 0,
+    val frameIntervalMs: Int = 400,
+    val spriteRows: Int = 0,
+    val spriteCols: Int = 0,
+    val frameLoop: Int = -1,
+    val spin: Int = 0,
+    val pulse: Boolean = false,
     val panelWidth: Int = 260,
     val panelHeight: Int = 0,
     val panelBg: String = "",
@@ -93,6 +140,14 @@ data class BubbleAppearance(
         const val SHAPE_SQUARE = "square"
         const val SHAPE_ROUNDED = "rounded"
 
+        /**
+         * 形状由 [shapePath] 那条 SVG path 描述 —— 任意形状。
+         *
+         * ⚠️ 这是「AI 想改什么形状都能改」的入口：圆/方/圆角只是三个预设，
+         *   而 path 能画星形、心形、盾牌、云朵、任意 logo 轮廓。
+         */
+        const val SHAPE_PATH = "path"
+
         /** 用内置的头像图片（默认）。 */
         const val AVATAR_DEFAULT = "default"
 
@@ -104,6 +159,14 @@ data class BubbleAppearance(
 
         /** 自定义头像的落盘文件名。内容变了会整体覆盖。 */
         const val AVATAR_FILE = "bubble-avatar.bin"
+
+        /**
+         * SVG path 文本的长度上限。
+         *
+         * 一条 100dp 的球上画不出那么多细节，而每次解析都在主线程 —— 4000 字符
+         * 已经足够描述很复杂的轮廓（对比：五角星的 path 约 100 字符）。
+         */
+        const val MAX_SHAPE_PATH_CHARS = 4000
 
         /** 配置落盘的 SharedPreferences 名。与位置共用一个文件，减少一次 I/O。 */
         const val PREFS = "dsh_bubble"
@@ -124,17 +187,38 @@ data class BubbleAppearance(
          */
         fun merge(json: String, base: BubbleAppearance, context: Context? = null): BubbleAppearance = try {
             val o = JSONObject(json)
-            base.copy(
+
+            // 轮播帧要先处理：它可能**改变帧数**，而帧数决定 sprite 网格是否还有意义。
+            var merged = base.copy(
                 state = enumOf(o, "state", base.state, STATE_AUTO, STATE_EXPANDED, STATE_COLLAPSED, STATE_HIDDEN),
-                shape = enumOf(o, "shape", base.shape, SHAPE_CIRCLE, SHAPE_SQUARE, SHAPE_ROUNDED),
+                shape = enumOf(
+                    o, "shape", base.shape,
+                    SHAPE_CIRCLE, SHAPE_SQUARE, SHAPE_ROUNDED, SHAPE_PATH,
+                ),
+                shapePath = textOf(o, "shapePath", base.shapePath, MAX_SHAPE_PATH_CHARS),
+                shapeViewBox = textOf(o, "shapeViewBox", base.shapeViewBox, 64),
                 size = clampInt(o, "size", base.size, 24, 160),
                 cornerRadius = clampInt(o, "cornerRadius", base.cornerRadius, 0, 80),
-                opacity = clampFloat(o, "opacity", base.opacity, 0.2f, 1f),
+                opacity = clampFloat(o, "opacity", base.opacity, 0.05f, 1f),
+                bgOpacity = clampFloat(o, "bgOpacity", base.bgOpacity, 0f, 1f),
+                avatarOpacity = clampFloat(o, "avatarOpacity", base.avatarOpacity, 0f, 1f),
+                avatarScale = clampFloat(o, "avatarScale", base.avatarScale, 0.2f, 2f),
                 bg = colorOf(o, "bg", base.bg),
                 bg2 = colorOf(o, "bg2", base.bg2),
                 border = colorOf(o, "border", base.border),
                 borderWidth = clampInt(o, "borderWidth", base.borderWidth, 0, 8),
                 avatar = avatarOf(o, "avatar", base.avatar, context),
+                // ⚠️ `frameCount` 必须在这里认：`load()` 就是拿磁盘 JSON 走
+                //   `merge`，漏了它的话重启后帧数永远是 0 —— 轮播帧文件还在
+                //   磁盘上，却再没人引用，表现为"重启后动画没了"。
+                //   下面处理 `frames` 时会用真实写入结果覆盖它。
+                frameCount = clampInt(o, "frameCount", base.frameCount, 0, BubbleFrames.MAX_FRAMES),
+                frameIntervalMs = clampInt(o, "frameIntervalMs", base.frameIntervalMs, 20, 60_000),
+                spriteRows = clampInt(o, "spriteRows", base.spriteRows, 0, 32),
+                spriteCols = clampInt(o, "spriteCols", base.spriteCols, 0, 32),
+                frameLoop = clampInt(o, "frameLoop", base.frameLoop, -1, 100_000),
+                spin = clampInt(o, "spin", base.spin, -720, 720),
+                pulse = if (o.has("pulse")) o.optBoolean("pulse", base.pulse) else base.pulse,
                 panelWidth = clampInt(o, "panelWidth", base.panelWidth, 180, 2000),
                 panelHeight = clampInt(o, "panelHeight", base.panelHeight, 0, 4000),
                 panelBg = colorOf(o, "panelBg", base.panelBg),
@@ -143,9 +227,98 @@ data class BubbleAppearance(
                 statusAutoHideMs = clampInt(o, "statusAutoHideMs", base.statusAutoHideMs, 0, 60_000),
                 edgeSnap = if (o.has("edgeSnap")) o.optBoolean("edgeSnap", base.edgeSnap) else base.edgeSnap,
             )
+
+            // ── 轮播帧 ──
+            //
+            // ⚠️ 帧字节**不落进配置**（几十张图进 SharedPreferences 会把它撑爆），
+            //   这里只处理"要不要换帧集"以及随之而来的元信息。
+            //   没有 context 时（纯解析场景）只认帧数，字节由调用方负责 —— 见 save()。
+            if (o.has("frames") && context != null) {
+                val arr = o.optJSONArray("frames")
+                if (arr == null || arr.length() == 0) {
+                    // 显式传空数组 = 清空轮播，回到单张头像。
+                    BubbleFrames.clear(context)
+                    merged = merged.copy(frameCount = 0)
+                } else {
+                    val frames = ArrayList<String>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val s = arr.optString(i, "")
+                        if (s.isNotEmpty()) frames += s
+                    }
+                    val durations = intArrayOf(o, "frameDurations")
+                    val sprite = spriteOf(merged)
+                    val n = BubbleFrames.write(
+                        context, frames, durations, sprite, merged.frameIntervalMs,
+                    )
+                    if (n != null) {
+                        merged = merged.copy(frameCount = n)
+                    } else {
+                        Log.w(TAG, "轮播帧写入失败，保持原帧集")
+                    }
+                }
+            } else if (context != null && o.has("spriteRows") && o.has("spriteCols")) {
+                // 只改精灵图网格、没重传 frames：旧帧集是按旧网格切的，必须重切。
+                // 做不到就退回"每帧一张完整图"，并明确告知 —— 静默用错网格会让
+                // 球显示成网格里的碎块，比不显示更难查。
+                val sprite = spriteOf(merged)
+                if (sprite != null && merged.frameCount > 0) {
+                    val n = BubbleFrames.rewriteSprite(context, sprite)
+                    if (n == null) {
+                        Log.w(TAG, "精灵图网格重切失败（帧字节已丢），退回整图模式")
+                        merged = merged.copy(spriteRows = 0, spriteCols = 0)
+                    }
+                }
+            }
+
+            // 帧集在磁盘上真的存在才算数：用户清过数据、或上一轮写失败时，
+            // 配置里留着 frameCount>0 会让球显示空白（找不到帧文件）。
+            if (context != null && merged.frameCount > 0 && !BubbleFrames.available(context)) {
+                Log.w(TAG, "配置里有轮播帧但磁盘上找不到，退回单张头像")
+                merged = merged.copy(frameCount = 0)
+            }
+
+            // 精灵图网格只在有帧时才有意义。
+            if (merged.frameCount <= 0 && (merged.spriteRows > 0 || merged.spriteCols > 0)) {
+                merged = merged.copy(spriteRows = 0, spriteCols = 0)
+            }
+
+            merged
         } catch (t: Throwable) {
             Log.w(TAG, "悬浮球外观配置解析失败（保持原配置）: ${t.message}")
             base
+        }
+
+        /** 精灵图网格（两者都 > 0 才有效）。 */
+        fun spriteOf(a: BubbleAppearance): Pair<Int, Int>? =
+            if (a.spriteRows > 0 && a.spriteCols > 0) a.spriteRows to a.spriteCols else null
+
+        /** 读一个 int 数组字段；不存在或非法时返回空数组。 */
+        private fun intArrayOf(o: JSONObject, key: String): List<Int> {
+            if (!o.has(key)) return emptyList()
+            val arr = o.optJSONArray(key) ?: return emptyList()
+            val out = ArrayList<Int>(arr.length())
+            for (i in 0 until arr.length()) {
+                val v = arr.optInt(i, -1)
+                if (v > 0) out += v
+            }
+            return out
+        }
+
+        /**
+         * 文本字段（如 SVG path）：去空白、限长。
+         *
+         * ⚠️ 限长是必须的：一条几万字符的 path 会让每次解析都卡住主线程，
+         *   而它带来的收益为零 —— 100dp 的球上画不出那么多细节。
+         */
+        private fun textOf(o: JSONObject, key: String, fallback: String, maxChars: Int): String {
+            if (!o.has(key)) return fallback
+            val v = o.optString(key, "").trim()
+            if (v.isEmpty()) return ""
+            if (v.length > maxChars) {
+                Log.w(TAG, "悬浮球外观配置的 $key 过长（${v.length} > $maxChars），已忽略")
+                return fallback
+            }
+            return v
         }
 
         /** 枚举字段：不在白名单里就退回 [fallback]。 */
@@ -303,14 +476,25 @@ data class BubbleAppearance(
             return merge(raw, BubbleAppearance(), context)
         }
 
-        /** 落盘。**每次 apply 都写**：插件改完就该在重启后仍然生效。 */
+        /**
+         * 落盘。**每次 apply 都写**：插件改完就该在重启后仍然生效。
+         *
+         * ⚠️ **这里漏一个字段 = 那个字段只在本次运行有效，重启即回默认。**
+         *   表现是"AI 改的时候看得见，重开 App 就没了" —— 加字段时务必同步这里，
+         *   [load] 走 [merge]，`merge` 认的键这里都得写出来。
+         */
         fun save(context: Context, appearance: BubbleAppearance) {
             val json = JSONObject().apply {
                 put("state", appearance.state)
                 put("shape", appearance.shape)
+                put("shapePath", appearance.shapePath)
+                put("shapeViewBox", appearance.shapeViewBox)
                 put("size", appearance.size)
                 put("cornerRadius", appearance.cornerRadius)
                 put("opacity", appearance.opacity.toDouble())
+                put("bgOpacity", appearance.bgOpacity.toDouble())
+                put("avatarOpacity", appearance.avatarOpacity.toDouble())
+                put("avatarScale", appearance.avatarScale.toDouble())
                 put("bg", appearance.bg)
                 put("bg2", appearance.bg2)
                 put("border", appearance.border)
@@ -319,6 +503,17 @@ data class BubbleAppearance(
                 //   SharedPreferences 会让每次读写都带上它。图片单独落盘（见
                 //   writeAvatar），配置里只留一个标记表示"用自定义头像"。
                 put("avatar", if (appearance.avatar.startsWith("data:image/")) AVATAR_FILE else appearance.avatar)
+                // ⚠️ 轮播帧同理，甚至更要紧：帧字节在 `filesDir/bubble-frames/`
+                //   （见 [BubbleFrames]），这里只存"有几帧、怎么播"。
+                //   `frameCount` 必须落盘，否则重启后 `load()` 以为没有帧，
+                //   磁盘上那堆文件再没人引用。
+                put("frameCount", appearance.frameCount)
+                put("frameIntervalMs", appearance.frameIntervalMs)
+                put("frameLoop", appearance.frameLoop)
+                put("spriteRows", appearance.spriteRows)
+                put("spriteCols", appearance.spriteCols)
+                put("spin", appearance.spin)
+                put("pulse", appearance.pulse)
                 put("panelWidth", appearance.panelWidth)
                 put("panelHeight", appearance.panelHeight)
                 put("panelBg", appearance.panelBg)
