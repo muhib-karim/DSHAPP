@@ -306,13 +306,21 @@ object LogCommandBridge {
         )
         out.put("lastExit", lastExit)
 
-        // headline 的优先级：**硬崩溃 > 非正常结束 > 错误数 > 干净**。
+        // headline 的优先级：**硬崩溃 > 非硬崩溃现场 > 非正常结束 > 错误数 > 干净**。
         // 崩溃最具体、最能直接指向下一步，所以排最前。
+        //
+        // ⚠️ **「有现场但不是硬崩溃」必须单独占一级**。原来这一级不存在，于是
+        //   现场全是 `engine-start-failed`（非硬崩溃）时会一路落到最后的 else，
+        //   报出「本次运行未发现错误，也无崩溃现场」—— 而 `crash` 计数明明是
+        //   非零、`crashes/` 里明明有文件。模型据此会直接跳过排查。
+        //   真机 22 个 warn 包的现场 100% 是这一类。
         val newest = scenes.firstOrNull { CrashRecorder.isHardCrash(it) }
         out.put(
             "headline",
             when {
                 newest != null -> "有 $hardCrashes 份崩溃现场，最近一份 ${newest.name}（${fmt.format(Date(newest.lastModified()))}）"
+                scenes.isNotEmpty() -> "有 ${scenes.size} 份非崩溃现场（${CrashRecorder.summarizeKinds(scenes)}），" +
+                    "最近一份 ${scenes.first().name}（${fmt.format(Date(scenes.first().lastModified()))}）"
                 prev.unclean -> lastExit
                 error > 0 -> "内存缓冲里有 $error 条错误（缓冲只覆盖本次运行，更早的请看 app.log）"
                 else -> "本次运行未发现错误，也无崩溃现场"

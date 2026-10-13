@@ -427,13 +427,9 @@ object DiagnosticBundle {
     /**
      * 把一批现场文件按类别汇总成 `engine-start-failed×70, engine-exit×16` 这样的短语。
      *
-     * 按**数量降序**排（多的在前），同数量按名字排 —— 让最占多数的那类一眼可见。
-     * 只报类别与数量，不解释原因（见 [runChecks] 的设计原则）。
+     * 实现在 [CrashRecorder.summarizeKinds]（`logs` 工具也要用同一套口径）。
      */
-    private fun sceneKindSummary(scenes: List<File>): String =
-        scenes.groupingBy { CrashRecorder.kindOf(it) }.eachCount()
-            .entries.sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
-            .joinToString(", ") { "${it.key}×${it.value}" }
+    private fun sceneKindSummary(scenes: List<File>): String = CrashRecorder.summarizeKinds(scenes)
 
     private fun runChecks(logDir: File, extra: List<Check>): JSONObject {
         val checks = mutableListOf<Check>()
