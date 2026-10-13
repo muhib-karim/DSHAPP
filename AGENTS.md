@@ -4019,6 +4019,70 @@ ssh ... 'cat /workspace/dsh-logs/index.jsonl'
 只有 `manual` / `startup-retry` ⇒ 崩溃那条链路没生效（见上面 ③）。
 ⚠️ 判断「重复上传」看 `sha256` 是否相同（见 ②），不要只看条数。
 
+#### ⚠️ 两处「不是本 App 的错，但会被记成本 App 的错」的归因修正
+
+诊断包的 `environment.json` / `crashes/*.txt` 是排查的**唯一入口**。下面两条会让
+入口本身指向错误的方向 —— 不是功能坏了，是**归因错了**，代价是排查时间全花在
+自己的代码上。
+
+**① `device.kernel` 曾经大面积为空 —— 是 SELinux 不给读，不是设备老。**
+
+现象：62 个诊断包里 **41 个** `device.kernel` 是空串。第一直觉是「老设备没有这个
+文件」，但按 SDK 分组后**恰好相反**：SDK 35 的设备 20/20 全空，SDK 28/31 的反倒有值。
+
+真机实测（CDY-TN90，HarmonyOS，Android 10 / SDK 29，`getenforce` = `Enforcing`）：
+
+```
+run-as com.dsh.android cat /proc/version     → cat: /proc/version: Permission denied
+adb shell cat /proc/version                  → Linux version 4.14.116 (HarmonyOS@localhost) …
+run-as com.dsh.android /system/bin/uname -a  → Linux localhost 4.14.116 #1 SMP PREEMPT … aarch64
+```
+
+Android 10+ 的 SELinux **拒绝 `untrusted_app` 读 `/proc/version`**（`/proc/sys/kernel/osrelease`、
+`/proc/sys/kernel/version`、`/system/build.prop` 同样被拒），而 `/proc/cpuinfo`、
+`/proc/self/status`、`/proc/self/maps` 可读。原实现是
+
+```kotlin
+runCatching { File("/proc/version").readText() }.getOrDefault("")
+```
+
+—— `runCatching` 把 EACCES **静默吞成空串**，于是「权限被拒」在包里长得跟
+「设备没这个信息」一模一样。
+
+做法（`EnvironmentSnapshot.kernelVersion()`）：先试 `/proc/version`，读不到回退
+`ProcessBuilder("/system/bin/uname", "-a")`（该二进制在 app 域**可执行**），
+两条都失败才返回 `""`；同时 `collect()` 在 kernel 为空时补写
+`kernelUnavailable: "read-denied"`，让「没读到」在包里**可区分于「本来就没有」**。
+
+⚠️ 回退路径必须 `waitFor(3, SECONDS)` + 超时 `destroyForcibly()`，否则子进程卡住会
+把 `collect()` 一起拖住（它跑在诊断包构建路径上）。
+
+**② `org.chromium.base.JniAndroid$UncaughtExceptionException` 不是本 App 的崩溃。**
+
+3 份现场（2 个包：`20261014-013411-94efb107`、`20261014-013846-35b8918e`，
+OPPO PKJ110 / Android 16 / API 36 / `0.2.8-logsfix (16) system`）被判成 App 的
+**硬崩溃**，`crash-scenes` 直接报 fail。看栈才发现：
+
+```
+reason: org.chromium.base.JniAndroid$UncaughtExceptionException: Native stack trace:
+#00 pc 0x… /my_product/app/TrichromeLibrary64CN/TrichromeLibrary64CN.apk (offset 0x8dc000)
+…（14 帧全在这个 apk 里）
+   ← org.chromium.base.JniAndroid.handleException
+   ← org.chromium.content.browser.input.ImeAdapterImpl.r
+   ← ImeAdapterImpl.updateState
+```
+
+那是**这台 ROM 的系统 WebView 内核在 IME 状态更新时自己 native 崩了**，
+抛进我们的默认未捕获处理器。`grep` 全工程 `app/src/**` 确认**零处**处理过它。
+
+做法（`CrashRecorder`）：新增 `isWebViewKernelCrash(err, stack)` —— 要求异常类名含
+`JniAndroid` **且**栈里出现 `TrichromeLibrary` / `libmonochrome` /
+`JniAndroid.handleException`（两个条件同时成立才认，避免误伤本 App 自己的异常），
+命中时给 `reason` 加前缀 `【系统 Web 内核崩溃，非本 App】`。
+
+⚠️ **只改归因文案，不改 level、不改 `isHardCrash`。** 界面确实死了（用户看到的是
+App 崩），把它从硬崩溃里摘出去会让 `crash-scenes` 漏报真实后果。**归因准确 ≠ 降低严重度。**
+
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
 **症状**：手机端对话框的「安装源」下拉只有**一项**（中国大陆镜像源）+ 自定义地址，
