@@ -763,6 +763,8 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `ui-probe.js` | 无需改（原生每次启动读一次进内存，见 ⑫.5）。⚠️ 但改了语义要同步升 `ui-probe.js` 内部的 `VERSION`（页面上的旧探针靠它判断要不要换） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
+| `preset-skills.zip` | `EngineManager.PRESET_SKILLS_VERSION`（现 `1.0.0-1`）。判据是 `skills/.preset_skills_version` 里的字符串，**改了内容不改这个常量 ⇒ 老设备永远拿不到新 skill** |
+| `preset-razor.zip` | 无需改（每次启动覆盖写） |
 
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
 这三个都是踩过的坑。

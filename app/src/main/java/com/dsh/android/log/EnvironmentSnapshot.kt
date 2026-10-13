@@ -71,7 +71,10 @@ object EnvironmentSnapshot {
                     put("previewSdk", Build.VERSION.PREVIEW_SDK_INT)
                     put("securityPatch", if (Build.VERSION.SDK_INT >= 23) Build.VERSION.SECURITY_PATCH else "")
                     // ⚠️ 内核版本是硬约束②的判据之一（execve 能否用取决于内核+SELinux）
-                    put("kernel", kernelVersion())
+                    //   读不到时**显式记原因**，别让空串被误读成「采集逻辑漏了这个字段」。
+                    val kv = kernelVersion()
+                    put("kernel", kv)
+                    if (kv.isEmpty()) put("kernelUnavailable", "read-denied")
                     put("locale", java.util.Locale.getDefault().toString())
                     put("timeZone", java.util.TimeZone.getDefault().id)
                 },
@@ -211,14 +214,58 @@ object EnvironmentSnapshot {
     }.getOrDefault(false)
 
     /**
-     * 内核版本。读 `/proc/version`（所有 Android 都读得到，不需要 root）。
+     * 内核版本。
      *
-     * ⚠️ 用 `readText` 而不是 `uname` 系统调用：不需要额外权限，且这正是
-     * 硬约束②排查时要看的那一行。
+     * ## 为什么不能只读 `/proc/version`（真机实测，2026-10-14）
+     *
+     * 原先只做 `File("/proc/version").readText()`，`runCatching` 一兜底就返回 `""`。
+     * 而 **Android 10（API 29）起 SELinux 把 `untrusted_app` 读 `/proc/version`
+     * 也拒了** —— 于是这个字段在 53 个诊断包里 **41 个是空串**，而它恰恰是硬约束②
+     * （`execve` 能否用取决于内核 + SELinux）排查时要看的第一行。
+     *
+     * 真机证据（CDY-TN90 / Android 10 / `Enforcing`）：
+     * ```
+     * $ run-as com.dsh.android cat /proc/version
+     * cat: /proc/version: Permission denied          ← app 域被拒
+     * $ adb shell cat /proc/version                   ← shell(uid 2000) 能读
+     * Linux version 4.14.116 (HarmonyOS@localhost) …
+     * ```
+     * 同批实测：`/proc/sys/kernel/osrelease`、`/proc/sys/kernel/version`、
+     * `/system/build.prop` 也全部 DENIED，而 `/proc/cpuinfo`、`/proc/self/status` 可读。
+     *
+     * ⚠️ **失败是设备/版本相关的，不是「老设备才这样」**：41 个空串里
+     * SDK 35 的 20 个**全部**为空、SDK 28/31 的反而有值。所以判据只能是「读得到就读」。
+     *
+     * ## 回退顺序
+     *
+     * 1. `/proc/version` —— 最完整（含编译器与构建时间），能读就用它；
+     * 2. `/system/bin/uname -a` —— 走 `uname(2)` **系统调用**而非读文件，
+     *    SELinux 管不到，app 域实测可 exec。输出略短（无编译器串），但内核版本
+     *    这个关键信息齐全。
+     *
+     * 两条都失败才返回 `""`，此时**额外记一个 `kernelUnavailable` 字段**说明原因 ——
+     * 静默的空串让人以为是采集逻辑漏了，而真因是权限，必须能区分。
      */
-    private fun kernelVersion(): String = runCatching {
-        File("/proc/version").readText().trim().take(200)
-    }.getOrDefault("")
+    private fun kernelVersion(): String {
+        val direct = runCatching { File("/proc/version").readText().trim() }.getOrNull()
+        if (!direct.isNullOrEmpty()) return direct.take(200)
+
+        // 回退：uname(2)。真机实测 app 域可 exec，且输出与 /proc/version 首部一致。
+        val viaUname = runCatching {
+            val proc = ProcessBuilder("/system/bin/uname", "-a")
+                .redirectErrorStream(true)
+                .start()
+            val text = proc.inputStream.bufferedReader().use { it.readText() }.trim()
+            if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                proc.destroyForcibly()
+                return@runCatching ""
+            }
+            text
+        }.getOrDefault("")
+        if (viaUname.isNotEmpty()) return viaUname.take(200)
+
+        return ""
+    }
 
     private fun hasPermission(context: Context, perm: String): Boolean = runCatching {
         context.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED

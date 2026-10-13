@@ -2143,7 +2143,8 @@ class EngineManager private constructor(private val context: Context) {
      * ## ⚠️ endpoint 必须用国际站域名
      *
      * 抽到国内站钥匙时，注入层靠**等长改写 Host 头**把请求路由到国内站，而基准
-     * 域名只能是较长的 `apihub`（`api.agnes-ai.cn` 加 4 个尾空格才够 18 字节）。
+     * 域名只能是较长的 `apihub`（`api.agnes-ai.cn` 加 3 个尾空格才够 18 字节 ——
+     * 18 − 15 = 3，别写成 4，见 `keyinject.c` 的 `KI_HOST_CN` 与那条 `_Static_assert`）。
      * 这里若写 `api.agnes-ai.cn`，注入层找不到 `KI_HOST_INTL` 可改 —— 抽到国内站
      * 钥匙就会拿国内站密钥去打国内站域名之外的路由，稳定 401。见 [KEY_BASE_URL]。
      *
@@ -5991,7 +5992,7 @@ class EngineManager private constructor(private val context: Context) {
          * baseURL **必须**用较长的国际站域名。
          *
          * combo 靠等长改写 Host 头区分站点：`apihub.agnes-ai.cn`（18 字符）可以
-         * 缩成 `api.agnes-ai.cn` + 4 个尾部空格（同为 18），反过来则没有等长写法。
+         * 缩成 `api.agnes-ai.cn` + 3 个尾部空格（同为 18），反过来则没有等长写法。
          * 所以基准域名只能是国际站 —— 国内站的钥匙由 `keyinject.c` 把 Host 改短。
          */
         private const val KEY_BASE_URL = "https://apihub.agnes-ai.cn/v1"
