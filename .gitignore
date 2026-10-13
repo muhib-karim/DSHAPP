@@ -37,6 +37,13 @@ app/src/main/assets/*
 !app/src/main/assets/ui-probe.js
 COMMIT_MSG.tmp
 
+# ── 真机调试工具的运行期产物：入库的是脚本，不是它的输出 ────────
+# uiagent-state-snapshot.json 由 tools/uiagent-state-snapshot.mjs 每次运行时
+# **覆盖写**，内容是「当时那台设备」的 localStorage（含真实 sessionId）。
+# 它随时会漂，入库没有意义，还会让工作区常驻一个未跟踪文件。
+# 脚本本身（tools/uiagent-state-snapshot.mjs）照常入库。
+tools/uiagent-state-snapshot.json
+
 # ── 内置号池的密钥：绝不入库 ─────────────────────────────
 #
 # agnes-keys.properties 是**明文密钥清单**，keyinject-keys.h 是它的混淆产物
@@ -44,8 +51,12 @@ COMMIT_MSG.tmp
 # 入库的只有手写源码 app/src/main/jni/keyinject.c 与生成脚本 tools/build-keyinject.ps1；
 # 别人 clone 后拿不到密钥，跑一次生成脚本才能得到可用的 keyinject.bin。
 agnes-keys.properties
+# ⚠️ 上面这条只匹配**全名**，`agnes-keys.properties.bak-<时间戳>` 不被覆盖 ——
+# 而备份恰恰是明文，且换池子前那份装的密钥比当前还多。通配一条堵住
+# `git add -A` 误提交（实测 `git check-ignore` 此前对 .bak-* 全部未命中）。
+agnes-keys.properties.bak-*
 app/src/main/jni/keyinject-keys.h
-# agnes-keys-guide.md 是密钥服务商发的原始文档（14 个明文密钥 + 配对邮箱），
+# agnes-keys-guide.md 是密钥服务商发的原始文档（明文密钥 + 配对邮箱），
 # 从公网 http://39.98.163.161:57647/ 抓下来留档，同样绝不入库。
 agnes-keys-guide.md
 
