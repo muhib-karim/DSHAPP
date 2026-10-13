@@ -785,6 +785,14 @@ class GeckoWebHost(
         pendingPaintAction = action
     }
 
+    override fun resetFirstFrame() {
+        // GeckoView 走 `ContentDelegate.onFirstComposite`，它是**每次合成**都会回调的，
+        // 不存在 WebView 那种「注册的回调被旧视觉状态立刻满足」的问题 ——
+        // 清掉标志即可让下一次 awaitFirstFrame 重新等新的一帧。
+        painted = false
+        pendingPaintAction = null
+    }
+
     override fun destroy() {
         pendingPaintAction = null
         pendingEvals.clear()

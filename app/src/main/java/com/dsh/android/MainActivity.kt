@@ -209,6 +209,14 @@ class MainActivity : AppCompatActivity() {
     /** WebView 是否已经提交过至少一帧（见 [awaitWebViewPainted]）。 */
     private var webViewPainted = false
 
+    /**
+     * **真正**收到了内核的首帧回调（区别于 [webViewPainted]：那个在兜底超时时也会被置 true）。
+     *
+     * `reloadWithRetry` 判「界面恢复了没有」必须用这个 —— 用 [webViewPainted] 会把
+     * 「兜底超时到了」当成「恢复成功」。
+     */
+    private var firstFrameReallyArrived = false
+
     /** 是否已有一个等待首帧的回调在飞，避免重复注册。 */
     private var paintPending = false
 
@@ -369,13 +377,28 @@ class MainActivity : AppCompatActivity() {
      */
     private fun reloadWithRetry(attempt: Int) {
         Log.i(DshApplication.TAG, "重载界面（第 $attempt 次尝试）")
+        // ⚠️ **必须在 reload() 之前重置首帧记忆**，否则 awaitFirstFrame 会因为
+        //   `painted` 早就是 true 而**同步立刻**回调 —— 判据在 reload 还没发生时就
+        //   被满足，「界面已恢复」是假的，而下面那个重试分支也永远命中
+        //   `if (webViewPainted) return`（真机全量 53 包：`界面未恢复，再试一次` 0 次）。
+        //   证据与时序见 WebHost.resetFirstFrame 的 KDoc。
+        // ⚠️ 三个状态都要清干净，少一个都会让下面的 awaitWebViewPainted 注册不上：
+        //   - paintPending：若还停在 true，它会走 `if (paintPending) return` 直接返回，
+        //     动作根本不会注册；
+        //   - webViewPainted：见上面；
+        //   - 在飞的兜底超时：它到点会把 webViewPainted 置回 true 并收起启动层。
+        overlayHandler.removeCallbacks(paintTimeoutRunnable)
+        paintPending = false
+        webViewPainted = false
+        firstFrameReallyArrived = false
+        web.resetFirstFrame()
         awaitWebViewPainted {
             // 首帧回来了 = 界面真的恢复到可用状态
             Log.i(DshApplication.TAG, "界面已恢复（第 $attempt 次尝试拿到首帧）")
         }
         web.reload()
         rendererHandler.postDelayed({
-            if (webViewPainted) return@postDelayed
+            if (firstFrameReallyArrived) return@postDelayed
             if (attempt < MAX_RELOAD_ATTEMPTS) {
                 Log.w(DshApplication.TAG, "界面未恢复，再试一次")
                 reloadWithRetry(attempt + 1)
@@ -2115,6 +2138,7 @@ class MainActivity : AppCompatActivity() {
         val done = {
             if (!webViewPainted) {
                 webViewPainted = true
+                firstFrameReallyArrived = true
                 paintPending = false
                 overlayHandler.removeCallbacks(paintTimeoutRunnable)
                 Log.i(DshApplication.TAG, "Web 内核已提交首帧，收起启动动画")

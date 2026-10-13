@@ -57,6 +57,12 @@ class SystemWebHost(
     /** `postVisualStateCallback` 的请求号，单调递增即可（它只是个标识）。 */
     private var paintRequestId = 0L
 
+    /**
+     * 已经作废到哪个 requestId（含）。`resetFirstFrame()` 会把它推到当前值，
+     * 于是所有**重载前**注册的回调都会被 `onComplete` 丢弃（见那里的门控）。
+     */
+    private var staleRequestId = 0L
+
     /** 已经等在首帧上的动作（首帧到达时执行）。 */
     private var pendingPaintAction: (() -> Unit)? = null
 
@@ -380,6 +386,9 @@ class SystemWebHost(
             paintRequestId,
             object : WebView.VisualStateCallback() {
                 override fun onComplete(requestId: Long) {
+                    // ⚠️ 被 resetFirstFrame() 作废的旧回调：它代表的是**重载前**那一帧，
+                    //   不能算「重载成功了」。
+                    if (requestId <= staleRequestId) return
                     if (painted) return
                     painted = true
                     paintPending = false
@@ -412,6 +421,17 @@ class SystemWebHost(
         paintPending = false
         pendingPaintAction = null
         webView.loadUrl(url)
+    }
+
+    override fun resetFirstFrame() {
+        // ⚠️ 只清标志**不够**：`postVisualStateCallback` 是排队到「当前视觉状态」的，
+        //   重载前注册的那个回调在视觉状态已提交时**可能立刻触发**，把
+        //   `painted` 又置回 true —— 那是**旧内容**的帧，照样是假成功。
+        //   所以必须按 requestId 作废所有在飞的旧回调（见 onComplete 里的门控）。
+        staleRequestId = paintRequestId
+        painted = false
+        paintPending = false
+        pendingPaintAction = null
     }
 
     override fun destroy() {
