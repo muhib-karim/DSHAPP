@@ -5172,6 +5172,51 @@ adb shell am force-stop com.dsh.android   # 重启才会重新加载
 ⚠️ **测试期隔离出来的 `.bak-<时间戳>` 会累积**：真机上跑一轮完整验证会留下五六个。
 测完记得 `rm -f files/home/.dsh/profiles/web/*.bak-*`，并把 profile 恢复成测前的样子。
 
+### ⚠️ 体检救不了的一种坏法：**我们自己注入的可选工具插件**注册失败
+
+上面的体检只看**配置文件**（profile / patch / `engine/`）。但还有一条同类死路它完全
+看不到 —— 坏在我们**自己的插件代码**里：
+
+```
+dsh: startup failed: 1 required plugin did not activate
+Failed plugins (1):
+  dsh-android-logs
+    Package: file:///…/.dsh/logs-tool/dsh-android-logs/lib/index.js
+    TypeError: tool "logs" must declare output { schema, render, presentationMeta? }
+        at Proxy.register (…/@deepseek-ai/dsh-tools/lib/index.js:2881:188)
+        at Object.apply (…/@deepseek-ai/cordis/lib/index.js:120:36)
+```
+
+真机实测（2026-10-13 21:46 ~ 23:29，20 个诊断包、**54 次启动**）：`logs` 工具的定义
+漏了 `output` 声明，`ctx.tools.register()` 抛 `TypeError`，异常从 `apply()` 冒出去 →
+cordis 判定该插件 failed → 引擎**直接退出**。用户看到的是
+**「引擎启动失败（引擎进程已退出）」—— App 完全打不开**，
+而表面上与「一个日志工具」毫无关联。**这正是体检覆盖不到的那一类**：配置文件全是好的。
+
+⚠️ **根因链的最后一环是 `EngineManager.writeLogsToolPatch()` 的 `- insert:` 语义**：
+它把 `dsh-android-logs` 作为**普通条目**插进 overlay，于是该插件与核心 bundle 的条目
+**同等对待**，失败即「required」⇒ 整引擎不启动。所以从这个插件进来的任何异常，
+代价都等于「App 打不开」。
+
+**做法：6 个工具插件的 `ctx.tools.register()` 一律包 `try/catch`。**
+覆盖 `bubble` / `logs` / `root` / `shell` / `statusbar` / `uiagent`
+（`mobile-ui-plugin/dsh-android-*/lib/index.js`）。
+
+降级方向：**注册失败 ⇒ 只有这一个工具不存在**（模型调用时会明确报「未知工具」），
+而不是整个 App 不可用。⚠️ **但绝不能静默** —— catch 里用 `logger.warn` 把**原始错误
+消息**（`error?.message`）原样打出来，否则又变成「工具不见了但没人知道为什么」。
+日志里应看到：
+
+```
+[dsh-android-logs] 注册 logs 工具失败，本插件不激活（引擎继续启动）: tool "logs" must declare output …
+```
+
+⚠️ **`try/catch` 只能挡住「注册那一刻抛的异常」，挡不住「工具自身在调用时炸」** ——
+后者由 `dsh-tools` 自己的调用边界处理，与启动无关。两者别混为一谈。
+
+⚠️ **给新插件写 `apply()` 时照抄这个形状**；已有插件逐个核对过，6/6 都带保护、
+无裸调用残留（`^\tctx\.tools\.register` 为 0 命中）。
+
 ## `$PREFIX/bin/node` 会坏，而且坏了之后只有卸载重装一条路 —— 自校验 + 自愈
 
 **症状**（粉丝截图，无日志）：启动层停在

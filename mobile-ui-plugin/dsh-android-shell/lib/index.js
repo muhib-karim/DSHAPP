@@ -312,9 +312,19 @@ export function apply(ctx) {
 		);
 	}
 
-	ctx.tools.register(shellTool(ctx, runner, process.execPath, dshHome, adbHomeValue));
-	ctx?.logger?.info?.(
-		`[dsh-android-shell] 已注册 uid 2000 特权工具 ${TOOL_NAME}: ${runner}` +
-			(adbHomeValue === '' ? '（无线调试通道不可用）' : `（内置 adb: ${adbHomeValue}）`)
-	);
+	// ⚠️ **register 必须包 try/catch**：见 `dsh-android-bubble` 同处的说明 ——
+	// 工具注册抛异常会让 cordis 判定插件 failed，进而
+	// `dsh: startup failed: N required plugin did not activate` ⇒ 引擎退出、
+	// App 完全打不开。真机实测过（`dsh-android-logs` 漏 `output` 声明，54 次）。
+	try {
+		ctx.tools.register(shellTool(ctx, runner, process.execPath, dshHome, adbHomeValue));
+		ctx?.logger?.info?.(
+			`[dsh-android-shell] 已注册 uid 2000 特权工具 ${TOOL_NAME}: ${runner}` +
+				(adbHomeValue === '' ? '（无线调试通道不可用）' : `（内置 adb: ${adbHomeValue}）`)
+		);
+	} catch (error) {
+		ctx?.logger?.warn?.(
+			`[dsh-android-shell] 注册 ${TOOL_NAME} 工具失败，本插件不激活（引擎继续启动）: ${error?.message ?? error}`,
+		);
+	}
 }

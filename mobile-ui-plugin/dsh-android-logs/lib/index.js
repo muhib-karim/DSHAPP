@@ -441,6 +441,27 @@ export function apply(ctx) {
 		return;
 	}
 
-	ctx.tools.register(logsTool(home));
-	ctx?.logger?.info?.(`[dsh-android-logs] 已注册日志工具 ${TOOL_NAME}: ${path.join(home, CMD_FILE)}`);
+	// ⚠️ **register 必须包 try/catch，否则一个可选调试工具能把整个 App 搞死。**
+	//
+	// 真机实测（`20261013-214917-3582eef4` 等 20 个诊断包、54 次启动）：本插件的
+	// 工具定义漏了 `output` 声明，`ctx.tools.register()` 抛
+	//   TypeError: tool "logs" must declare output { schema, render, presentationMeta? }
+	// 异常从 apply 冒出去 → cordis 判定该插件 failed → 引擎打印
+	//   dsh: startup failed: 1 required plugin did not activate
+	//   Failed plugins (1): dsh-android-logs
+	// 然后**整个引擎退出**，用户看到的是「引擎启动失败（引擎进程已退出）」——
+	// App 完全打不开，而表面上与「一个日志工具」毫无关联。
+	//
+	// 降级方向是对的：工具注册失败 ⇒ **只有这个工具不存在**（模型调用时会明确
+	// 报「未知工具」），而不是整个 App 不可用。但**绝不能静默** —— 所以这里
+	// 用 warn 把原始错误原样打出来（含 `output` 契约那类原因），否则又变成
+	// 「工具不见了但没人知道为什么」这种本工程反复踩过的坑。
+	try {
+		ctx.tools.register(logsTool(home));
+		ctx?.logger?.info?.(`[dsh-android-logs] 已注册日志工具 ${TOOL_NAME}: ${path.join(home, CMD_FILE)}`);
+	} catch (error) {
+		ctx?.logger?.warn?.(
+			`[dsh-android-logs] 注册 ${TOOL_NAME} 工具失败，本插件不激活（引擎继续启动）: ${error?.message ?? error}`,
+		);
+	}
 }

@@ -792,6 +792,21 @@ export function apply(ctx) {
 		return;
 	}
 
-	ctx.tools.register(bubbleTool(home));
-	ctx?.logger?.info?.(`[dsh-android-bubble] 已注册悬浮球控制工具 ${TOOL_NAME}: ${path.join(home, CMD_FILE)}`);
+	// ⚠️ **register 必须包 try/catch**：本插件的工具注册一旦抛异常（工具定义
+	// 不合契约、服务未就绪…），异常会从 apply 冒出去 → cordis 判定插件 failed
+	// → 引擎打印 `dsh: startup failed: N required plugin did not activate`
+	// 并**直接退出**。真机实测同类情形（`dsh-android-logs` 漏了 `output` 声明）
+	// 造成 54 次「引擎启动失败」，用户看到的是 App 完全打不开，而表面上与
+	// 「一个可选工具」毫无关联。
+	//
+	// 降级方向：工具注册失败 ⇒ 只有这个工具不存在（模型调用时会明确报「未知工具」），
+	// 而不是整个 App 不可用。但**不能静默** —— warn 里带上原始错误。
+	try {
+		ctx.tools.register(bubbleTool(home));
+		ctx?.logger?.info?.(`[dsh-android-bubble] 已注册悬浮球控制工具 ${TOOL_NAME}: ${path.join(home, CMD_FILE)}`);
+	} catch (error) {
+		ctx?.logger?.warn?.(
+			`[dsh-android-bubble] 注册 ${TOOL_NAME} 工具失败，本插件不激活（引擎继续启动）: ${error?.message ?? error}`,
+		);
+	}
 }
