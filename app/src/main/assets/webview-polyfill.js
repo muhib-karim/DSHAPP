@@ -1032,4 +1032,111 @@
       /* 同上 */
     }
   }
+
+  // ── Worker 失败留痕 ─────────────────────────────────────────────────
+  //
+  // 客户端把**非图片**附件交给 Worker 上传：主线程建一个 blob 形式的 Worker，
+  // Worker 内部用 XHR 把文件发出去（见 `dsh-client-file-upload` 的
+  // `workerTransport()` / `fileUploadWorker()`）。图片走的是另一条路
+  // （base64 JSON 经 `ctx.remote.fileUploads.upload`），**根本不用 Worker** ——
+  // 所以「大多数人正常、少数人失败」在这条链路上完全说得通：发图的都没事，
+  // 发压缩包/文档的才踩到。
+  //
+  // 而这条路失败时**一行日志都不留**：Worker 的 `onerror` 只 reject 一个
+  // Promise，上层把它变成一个「上传失败，点击重试」卡片，全程没有 `console.*`。
+  // 于是 `web.log` 里没有痕迹，诊断包拿回来也定不了位。
+  //
+  // 这个代价已经真金白银付过一次：23 份诊断包里**零条**上传失败记录，
+  // 而用户反馈的失败是真存在的 —— 不是没发生，是没留痕。
+  //
+  // ⚠️ 只挂监听器，**不碰 `onerror` 属性**：`addEventListener` 与 `onerror`
+  //   属性在事件派发时**并存**、互不顶替，所以这是纯观测，不改变任何既有语义。
+  // ⚠️ 同步抛错（blob URL 无效、超并发上限）也要留痕，否则同样无声。
+  // ⚠️ 观测本身绝不能影响 Worker：所有补丁分支都吞掉自己的异常。
+  if (typeof window !== 'undefined' && typeof window.Worker === 'function') {
+    (function () {
+      var NativeWorker = window.Worker;
+      if (NativeWorker.__dshWorkerObserved === true) return;
+
+      function label(options) {
+        return options && options.name ? String(options.name) : '(未命名)';
+      }
+
+      function observed(url, options) {
+        var worker;
+        try {
+          worker = new NativeWorker(url, options);
+        } catch (e) {
+          console.error(
+            '[dsh-webview] 创建 Worker 失败 [' + label(options) + ']: ' +
+              ((e && e.message) || String(e))
+          );
+          throw e;
+        }
+        try {
+          worker.addEventListener('error', function (event) {
+            console.error(
+              '[dsh-webview] Worker 运行失败 [' + label(options) + ']: ' +
+                ((event && event.message) ||
+                  (event && event.error && event.error.message) ||
+                  '脚本加载或执行失败')
+            );
+          });
+          worker.addEventListener('messageerror', function () {
+            console.error(
+              '[dsh-webview] Worker 消息无法结构化克隆 [' + label(options) + ']'
+            );
+          });
+          // ⚠️ 只挂 error 是**不够**的：上传 Worker 在内部用 XHR 发文件，XHR 失败时
+          //    它**不抛异常**，而是 `postMessage({ kind: 'error', message })`，主线程
+          //    拿到后只是 reject 一个 Promise —— 既不触发 `error` 事件，也不打日志。
+          //    HTTP 非 200 同理（`kind: 'complete'` + `status`，由调用方判 200）。
+          //    所以这里必须同时观测 message，否则「网络/服务端拒绝」这一类失败
+          //    仍然完全无声，而那恰恰是最可能的一类。
+          worker.addEventListener('message', function (event) {
+            try {
+              var d = event && event.data;
+              if (d === null || typeof d !== 'object') return;
+              if (d.kind === 'error') {
+                console.error(
+                  '[dsh-webview] Worker 上报传输失败 [' + label(options) + ']: ' +
+                    (d.message || '(无 message)')
+                );
+              } else if (d.kind === 'complete' && d.status !== 200) {
+                console.error(
+                  '[dsh-webview] Worker 传输返回 HTTP ' + String(d.status) +
+                    ' [' + label(options) + ']: ' +
+                    String(d.body === undefined ? '' : d.body).slice(0, 200)
+                );
+              }
+            } catch (e) {
+              /* 观测失败不能影响 Worker 本身 */
+            }
+          });
+        } catch (e) {
+          /* 观测失败不能影响 Worker 本身 */
+        }
+        return worker;
+      }
+
+      // 保住 `instanceof Worker` 与静态成员：新构造器的原型指回原生原型，
+      // 而 `new` 一个返回对象的构造器得到的就是那个 Worker 实例。
+      observed.prototype = NativeWorker.prototype;
+      for (var key in NativeWorker) {
+        if (Object.prototype.hasOwnProperty.call(NativeWorker, key)) {
+          try {
+            observed[key] = NativeWorker[key];
+          } catch (e) {
+            /* 只读静态成员跳过 */
+          }
+        }
+      }
+      observed.__dshWorkerObserved = true;
+      try {
+        window.Worker = observed;
+      } catch (e) {
+        /* 不可写时保持原样 */
+      }
+    })();
+  }
 })();
