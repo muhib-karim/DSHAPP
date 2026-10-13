@@ -341,10 +341,31 @@ object LogStore {
         }
         // 清完之后立刻重开 app.log：不重开的话，writer 还指向已被删除的 inode，
         // 后续日志会写进一个「已经没有名字」的文件，界面上看不到任何新日志。
+        //
+        // ⚠️ **`engine.log` / `web.log` 必须一起重开**（踩过，代价是整段日志凭空消失）：
+        //   这两者走 [engineWriterOf] / [webWriterOf] 的惰性创建，而它们的第一行是
+        //   `engineWriter?.let { return it }` —— 只要引用非空就直接返回**旧** writer，
+        //   永远不会自己发现文件已被删。于是此后的引擎输出全部写进那个已被 unlink
+        //   的 inode（没有名字、进程一死就彻底消失）。
+        //   真机证据：`20261013-232433-ee417cc3` 等 6 个包在 23:00:41 点了「清空」，
+        //   之后引擎又输出了 32~97 行，而 `engine.log` 里**一行都没有**（0 字节）；
+        //   同时 `app.log` 里那 32~97 行 `[engine]` 副本完好无损 —— 两份日志的分叉
+        //   正好卡在清空那一刻，这就是判据。
+        //   置空引用即可：下次写引擎/网页日志时惰性重开，落到新建的文件上。
         runCatching {
-            appWriter?.close()
-            appWriter = null
-            openApp(append = false)
+            lock.withLock {
+                appWriter?.close()
+                appWriter = null
+                openApp(append = false)
+
+                engineWriter?.close()
+                engineWriter = null
+                engineBytes = 0L
+
+                webWriter?.close()
+                webWriter = null
+                webBytes = 0L
+            }
         }
         app('I', "Log", "日志已由用户清空（删除 $n 个文件）")
         return n
