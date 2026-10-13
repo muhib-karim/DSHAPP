@@ -20,16 +20,31 @@ import java.util.concurrent.TimeUnit
  * 国产 ROM 又会主动冻结/杀后台。而用户报上来的永远是同一句话：「它自己退了」。
  * 没有现场文件，那句话之外什么都查不了。
  *
- * ## 四类分别抓，因为「谁死了」决定了「怎么查」
+ * ## 分别抓，因为「谁死了」决定了「怎么查」
  *
- * | 类型 | 捕获点 | 现场文件 |
- * |---|---|---|
- * | 未捕获异常 | `Thread.setDefaultUncaughtExceptionHandler` | `<ts>-uncaught.txt` |
- * | 渲染进程崩溃 | `WebHostCallbacks.onRendererGone` | `<ts>-renderer.txt` |
- * | 引擎进程退出 | `EngineManager` 的 stdout EOF（已有检测点） | `<ts>-engine-exit.txt` |
- * | 主线程卡死 | 自建 watchdog（见下） | `<ts>-anr.txt` |
+ * 现场文件统一命名 `yyyyMMdd-HHmmss-<kind>.txt`，`<kind>` 的**全部取值**如下
+ * （这是权威清单，对着 [writeScene] 的每个调用点逐个抄的）：
  *
- * ⚠️ **四类不能合并成一种**：WebView 渲染进程崩溃时**本进程还活着**，能继续跑、
+ * | 类型 | 捕获点 | `<kind>` | 等级 | 硬崩溃？ |
+ * |---|---|---|---|---|
+ * | 未捕获异常 | `Thread.setDefaultUncaughtExceptionHandler` | `uncaught-exception` | E | 是 |
+ * | 渲染进程崩溃 | `WebHostCallbacks.onRendererGone`（`didCrash = true`） | `renderer-crash` | E | 是 |
+ * | 渲染进程被回收 | 同上（`didCrash = false`） | `renderer-reclaimed` | W | 否 |
+ * | 引擎进程意外退出 | `EngineManager` 的 stdout EOF | `engine-exit` | W | 否 |
+ * | 引擎进程被我们停掉 | 同上（`expected = true`） | `engine-exit-expected` | I | 否 |
+ * | 主线程卡死 | 自建 watchdog | `main-thread-stall` | E | 是 |
+ * | 整个进程被冻结 | 自建 watchdog（超过上界） | `process-freeze` | W | 否 |
+ * | 引擎起不来 | `EngineManager` 启动超时 | `engine-start-failed` | E | 否 |
+ *
+ * ⚠️ **这张表原先写的四个文件名（`<ts>-uncaught.txt` / `-renderer.txt` /
+ *   `-engine-exit.txt` / `-anr.txt`）一个都不存在**（2026-10-14 自检发现）——
+ *   它们既不是 [writeScene] 产出的名字，也不在 `crash/` 目录里出现过。照着它去
+ *   `crash/` 找「ANR 现场」的分析者会认定「这台机器没有过 ANR」，而真机
+ *   `main-thread-stall` 现场是指纹之外另有其人。这正是本项目记录的第 15 次
+ *   同族缺陷：**文档描述的总体与实际的总体不是同一个**。
+ *   写文件名的表必须对着调用点抄，不能凭「应该叫什么」推。
+ *
+ * ⚠️ **不能合并成一种**：WebView 渲染进程崩溃时**本进程还活着**，能继续跑、
  * 能弹提示、能重载（`MainActivity` 已有这套恢复逻辑）。把它记成「App 崩溃」会
  * 让分析者去查一个根本不存在的进程崩溃。
  *
@@ -559,13 +574,33 @@ object CrashRecorder {
     fun sceneCount(): Int = listScenes().size
 
     /**
-     * 判断某个现场文件是不是「真崩溃」（有堆栈的那两类）。
+     * 判断某个现场文件是不是「真崩溃」（界面要标红的那几类）。
      *
-     * 界面据此决定标红还是标黄 —— 渲染进程被回收、引擎正常退出都不该是红色。
+     * 判据是**三个 kind**：`uncaught-exception`、`renderer-crash`、`main-thread-stall`
+     * —— 都用 [kindOf] 会认的名字（这里用 `contains` 而不是相等，因为文件名前面
+     * 还有时间戳）。
+     *
+     * ⚠️ **KDoc 原先写的是「有堆栈的那两类」，那是错的**（2026-10-14 自检发现）：
+     *   它描述的是一个**不存在的总体**。三类里只有 `uncaught-exception` 带堆栈 ——
+     *   [recordRendererGone] 与 [recordMainThreadStall] 都把 `stack` 显式传 `null`。
+     *   照「有堆栈」去理解，分析者会以为 `renderer-crash` 里有内核栈可读，翻遍
+     *   现场文件找不到，进而怀疑现场写坏了。实测 `20261014-054414-renderer-crash.txt`
+     *   （13,031 字节）确实**没有** `--- stack trace ---` 段。
+     *   更要紧的是：**判据是 kind，不是有没有堆栈** —— 有没有堆栈是记录能力问题，
+     *   是不是「真崩溃」是分类问题，两者独立。写 KDoc 时把实现里那个 `||` 表达式
+     *   如实描述出来即可，不要替它编一条更好懂的理由。
+     *
+     * 界面据此决定标红还是标黄 —— 渲染进程被回收、引擎（正常/意外）退出、
+     * 进程被冻结、引擎起不来都不该是红色。
      *
      * ⚠️ `process-freeze` **刻意不在此列**：进程被系统冻结是后台治理的正常结果，
      * 不是本 App 的崩溃。它由 watchdog 记下来是为了解释「回来就白屏」这类现象，
      * 但标红会把真崩溃的比例冲淡（实测 44 份里 36 份是冻结，标红后满屏红）。
+     *
+     * ⚠️ `engine-start-failed` **也刻意不在此列**：它确实是本 App 最严重的故障
+     * （界面直接不可用，见 [com.dsh.android.EngineManager]），但它是**启动失败、
+     * 没有崩溃过**。标红会让「崩溃现场」这个计数失去意义 —— 用户看到的是
+     * 「有 70 份崩溃」而非「引擎反复起不来」。
      */
     fun isHardCrash(f: File): Boolean =
         f.name.contains("uncaught-exception") || f.name.contains("renderer-crash") ||
