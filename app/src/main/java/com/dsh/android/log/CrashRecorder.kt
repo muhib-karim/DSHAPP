@@ -60,6 +60,9 @@ object CrashRecorder {
     /** 文件名时间戳。不能含冒号（文件系统不允许）。 */
     private val fileFmt = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
+    /** 现场文件名：`yyyyMMdd-HHmmss-<kind>.txt`（见 [writeScene] 的命名）。 */
+    private val sceneNamePattern = Regex("^\\d{8}-\\d{6}-(.+)\\.txt$")
+
     /**
      * 拿日志锁的最长等待。见类注释约束①。
      *
@@ -501,4 +504,14 @@ object CrashRecorder {
     fun isHardCrash(f: File): Boolean =
         f.name.contains("uncaught-exception") || f.name.contains("renderer-crash") ||
             f.name.contains("main-thread-stall")
+
+    /**
+     * 从现场文件名里取出类别（`kind`），取不到就返回 `"unknown"`。
+     *
+     * 命名契约见 [writeScene]：`yyyyMMdd-HHmmss-<kind>.txt`。**必须是这个正则**，
+     * 不能用 `substringAfter('-')` —— 时间戳本身自带一个 `-`（`20261013-214701`），
+     * 那样取出来的是 `214701-engine-start-failed`。
+     */
+    fun kindOf(f: File): String =
+        sceneNamePattern.matchEntire(f.name)?.groupValues?.get(1) ?: "unknown"
 }

@@ -424,6 +424,17 @@ object DiagnosticBundle {
      *
      * ⚠️ 编造原因比不给结论更糟：它会把人引到错误的方向，而且看起来很可信。
      */
+    /**
+     * 把一批现场文件按类别汇总成 `engine-start-failed×70, engine-exit×16` 这样的短语。
+     *
+     * 按**数量降序**排（多的在前），同数量按名字排 —— 让最占多数的那类一眼可见。
+     * 只报类别与数量，不解释原因（见 [runChecks] 的设计原则）。
+     */
+    private fun sceneKindSummary(scenes: List<File>): String =
+        scenes.groupingBy { CrashRecorder.kindOf(it) }.eachCount()
+            .entries.sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+            .joinToString(", ") { "${it.key}×${it.value}" }
+
     private fun runChecks(logDir: File, extra: List<Check>): JSONObject {
         val checks = mutableListOf<Check>()
 
@@ -451,7 +462,17 @@ object DiagnosticBundle {
                 when {
                     scenes.isEmpty() -> Check("crash-scenes", "ok", "没有崩溃现场文件")
                     hard > 0 -> Check("crash-scenes", "fail", "有 $hard 份崩溃现场（共 ${scenes.size} 份），详见 crashes/")
-                    else -> Check("crash-scenes", "warn", "有 ${scenes.size} 份非崩溃现场（渲染进程被回收/引擎正常退出等）")
+                    // ⚠️ **必须列出实际类别，不能举例子。** 原来这里写的是
+                    //   「（渲染进程被回收/引擎正常退出等）」—— 而真机 22 个 warn 包
+                    //   里那两个例子出现 **0** 次，实际全是 `engine-start-failed`(70)
+                    //   与 `engine-exit`(16)。也就是说文案把「引擎起不来」这种
+                    //   `EngineManager` 自己注释成「本 App 最严重的一类故障」的事，
+                    //   报告成了「引擎正常退出等」—— 分析者据此会直接跳过它。
+                    //   例子是猜测，类别是事实；这里只报事实。
+                    else -> Check(
+                        "crash-scenes", "warn",
+                        "有 ${scenes.size} 份非崩溃现场（${sceneKindSummary(scenes)}），详见 crashes/",
+                    )
                 },
             )
         }
