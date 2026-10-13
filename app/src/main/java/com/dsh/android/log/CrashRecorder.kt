@@ -55,6 +55,8 @@ import java.util.concurrent.TimeUnit
  */
 object CrashRecorder {
 
+    private const val TAG = "DSH"
+
     private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     /** 文件名时间戳。不能含冒号（文件系统不允许）。 */
@@ -332,7 +334,12 @@ object CrashRecorder {
     /**
      * 写一份现场文件。**这是本类唯一的写入口**，四类都走它，格式因此完全一致。
      *
-     * ⚠️ 全程 `runCatching`：写现场失败也绝不能抛 —— 调用方可能正在崩溃路径上。
+     * ⚠️ 全程不能抛（调用方可能正在崩溃路径上），但**也不能无声地失败** ——
+     *   见下方的 `onFailure`：原来这里是裸 `runCatching {}`，于是「现场写不进去」
+     *   （磁盘满 / `crash/` 建不出来、`crashDir` 为 null）与「这里压根没崩过」
+     *   在产物上**完全一样**：`crash/` 目录空着，诊断包的 `crash-scenes` 报「无现场」，
+     *   分析者据此判定「本次运行正常」。而崩溃现场正是本系统唯一的排查入口。
+     *   与 `DiagnosticBundle.writeCrashes` 是同一个失效模式（裸 runCatching 吞掉）。
      */
     private fun writeScene(
         kind: String,
@@ -342,7 +349,13 @@ object CrashRecorder {
         level: Char = 'E',
     ) {
         runCatching {
-            val dir = crashDir ?: return@runCatching
+            val dir = crashDir
+            if (dir == null) {
+                // ⚠️ 这一支过去是 `?: return@runCatching` —— 静默丢弃。它发生在
+                //   `install()` 还没跑（启动极早期崩溃）或 mkdirs 失败时。
+                reportSceneFailure(kind, "crashDir 未初始化（install() 尚未执行或 crash/ 建不出来）")
+                return@runCatching
+            }
             if (!dir.exists()) dir.mkdirs()
             val now = System.currentTimeMillis()
             val name = "${fileFmt.format(Date(now))}-$kind.txt"
@@ -389,6 +402,28 @@ object CrashRecorder {
             // ⚠️ 让用户在日志界面顺着时间翻也能看到「这里发生过什么」。
             withLogLock {
                 LogStore.app(level, "Crash", "已记录现场: crash/$name —— $reason")
+            }
+        }.onFailure { t ->
+            reportSceneFailure(kind, "${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    /**
+     * 现场文件**没写成**时的唯一留痕出口。
+     *
+     * ⚠️ 存在的意义：`writeScene` 是全类唯一写入口，它静默失败 ⇒ 「这次没崩」与
+     *   「现场丢了」不可区分。这里至少把损失说出来，并**明确写进 `app.log`**
+     *   （`AndroidLog` 只在 logcat 里，离线诊断包拿不到 logcat）。
+     *
+     * ⚠️ 本函数自身也必须 fail-safe：它跑在崩溃路径上，再抛一次就是二次崩溃。
+     *   所以整体 `runCatching`，且不用 `LogStore.app` 的锁语义 —— 用
+     *   [withLogLock]（超时即跳过），拿不到锁时不阻塞、不抛。
+     */
+    private fun reportSceneFailure(kind: String, detail: String) {
+        runCatching {
+            AndroidLog.e(TAG, "现场文件写入失败（$kind）: $detail")
+            withLogLock {
+                LogStore.app('E', "Crash", "⚠️ 现场文件写入失败（$kind）：$detail —— 本次崩溃无现场可查")
             }
         }
     }
