@@ -219,6 +219,16 @@ object LogCommandBridge {
             notes += "本次运行已折叠 ${LogStore.throttledTotal} 条重复行（1 秒内同 tag 同内容超过 20 次）。" +
                 "高频重复的报错只留了前 20 条。"
         }
+        // ⚠️ **`droppedAsync` 必须一起说**：它是**另一个**丢失渠道 —— 异步队列
+        //   （engine/web 输出）满时直接丢，与上面的限流折叠成因不同、数字也不同。
+        //   `DiagnosticBundle` 的 `log-completeness` 一直是两者都报，而这里
+        //   只报限流 ⇒ 同一次运行在两条通道上给出不同结论。
+        //   漏报的后果与上一段同：模型会把「缓冲里没有」当成「没发生过」，
+        //   而实际是队列满丢的（engine.stdout 刷屏时最容易发生）。
+        if (LogStore.droppedAsync > 0) {
+            notes += "本次运行另有 ${LogStore.droppedAsync} 条因异步队列满被直接丢弃" +
+                "（引擎/网页输出刷屏时发生，与上面的限流折叠是两回事）。"
+        }
         if (notes.isNotEmpty()) out.put("truncatedNote", notes.joinToString("\n"))
     }
 
@@ -350,6 +360,14 @@ object LogCommandBridge {
             notes += "本次运行已折叠 ${LogStore.throttledTotal} 条重复行（1 秒内同 tag 同内容超过 20 次）" +
                 "—— 不要据此断言「某错误从未发生」。⚠️ 这个数只覆盖本次运行；app.log 里" +
                 "更早的运行若也被折叠过，只会在其中留下「…被抑制 N 次」的行。"
+        }
+        // ⚠️ **`droppedAsync` 是另一个丢失渠道，summary 同样不能说漏。**
+        //   [doRead] 与 `DiagnosticBundle` 的 `log-completeness` 都报它，
+        //   只有 summary 原来不提 ⇒ 模型看 summary 会以为「缓冲 4000 条就是全部」，
+        //   而实际可能有一批被队列满丢了（引擎 stdout 刷屏时）。
+        if (LogStore.droppedAsync > 0) {
+            notes += "本次运行另有 ${LogStore.droppedAsync} 条因异步队列满被直接丢弃" +
+                "（引擎/网页输出刷屏时发生，与限流折叠是两回事）—— 它们不在缓冲里。"
         }
         if (pending > 0) {
             notes += "有 $pending 个诊断包等待上传（网络恢复或下次启动时自动重试）。"
