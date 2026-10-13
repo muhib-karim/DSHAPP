@@ -375,6 +375,25 @@ object CrashRecorder {
             val f = File(dir, name)
 
             val sb = StringBuilder()
+            // ⚠️ **`reason` 与 `stack` 必须过脱敏网**（2026-10-14 对抗式审查查出）。
+            //   本文件是**唯一**不过 `LogStore.safeRedact` 的出口：它的内容最终由
+            //   `DiagnosticBundle.writeCrashes()` **逐字节**拷进诊断包，而 `reason`
+            //   直接来自异常 message（见 [install] 里 `"${err.javaClass.name}: ${err.message}"`）
+            //   —— 一条含 `?token=` 或 `sk-…` 的 message 就会原样出设备。
+            //
+            //   同一份文件里另外两段其实**已经**是脱敏过的，容易误以为整份都安全：
+            //   - `--- last 200 log lines ---` 来自 `LogStore.tail()`（写 app.log 时已抹）；
+            //   - `--- recent events ---` 来自 `EventLog.readAll()`（[EventLog.record]
+            //     现在已抹）。
+            //   只有 `reason` 与 `stack` 是原样进来的。所以只处理这两个字段，
+            //   不整份重扫 —— 崩溃路径上不做无谓的重活。
+            //
+            //   ⚠️ 用 `runCatching` 兜底：这里跑在崩溃路径上，脱敏失败绝不能让它抛
+            //   （铁律 ①）。失败时退化为原文，与修复前行为一致 —— 即「脱敏没成功」
+            //   不会比「从未尝试」更糟。
+            val safeReason = runCatching { Redactor.redact(reason) }.getOrDefault(reason)
+            val safeStack = stack?.let { runCatching { Redactor.redact(it) }.getOrDefault(it) }
+
             sb.append("time: ").append(fmt.format(Date(now))).append('\n')
             sb.append("kind: ").append(kind).append('\n')
             sb.append("bootId: ").append(BootState.bootId).append('\n')
@@ -388,10 +407,10 @@ object CrashRecorder {
             //   直接内联会让 `reason:` 那一行后面跟几百行，破坏格式、也把
             //   `LogViewerActivity` 的 12 行预览挤出 `--- stack trace ---` 之后的内容。
             //   折叠成 `\n` 字面量只是**显示**处理，栈全文仍在下方的 stack 段里完整保留。
-            sb.append("reason: ").append(reason.replace("\r\n", "\\n").replace("\n", "\\n")).append('\n')
+            sb.append("reason: ").append(safeReason.replace("\r\n", "\\n").replace("\n", "\\n")).append('\n')
 
-            if (stack != null) {
-                sb.append("\n--- stack trace ---\n").append(stack).append('\n')
+            if (safeStack != null) {
+                sb.append("\n--- stack trace ---\n").append(safeStack).append('\n')
             }
 
             // ⚠️ 最后 200 行：这是整个现场里信息量最大的一段。
@@ -410,7 +429,6 @@ object CrashRecorder {
             }.onFailure { sb.append("(事件时间线不可读: ${it.message})\n") }
 
             f.writeText(sb.toString())
-
             // 现场文件写完后，在 app.log 里留一条索引（拿得到锁才有）。
             // ⚠️ 让用户在日志界面顺着时间翻也能看到「这里发生过什么」。
             withLogLock {

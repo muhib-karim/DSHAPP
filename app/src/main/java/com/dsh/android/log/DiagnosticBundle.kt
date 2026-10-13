@@ -171,6 +171,8 @@ object DiagnosticBundle {
                         put(
                             "scope",
                             "只覆盖 checked 列出的条目（本次实际走过自检的那些，都是新构造的文本）。" +
+                                "**manifest.json 自身不在其中** —— 它承载的就是这份自检结论，" +
+                                "不能自引用（先有结论才能写它）。" +
                                 "流式写的 crashes/ · *.log · engine-startup/ 由各自的写入方" +
                                 "（LogStore.safeRedact / EventLog.record）在写入时脱敏，" +
                                 "**未在打包时复检**；因此 clean=true 的含义是" +
