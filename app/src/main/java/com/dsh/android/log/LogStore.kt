@@ -367,6 +367,10 @@ object LogStore {
                 webBytes = 0L
             }
         }
+        // ⚠️ `events.jsonl` 也在这份删除清单里，所以 EventLog 的 writer 同样必须重开 ——
+        //   它与 engine/web 是同一个失效模式（引用非空即写旧 writer），只是没有惰性
+        //   创建、需要显式重开。见 [EventLog.reopen]。
+        runCatching { EventLog.reopen(logDir) }
         app('I', "Log", "日志已由用户清空（删除 $n 个文件）")
         return n
     }

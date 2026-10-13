@@ -171,6 +171,34 @@ object EventLog {
         return "[+${elapsed}ms] $name ${detail}".trim()
     }
 
+    /**
+     * 文件被外部删掉后重开（[LogStore.clearAll] 删了 `events.jsonl` 时调用）。
+     *
+     * ⚠️ **不重开就等于此后所有事件都写进幽灵文件**（踩过）：[record] 第一行是
+     * `val w = writer ?: return` —— 引用非空就直接写**旧** writer，永远不会自己
+     * 发现文件已被删。Linux 上那个 inode 已经**没有名字**，写入不报错、进程一死
+     * 内容就没了，而 `.jsonl` 时间线恰恰是排查「上次卡在哪一步」的主线索。
+     *
+     * 与 [LogStore.clearAll] 里重开 engineWriter / webWriter 是同一类修复
+     * （那两个走惰性创建，这里是显式重开）——三处必须一起做，漏一处就还有一份
+     * 日志在清空后失写。
+     */
+    fun reopen(logDir: File) {
+        try {
+            synchronized(this) {
+                runCatching { writer?.close() }
+                writer = null
+                val f = File(logDir, FILE_NAME)
+                file = f
+                writer = BufferedWriter(OutputStreamWriter(FileOutputStream(f, true), Charsets.UTF_8))
+                bytes = f.length()
+            }
+        } catch (t: Throwable) {
+            AndroidLog.w(TAG, "EventLog.reopen 失败（此后事件只进 app.log）: ${t.message}")
+            writer = null
+        }
+    }
+
     fun flushAndClose() {
         try {
             synchronized(this) { writer?.flush() }
