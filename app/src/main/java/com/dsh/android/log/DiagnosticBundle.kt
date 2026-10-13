@@ -233,7 +233,7 @@ object DiagnosticBundle {
                 f.inputStream().use { it.copyTo(zos) }
                 zos.closeEntry()
                 written.add(name)
-                recordRange(completeness, name, f, truncated = false)
+                recordRange(completeness, name, f, truncated = false, includedBytes = size)
                 size
             } else if (budget > 64 * 1024) {
                 // 保留尾部 budget 字节
@@ -242,14 +242,24 @@ object DiagnosticBundle {
                 val cut = text.takeLast(keep.toInt().coerceAtMost(text.length))
                 val content = "…（本文件前 ${text.length - cut.length} 字符因体积上限被截断）…\n$cut"
                 zos.putNextEntry(ZipEntry(name))
+                val writtenBytes = content.toByteArray(Charsets.UTF_8).size.toLong()
                 zos.write(content.toByteArray(Charsets.UTF_8))
                 zos.closeEntry()
                 written.add(name)
-                recordRange(completeness, name, f, truncated = true)
-                keep
+                recordRange(completeness, name, f, truncated = true, includedBytes = writtenBytes)
+                writtenBytes
             } else {
+                // ⚠️ **整个跳过时必须与「截断」区分开。** 这条分支一个字都没进包，
+                //   而上面那条只砍了头部。两者原来都写 `truncated = true`，
+                //   分析者看到 true 会以为「包里有这个文件的一部分」，
+                //   于是去包里找、找不到，再怀疑是打包坏了 —— 而同一份 JSON 里的
+                //   `${name}_skipped` 明明写着「已跳过」。两个字段互相矛盾。
+                //
+                //   现在的口径：`truncated` = **未完整进包**（false ⟺ 逐字节完整），
+                //   再用 `includedBytes` 区分「部分（>0）」与「一条都没有（0）」，
+                //   并由 `skipped: true` 点明是整跳。三个字段各管一件事，不重叠。
                 completeness.put("${name}_skipped", "体积预算不足，已跳过")
-                recordRange(completeness, name, f, truncated = true)
+                recordRange(completeness, name, f, truncated = true, includedBytes = 0L, skipped = true)
                 0L
             }
         } catch (t: Throwable) {
@@ -342,17 +352,38 @@ object DiagnosticBundle {
      *
      * ⚠️ 这是 `completeness` 里最重要的信息：分析者必须能回答「这份日志覆盖了
      * 哪段时间」。否则「日志里没有这条错误」可能只是**那段时间不在包里**。
+     *
+     * ⚠️ **`sizeBytes` 是源文件在设备上的大小，不是包里的字节数。**
+     *   截断时两者能差出几个数量级（源 8MB、包里 0 字节）。原来只有这一个字段，
+     *   分析者拿它当「包里有这么多」，于是会以为日志完整 —— 明明 `truncated`
+     *   就写着 true。所以补一个 [includedBytes]（真正写进包的字节数），
+     *   两者一比即可看出被砍掉了多少。
+     *
+     * @param truncated **未完整进包**。false ⟺ 逐字节完整。
+     * @param includedBytes 真正写进 zip 的字节数（整跳时为 0）。
+     * @param skipped 整个文件都没进包（与「部分保留」区分）。
      */
-    private fun recordRange(completeness: JSONObject, name: String, f: File, truncated: Boolean) {
+    private fun recordRange(
+        completeness: JSONObject,
+        name: String,
+        f: File,
+        truncated: Boolean,
+        includedBytes: Long,
+        skipped: Boolean = false,
+    ) {
         runCatching {
             completeness.put(
                 name,
                 JSONObject().apply {
                     put("sizeBytes", f.length())
+                    put("includedBytes", includedBytes)
                     put("truncated", truncated)
+                    if (skipped) put("skipped", true)
                     put("lastModified", f.lastModified())
                     put("lastModifiedText", fmt.format(Date(f.lastModified())))
-                    put("lines", countLines(f))
+                    // ⚠️ 行数同样是**源文件**的（截断时包里的行数少得多）。
+                    //   键名带上 `onDevice` 以免被当成「包里有多少行」。
+                    put("linesOnDevice", countLines(f))
                 },
             )
         }
