@@ -769,6 +769,41 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
 这三个都是踩过的坑。
 
+### ⚠️ 改 `mobile-ui-plugin/**` 的源码**必须手工重打对应的 `.zip`**
+
+`assets/*.zip` 全部被 `.gitignore` 忽略（L33），**没有任何打包脚本** ——
+`logs-tool.zip` / `bubble-tool.zip` / `statusbar-tool.zip` / `shell-tool.zip` /
+`uiagent-tool.zip` / `root-tool.zip` 都是**手工**打的。所以改完源码很容易
+「commit 了、构建也过了、APK 里却是旧代码」。
+
+**真踩过（`b0fbb4b`，10-14 02:44）**：那次给 6 个工具插件加了「注册失败不拖垮引擎」
+的 try/catch，但只改了源码、一个 zip 都没重打。事后补打时又**漏了
+`root-tool.zip`** —— 它停在 10-08 的版本，于是 `0.2.9-tooliso` 的 APK 里
+**唯独 root 插件仍会在注册失败时把整个引擎带崩**（这正是那次修复要解决的问题）。
+
+**判据（每次改完必须做）**：zip 内的 `lib/index.js` 必须与源目录**逐字节一致**。
+一条命令验完 6 个：
+
+```powershell
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$pairs=@{'logs-tool'='dsh-android-logs';'bubble-tool'='dsh-android-bubble';
+ 'statusbar-tool'='dsh-android-statusbar';'shell-tool'='dsh-android-shell';
+ 'uiagent-tool'='dsh-android-uiagent';'root-tool'='dsh-android-root'}
+foreach($k in $pairs.Keys){
+  $z=[IO.Compression.ZipFile]::OpenRead((Resolve-Path "app\src\main\assets\$k.zip").Path)
+  foreach($e in $z.Entries){
+    $r=New-Object IO.StreamReader($e.Open());$a=$r.ReadToEnd();$r.Dispose()
+    $b=Get-Content "mobile-ui-plugin\$($pairs[$k])\$($e.FullName -replace '/','\')" -Raw
+    if($a -ne $b){ "⚠️ $k :: $($e.FullName) 不一致" }
+  }
+  $z.Dispose()
+}
+```
+
+**打包格式**（六个 zip 同构）：条目为 `package.json` + `lib/index.js`
+（`uiagent-tool` 多一个 `lib/screens.js`），**相对路径、没有顶层目录** ——
+`EngineManager` 直接往 `$DSH_HOME/<xxx>-tool/dsh-android-xxx/` 解，多一层目录就找不到入口。
+
 ### ⑦ WebView 默认没有文件选择器 —— 必须实现 `onShowFileChooser`
 
 **症状**：composer 里点「+」→「文件」，**静默无反应**，没有报错、没有日志。
