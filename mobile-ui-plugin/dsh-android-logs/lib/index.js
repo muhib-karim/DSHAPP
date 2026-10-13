@@ -211,9 +211,15 @@ function renderText(value) {
 	}
 	if (typeof value.counts === 'object' && value.counts !== null) {
 		const c = value.counts;
+		// ⚠️ 标签是「现场文件」不是「崩溃现场」：`counts.crash` 数的是 `crash/`
+		//   目录下的**全部** .txt，其中大部分是**非**崩溃类（引擎起不来、引擎正常
+		//   退出、主线程卡住、渲染进程被回收…）。而同一屏的 `结论:` 行会写
+		//   「有 N 份非崩溃现场（…）」—— 两行指着同一批文件却一个说「非崩溃」
+		//   一个说「崩溃」，模型会据此认为存在 N 份崩溃。
+		//   真正的硬崩溃数只有 `crashes` 分支的 `[崩溃]/[非崩溃]` 标签能给出。
 		lines.push(
 			`计数: 共 ${c.total ?? 0} 条 / 警告 ${c.warn ?? 0} / 错误 ${c.error ?? 0}`
-			+ ` / 崩溃现场 ${c.crash ?? 0} / 待上传 ${c.pending ?? 0}`,
+			+ ` / 现场文件 ${c.crash ?? 0} / 待上传 ${c.pending ?? 0}`,
 		);
 	}
 	if (typeof value.throttleNote === 'string' && value.throttleNote !== '') {
@@ -234,10 +240,11 @@ function renderText(value) {
 	// crashes 分支
 	if (Array.isArray(value.scenes)) {
 		if (value.scenes.length === 0) {
-			lines.push('崩溃现场: 无');
+			lines.push('现场文件: 无');
 		} else {
 			lines.push('');
-			lines.push(`—— 崩溃现场（${value.scenes.length} 份）——`);
+			// 标题同样不能说「崩溃现场」：这一列里通常大部分是 `[非崩溃]`。
+			lines.push(`—— 现场文件（${value.scenes.length} 份，逐份标注是否真崩溃）——`);
 			for (const s of value.scenes) {
 				lines.push(`${s.file}  ${s.hardCrash ? '[崩溃]' : '[非崩溃]'}  ${s.atText ?? ''}  ${s.sizeBytes ?? 0} B`);
 			}
