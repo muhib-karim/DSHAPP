@@ -104,10 +104,10 @@ object LogStore {
     private const val THROTTLE_WINDOW_MS = 1000L
     private const val THROTTLE_MAX_REPEAT = 20
 
-    private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     /** 紧凑时间戳（文件名用，不能含冒号）。 */
-    private val fileFmt = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+    private val fileFmt = SafeDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
     // ── 写入句柄 ──────────────────────────────────────────────────────────────
 
@@ -343,7 +343,13 @@ object LogStore {
             APP_LOG, "$APP_LOG.1",
             ENGINE_LOG, "$ENGINE_LOG.1",
             WEB_LOG, "$WEB_LOG.1",
-            EventLog.FILE_NAME,
+            // ⚠️ **`.1` 必须成对写**（2026-10-14 对抗式审查查出）：`EventLog.rotate()`
+            //   产生的正是 `events.jsonl.1`，而 `EventLog.readAll()` 读的也是它
+            //   （读取列表是 `["$FILE_NAME.1", FILE_NAME]`）。只删当前代的话，
+            //   用户点「清空日志」后界面看不到旧事件了，但**下一次导出诊断包时
+            //   `timeline.jsonl` 仍会包含清空前的全部事件** —— 用户以为清干净了
+            //   并把包发出去。上面三对都写全了，唯独 events 少了，不像有意为之。
+            EventLog.FILE_NAME, "$(EventLog.FILE_NAME).1",
             "last-crash.txt",
         )
         for (name in targets) {
@@ -415,7 +421,12 @@ object LogStore {
                 w.write(line)
                 w.write("\n")
                 w.flush()
-                appBytes += line.length + 1
+                // ⚠️ **按真实字节数计**，不能拿 `line.length`（那是 UTF-16 字符数）。
+                //   真机 `app.log` 实测 344,103 字节 / 286,637 字符 = 1.202 B/char，
+                //   即声明的 1 MB 轮转实际在 ~1.2 MB 才触发；日志全中文时到 3x。
+                //   同源问题也修在 `EventLog.record`（那里原来用的是 `JSONObject.length()`，
+                //   低估 20 倍）。见 2026-10-14 对抗式审查报告。
+                appBytes += line.toByteArray(Charsets.UTF_8).size.toLong() + 1
                 // ⚠️ **写成功必须清零，否则「连续」二字是假的。** [noteFailure] 的
                 //   注释与它写进 app.log 的文案都是「**连续**写入失败 N 次」，
                 //   而原来这个计数器只增不减 —— 于是三次**相隔几小时**的瞬时失败
@@ -513,10 +524,12 @@ object LogStore {
             while (true) {
                 try {
                     val item = queue.poll(1, TimeUnit.SECONDS) ?: continue
-                    when (item.target) {
+                    val needRotate = when (item.target) {
                         QueuedLine.Target.ENGINE -> writeAsync(engineWriterOf(), item.line, { n -> engineBytes = n }, { engineBytes })
                         QueuedLine.Target.WEB -> writeAsync(webWriterOf(), item.line, { n -> webBytes = n }, { webBytes })
                     }
+                    // 轮转在 [writeAsync] 的锁**之外**做（它自己要 close/rename/重开）。
+                    if (needRotate) rotateAsync(item.target)
                 } catch (_: InterruptedException) {
                     return@Thread
                 } catch (_: Throwable) {
@@ -554,26 +567,85 @@ object LogStore {
         }
     }
 
+    /**
+     * 写一行异步日志。**返回值 = 这一行之后是否需要轮转**（由调用方在锁外执行
+     * [rotateAsync]，原因见那里的注释）。
+     */
     private fun writeAsync(
         w: BufferedWriter?,
         line: String,
         setBytes: (Long) -> Unit,
         getBytes: () -> Long,
-    ) {
-        if (w == null) return
-        try {
+    ): Boolean {
+        if (w == null) return false
+        return try {
             lock.withLock {
                 w.write(line)
                 w.write("\n")
-                // 异步档**攒着不 flush**：靠 BufferedWriter 自己的缓冲 + 下面的
-                // 阈值触发。这正是它与 app.log 的区别所在。
-                val next = getBytes() + line.length + 1
+                // 异步档**攒着不 flush**：靠 BufferedWriter 自己的缓冲 + 阈值触发。
+                // 这正是它与 app.log 的区别所在。
+                val next = getBytes() + line.toByteArray(Charsets.UTF_8).size.toLong() + 1
                 setBytes(next)
                 if (next >= MAX_FILE_BYTES) {
                     w.flush()
+                    return@withLock true
+                }
+                false
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 异步档（`engine.log` / `web.log`）的轮转。
+     *
+     * ## 🔴 为什么必须补上（2026-10-14 对抗式审查查出）
+     *
+     * 原来这两路**根本没有轮转**：`rotateFiles()` 在全仓库只有 `rotateApp()` 一个
+     * 调用点，所以 [MAX_FILE_BYTES] 对它们唯一的实际效果就是「到 1 MB 就 flush 一次」。
+     * 而 [enforceDirQuota] 又把这两个文件名排除在删除之外（理由正当：writer 会写到
+     * 已 unlink 的 inode 上）—— 于是它们是**唯一既不长轮转、又不受配额管**的文件。
+     *
+     * 后果是一条闭环的坏链：引擎 stdout / 网页 console 刷屏（正是最容易刷屏的两路）
+     * ⇒ `engine.log`/`web.log` 无上限增长 ⇒ 撑爆 32 MB 总配额 ⇒ [enforceDirQuota]
+     * 把其它文件（含 `device-id`、`events.jsonl`）删光 ⇒ **仍降不回配额**，
+     * 因为超标的正是这两个不能删的文件。
+     *
+     * 这与 `AGENTS.md` 的三处明文（「1MB 轮转，留一代」）以及插件描述
+     * （`mobile-ui-plugin/dsh-android-logs/lib/index.js`：All three are capped at
+     * ~1 MB per file with one rotated generation）都不符 —— 那三处说的是**三个**
+     * 文件都轮转，实现里只有一个。
+     *
+     * ## 为什么放在 `writeAsync` 之外
+     *
+     * [writeAsync] 在 `lock.withLock` 里被调用，而轮转要 close + rename + 重开
+     * writer，不能在同一把锁内做（重开走 `engineWriterOf()`，它自己也要拿这把锁
+     * —— `ReentrantLock` 虽然可重入，但在这里做重活会把 worker 卡住）。
+     * 所以由调用方在写完之后判断，与 `app.log` 的 `rotateApp()` 结构一致。
+     *
+     * @param target 轮转哪一路（决定重开哪个 writer、以及哪两个字节计数要清零）。
+     */
+    private fun rotateAsync(target: QueuedLine.Target) {
+        try {
+            lock.withLock {
+                when (target) {
+                    QueuedLine.Target.ENGINE -> {
+                        runCatching { engineWriter?.close() }
+                        engineWriter = null
+                        dir?.let { rotateFiles(File(it, ENGINE_LOG)) }
+                        engineBytes = 0L
+                    }
+                    QueuedLine.Target.WEB -> {
+                        runCatching { webWriter?.close() }
+                        webWriter = null
+                        dir?.let { rotateFiles(File(it, WEB_LOG)) }
+                        webBytes = 0L
+                    }
                 }
             }
         } catch (_: Throwable) {
+            // 轮转失败不该让日志线程挂掉：writer 已置空，下一行会走惰性重开。
         }
     }
 
@@ -592,21 +664,31 @@ object LogStore {
      */
     fun flushAsync() {
         try {
+            // ⚠️ **排干时越过 1 MB 的那一行，很可能就是本方法自己写的** ——
+            //   所以不能在锁内轮转（`rotateAsync` 要拿同一把锁并做 close/rename），
+            //   必须把「需要轮转」这个事实带出锁外再执行。原来这里直接忽略返回值，
+            //   靠「worker 下一行会轮转」兜底：如果此后**再没有新行**（打包完就退出、
+            //   或引擎安静了），文件就永远停在超限状态，而 `engine.log` 恰好是
+            //   唯一不受 `enforceDirQuota` 管的那两个之一（见 [rotateAsync]）。
+            var rotateTarget: QueuedLine.Target? = null
             lock.withLock {
                 // ① 排干队列：直接自己写，不等 worker 调度。
                 while (true) {
                     val item = queue.poll() ?: break
-                    when (item.target) {
+                    val need = when (item.target) {
                         QueuedLine.Target.ENGINE ->
                             writeAsync(engineWriterOf(), item.line, { n -> engineBytes = n }, { engineBytes })
                         QueuedLine.Target.WEB ->
                             writeAsync(webWriterOf(), item.line, { n -> webBytes = n }, { webBytes })
                     }
+                    if (need) rotateTarget = item.target
                 }
                 // ② 再 flush 已经攒在 BufferedWriter 里的。
                 engineWriter?.flush()
                 webWriter?.flush()
             }
+            // ③ 锁外轮转（只可能有一路超限；两路同时超限时下一轮再处理另一路）。
+            rotateTarget?.let { rotateAsync(it) }
         } catch (_: Throwable) {
         }
     }
@@ -771,19 +853,46 @@ object LogStore {
      *
      * ⚠️ 崩溃现场另有 [enforceCrashQuota] 单独把关（8MB / 20 份）；
      *   `pending/` 靠「上传成功即出队」收敛；**`failed/` 目前没有任何上限**。
+     *
+     * ⚠️ **`device-id` 必须豁免，否则它必然第一个被删**（2026-10-14 对抗式审查查出）：
+     *   本函数按 `lastModified()` **升序**删，而 `device-id` 是**安装期写一次、
+     *   此后再不 touch** 的文件 —— 它的 mtime 永远是全目录最老的。真机 `adb stat`
+     *   实测它比第二名早 **5994 秒**（`device-id` mtime=1791919580，
+     *   `web.log`=1791925574）。也就是说只要配额触发，**第一个被删的就是它**，
+     *   而本文件 L333 的 KDoc 明明写着「不删 `device-id`」—— 文档与实现直接分叉。
+     *   后果：服务器侧同一台机器变成 N 台设备，崩溃上报无法关联。
+     *   代价极低（36 字节，删它省不下任何配额），所以直接豁免。
+     *
+     * ⚠️ **降不回配额时要留痕。** `app.log`/`engine.log`/`web.log` 三个正在被写的
+     *   文件不能删（见下），若它们单独就超过 [TOTAL_QUOTA_BYTES]，循环会把**其它
+     *   所有文件删光**也降不回配额，然后静默退出。原来那种「删完就走」的写法让
+     *   分析者只看到「文件莫名少了一堆」，看不出是配额收敛失败。
      */
     private fun enforceDirQuota(d: File, quota: Long) {
         val files = d.listFiles() ?: return
         val candidates = files.filter { it.isFile }.sortedBy { it.lastModified() }
+        // `total` 含全部文件（配额确实是目录配额），但删除只对可删的那些动手。
         var total = candidates.sumOf { it.length() }
         if (total <= quota) return
+        val before = total
         for (f in candidates) {
             if (total <= quota) break
-            // 内存里正在写的那两个文件不能删 —— 删了 writer 会写到已 unlink 的
+            // 匿名指纹：删了它这台机器在服务器侧就变成另一台设备（见上面的 ⚠️）。
+            if (f.name == DEVICE_ID_FILE) continue
+            // 内存里正在写的那三个文件不能删 —— 删了 writer 会写到已 unlink 的
             // inode 上，日志从此静默消失（文件系统里看不到，但也不报错）。
             if (f.name == APP_LOG || f.name == ENGINE_LOG || f.name == WEB_LOG) continue
             val len = f.length()
             if (f.delete()) total -= len
+        }
+        if (total > quota) {
+            // 走到了这里说明「可删的都删了还是超标」—— 只可能是那三个活文件自己就超了。
+            // 必须说出来：否则现象是「日志文件莫名少了一堆，配额却还是超」。
+            AndroidLog.w(
+                TAG,
+                "日志配额降不回（${before / 1024}KB → ${total / 1024}KB，配额 ${quota / 1024}KB）：" +
+                    "可删的文件已删光，剩下的 ${APP_LOG}/${ENGINE_LOG}/${WEB_LOG} 正在被写入、不能删",
+            )
         }
     }
 
@@ -853,6 +962,14 @@ object LogStore {
     const val APP_LOG = "app.log"
     const val ENGINE_LOG = "engine.log"
     const val WEB_LOG = "web.log"
+
+    /**
+     * 安装期生成一次的匿名设备指纹。
+     *
+     * ⚠️ **这个文件受 [enforceDirQuota] 豁免**（见其注释）—— 它是最老的，
+     *   不豁免就必然第一个被删。[LogUploader] 也读它，所以名字只在这里定义一次。
+     */
+    const val DEVICE_ID_FILE = "device-id"
 
     private const val TAG = "DSH/LogStore"
 }

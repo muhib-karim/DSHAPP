@@ -251,7 +251,14 @@ class TermuxBootstrap(private val context: Context) {
     }
 
     /**
-     * 每次启动都跑：确保各包管理器指向已选定的国内快源（幂等，内容相同则不写盘）。
+     * 每次启动都跑：确保各包管理器指向**候选表里**的国内快源（幂等，内容相同则不写盘）。
+     *
+     * ⚠️ **这里是「写死的那张表」，不是「实测最快的那张表」。** 真机实测过的
+     *   「打 19 个候选站挑最快」那条链路是 [probeMirrors]，而它**从未被调用**
+     *   （见其 KDoc 的核实记录）。所以本函数实际写入的是
+     *   [MirrorProbe.defaults]（各生态实测最快的那一个）或 `mirrors.conf` 里
+     *   已被 [MirrorProbe.loadOrDefaults] 自愈过的表 —— 后者同样源自默认表。
+     *   说清楚这一点，是为了不让排查者以为「某生态慢」是测速选错了站。
      *
      * ⚠️ **不能挂在 [ensurePathsRewritten] 里**：那条路径被 `.paths_rewritten_v6` 门住，
      * 已装好的机器永远不会再进 —— 也就是说新增的镜像配置对**老装机完全不会生效**。
@@ -687,6 +694,21 @@ class TermuxBootstrap(private val context: Context) {
     /**
      * 后台跑一次镜像测速，挑每个生态最快的源并落盘。**不阻塞启动**。
      *
+     * ⚠️ **⚠️ 本函数从未被调用过（死代码，2026-10-14 核实）。**
+     *   `git log --all -S 'probeMirrors('` 只有初始提交 `e253c7c` 那一条，
+     *   全仓库（Kotlin / Java / 资产 / 插件 JS）搜不到任何调用点。
+     *
+     *   **后果**：下面的 KDoc 描述的能力——「让机器实测一遍比让模型记住一张表
+     *   可靠得多」——**从来没有生效过**。实际生效的只有
+     *   `MirrorProbe.loadOrDefaults`（读 [MirrorProbe.STATE_FILE]，不存在/损坏
+     *   时回退候选表默认值）。所以 `mirrors.conf` 里永远是 `defaults()` 那张
+     *   写死的表，不是实测结果。
+     *
+     *   ⚠️ 别把这段话当成「补个调用点就好」——`probeScript()` 会打 19 个候选站，
+     *   而它**每次启动都要跑**（`ensureMirrorsConfigured` 是每启动必跑的路径）还是
+     *   只在首次跑，是个需要真机实测才能定的功能决策，不是缺陷修复。
+     *   在这里写明「没接线」是为了不让下一个人照 KDoc 以为它已经生效。
+     *
      * 为什么值得自动跑：真机实测 `pypi.org` 与 `proxy.golang.org` 完全不可达、
      * aliyun 是 PyPI 冠军但 APT 是 404 —— 写死任何一个源都会在某个生态上静默失败。
      * 让机器实测一遍比让模型记住一张表可靠得多（这正是用户要的「先检索节点挑最快」）。
@@ -740,13 +762,33 @@ class TermuxBootstrap(private val context: Context) {
         out
     }
 
-    /** 落盘镜像选择 + 记录我们写进 sources.list 的 apt 源，供下次判断是否被用户改过。 */
+    /**
+     * 落盘镜像选择 + 记录我们写进 sources.list 的 apt 源，供下次判断是否被用户改过。
+     *
+     * ⚠️ **本函数目前没有活调用点。** 唯一调用者是 [probeMirrors]，而它从初始提交
+     *   `e253c7c` 起就**从未被任何地方调用**（`git log -S 'probeMirrors('` 只有初始
+     *   提交那一条，此后无人调用）—— 也就是说自动测速这条链路整条是死的，
+     *   `mirrors.conf` 从来只有 `MirrorProbe.loadOrDefaults` 的**自愈写**在维护
+     *   （那条会写 `apt_written`，所以 `isUserCustomizedApt` 的判定仍能工作）。
+     *
+     *   这与 `skipDirs` / `writeEntry` / `bumpAttempts` 是同一族缺陷：**KDoc 承诺了
+     *   一个实现里不存在的保证**（[probeMirrors] 的 KDoc 写着「后台跑一次镜像测速…
+     *   不阻塞启动」，读代码的人会以为镜像会自动择优）。真要修不是补这一行的返回值，
+     *   而是决定这条链路**要不要接上** —— 那属于功能决策，不是缺陷修复，见 AGENTS.md。
+     */
     private fun saveState(mirrors: Map<String, String>) {
         val withApt = LinkedHashMap(mirrors)
         mirrors[MirrorProbe.ECO_APT]?.let { withApt[MirrorProbe.KEY_APT_WRITTEN] = it }
         val f = File(dataDir, MirrorProbe.STATE_FILE)
         try {
-            AtomicTextFile.write(f, MirrorProbe.encodeState(withApt))
+            // ⚠️ **必须检查返回值**：`AtomicTextFile.write` 失败时**返回 false 而不抛异常**
+            //   （见其 KDoc），只包 try/catch 接不住这种失败。写不进去的后果不是
+            //   「少了个缓存」—— `apt_written` 是下次启动判断「sources.list 是不是被
+            //   用户手改过」的唯一依据；丢了这个键，App 会把自己上次写的源当成
+            //   「用户改的」，于是再也不更新 apt 源，而日志里看不到任何异常。
+            if (!AtomicTextFile.write(f, MirrorProbe.encodeState(withApt))) {
+                Log.w("TERMUX", "镜像选择落盘失败（${f.name}）：下次启动可能误判 apt 源被用户改过")
+            }
         } catch (e: Exception) {
             Log.w("TERMUX", "save mirror state: ${e.message}")
         }

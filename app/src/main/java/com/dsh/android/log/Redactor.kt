@@ -79,7 +79,23 @@ object Redactor {
                 "${m.groupValues[1]}${m.groupValues[2]}${m.groupValues[3]}***REDACTED***${m.groupValues[3]}"
             }
         }
-        if (out.contains("token=") || out.contains("api_key=") || out.contains("key=")) {
+        // ⚠️ **守卫不能枚举键名，必须问「这条正则会不会命中」。**
+        //   原来写的是 `out.contains("token=") || out.contains("api_key=") || out.contains("key=")`
+        //   —— 而它守卫的 [urlSecretPattern] 还匹配 `secret=` 与 `access_token=`。
+        //   于是 `?secret=<base64>` 这种形态**守卫为假 ⇒ 替换整段被跳过 ⇒ 原样进包出设备**。
+        //   （`access_token=` 侥幸没事，只因它含子串 `token=`；那是巧合不是设计。）
+        //
+        //   真机复现（同引擎 `java.util.regex` 逐字照抄三条正则与顺序）：
+        //     `?secret=%2BWpZq3RtY9kLmNvBx4Td`  守卫=false  urlRx=true  ⇒ 结果原样，零抹除
+        //     `?secret=YWJjZGVm%2FZ2hpamt`      守卫=false  urlRx=true  ⇒ 只抹了前半，尾部 `%2FZ2hpamt` 残留
+        //     `?token=…` / `?access_token=…` / `?key=…`  守卫=true  ⇒ 已抹
+        //   纯字母数字的 `?secret=…` 会被 [secretKeyPattern] 当副作用兜住，但 base64 经
+        //   URL 编码后含 `%`，而那条正则的字符类不含 `%` —— 两条都不管它。
+        //
+        //   改成 `containsMatchIn` 之后，「正则能命中就一定会被替换」，键名再增也不会漏。
+        //   代价是每次都跑一遍正则（比三个 contains 慢），但这条路径只在写日志时走一次，
+        //   且 [redact] 本来就在上面跑了两条正则 —— 量级不变。
+        if (urlSecretPattern.containsMatchIn(out)) {
             out = urlSecretPattern.replace(out) { m -> "${m.groupValues[1]}***REDACTED***" }
         }
         return out

@@ -24,6 +24,7 @@ import com.dsh.android.log.DiagnosticBundle
 import com.dsh.android.log.DshLog
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
+import com.dsh.android.log.SafeDateFormat
 import com.dsh.android.log.LogUploader
 import com.dsh.android.log.VersionInfo
 import java.io.File
@@ -518,7 +519,7 @@ class LogViewerActivity : AppCompatActivity() {
         private const val REFRESH_MS = 2000L
         private const val MAX_CRASH_ROWS = 20
         private const val HEAD_LINES = 12
-        private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+        private val timeFmt = SafeDateFormat("HH:mm:ss.SSS", Locale.US)
 
         /**
          * 拉起日志界面的标准入口。

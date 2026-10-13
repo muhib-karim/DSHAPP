@@ -102,7 +102,9 @@ object LogUploader {
     }
 
     private fun loadOrCreateDeviceId(logDir: File): String = runCatching {
-        val f = File(logDir, "device-id")
+        // 名字取自 [LogStore.DEVICE_ID_FILE]，别在这里另写一份字面量 ——
+        // `enforceDirQuota` 靠同一个名字豁免它，两处漂移就会把它删掉（见那里的注释）。
+        val f = File(logDir, LogStore.DEVICE_ID_FILE)
         if (f.isFile) {
             f.readText().trim().takeIf { it.isNotEmpty() }?.let { return@runCatching it }
         }

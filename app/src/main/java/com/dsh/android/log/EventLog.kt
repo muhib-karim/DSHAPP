@@ -105,11 +105,41 @@ object EventLog {
                     put("fields", JSONObject().apply { fields.forEach { (k, v) -> put(k, v) } })
                 }
             }
+            // ⚠️ **事件行也必须过脱敏网**（2026-10-14 对抗式审查查出）。
+            //   `Redactor` 的类注释写着「日志系统有多个写入方（LogStore、EventLog、
+            //   CrashRecorder、EnvironmentSnapshot）……收敛到一处、由所有写入方共用」，
+            //   但 `Redactor.redact` 在全仓库**只有 `LogStore.safeRedact` 一个调用点**
+            //   —— 也就是说上面那句承诺里点名的四个写入方，只有第一个真的调了。
+            //
+            //   `EventLog` 这条通道的出口有两个，都会把**原文**带出设备：
+            //   ① `DiagnosticBundle.buildTimeline()` 把 `readAll()` 的结果原样拼成
+            //      包里的 `timeline.jsonl`（见那里的 `joinToString`，零处理）；
+            //   ② `CrashRecorder.writeScene()` 把 `readAll().takeLast(20)` 经
+            //      `describe()` 写进 `crash/*.txt`，再被 `writeCrashes()` 收进包。
+            //   而调用方往里塞的是**异常 message 与任意字符串**（如
+            //   `EventLog.record("termux.failed", mapOf("err" to (t.message ?: ...)))`），
+            //   一条含 `?token=` 或 `sk-…` 的 message 就会原样进包出设备。
+            //
+            //   实测：65 个真机诊断包里 `?token=` 出现 692 处、**全部**是
+            //   `***REDACTED***`，0 处原文 —— 但那是 `LogStore` 那三条通道
+            //   （app/engine/web）挡住的，**不是** EventLog 挡住的；EventLog 只是
+            //   恰好还没被塞进过密钥。这是「缺口存在但尚未被数据触发」，
+            //   与「没有缺口」是两回事。
+            val line = Redactor.redact(o.toString())
             synchronized(this) {
-                w.write(o.toString())
+                w.write(line)
                 w.write("\n")
                 w.flush()
-                bytes += o.length() + 1
+                // ⚠️ **不能用 `o.length()` 当字节数**（2026-10-14 对抗式审查查出）：
+                //   `org.json.JSONObject.length()` 返回的是**键的个数**，不是字符串
+                //   长度、更不是 UTF-8 字节数。每条事件固定 4~5 个键，于是每条只记
+                //   5~6 —— 而真实一行是 100+ 字节。真机 `events.jsonl` 实测：
+                //   21,094 字节 / 182 条，代码累计只有 1032，**低估 20.44 倍**
+                //   ⇒ 声明的 1 MB 轮转实际要到 **~20.4 MB** 才触发。
+                //   后果不只是文件大：它参与 `LogStore.enforceDirQuota` 的 32MB 总配额，
+                //   而且 `readAll()` 会把整个文件读进内存再拼成 `timeline.jsonl`。
+                //   现在用真实字节数（与 `LogStore.writeApp` 同口径）。
+                bytes += line.toByteArray(Charsets.UTF_8).size.toLong() + 1
                 if (bytes >= MAX_BYTES) rotate()
             }
         } catch (_: Throwable) {

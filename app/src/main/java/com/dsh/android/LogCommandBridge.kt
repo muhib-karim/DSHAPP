@@ -7,6 +7,7 @@ import com.dsh.android.log.DshLog as Log
 import com.dsh.android.log.LogContext
 import com.dsh.android.log.LogStore
 import com.dsh.android.log.LogUploader
+import com.dsh.android.log.SafeDateFormat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -75,7 +76,7 @@ object LogCommandBridge {
     /** 崩溃现场全文的字符上限。与插件侧的 `MAX_CRASH_CHARS` 一致。 */
     private const val MAX_CRASH_CHARS = 40000
 
-    private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "dsh-logs-cmd").apply { isDaemon = true }

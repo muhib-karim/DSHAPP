@@ -72,7 +72,7 @@ object BootState {
     /** 连续非正常结束多少次后，界面应当明确提示用户。 */
     const val UNSTABLE_THRESHOLD = 3
 
-    private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     @Volatile
     private var file: File? = null

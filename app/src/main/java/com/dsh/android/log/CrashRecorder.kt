@@ -57,10 +57,10 @@ object CrashRecorder {
 
     private const val TAG = "DSH"
 
-    private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     /** 文件名时间戳。不能含冒号（文件系统不允许）。 */
-    private val fileFmt = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+    private val fileFmt = SafeDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
     /** 现场文件名：`yyyyMMdd-HHmmss-<kind>.txt`（见 [writeScene] 的命名）。 */
     private val sceneNamePattern = Regex("^\\d{8}-\\d{6}-(.+)\\.txt$")
@@ -99,8 +99,21 @@ object CrashRecorder {
      *
      * 判错的代价是双向的：把冻结记成卡死 ⇒ 现场里一半是假警报，真问题被淹掉；
      * 而按「冻结」记下来正好解释了用户口中的「它自己卡住了」。
+     *
+     * ⚠️ **上界就是 [WATCHDOG_STALL_MS] + [WATCHDOG_PING_MS]，不是再乘 2**
+     *   （2026-10-14 对抗式审查查出）。上面那段的推理是：watchdog 每
+     *   [WATCHDOG_PING_MS] 醒一次，第一次发现 `gap > WATCHDOG_STALL_MS` 时，
+     *   这次醒来距上次醒来至多 [WATCHDOG_PING_MS] —— 所以 `gap` 必然 ≤
+     *   `WATCHDOG_STALL_MS + WATCHDOG_PING_MS` = **20 秒**。原值 `+ PING * 2`
+     *   = 25 秒，把 `(20s, 25s]` 这一段判成了 `main-thread-stall`（`level='E'`，
+     *   且被 `isHardCrash()` 算作真崩溃、界面标红）—— 而按本 KDoc 自己的论证，
+     *   这个区间**不可能**是主线程卡死。也就是说 KDoc 说「硬上界」，代码给了
+     *   5 秒的额外余量，恰好把要避免的「假警报标红」放回来了。
+     *
+     *   影响窗口很窄（只有 `(20s, 25s]`）：真机 44 份现场里 36 份的 `gap` 是
+     *   60~888 秒，那些仍走 freeze 分支，不受影响。
      */
-    private const val WATCHDOG_FREEZE_MS = WATCHDOG_STALL_MS + WATCHDOG_PING_MS * 2
+    private const val WATCHDOG_FREEZE_MS = WATCHDOG_STALL_MS + WATCHDOG_PING_MS
 
     /**
      * 系统 Web 内核抛出的未捕获异常，在 `reason` 前加的归因前缀。

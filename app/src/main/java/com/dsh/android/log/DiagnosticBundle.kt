@@ -62,8 +62,8 @@ object DiagnosticBundle {
      */
     private const val MAX_STARTUP_LOGS = 5
 
-    private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-    private val fileFmt = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+    private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fileFmt = SafeDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
     /**
      * 生成诊断包。
@@ -110,17 +110,20 @@ object DiagnosticBundle {
 
             val completeness = JSONObject()
             val entriesWritten = mutableListOf<String>()
+            // 脱敏自检：命中条目名 + **实际查过的条目名**（见 [writeEntry]）。
+            val redactionFindings = mutableListOf<String>()
+            val redactionChecked = mutableListOf<String>()
             var budget = MAX_BUNDLE_BYTES
 
             ZipOutputStream(out.outputStream().buffered()).use { zos ->
                 // ── ① 先写体积小、价值高的（保证它们一定进包）──
-                budget -= writeEntry(zos, "environment.json", EnvironmentSnapshot.collect(LogContext.get()).toString(2), entriesWritten)
+                budget -= writeEntry(zos, "environment.json", EnvironmentSnapshot.collect(LogContext.get()).toString(2), entriesWritten, redactionFindings, redactionChecked)
 
                 val diagnosis = runChecks(logDir, checks)
-                budget -= writeEntry(zos, "diagnosis.json", diagnosis.toString(2), entriesWritten)
+                budget -= writeEntry(zos, "diagnosis.json", diagnosis.toString(2), entriesWritten, redactionFindings, redactionChecked)
 
                 val timeline = buildTimeline(logDir, completeness)
-                budget -= writeEntry(zos, "timeline.jsonl", timeline, entriesWritten)
+                budget -= writeEntry(zos, "timeline.jsonl", timeline, entriesWritten, redactionFindings, redactionChecked)
 
                 // ── ② 崩溃现场（价值高、体量中等）──
                 budget -= writeCrashes(zos, logDir, entriesWritten, completeness)
@@ -130,7 +133,7 @@ object DiagnosticBundle {
                     budget -= writeEntry(
                         zos, "files.json",
                         EnvironmentSnapshot.collectFileStates(extraFiles).toString(2),
-                        entriesWritten,
+                        entriesWritten, redactionFindings, redactionChecked,
                     )
                 }
 
@@ -157,6 +160,23 @@ object DiagnosticBundle {
                     put("device", VersionInfo.deviceSummary())
                     put("entries", JSONArray(entriesWritten))
                     put("completeness", completeness)
+                    // ⚠️ **脱敏自检结论，口径必须写在结论旁边**（本项目第 15 类
+                    //   「结论与它描述的总体不符」正是这样产生的）。
+                    //   不能只写一个 `redactionOk: true` —— 那会让分析者以为
+                    //   「整包干净」，而实际只查了新构造的那 4 个文本条目。
+                    put("redaction", JSONObject().apply {
+                        put("checked", JSONArray(redactionChecked))
+                        put("unredactedEntries", JSONArray(redactionFindings))
+                        put("clean", redactionFindings.isEmpty())
+                        put(
+                            "scope",
+                            "只覆盖 checked 列出的条目（本次实际走过自检的那些，都是新构造的文本）。" +
+                                "流式写的 crashes/ · *.log · engine-startup/ 由各自的写入方" +
+                                "（LogStore.safeRedact / EventLog.record）在写入时脱敏，" +
+                                "**未在打包时复检**；因此 clean=true 的含义是" +
+                                "「新构造的文本没有漏网」，不等于「包内每个字节都已复检」。",
+                        )
+                    })
                     put("limits", JSONObject().apply {
                         put("maxBundleBytes", MAX_BUNDLE_BYTES)
                         put("crashTailLines", LogStore.CRASH_TAIL_LINES)
@@ -199,7 +219,27 @@ object DiagnosticBundle {
         name: String,
         content: String,
         written: MutableList<String>,
+        redactionFindings: MutableList<String>? = null,
+        redactionChecked: MutableList<String>? = null,
     ): Long {
+        // ⚠️ **脱敏自检就挂在这里**，因为这是「新构造的文本」进包的唯一出口。
+        //   见 [Redactor.looksUnredacted] 的 KDoc —— 那个函数原来零调用点，
+        //   属本项目已记录的「死代码造成的虚构保证」类；现在接上了。
+        //
+        //   ⚠️ **只记条目名，绝不记命中片段**：片段本身就是密钥，把它写进
+        //   `manifest.completeness` 等于自检自己制造了泄漏。分析者拿到包后
+        //   打开那个条目自己看即可。
+        //
+        //   ⚠️ **`redactionChecked` 必须在这里记，不能在调用方写死一份名单。**
+        //   第一版就是写死的（`environment.json / diagnosis.json / timeline.jsonl /
+        //   files.json` 四个名字），而 `files.json` 只在 `extraFiles` 非空时才写 ——
+        //   于是「export 路径」出的包里**没有** `files.json`，`checked` 却声称查了它。
+        //   那正是本项目已记录 14 次的缺陷族：**结论与它描述的总体不符**。
+        //   自检自己犯这个错尤其难看，所以改成「查到哪条记哪条」。
+        if (redactionChecked != null) redactionChecked.add(name)
+        if (redactionFindings != null && Redactor.looksUnredacted(content)) {
+            redactionFindings.add(name)
+        }
         val bytes = content.toByteArray(Charsets.UTF_8)
         zos.putNextEntry(ZipEntry(name))
         zos.write(bytes)
@@ -251,18 +291,49 @@ object DiagnosticBundle {
                 recordRange(completeness, name, f, truncated = false, includedBytes = size)
                 size
             } else if (budget > 64 * 1024) {
-                // 保留尾部 budget 字节
+                // ⚠️ **必须按字节切，不能按字符切**（2026-10-14 对抗式审查查出）。
+                //   原来写的是 `text.takeLast(budget)` —— 而 `budget` 是**字节**预算
+                //   （调用方 L113 从 `MAX_BUNDLE_BYTES = 8 MiB` 递减，且会写进
+                //   manifest 的 `limits.maxBundleBytes`），`takeLast` 切的是 **UTF-16
+                //   字符**。UTF-8 下一个中文字符占 3 字节，于是：
+                //
+                //   | 内容 | 声明预算 | 实际写入 |
+                //   |---|---|---|
+                //   | 纯 ASCII | 8 MiB | 8.0 MiB（1.00x） |
+                //   | 真机 app.log 字符分布（1.20 B/char） | 8 MiB | 9.6 MiB（1.20x） |
+                //   | 纯中文 | 8 MiB | **24.0 MiB（3.00x）** |
+                //
+                //   中文日志是本项目的常态，所以这不是理论问题。manifest 里那个
+                //   `maxBundleBytes` 是对分析者的**承诺**，超发 3 倍时承诺失效；
+                //   而 `completeness.truncated` 的口径写着「false ⟺ 逐字节完整」，
+                //   也跟着失真（分析者会以为「没超限 ⇒ 内容完整」）。
+                //
+                //   现在从尾部按 **code point** 反向累计 UTF-8 字节数，保证保留的
+                //   尾部 ≤ `keep` 字节，且不会把代理对（emoji）从中间劈开。
                 val keep = budget
                 val text = f.readText()
-                val cut = text.takeLast(keep.toInt().coerceAtMost(text.length))
+                var acc = 0L
+                var i = text.length
+                while (i > 0) {
+                    val cp = text.codePointBefore(i)
+                    val n = utf8Len(cp).toLong()
+                    if (acc + n > keep) break
+                    acc += n
+                    i -= Character.charCount(cp)
+                }
+                val cut = text.substring(i)
+                // ⚠️ 截断标记本身也要占几十字节，所以最终 `writtenBytes` 会比 `keep`
+                //   略大一点。这是**刻意的取舍**：标记必须留下（否则分析者不知道
+                //   头部被砍了），而那几十字节相对 64KB 起步的预算可忽略。
+                //   `recordRange` 记的是**真实**写入字节数，所以配额递减是准的。
                 val content = "…（本文件前 ${text.length - cut.length} 字符因体积上限被截断）…\n$cut"
                 zos.putNextEntry(ZipEntry(name))
-                val writtenBytes = content.toByteArray(Charsets.UTF_8).size.toLong()
-                zos.write(content.toByteArray(Charsets.UTF_8))
+                val bytes = content.toByteArray(Charsets.UTF_8)
+                zos.write(bytes)
                 zos.closeEntry()
                 written.add(name)
-                recordRange(completeness, name, f, truncated = true, includedBytes = writtenBytes)
-                writtenBytes
+                recordRange(completeness, name, f, truncated = true, includedBytes = bytes.size.toLong())
+                bytes.size.toLong()
             } else {
                 // ⚠️ **整个跳过时必须与「截断」区分开。** 这条分支一个字都没进包，
                 //   而上面那条只砍了头部。两者原来都写 `truncated = true`，
@@ -285,6 +356,20 @@ object DiagnosticBundle {
             completeness.put("${name}_failed", "读取失败: ${t.javaClass.simpleName}: ${t.message}")
             0L
         }
+    }
+
+    /**
+     * 一个 code point 编成 UTF-8 后占几字节。
+     *
+     * ⚠️ 存在的理由：`writeLogFile` 的预算是**字节**，而字符串按**字符**切 ——
+     *   两者之间的换算必须显式做，不能拿 `String.length` 当字节数（一个中文
+     *   字符 3 字节，一个 emoji 4 字节）。见 [writeLogFile] 里那张实测表。
+     */
+    private fun utf8Len(codePoint: Int): Int = when {
+        codePoint < 0x80 -> 1
+        codePoint < 0x800 -> 2
+        codePoint < 0x10000 -> 3
+        else -> 4
     }
 
     /**
