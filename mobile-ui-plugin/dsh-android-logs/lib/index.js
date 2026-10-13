@@ -221,6 +221,14 @@ function renderText(value) {
 			`计数: 共 ${c.total ?? 0} 条 / 警告 ${c.warn ?? 0} / 错误 ${c.error ?? 0}`
 			+ ` / 现场文件 ${c.crash ?? 0} / 待上传 ${c.pending ?? 0}`,
 		);
+		// ⚠️ **必须把两种总体分开说。** 上面那行把口径不同的两组数并排放在一起：
+		//   `共/警告/错误` 来自内存缓冲，只覆盖**本次运行**；`现场文件/待上传`
+		//   来自磁盘目录，是**跨多次运行累积**的。并排且不标注，读者会以为
+		//   「错误 0」说的是这台机器从来没出过错，而它只说明「这次启动以来没有」。
+		//   原生侧已在 `counts.scope` 里如实写清了，这里照搬，不要在渲染层丢掉。
+		if (typeof c.scope === 'string' && c.scope !== '') {
+			lines.push(`口径: ${c.scope}`);
+		}
 	}
 	if (typeof value.throttleNote === 'string' && value.throttleNote !== '') {
 		lines.push(`⚠ ${value.throttleNote}`);
