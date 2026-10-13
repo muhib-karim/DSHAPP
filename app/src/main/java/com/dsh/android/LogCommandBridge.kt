@@ -328,7 +328,16 @@ object LogCommandBridge {
         val scenes = CrashRecorder.listScenes()
         val hardCrashes = scenes.count { CrashRecorder.isHardCrash(it) }
         val logDir = LogStore.dirOrNull()
-        val pending = logDir?.let { LogUploader.pendingCount(it) } ?: 0
+        // ⚠️ **`pending` 计数不能只认 `LogStore.dirOrNull()`**（2026-10-14 自检发现）。
+        //   `LogStore.init` 失败（`dir = null`）时它返回 null，于是上面那行会把
+        //   `pending` 报成 **0** —— 而 `pending/` 目录和里面的 zip 是**磁盘上的东西**，
+        //   与 `LogStore.dir` 毫无关系。真机复现形态① 时 `logs/pending/` 明明还在。
+        //   报 0 的后果很具体：模型读到「待上传 0」就不会去追问那批包，
+        //   而它们正卡在磁盘上等着（`LogUploader.configure` 单独持有 logDir）。
+        //   退回用 `LogContext.filesDirOrNull()` 拼路径 —— 它由更早的
+        //   `LogContext.install` 装上，不依赖 `LogStore.init` 成不成功。
+        val dirForDirs = logDir ?: LogContext.filesDirOrNull()?.let { File(it, DshApplication.LOG_DIR) }
+        val pending = dirForDirs?.let { LogUploader.pendingCount(it) } ?: 0
 
         val prev = BootState.previous()
         val lastExit = prev.describe()
@@ -402,8 +411,34 @@ object LogCommandBridge {
             notes += "有 $pending 个诊断包等待上传（网络恢复或下次启动时自动重试）。"
         }
         if (notes.isNotEmpty()) out.put("throttleNote", notes.joinToString(" "))
-        out.put("message", "日志目录: ${logDir?.absolutePath ?: "（落盘不可用，仅内存）"}；" +
-            "缓冲 ${entries.size} 条（上限 ${LogStore.RING_MAX}）。")
+        // ⚠️ **这句话原先在两种失效形态下都是错的**（2026-10-14 真机实验证伪）。
+        //   `LogStore.logDirAvailable` = `dir != null`，即 `LogStore.init` 有没有
+        //   成功挂上目录；而"落盘不可用、仅内存"这个结论只在**目录也没挂上**时成立。
+        //   真机复现（把 `logs/app.log` 换成一个目录 ⇒ `init` 抛 EISDIR 失败）：
+        //   此时 `LogStore.dir` 是 null、`app.log`/`engine.log`/`web.log` 确实不写，
+        //   但**磁盘上照旧在长东西** —— 同一时刻实测：
+        //   - `events.jsonl` 3,593 B，其中 **6 行属于本次启动**（bootId 对得上）；
+        //   - `crash/` 里 13,777 B 的 `20261014-061130-renderer-crash.txt`；
+        //   因为 `EventLog.init` 与 `CrashRecorder.install` 各自持有 **自己的**
+        //   `logDir`，根本不看 `LogStore.dir`。
+        //   而这句话会说"落盘不可用、仅内存"⇒ 读者不去看 `events.jsonl` 与 `crash/`，
+        //   恰恰丢掉唯一还完整的证据（时间线 + 现场文件）。
+        out.put(
+            "message",
+            buildString {
+                append("日志目录: ")
+                append(if (LogStore.logDirAvailable) logDir?.absolutePath ?: "?" else "（未挂上，app.log/engine.log/web.log 本次不落盘）")
+                append("；缓冲 ${entries.size} 条（上限 ${LogStore.RING_MAX}）")
+                if (!LogStore.logDirAvailable) {
+                    append("。⚠️ 「未挂上」只针对 app.log/engine.log/web.log —— events.jsonl 与 crash/ " +
+                        "由 EventLog / CrashRecorder 各自持有目录，仍照常落盘，别跳过它们")
+                } else if (!LogStore.appLogEnabled) {
+                    append("。⚠️ app.log 句柄已关闭（连续 3 次写失败），本次此后不再写 app.log；" +
+                        "engine.log / web.log / events.jsonl / crash/ 仍照常落盘")
+                }
+                append("。")
+            },
+        )
     }
 
     /**
@@ -414,13 +449,35 @@ object LogCommandBridge {
      *   **下次启动时**补打包（崩溃进程只有几秒预算，做不了打包这种重活）。
      */
     private fun doExport(out: JSONObject) {
-        val logDir = LogStore.dirOrNull() ?: throw IllegalStateException("日志落盘不可用，无法生成诊断包")
+        // ⚠️ **不能只认 `LogStore.dirOrNull()`**（2026-10-14 真机复现后修）。
+        //   `LogStore.init` 失败（`dir = null`）时它返回 null，于是这里直接抛
+        //   「日志落盘不可用，无法生成诊断包」、**一个包都不打** —— 而真机实测
+        //   那个状态下磁盘上明明有料：`events.jsonl` 里 6 行属于本次启动、
+        //   `crash/` 里躺着 13,777 B 的现场文件。打一个包出来完全做得到，
+        //   只是里面没有 `app.log`/`engine.log`/`web.log` 三样。
+        //   拒绝生成等于「最需要取证的时候恰好不给取证」，而且理由是**假的**
+        //   （落盘并非不可用）。所以退到 `LogContext.filesDirOrNull()` 拼路径 ——
+        //   它由更早的 `LogContext.install` 装上，不依赖 `LogStore.init` 成不成功。
+        val logDir = LogStore.dirOrNull()
+            ?: LogContext.filesDirOrNull()?.let { File(it, DshApplication.LOG_DIR) }
+            ?: throw IllegalStateException("拿不到日志目录（LogContext 未安装），无法生成诊断包")
         val outDir = File(logDir, "export")
         val bundle = DiagnosticBundle.build(logDir, outDir, "manual")
             ?: throw IllegalStateException("诊断包生成失败（见 app.log）")
 
         out.put("bundlePath", bundle.absolutePath)
         out.put("bundleBytes", bundle.length())
+
+        // ⚠️ 用 `LogStore.logDirAvailable`（而不是 `logDir == null`）如实告诉模型
+        //   这个包**少了哪几样**。不写的话，模型拿到一个「能打开但 app.log 是空的」
+        //   的包，会以为「这台机器没报过错」—— 而实际是那三路本次根本没落盘。
+        if (!LogStore.logDirAvailable) {
+            out.put(
+                "message",
+                "⚠️ 本包是在「LogStore 目录未挂上」的状态下打的：不含 app.log / engine.log / web.log" +
+                    "（本次运行这三路都没落盘）。events.jsonl（时间线）与 crash/（崩溃现场）仍在包内。",
+            )
+        }
 
         // ⚠️ 额外复制一份到公共目录并把路径告诉模型：私有目录里的包**用户拿不到**
         //   （文件管理器进不去 `/data/data/`），而这条路存在的意义就是让用户能把

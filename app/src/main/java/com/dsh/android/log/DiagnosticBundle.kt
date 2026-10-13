@@ -271,7 +271,20 @@ object DiagnosticBundle {
         //   白烧了一轮排查。现在把「不存在 / 空 / 跳过」三种情况都写进 completeness，
         //   分析者一眼能看出是哪一种。
         if (!f.isFile) {
-            completeness.put("${name}_absent", "文件不存在")
+            // ⚠️ **必须区分「不存在」与「存在但不是文件」**（2026-10-14 自检发现）。
+            //   `!f.isFile` 对**目录**同样为真，于是 `logs/app.log` 被换成目录时
+            //   这里写的是 `app.log_absent: "文件不存在"` —— **假话**：它明明存在，
+            //   而且它存在这件事本身就是根因（`LogStore.init` 会因 `EISDIR` 失败）。
+            //   分析者读到「不存在」会去查「谁把 app.log 删了」，而正确的问题是
+            //   「谁在那儿建了个同名目录」。同族缺陷第 15 次的又一实例。
+            if (f.exists()) {
+                completeness.put(
+                    "${name}_notAFile",
+                    "路径存在但不是普通文件（isDirectory=${f.isDirectory}）—— 日志写不进去就是这个原因",
+                )
+            } else {
+                completeness.put("${name}_absent", "文件不存在")
+            }
             return 0L
         }
         val size = f.length()
@@ -689,14 +702,49 @@ object DiagnosticBundle {
         }
 
         // ④ 落盘是否可用
+        //
+        // ⚠️ **必须区分两种失效形态**（2026-10-14 真机复现后写死）。`fileLoggingEnabled`
+        //   是 `dir != null && appWriter != null`，把两件不同的事压成了一个布尔：
+        //   ① 目录没挂上（`LogStore.init` 失败）⇒ `app.log`/`engine.log`/`web.log`
+        //      三路都不写；
+        //   ② 目录在、只是 `app.log` 的句柄被 `noteFailure` 关了 ⇒ `engine.log`
+        //      / `web.log` 照旧在写。
+        //   **但两种形态下都有一批文件照旧落盘** —— 真机把 `logs/app.log` 换成一个
+        //   目录（`init` 报 `EISDIR` 失败、`LogStore.dir = null`）后实测：
+        //   `events.jsonl` 仍在长（其中 **6 行属于本次启动**，bootId 对得上）、
+        //   `crash/` 里的现场文件照旧存在。因为 `EventLog.init` 与
+        //   `CrashRecorder.install` 各自持有**自己的** `logDir`，不光看 `LogStore.dir`。
+        //   原文案只有一句「文件日志不可用（磁盘满/只读/权限），只有内存缓冲」，
+        //   三重错误：
+        //   - 事实错①：形态①下 `events.jsonl` / `crash/` 仍在落盘；
+        //   - 事实错②：形态②下 `engine.log` / `web.log` 也在落盘；
+        //   - 原因错：本文件 L601 的设计原则明写「只报事实，不猜原因」，
+        //     而括号里那三个原因一个都没被本方法检查过，是凭空断言。
+        //   后果很具体：读者读到「只有内存缓冲」，就不去翻 `engine.log` 与
+        //   `events.jsonl` —— 而引擎的报错**只**在 `engine.log` 里，
+        //   「崩在哪一步」**只**在 `events.jsonl` 里。这条 check 把有用的证据藏了。
         runCatching {
-            checks.add(
-                if (LogStore.fileLoggingEnabled) {
-                    Check("file-logging", "ok", "文件日志可用")
-                } else {
-                    Check("file-logging", "fail", "文件日志不可用（磁盘满/只读/权限），只有内存缓冲")
-                },
-            )
+            when {
+                LogStore.logDirAvailable && LogStore.appLogEnabled -> checks.add(
+                    Check("file-logging", "ok", "文件日志可用（app.log 与 engine.log/web.log 都在写）"),
+                )
+                !LogStore.logDirAvailable -> checks.add(
+                    Check(
+                        "file-logging", "fail",
+                        "日志目录未挂上（LogStore.init 失败）：本次运行 app.log / engine.log / web.log 都不写。" +
+                            "⚠️ 包内若仍有 engine.log / web.log，那是**上一次**运行留下的残卷（文件不随启动清空），" +
+                            "别把它们当成本次运行的日志读；本次的时间线看 timeline.jsonl、崩溃现场看 crashes/。" +
+                            "events.jsonl 与 crash/ 由 EventLog / CrashRecorder 各自持目录，本次仍照常落盘。",
+                    ),
+                )
+                else -> checks.add(
+                    Check(
+                        "file-logging", "warn",
+                        "app.log 句柄已关闭（连续 3 次写失败后由 LogStore.noteFailure 关掉），此后本次运行不再写 app.log；" +
+                            "engine.log / web.log / events.jsonl / crash/ 仍照常落盘 —— 引擎的报错在 engine.log 里，别跳过它。",
+                    ),
+                )
+            }
         }
 
         // ⑤ 磁盘空间 —— 解包失败的常见原因

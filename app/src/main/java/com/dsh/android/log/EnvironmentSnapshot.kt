@@ -85,10 +85,16 @@ object EnvironmentSnapshot {
         }
 
         // ── 屏幕（本项目大量 UI 修复与尺寸/DPI 有关）──
+        //
+        // ⚠️ `@Suppress("DEPRECATION")` 必须罩住**整个块**，不能只罩 `getMetrics`：
+        //   `DisplayMetrics.scaledDensity`（下面 L100 附近）在 API 34 起同样被废弃，
+        //   原来只标了前面那一行，于是构建一直带一条
+        //   `'field scaledDensity: Float' is deprecated` 警告（增量编译没重编本文件时
+        //   看不到，全量构建才露出来）—— 「零警告」这个验收信号因此是假的。
+        @Suppress("DEPRECATION")
         runCatching {
             val wm = context?.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
             val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
             wm?.defaultDisplay?.getMetrics(dm)
             o.put(
                 "display",
@@ -164,7 +170,15 @@ object EnvironmentSnapshot {
                 JSONObject().apply {
                     put("bootId", BootState.bootId)
                     put("uptimeMs", BootState.uptimeMs())
+                    // ⚠️ `logFileLogging` 是 `dir != null && appWriter != null`，把两种
+                    //   失效形态压成了一个布尔。单独看 false **推不出**「这个包里没有
+                    //   磁盘日志」：目录还在、只是 app.log 句柄被 noteFailure 关掉时，
+                    //   engine.log / web.log / events.jsonl 照旧在写。
+                    //   所以后两个字段必须一并给出，读的人（或 AI）才能分辨。
+                    //   详见 LogStore.logDirAvailable / appLogEnabled 的 KDoc。
                     put("logFileLogging", LogStore.fileLoggingEnabled)
+                    put("logDirAvailable", LogStore.logDirAvailable)
+                    put("logAppLogEnabled", LogStore.appLogEnabled)
                     put("logThrottled", LogStore.throttledTotal)
                     put("logDroppedAsync", LogStore.droppedAsync)
                     put("javaVersion", System.getProperty("java.vm.version") ?: "")

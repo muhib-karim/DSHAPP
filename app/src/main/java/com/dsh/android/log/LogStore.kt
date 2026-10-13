@@ -156,8 +156,38 @@ object LogStore {
     var throttledTotal = 0L
         private set
 
-    /** 落盘是否可用。false 时只有内存缓冲。 */
+    /**
+     * 落盘是否可用。false 时只有内存缓冲。
+     *
+     * = [logDirAvailable] && [appLogEnabled]。
+     */
     val fileLoggingEnabled: Boolean get() = dir != null && appWriter != null
+
+    /**
+     * 日志**目录**是否可用（`LogStore.init` 有没有成功挂上目录）。
+     *
+     * ⚠️ 必须与 [fileLoggingEnabled] 分开看（2026-10-14 自检发现）：
+     *   落盘失效有**两种完全不同的形态**，而 `fileLoggingEnabled` 把它们压成了一个
+     *   布尔，于是诊断包只能笼统报「文件日志不可用，只有内存缓冲」—— 这句话在
+     *   第二种形态下是**假的**：
+     *   ① 目录没了（`init` 失败）⇒ 真·什么都没有，所有日志只在内存 ring 里；
+     *   ② 目录还在、只是 `app.log` 的句柄被 [noteFailure] 关了（连续 3 次写失败）
+     *      ⇒ `engine.log` / `web.log` 照旧在写（它们走 [engineWriterOf] /
+     *      [webWriterOf]，与 `appWriter` 无关），`events.jsonl` 也在写。
+     *   把 ② 报成「只有内存缓冲」，会让分析者得出结论「这个包里没有磁盘日志」，
+     *   从而**不去看**实际上存在的 `engine.log` —— 而引擎的报错只在 `engine.log` 里。
+     */
+    val logDirAvailable: Boolean get() = dir != null
+
+    /**
+     * `app.log` 的句柄是否还开着。
+     *
+     * ⚠️ 关了就**不会再自动重开**：[noteFailure] 把 `appWriter` 置 null 之后，
+     *   [writeApp] 第一行就 `?: return`，连重开的机会都没有（这正是「连续」二字
+     *   必须配 `writeFailures = 0` 的原因，见那里）。所以这个值为 false 表示
+     *   **此后本次进程的全部应用日志都不落盘**，哪怕磁盘早就恢复了。
+     */
+    val appLogEnabled: Boolean get() = appWriter != null
 
     /** 日志目录（诊断包用）。 */
     fun dirOrNull(): File? = dir
