@@ -302,6 +302,19 @@ object LogCommandBridge {
                 put("error", error)
                 put("crash", scenes.size)
                 put("pending", pending)
+                // ⚠️ **这个对象里混了两种总体，必须自己说清楚。**
+                //   `total`/`warn`/`error` 数的是内存 ring（[LogStore.entries]），
+                //   只覆盖**本次运行**；`crash`/`pending` 数的是磁盘目录
+                //   （`crash/`、`pending/`），是**跨多次运行累积**的。
+                //   不标注的话，读者会把 `warn: 0` 理解成「这台机器从来没告警过」，
+                //   而它其实只说明「这次启动以来没告警」。`headline` 里那一级
+                //   （`error > 0`）是带限定的，这里原来没有 —— 同一个数两种口径，
+                //   与 `throttleNote`、`log-completeness` 是同族缺陷。
+                put(
+                    "scope",
+                    "total/warn/error = 内存缓冲，仅本次运行（更早的看 app.log）；" +
+                        "crash/pending = 磁盘目录，跨多次运行累积",
+                )
             },
         )
         out.put("lastExit", lastExit)
