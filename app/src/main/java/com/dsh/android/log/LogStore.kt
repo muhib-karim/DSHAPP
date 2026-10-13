@@ -34,9 +34,15 @@ import kotlin.concurrent.withLock
  *
  * ## 三条不变量
  *
- * ① **写日志绝不能把 App 搞崩。** 任何异常都被吞掉并计数，连续失败就彻底关掉落盘、
- *    退回纯内存 —— 与改造前的行为一致。因为写日志失败而崩溃是灾难，而且那时
- *    崩溃现场也写不出来。
+ * ① **写日志绝不能把 App 搞崩。** 任何异常都被吞掉并计数，连续失败就彻底关掉落盘 ——
+ *    与改造前的行为一致。因为写日志失败而崩溃是灾难，而且那时崩溃现场也写不出来。
+ *
+ *    ⚠️ **「关掉落盘」只针对本类管的三个文件**（`app.log`/`engine.log`/`web.log`）。
+ *    `events.jsonl` 由 [EventLog] 持自己的目录、`crash/` 里的现场文件由
+ *    [CrashRecorder] 持自己的目录，**两者都不看本类的 `dir`**，所以这时它们照常落盘。
+ *    别把这种状态叫「纯内存」—— 2026-10-14 真机实测：把 `logs/app.log` 换成同名目录逼
+ *    [init] 失败后，`events.jsonl` 仍在长（6 行属于当次启动）、`crash/` 里那份
+ *    13,777 B 的现场也还在，而三路文件日志确实零增长。
  * ② **崩溃路径用 `tryLock`。** 崩溃可能发生在**正持有日志锁**的线程上，硬等锁会
  *    死锁、把「闪退」变成「卡死」。拿不到锁就只写 crash 文件（见 [CrashRecorder]）。
  * ③ **轮转只保一代。** `app.log` → `app.log.1`，更老的不留 —— 否则长期使用会
@@ -50,7 +56,15 @@ import kotlin.concurrent.withLock
  */
 object LogStore {
 
-    /** 日志目录，由 [init] 注入。null = 纯内存模式（落盘不可用）。 */
+    /**
+     * 日志目录，由 [init] 注入。
+     *
+     * `null` = 本类管的三个文件（`app.log`/`engine.log`/`web.log`）**不落盘**；
+     * ⚠️ 这**不等于**「本次运行什么都没落盘」—— `events.jsonl` 与 `crash/`
+     * 由 [EventLog] / [CrashRecorder] 各自持目录，与本字段无关。用
+     * [logDirAvailable] 判断「目录挂上没」，用 [appLogEnabled] 判断
+     * 「`app.log` 句柄还在不在」，别用本字段下「有没有日志」的结论。
+     */
     @Volatile
     private var dir: File? = null
 
@@ -222,7 +236,13 @@ object LogStore {
         } catch (t: Throwable) {
             // 落盘不可用就退回纯内存。**不要**在这里用 DshLog —— 它还没接上。
             dir = null
-            AndroidLog.e(TAG, "LogStore.init 失败，退回纯内存: ${t.message}")
+            // ⚠️ **不能只说「退回纯内存」**：这是排查者最先看到的一行，而它字面上
+            //   会让人以为「这台机器本次没有日志可查」。真机实测（2026-10-14）相反：
+            //   events.jsonl 与 crash/ 各有自己的目录，这时仍在落盘。把范围写清楚。
+            AndroidLog.e(
+                TAG,
+                "LogStore.init 失败：app.log/engine.log/web.log 本次不落盘（events.jsonl 与 crash/ 仍照常落盘）: ${t.message}",
+            )
             false
         }
     }
@@ -512,11 +532,18 @@ object LogStore {
     }
 
     /**
-     * 写日志失败计数。连续 3 次就彻底关掉落盘。
+     * 写日志失败计数。连续 3 次就彻底关掉 `app.log` 的落盘。
      *
      * ⚠️ 为什么是「关掉」而不是「继续重试」：磁盘满 / 只读时每条日志都会抛一次
      * 异常，那会**拖慢整个回合**（每条日志一次 IOException + 栈展开）。而日志
      * 本身是辅助功能，不该拖垮主流程。
+     *
+     * ⚠️ **关掉的只有 `app.log` 一个文件**：这里只置空 `appWriter`，而 `engine.log`/
+     * `web.log` 走异步队列（`enqueue` → worker），`events.jsonl` 与 `crash/` 更是
+     * 另有自己的目录。所以这条日志的措辞不能是「已关掉落盘」——那是**形态②**
+     * 的失真：读者会以为本次运行什么都没有了，实际只有 `app.log` 停了。
+     * （形态② 无法从外部制造：已打开的 fd 不受文件替换与权限变更影响，只有
+     * 真·磁盘满能触发，所以这条文案此前没被真机证伪过 —— 按逻辑改准。）
      */
     private fun noteFailure(what: String) {
         writeFailures++
@@ -526,7 +553,11 @@ object LogStore {
             } catch (_: Throwable) {
             }
             appWriter = null
-            AndroidLog.e(TAG, "LogStore: $what 连续写入失败 $writeFailures 次，已关掉落盘")
+            AndroidLog.e(
+                TAG,
+                "LogStore: $what 连续写入失败 $writeFailures 次，已关闭 app.log 的写入" +
+                    "（engine.log / web.log / events.jsonl / crash/ 不受影响，仍在写）",
+            )
         }
     }
 
