@@ -91,7 +91,15 @@ const MAX_CRASH_CHARS = 40000;
 /** 合法的日志级别。与原生侧 `LogStore.severity` 对应。 */
 const LEVELS = ['all', 'warn', 'error'];
 
-/** 合法的日志来源。与原生侧 `LogViewerActivity` 的筛选项一致。 */
+/**
+ * 合法的日志来源。与原生侧 `LogViewerActivity` 的筛选项一致。
+ *
+ * ⚠️ **`'crash'` 是个名不副实的取值，但保留它。** 原生侧 `matchesSource` 里
+ *   它落进 `else -> true`，与 `'all'` 完全等价 —— 因为 `read` 读的是内存缓冲，
+ *   而崩溃现场是独立文件、从来不在缓冲里。删掉它会让老调用直接报「参数非法」
+ *   （断崖），所以改为在 description 里说明 + 原生侧在回执里如实纠正。
+ *   真正的现场读取入口是 `action:"crashes"`。
+ */
 const SOURCES = ['all', 'app', 'engine', 'web', 'crash'];
 
 /**
@@ -109,7 +117,7 @@ Use it whenever the user reports something broken ("it crashed", "this reply fai
 
 Actions:
 - "summary" (default): one-shot conclusion — how the last launch ended, how many warnings/errors, how many crash scenes are stored, how many bundles await upload. START HERE: it is cheap and usually enough to decide the next step.
-- "read": recent log lines (newest last). Filter with level ("all"/"warn"/"error"), source ("all"/"app"/"engine"/"web"), and query (substring, case-insensitive; searches both tag and text). At most ${MAX_LINES} lines are returned — if you need older lines, narrow the filters instead of asking for more.
+- "read": recent log lines (newest last). Filter with level ("all"/"warn"/"error"), source ("all"/"app"/"engine"/"web"), and query (substring, case-insensitive; searches both tag and text). At most ${MAX_LINES} lines are returned — if you need older lines, narrow the filters instead of asking for more. Note: the schema also accepts source:"crash", but it is NOT a filter — crash scenes are separate files, so it behaves exactly like "all" and the reply will say so. Use action:"crashes" for scenes.
 - "crashes": list stored crash scenes, or read one in full via crashFile.
 - "export": build a diagnostic bundle (zip) containing the logs, device info, crash scenes and an automatic diagnosis (diagnosis.json), and return its path so the user can send it. This takes a few seconds.
 
@@ -330,7 +338,7 @@ function logsTool(home) {
 				source: {
 					type: 'string',
 					enum: SOURCES,
-					description: 'For action:"read" — which stream. "app" = native app logs, "engine" = Node engine stdout/stderr, "web" = WebView console, "crash" = crash scenes, "all" (default) = everything merged.',
+					description: 'For action:"read" — which stream. "app" = native app logs, "engine" = Node engine stdout/stderr, "web" = WebView console, "all" (default) = everything merged. ⚠️ "crash" is NOT a filter: crash scenes are separate files, not part of the in-memory buffer, so "crash" behaves exactly like "all" (and the reply says so). To read a crash scene use action:"crashes".',
 				},
 				query: {
 					type: 'string',

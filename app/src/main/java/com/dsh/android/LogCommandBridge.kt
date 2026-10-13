@@ -207,8 +207,17 @@ object LogCommandBridge {
 
         // ⚠️ 截断必须**说出来**。静默只给最后 N 行，模型会把「没看到」当成「没有」。
         val notes = mutableListOf<String>()
+        // ⚠️ **`${matched.size}` 的花括号不能省**（2026-10-14 真机验证查出）。
+        //   Kotlin 字符串模板里 `"$matched.size"` 解析成 `$matched`（即列表的
+        //   `toString()`）后面跟**字面量** `.size` —— 不是属性访问。
+        //   真机实测后果有两层，都不是小事：
+        //   ① 回执里那一行变成 `匹配 [Entry(t=…), Entry(t=…), …].size 条`，
+        //      把**整个匹配列表的 toString** 倒了进去（几百条 Entry ⇒ 几 KB），
+        //      而真正的数字一个都没有 —— 模型据此完全无法判断截断了多少；
+        //   ② 这正是本项目记录 15 次的缺陷族：**结论与它描述的总体不符**。
+        //   全仓库扫过一遍（`$ident.属性` 形态），**只有这一处**。
         if (matched.size > taken.size) {
-            notes += "匹配 $matched.size 条，只返回最近 ${taken.size} 条（上限 $lines）。" +
+            notes += "匹配 ${matched.size} 条，只返回最近 ${taken.size} 条（上限 $lines）。" +
                 "要更早的请加 query 或收紧 level/source —— 不要靠加大 lines。"
         }
         if (taken.isEmpty()) {
@@ -229,6 +238,25 @@ object LogCommandBridge {
         if (LogStore.droppedAsync > 0) {
             notes += "本次运行另有 ${LogStore.droppedAsync} 条因异步队列满被直接丢弃" +
                 "（引擎/网页输出刷屏时发生，与上面的限流折叠是两回事）。"
+        }
+        // ⚠️ **`source:"crash"` 必须显式纠正，不能默默按 `all` 处理**（2026-10-14 自检查出）。
+        //   插件侧 `SOURCES` 收了 `'crash'`，schema 的 description 也写着
+        //   `"crash" = crash scenes`（`mobile-ui-plugin/dsh-android-logs/lib/index.js`）。
+        //   但**本动作读的是内存 ring，里面根本没有现场** —— [matchesSource] 让
+        //   `"crash"` 落进 `else -> true`，与 `"all"` 完全等价。
+        //   于是模型按插件文档选了 `source:"crash"`，拿回来的是**全部日志**，
+        //   而它以为自己在看现场 ⇒ 会得出「现场里没有这个错误」这类**凭空结论**。
+        //   这正是本项目已记录 15 次的缺陷族：结论与它描述的总体不符。
+        //
+        //   两条修法里选了「如实纠正」而不是「改插件枚举」：把 `'crash'` 从枚举里
+        //   删掉会让老调用直接报参数非法（那是个**断崖**），而纠正只加一句话，
+        //   既保留兼容、又把事实说清楚 —— 并且顺手把模型引到真正能读现场的那条路
+        //   （`action:"crashes"` + `crashFile`，那里给的是**全文**）。
+        if (source == "crash") {
+            notes += "⚠️ `source:\"crash\"` **不返回崩溃现场**：本动作读的是内存缓冲，" +
+                "现场是独立文件、不在缓冲里，所以这里的筛选与 `\"all\"` 等价，" +
+                "返回的是全部来源的日志。要看现场请用 `action:\"crashes\"`" +
+                "（先不带 crashFile 列一份，再带文件名读全文）。"
         }
         if (notes.isNotEmpty()) out.put("truncatedNote", notes.joinToString("\n"))
     }
