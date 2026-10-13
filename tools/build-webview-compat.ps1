@@ -100,7 +100,24 @@ param(
     #     道理：改的是 mobile-ui 源码，`mobileui/lib/client.js` 的降级产物随之变化，
     #     不 bump 会命中「两戳都一致 → 整体跳过」，设备上那棵树继续被**旧**降级产物
     #     覆盖 ⇒ 设置页永远只显示改动前的通用引导。
-    [string]$CompatVersion = "12",
+    # v12：`mpPageBackground()` 改为读主题 token `--dsw-alias-bg-base`（取不到才退回
+    #     `backgroundColor`）。同 v4~v11 的道理：改的是 mobile-ui 源码，
+    #     `mobileui/lib/client.js` 的降级产物随之变化，不 bump 会命中
+    #     「两戳都一致 → 整体跳过」，设备上那棵树继续被旧产物覆盖 ⇒
+    #     系统栏跟随的仍是旧投影色，"跟随主题色"这层改动静默失效。
+    # v13：`fullscreen` 让位修复尝试一 —— `mobileui/lib/client.js` 给内容列
+    #     `.pI_x6G_centerCol` 加了一条 `padding-top: var(--dsh-android-system-top)`
+    #     CSS 规则。**这一版是错的**：同属性上已有修复 66 加的
+    #     `padding-top: var(--mp-float-nav-h) !important`，被它压掉，整条规则
+    #     完全不生效（实测 getComputedStyle 仍是 0px）。
+    # v14：改用 JS —— 让 `mpSyncFloatNavGap()` 在算 `--mp-float-nav-h` 时把
+    #     状态栏高度也纳入（JS 的 Math.max 不受内核版本限制）。
+    #     不能在 CSS 里写 max()：那是 Chrome 79 才有的，本工程目标内核
+    #     **chrome74**，老内核上整条声明会失效 ⇒ 全屏下顶部被啃掉且只在老设备复现。
+    #     ⚠️ mobile-ui 源码改了就必须 bump：不 bump 会命中「两戳都一致 → 整体跳过」，
+    #     设备上那棵树继续被旧降级产物覆盖 ⇒ "开了全面屏，顶上一行被时间盖住"，
+    #     而原生侧日志看起来一切正常。
+    [string]$CompatVersion = "15",
 
     [string]$EngineBin,
     [string]$OutZip

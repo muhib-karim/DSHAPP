@@ -53,6 +53,24 @@ window.__ModuleLoader__.load({
 [data-mobile] .pI_x6G_sidebarCol {
   padding-top: var(--dsh-android-system-top, 0px);
 }
+/* 内容列的顶部让位**不在 CSS 里做**（修复 58 的第一版就是死在这里，别再走回去）：
+   ============================================================
+   全面屏打开后内容列必须让出状态栏（窗口 content 由 [0,108] 变 [0,0]，
+   状态栏直接压住汉堡与聊天页 header，实测汉堡 rect.top=3.75）。
+
+   第一版在这里加了一条
+     [data-mobile] .pI_x6G_centerCol { padding-top: var(--dsh-android-system-top, 0px) }
+   结果**完全不生效**：同一个属性上已经有一条修复 66 加的
+     [data-mobile] .pI_x6G_centerCol { padding-top: var(--mp-float-nav-h, 0px) !important }
+   它带 !important，后加的规则压不过它（实测 getComputedStyle 仍是 0px）。
+
+   也不能在 CSS 里写成 max(两条变量之和 / 取大者)：max() 要 Chrome 79，而本 App
+   的目标内核是 **chrome74**（见 ⑯），老内核上整条声明会失效 ⇒ 全屏下顶部被啃掉，
+   且只在老设备上复现。
+
+   正解是**并进 --mp-float-nav-h 的语义**：让 mpSyncFloatNavGap() 在算它的时候
+   把状态栏高度也纳入（JS 里 Math.max 不受内核版本限制）。那条 !important 规则
+   于是不用动，两条让位需求由同一个变量统一表达。 */
 [data-mobile] button:focus, [data-mobile] button:focus-visible, [data-mobile] a:focus,
 [data-mobile] [tabindex]:focus, [data-mobile] input:focus,
 [data-mobile] textarea:focus, [data-mobile] select:focus {
@@ -2677,11 +2695,32 @@ window.__ModuleLoader__.load({
 				}
 				const btn = mpNavBtnEl;
 				const floating = !!(btn && btn.isConnected && !btn.classList.contains("mp-in-header"));
-				let next = "0px";
+				let needed = 0;
 				if (floating) {
 					const r = btn.getBoundingClientRect();
-					if (r.height > 0) next = Math.round(r.bottom + MP_FLOAT_NAV_GAP) + "px";
+					if (r.height > 0) needed = r.bottom + MP_FLOAT_NAV_GAP;
 				}
+				/* 修复 58：全面屏打开时，内容列还要再让出状态栏。
+				   ============================================================
+				   全面屏把窗口 content 从 [0,108] 变成 [0,0]，WebView 不再自己
+				   避让系统栏，状态栏于是直接压在内容上（实测汉堡 rect.top=3.75、
+				   正好被时间/电量那一行盖住）。原生侧会把状态栏高度写进
+				   --dsh-android-system-top，这里取它。
+
+				   ⚠️ 两种让位（浮层汉堡、状态栏）必须在**同一个变量**里合并：
+				     吃这个变量的是 CSS 里那条带 !important 的
+				     .pI_x6G_centerCol { padding-top: var(--mp-float-nav-h) }，
+				     同属性上再加一条不带 !important 的规则压不过它。
+				   ⚠️ 合并用 JS 的 Math.max 而不是 CSS 的 max()：后者要 Chrome 79，
+				     本 App 目标内核是 chrome74，老内核上整条声明失效。
+				   ⚠️ 汉堡浮层时不必再取 max —— 它本身是 fixed 且 top 已含系统栏高度
+				     （calc(--dsh-android-system-top + 6px)），bottom 必然大于状态栏高度；
+				     取 max 只是为了在两种形态下都成立，多算一次不影响结果。 */
+				const sysTop = parseFloat(
+					getComputedStyle(root).getPropertyValue("--dsh-android-system-top"),
+				) || 0;
+				if (sysTop > needed) needed = sysTop;
+				const next = Math.round(needed) + "px";
 				if (next === mpFloatNavH) return; // 无变化 ⇒ 不写 DOM ⇒ 不触发 observer
 				mpFloatNavH = next;
 				root.style.setProperty("--mp-float-nav-h", next);
@@ -3439,20 +3478,73 @@ window.__ModuleLoader__.load({
 		// ⚠️ 不能写死颜色：官方主题可切换，写死只是把问题换个方向暴露。
 		// ⚠️ 输出 `#RRGGBB` 而不是 computed style 的 `rgb(...)`：Android 的
 		//   `Color.parseColor` 原生就吃这个格式，省掉在 Kotlin 里再写一套 CSS 颜色解析。
+		//
+		// ⚠️ **读主题 token 而不是读 `backgroundColor`**（这是"默认跟随主题色"这一条的
+		//   实现）：`backgroundColor` 只是 token 的**最终投影**，在纯色主题下两者恰好
+		//   相等，一旦主题改用背景图/渐变，投影与主题语义就分叉 —— 那时要把系统栏
+		//   对齐到"主题的基底色"就只能靠 token。深色主题下 token 是 `#151517`、
+		//   浅色是 `#fff`，与旧行为一致，所以这次替换对当前外观零改变。
+		//   token 定义在 `body` 上（`html` 上取到空串），所以两个元素都要试。
+
+		/** 主题基底色 token，按优先级排列。 */
+		const MP_THEME_BG_TOKENS = ["--dsw-alias-bg-base"];
+
+		// 把 CSS 颜色值规范化成 `#RRGGBB`；无法解析或完全透明时返回空串。
+		//
+		// 支持 token 实际会用到的几种写法：`#fff`（缩写）、`#ffffff`、`#ffffffff`
+		// （带 alpha，取前 6 位）与 `rgb()/rgba()`。其余写法（百分比、颜色函数）
+		// 一律返回空串，让调用方退回下一条路 —— 猜错比不猜更糟。
+		function mpCssColorToHex(value) {
+			const raw = String(value || "").trim();
+			if (!raw) return "";
+			let r;
+			let g;
+			let b;
+			if (raw.startsWith("#")) {
+				const h = raw.slice(1);
+				const expand = (s) => (s.length === 1 ? s + s : s);
+				if (h.length === 3 || h.length === 4) {
+					r = parseInt(expand(h[0]), 16);
+					g = parseInt(expand(h[1]), 16);
+					b = parseInt(expand(h[2]), 16);
+				} else if (h.length === 6 || h.length === 8) {
+					r = parseInt(h.slice(0, 2), 16);
+					g = parseInt(h.slice(2, 4), 16);
+					b = parseInt(h.slice(4, 6), 16);
+				} else {
+					return "";
+				}
+			} else {
+				const m = /^rgba?\(([^)]+)\)$/.exec(raw);
+				if (!m) return "";
+				const parts = m[1].split(",").map((s) => parseFloat(s));
+				if (parts.length < 3 || parts.some((n) => !isFinite(n))) return "";
+				// 完全透明 ⇒ 视为"没设背景"（rgba(0,0,0,0) 是常见表示）
+				if (parts.length === 4 && parts[3] === 0) return "";
+				[r, g, b] = parts;
+			}
+			if (![r, g, b].every((n) => isFinite(n))) return "";
+			const hex = (n) => Math.max(0, Math.min(255, Math.round(n)))
+				.toString(16).padStart(2, "0").toUpperCase();
+			return "#" + hex(r) + hex(g) + hex(b);
+		}
+
 		function mpPageBackground() {
+			// ① 主题 token 优先（见上方注释里为什么要换掉 backgroundColor）
+			for (const el of [document.documentElement, document.body]) {
+				if (!el) continue;
+				const cs = getComputedStyle(el);
+				for (const token of MP_THEME_BG_TOKENS) {
+					const hex = mpCssColorToHex(cs.getPropertyValue(token));
+					if (hex) return hex;
+				}
+			}
+			// ② token 取不到（老内核/主题改结构）⇒ 退回实际算出来的背景色。
 			// body 透明时往上找 html；都透明才退回白。
 			for (const el of [document.body, document.documentElement]) {
 				if (!el) continue;
-				const bg = getComputedStyle(el).backgroundColor || "";
-				const m = /^rgba?\(([^)]+)\)$/.exec(bg);
-				if (!m) continue;
-				const parts = m[1].split(",").map((s) => parseFloat(s));
-				if (parts.length < 3 || parts.some((n) => !isFinite(n))) continue;
-				// 完全透明 ⇒ 继续往上找（rgba(0,0,0,0) 是"没设背景"的常见表示）
-				if (parts.length === 4 && parts[3] === 0) continue;
-				const hex = (n) => Math.max(0, Math.min(255, Math.round(n)))
-					.toString(16).padStart(2, "0").toUpperCase();
-				return "#" + hex(parts[0]) + hex(parts[1]) + hex(parts[2]);
+				const hex = mpCssColorToHex(getComputedStyle(el).backgroundColor);
+				if (hex) return hex;
 			}
 			return "#FFFFFF";
 		}

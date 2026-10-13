@@ -21,6 +21,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.widget.TextView
@@ -29,6 +30,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.dsh.android.databinding.ActivityMainBinding
 import com.dsh.android.web.DownloadRequest
@@ -506,6 +508,9 @@ class MainActivity : AppCompatActivity() {
         //   onAppBackground 还没跑过。不提前记 context 的话 bubbleApply 会静默返回
         //   false（真机实测踩到），表现为"插件改了没反应"。
         FloatingBubble.attach(this)
+        // 同上：AI 可能在 App 刚起、还没走到 onResume 时下发系统栏配色，
+        // 不提前登记窗口宿主的话这一轮就只能落盘、看不到效果。
+        SystemBarAppearance.attach(this)
         observeEngine()
         observeImeInsets()   // 修复 65：键盘高度自学习 + 预判交接
         // 前台服务要在引擎启动前拉起：它同时是「进程不被回收」和 WakeLock 的持有者，
@@ -784,6 +789,12 @@ class MainActivity : AppCompatActivity() {
                 bridge = StatusBridge(),
                 onPageFinished = { url ->
                     Log.i(DshApplication.TAG, "Web 界面加载完成: $url")
+                    // ⚠️ **必须在这里补推让位变量**：applyFullscreen 有状态门（配置没变
+                    //   就不再写 DOM），而变量是写在页面 documentElement 的**行内样式**上，
+                    //   文档一重载就没了 —— 只靠配置变化那一次推，重启 App 后
+                    //   （配置早已是 fullscreen:true）页面就永远拿不到这个值，
+                    //   症状是"全面屏开着但顶部被状态栏压住"。
+                    pushSystemBarInset(SystemBarAppearance.load(this).fullscreen)
                     // DOM 到了，但移动端 UI 插件仍在激活（实测还有约 1.7s）——
                     // 这段宿主本来完全感知不到，上报给启动层，动画才不会提前收尾。
                     engine.notifyPageLoaded()
@@ -1401,48 +1412,384 @@ class MainActivity : AppCompatActivity() {
         // 窗口底色也跟上：DecorView 与 WebView 是两层独立的合成，窗口缩小时
         // 两层各自的 Surface 更新并不同步，只改一层仍可能露出一帧旧色
         window.setBackgroundDrawable(ColorDrawable(color))
-        // 系统栏只在启动层收起后才跟随，理由见 applySystemBarColor
-        if (overlayDismissed) applySystemBarColor(bg)
+        // 系统栏只在启动层收起后才跟随，理由见 applySystemBarColors
+        if (overlayDismissed) syncSystemBars()
     }
 
     /**
-     * 把系统栏（状态栏 + 导航栏）的底色与图标明暗同步到页面实际底色。
+     * 把系统栏（**状态栏** + **导航栏**）的底色与图标明暗同步到页面实际底色，
+     * 但**两条栏各自优先用钦定色**（[SystemBarAppearance]）。
      *
      * **为什么要做**：这两处原先在 `themes.xml` 里写死 `#0F1115`（深色），
      * 而官方 Web GUI 是浅色的 —— 于是屏幕顶部、底部各留一条黑边，与页面割裂。
      * 页面底色本来就经 `onStatus` 上报（见 [applyPageBackground]），这里把它一并
      * 应用到系统栏，App 主题切深色时也会自动跟上（不写死颜色）。
      *
+     * **两条栏是分开决定的**：各自「有钦定色就用钦定色，没有就跟随页面底色」。
+     * 所以「只改状态栏、底部继续跟主题」这种组合是天然支持的，不需要额外的开关。
+     *
      * ⚠️ **必须在启动层收起之后才调用**：启动页是深色的（`#0B0E18`），
      *   引擎起来之前就把系统栏刷成白色，会在顶部露一条白边（比黑边更刺眼）。
      *   所以 `applyPageBackground` 里用 `overlayDismissed` 拦一道。
      * ⚠️ 底色浅时**必须**把图标切成深色：状态栏图标默认是浅色，白底上会看不见。
+     *   图标明暗由实际生效的底色算（不是由钦定色算 —— 那是同一件事）。
      * ⚠️ 必须在主线程调用（`runOnUiThread`）。
+     *
+     * ⚠️ **正在闪的时候不要用它覆盖**：本方法只画「静态色」（钦定色或页面底色），
+     *   而闪烁由 [flashStep] 逐帧驱动。真正的分派在 [syncSystemBars]，它决定
+     *   该走哪条路。直接调本方法会把闪的当前帧顶掉。
+     *
+     * @param pageBg 页面底色 `#RRGGBB`；空串表示还没收到过上报，此时只有钦定色会生效。
      */
-    private fun applySystemBarColor(bg: String) {
-        val color = try {
-            Color.parseColor(bg)
-        } catch (t: Throwable) {
-            return
+    private fun applySystemBarColors(pageBg: String) {
+        val config = SystemBarAppearance.load(this)
+        val statusHex = config.statusBar.ifEmpty { pageBg }
+        val navHex = config.navBar.ifEmpty { pageBg }
+        setSystemBarColors(
+            parseColorOrNull(statusHex),
+            parseColorOrNull(navHex),
+        )
+    }
+
+    /**
+     * 真正落窗口属性的那一层：两条栏各给一个颜色，`null` 表示「这条栏不动」。
+     *
+     * 抽出来是因为它有**两个调用方**（静态路径 [applySystemBarColors] 与
+     * 闪烁路径 [flashStep]），而图标明暗的算法只有这一份 —— 抄成两份迟早分叉，
+     * 而分叉的症状是「闪的时候图标看不见了」，很难归因。
+     */
+    private fun setSystemBarColors(status: Int?, nav: Int?) {
+        // ⚠️ **全面屏下什么都不做**：那时两条栏必须是透明的，让页面内容透上来。
+        //   这里是所有"画颜色"路径的唯一收口（静态色、闪烁每帧、闪完停在钦定色），
+        //   把守卫放在这一层，就不必在三个调用点各写一遍 —— 少写一处就是
+        //   "全面屏开着，但顶上突然冒出一条红色"这种间歇性现象。
+        if (fullscreenApplied) return
+        // 两条都无从决定（既没钦定、页面也还没上报）⇒ 保持 themes.xml 里的深色不动
+        if (status == null && nav == null) return
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        status?.let {
+            window.statusBarColor = it
+            controller.isAppearanceLightStatusBars = SystemBarAppearance.isLightColor(it)
         }
-        window.statusBarColor = color
-        window.navigationBarColor = color
-        val light = isLightColor(color)
-        WindowCompat.getInsetsController(window, window.decorView).apply {
-            isAppearanceLightStatusBars = light
-            isAppearanceLightNavigationBars = light
+        nav?.let {
+            window.navigationBarColor = it
+            controller.isAppearanceLightNavigationBars = SystemBarAppearance.isLightColor(it)
+        }
+        // 钦定图标明暗（全面屏下"底色"不是纯色、自动算不准，见 SystemBarAppearance 的注释）。
+        // ⚠️ 必须在 setSystemBarColors 里也做一次：闪烁每帧走的是这条路径，
+        //   不在这里处理的话"全面屏 + 闪烁"会让每帧都把钦定值刷回自动算的值。
+        applyIconOverrides(controller, status != null, nav != null)
+    }
+
+    /**
+     * 把钦定的图标明暗盖到窗口上。`auto` 时什么都不做（保留上一行的自动算结果）。
+     *
+     * @param touchStatus 本次是否真的动过状态栏。两条栏各自判断 —— 只看状态栏的
+     *   钦定值不该去动导航栏的图标。
+     */
+    private fun applyIconOverrides(controller: WindowInsetsControllerCompat, touchStatus: Boolean, touchNav: Boolean) {
+        val config = SystemBarAppearance.load(this)
+        if (touchStatus) {
+            when (config.statusBarIcons) {
+                SystemBarAppearance.ICON_LIGHT -> controller.isAppearanceLightStatusBars = false
+                SystemBarAppearance.ICON_DARK -> controller.isAppearanceLightStatusBars = true
+            }
+        }
+        if (touchNav) {
+            when (config.navBarIcons) {
+                SystemBarAppearance.ICON_LIGHT -> controller.isAppearanceLightNavigationBars = false
+                SystemBarAppearance.ICON_DARK -> controller.isAppearanceLightNavigationBars = true
+            }
         }
     }
 
     /**
-     * 判断颜色是否算「浅色」，用来决定系统栏图标该用深色还是浅色。
+     * **全面屏**：把内容延展到整屏，两条栏变成"浮在内容之上的透明层"。
      *
-     * 用 ITU-R BT.601 的感知亮度权重，不取 RGB 平均：人眼对绿最敏感、对蓝最不敏感，
-     * 取平均会把纯蓝（`#0000FF`）误判成浅色，于是配上深色图标、在蓝底上糊成一片。
+     * ## 这是「背景覆盖全屏」的底座，不是给背景图开的特例
+     *
+     * 改动前窗口是 `LAYOUT_INSET_DECOR`，内容区被系统挤到状态栏**下沿**
+     * （真机实测 `content=[0,108][1080,2400]`）—— 顶部那 108px 是块死区，
+     * 页面根本画不进去，所以**任何**背景（纯色/渐变/图片）都铺不到屏幕最顶。
+     * 打开全面屏后内容从 y=0 开始铺，于是背景自然覆盖全屏，不需要为"背景图"
+     * 写任何专门代码 —— 这也是为什么它值得做成一个**开关**而不是图片特例。
+     *
+     * ## 两个动作
+     *
+     * ① **两条栏设透明**：`statusBarColor` / `navigationBarColor` 给
+     *    `Color.TRANSPARENT`，并把 `LAYOUT_NO_LIMITS` 加上去让内容铺满；
+     * ② **把状态栏高度写进页面**（`--dsh-android-system-top`）：页面自己在顶部
+     *    留出让位空间，否则标题/汉堡会被时间、电量压住。
+     *
+     * ## 为什么用 `LAYOUT_NO_LIMITS` 而不是 `setDecorFitsSystemWindows(false)`
+     *
+     * 后者是 API 30+ 的现代写法，而本机是 **API 29**（硬约束②把 targetSdk 钉在 28，
+     * 但设备是 Android 10）。`WindowCompat.setDecorFitsSystemWindows` 在 API 29 上
+     * 走的是兼容分支，实测不生效。`LAYOUT_NO_LIMITS` 在 API 14+ 全版本可用，
+     * 是这个工程唯一能用的那条路。
+     *
+     * ⚠️ **关掉时要把 flag 摘干净**：只把颜色改回不透明、不摘 `LAYOUT_NO_LIMITS`
+     *   的话，内容仍铺在系统栏下面（标题被状态栏压住），而颜色已不透明 ⇒
+     *   用户看到的是"顶部内容被啃掉一块"。所以 `fullscreen` 是**双向**开关，
+     *   两个方向都必须完整。
+     *
+     * ⚠️ **必须在主线程调用**（改窗口 flag 与布局）。
      */
-    private fun isLightColor(color: Int): Boolean {
-        val luminance = 0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)
-        return luminance / 255.0 > 0.5
+    private fun applyFullscreen(config: SystemBarAppearance, pageBg: String) {
+        // ⚠️ **图标明暗必须在状态门之外应用**：全面屏**已经开着**的时候，用户/模型
+        //   仍然可以把 statusBarIcons 从 light 改成 auto。若这一步也放进下面的
+        //   状态门里（fullscreen 没变就整体 return），那次改动就永远不生效 ——
+        //   真机踩过：设成 light（白图标）后再改回 auto，顶部时间和电量一直不可见，
+        //   而配置、日志、回执全是"已应用"，完全看不出问题在哪。
+        if (config.fullscreen) applyFullscreenIcons(config, pageBg)
+        // ⚠️ **窗口状态没变就别再动窗口**：本方法挂在 syncSystemBars 上，而那个入口
+        //   每秒都可能被页面底色上报触发。无条件执行的话每秒钟都会写一次
+        //   window.attributes（触发一次窗口重布局）再推一次 JS —— 纯浪费，
+        //   而且在低端机上能看出掉帧。
+        if (config.fullscreen == fullscreenApplied) return
+        fullscreenApplied = config.fullscreen
+        val lp = window.attributes
+        if (config.fullscreen) {
+            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            // ⚠️ 透明是"内容能透出来"的前提。不透明色 + NO_LIMITS = 内容被色块盖住，
+            //   比改动前的黑边更糟（用户会以为界面坏了）。
+            window.statusBarColor = Color.TRANSPARENT
+            window.navigationBarColor = Color.TRANSPARENT
+            Log.i(DshApplication.TAG, "已开启全面屏：两条栏透明，内容延展到整屏")
+        } else {
+            lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS.inv()
+        }
+        window.attributes = lp
+        // 页面要让位才知道该留多少 —— 两个方向都推一次（关掉时推 0，页面恢复原样）。
+        pushSystemBarInset(config.fullscreen)
+    }
+
+    /**
+     * 全面屏下的图标明暗（两条栏各自决定）。**每次调用都落窗口**，不受开关状态门约束。
+     *
+     * 钦定优先；没钦定时按"最可能压在栏下面的颜色"（页面底色或该栏的钦定色）算 ——
+     * 拿透明色去算恒为"暗"，会给出浅色图标，在浅色背景上正好看不见。
+     *
+     * ⚠️ 必须在主线程调用。
+     */
+    private fun applyFullscreenIcons(config: SystemBarAppearance, pageBg: String) {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        val statusRef = config.statusBar.ifEmpty { pageBg }
+        val navRef = config.navBar.ifEmpty { pageBg }
+        when (config.statusBarIcons) {
+            SystemBarAppearance.ICON_LIGHT -> controller.isAppearanceLightStatusBars = false
+            SystemBarAppearance.ICON_DARK -> controller.isAppearanceLightStatusBars = true
+            else -> parseColorOrNull(statusRef)?.let {
+                controller.isAppearanceLightStatusBars = SystemBarAppearance.isLightColor(it)
+            }
+        }
+        when (config.navBarIcons) {
+            SystemBarAppearance.ICON_LIGHT -> controller.isAppearanceLightNavigationBars = false
+            SystemBarAppearance.ICON_DARK -> controller.isAppearanceLightNavigationBars = true
+            else -> parseColorOrNull(navRef)?.let {
+                controller.isAppearanceLightNavigationBars = SystemBarAppearance.isLightColor(it)
+            }
+        }
+    }
+
+    /**
+     * 把状态栏高度写进页面的 `--dsh-android-system-top`。
+     *
+     * ## 为什么这个变量一直存在却恒为 0
+     *
+     * 页面侧**早就预留了**这个让位接缝（`[data-mobile] .pI_x6G_sidebarCol` 的
+     * `padding-top`、汉堡的 `top` 都在读它），但插件源码里明写着
+     * 「该变量在本 App 里**从未被任何代码写入**（恒 0）」——
+     * 因为改动前 WebView 自己就被系统挤在状态栏下沿了，页面不需要再让位。
+     * 全面屏把这层避让撤掉了，所以现在必须由原生把高度补上。
+     *
+     * ⚠️ **关掉全面屏时要显式写回 0px**：留着旧高度会让页面白留一条空白
+     *   （WebView 已经从状态栏下沿开始了，再留一次就是双倍）。
+     *
+     * ⚠️ 用 `evaluateJavascript` 注入，**不保证一定被调用**（页面未就绪时不会回），
+     *   所以这是"尽力而为"的推值；页面侧自己也有兜底（取不到时默认为 0px）。
+     */
+    private fun pushSystemBarInset(fullscreen: Boolean) {
+        val px = if (fullscreen) statusBarHeightPx() else 0
+        val js = "(function(){try{document.documentElement.style.setProperty(" +
+            "'--dsh-android-system-top','${px}px');}catch(e){}})()"
+        web.evaluateJavascript(js, null)
+        Log.i(DshApplication.TAG, "页面让位变量 --dsh-android-system-top = ${px}px")
+    }
+
+    /**
+     * 状态栏高度（px）。
+     *
+     * ⚠️ 读系统资源 `status_bar_height` 而不是从 insets 里取：`LAYOUT_NO_LIMITS`
+     *   生效后 insets 里的 systemBars 会变成空（内容已经"在栏下面"了），
+     *   那时再问 insets 会拿到 0，页面就白留 0px、标题被时间压住。
+     *   系统资源是静态的，两种状态下取值一致。
+     */
+    private fun statusBarHeightPx(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        val fromRes = if (id > 0) resources.getDimensionPixelSize(id) else 0
+        if (fromRes > 0) return fromRes
+        // 兜底：按密度折算 24dp（AOSP 默认值），至少不让页面完全不让位
+        return (24 * resources.displayMetrics.density).toInt()
+    }
+
+    /** 最近一次已应用到窗口的全面屏状态（见 [applyFullscreen] 的状态门）。 */
+    private var fullscreenApplied = false
+
+    /** 解析 `#RRGGBB` / `#AARRGGBB`；空串或非法时返回 null（调用方据此跳过这条栏）。 */
+    private fun parseColorOrNull(hex: String): Int? {
+        if (hex.isEmpty()) return null
+        return try {
+            Color.parseColor(hex)
+        } catch (t: Throwable) {
+            Log.w(DshApplication.TAG, "忽略非法系统栏底色: $hex")
+            null
+        }
+    }
+
+    // ══ 系统栏闪烁：由原生自驱，不是让模型反复调工具 ══════════════════════
+    //
+    // 这条设计来自一次真机失败。用户要「7 色不断闪」，模型只能一轮一轮调
+    // `statusbar` 工具，而每次调用要走「模型生成 → 写信箱 → 250ms 轮询 → 应用
+    // → 回执」——实测帧间隔 7.6~27.9 秒（会话 session-139dd35d 的日志），
+    // 根本闪不起来。正解是把「颜色序列」一次性交给原生、这里自己轮转，
+    // 与悬浮球的 `spin` / `pulse` 同一个思路。
+
+    /** 闪烁驱动。与其它 Handler 一样用主线程 —— 改窗口属性必须在主线程。 */
+    private val flashHandler = Handler(Looper.getMainLooper())
+
+    /** 当前帧下标。两条栏共用同一帧号，序列短的那条自然回绕。 */
+    private var flashFrame = 0
+
+    /** 已完成的圈数，用于 `flashLoops` 收尾。 */
+    private var flashLoopsDone = 0
+
+    /** 本次闪烁用到的配置快照；null 表示没在闪。 */
+    private var flashConfig: SystemBarAppearance? = null
+
+    /**
+     * 推进一帧的 Runnable。**每帧重新 post**（不是 `scheduleAtFixedRate`）：
+     * 逐帧时长可以不同（`flashDurations`），固定周期表达不了。
+     */
+    private val flashRunnable = Runnable { flashStep() }
+
+    /**
+     * 统一的系统栏刷新入口：**全面屏优先，其次闪，最后静态色**。
+     *
+     * 四个调用点都走它（配置变了 / 页面底色变了 / 启动层收起 / 全面屏开关），
+     * 所以三套逻辑不会互相打架 —— 否则会出现「页面底色一变，闪就停了」
+     * 或者「闪的帧被静态色顶掉」这类间歇性现象。
+     *
+     * ⚠️ **全面屏是排他的，要最先判**：它把两条栏设成透明、内容延展到整屏；
+     *   若还继续跑静态色/闪烁，那些颜色会盖在页面内容上 —— 用户看到的就不是
+     *   "背景覆盖全屏"，而是"顶上一条色块"。所以全面屏打开时闪烁**刻意不生效**
+     *   （回到工具描述里那句话：全面屏与闪烁是两种互斥的展示意图，同时要没有意义）。
+     *
+     * ⚠️ 必须在主线程调用。
+     */
+    private fun syncSystemBars() {
+        val config = SystemBarAppearance.load(this)
+        if (config.fullscreen) {
+            stopFlash()
+            applyFullscreen(config, appliedBgHex)
+            return
+        }
+        // 从全面屏切回来：摘 flag、把让位变量归零，再走静态路径
+        applyFullscreen(config, appliedBgHex)
+        if (config.flashRunning && config.hasFlash) {
+            startFlash(config)
+        } else {
+            stopFlash()
+            applySystemBarColors(appliedBgHex)
+        }
+    }
+
+    /**
+     * 开始/重启闪烁。配置或帧号有变时会被再调一次（幂等：先清旧的再排新的）。
+     *
+     * ⚠️ **重启时要把帧号归零**：不归零的话，AI 改完序列后用户会看到它从
+     *   「上一次闪到一半的位置」接着闪，而不是从第一色开始 —— 很容易被误判成
+     *   「新序列没生效」。
+     */
+    private fun startFlash(config: SystemBarAppearance) {
+        flashHandler.removeCallbacks(flashRunnable)
+        flashConfig = config
+        flashFrame = 0
+        flashLoopsDone = 0
+        Log.i(
+            DshApplication.TAG,
+            "系统栏开始闪烁: 状态栏 ${config.statusBarFlash.size} 色, 导航栏 ${config.navBarFlash.size} 色, " +
+                "${config.flashIntervalMs}ms/帧, 圈数=${if (config.flashLoops < 0) "无限" else config.flashLoops.toString()}",
+        )
+        flashStep()
+    }
+
+    /**
+     * 停掉闪烁（撤回所有未执行的帧）。**不停留在中间色上**：配置里的钦定色才是
+     * 用户/模型表达的那个「我要的颜色」，闪到一半停下会留下一个谁都没指定的颜色。
+     */
+    private fun stopFlash() {
+        if (flashConfig != null) {
+            Log.i(DshApplication.TAG, "系统栏闪烁已停止")
+        }
+        flashHandler.removeCallbacks(flashRunnable)
+        flashConfig = null
+        flashFrame = 0
+        flashLoopsDone = 0
+    }
+
+    /**
+     * 画一帧并排下一帧。
+     *
+     * 两条栏的序列**各取各的第 `flashFrame % size` 项**，所以长度不同是可以的
+     * （一栏 3 色、另一栏 7 色都成立）。某一条栏没有序列时，那一帧它保持
+     * 配置里的静态色（而不是变成「不动」），这样「另一栏闪、这栏不闪」也符合直觉。
+     */
+    private fun flashStep() {
+        val config = flashConfig ?: return
+        val statusList = config.statusBarFlash
+        val navList = config.navBarFlash
+
+        val statusHex = statusList.getOrNull(flashFrame % statusList.size.coerceAtLeast(1))
+        val navHex = navList.getOrNull(flashFrame % navList.size.coerceAtLeast(1))
+        setSystemBarColors(
+            statusHex?.let { parseColorOrNull(it) } ?: parseColorOrNull(config.statusBar.ifEmpty { appliedBgHex }),
+            navHex?.let { parseColorOrNull(it) } ?: parseColorOrNull(config.navBar.ifEmpty { appliedBgHex }),
+        )
+
+        // 圈数判定：以**最长的**那条序列走完一圈为准，否则两条长度不同时
+        // 会有「短的那条多闪了几轮」的观感。
+        val cycle = maxOf(statusList.size, navList.size).coerceAtLeast(1)
+        flashFrame++
+        if (flashFrame >= cycle) {
+            flashFrame = 0
+            flashLoopsDone++
+            if (config.flashLoops >= 0 && flashLoopsDone >= config.flashLoops) {
+                // 闪够了：停在配置里的静态色上，而不是随机一帧
+                Log.i(DshApplication.TAG, "系统栏闪烁已完成 $flashLoopsDone 圈，停在钦定色上")
+                stopFlash()
+                applySystemBarColors(appliedBgHex)
+                return
+            }
+        }
+        flashHandler.postDelayed(flashRunnable, config.frameDelayMs(flashFrame))
+    }
+
+
+    /**
+     * 系统栏钦定配置变了（[SystemBarAppearance.apply] / [reset] / [stopFlash] 后回调）。
+     *
+     * ⚠️ 可能在**任意线程**被调用（命令信箱轮询线程），内部自己切主线程。
+     * ⚠️ 与 `applyPageBackground` 一样受启动层守卫：启动页还在时只落盘不应用，
+     *   等 [hideOverlay] 那一枪补上。
+     * ⚠️ 走 [syncSystemBars] 而不是直接画静态色：配置里可能带着闪烁序列，
+     *   直接画静态色会让「设了序列但一帧都不闪」——那正是上一轮真机失败的样子。
+     */
+    fun onSystemBarConfigChanged() {
+        runOnUiThread {
+            if (!overlayDismissed) return@runOnUiThread
+            syncSystemBars()
+        }
     }
 
     /**
@@ -1779,7 +2126,10 @@ class MainActivity : AppCompatActivity() {
         // 启动层收起 = 页面底色开始可见，此时才把系统栏交给页面底色
         // （之前一直保持 themes.xml 的深色，与深色启动页一致）。
         // 用最近一次上报的底色；还没收到过就保持主题里的深色不动。
-        if (appliedBgHex.isNotEmpty()) applySystemBarColor(appliedBgHex)
+        // ⚠️ 即使还没有页面底色也要调一次：AI 可能已经钦定过颜色，那两条栏
+        //   本来就该在启动层收起后立刻显形（applySystemBarColors 内部会判空）。
+        // ⚠️ 走 syncSystemBars：配置里可能带着闪烁序列，得从这一枪就开始闪。
+        syncSystemBars()
         binding.overlay.animate()
             .alpha(0f)
             .setDuration(OVERLAY_FADE_OUT_MS)
@@ -1950,6 +2300,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         // 引擎跟随进程存活，这里不停止，避免转屏/重建时反复冷启动。
+        // ⚠️ 先撤掉系统栏配色的窗口宿主引用：留着它，AI 后续下发配置会对着
+        //   一个已销毁的 Activity 调 setStatusBarColor（静默无效）。
+        SystemBarAppearance.detach(this)
+        // ⚠️ 闪烁的帧是 postDelayed 排的，不清会在 Activity 销毁后继续打窗口属性
+        //   （那些帧还持有旧 window，轻则无效、重则抛异常）。
+        flashHandler.removeCallbacks(flashRunnable)
+        flashConfig = null
         imeHandler.removeCallbacks(imeRestoreRunnable)
         overlayHandler.removeCallbacks(overlayTimeoutRunnable)
         overlayHandler.removeCallbacks(paintTimeoutRunnable)

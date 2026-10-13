@@ -3029,6 +3029,78 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出系统栏配色工具插件（`statusbar-tool.zip` → `$DSH_HOME/statusbar-tool/dsh-android-statusbar/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `statusbar` 的**独立工具**，让模型能改
+     * **状态栏（顶部）**与**导航栏（底部）**的配色 —— 也就是把原先只有 App 自己
+     * （页面底色驱动）够得着的那两条栏，接到模型的工具列表里。
+     *
+     * ⚠️ **为什么解到 `$DSH_HOME/statusbar-tool/` 而不是 profile 的 `node_modules`**：
+     * 与 [ensureBubbleTool] 同一个坑 —— 那个目录归 pnpm 管，而本包不在 profile 的
+     * `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`。
+     *
+     * 与 `bubble-tool` 一样**不做版本戳**：包很小（两个文件），每次启动覆盖写。
+     */
+    private fun ensureStatusBarTool() {
+        val target = File(dshHome, "$STATUSBAR_TOOL_DIR/$STATUSBAR_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(STATUSBAR_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装系统栏配色工具插件 $STATUSBAR_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 statusbar 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装系统栏配色工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载系统栏配色工具的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeBubbleToolPatch] 同构。**没有「能力探测」这一步**：改系统栏配色
+     * 不需要任何特权或授权，只要文件在就挂载。
+     */
+    private fun writeStatusBarToolPatch(): File? {
+        val patch = File(dshHome, STATUSBAR_TOOL_PATCH)
+        val entry = File(dshHome, "$STATUSBAR_TOOL_DIR/$STATUSBAR_TOOL_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "系统栏配色工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载系统栏配色工具插件：注册一个独立的 `statusbar` 工具，
+                # 让模型能改状态栏（顶部）与导航栏（底部）的配色。
+                - insert:
+                    - id: $STATUSBAR_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入系统栏配色工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入系统栏配色工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出 UI 调试工具插件（`uiagent-tool.zip` → `$DSH_HOME/uiagent-tool/dsh-android-uiagent/`）。
      *
      * 该插件在 `apply()` 里注册一个名为 `ui` 的**独立工具**，让模型能枚举界面上的
@@ -4165,6 +4237,11 @@ class EngineManager private constructor(private val context: Context) {
         //   悬浮球不需要任何身份，只要求用户开过开关并授权过悬浮窗。
         ensureBubbleTool()
         val bubblePatch = writeBubbleToolPatch()
+        // 系统栏配色工具：把「改状态栏/导航栏颜色」接到模型的工具列表里。
+        // ⚠️ 与 bubble 工具**完全并列且独立**（不同信箱、不同能力），同样与特权无关：
+        //   改系统栏配色不需要任何授权。必须早于引擎启动（overlay 要在 profile 解析前落盘）。
+        ensureStatusBarTool()
+        val statusBarPatch = writeStatusBarToolPatch()
         // UI 调试工具：把「看/点这个 App 的界面」接到模型的工具列表里。
         // ⚠️ 与 bubble 工具**完全并列且独立**（不同信箱、不同能力）。
         //   同样必须早于引擎启动：overlay 要在 profile 解析前落盘。
@@ -4178,6 +4255,10 @@ class EngineManager private constructor(private val context: Context) {
         // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
         // 信箱还没人守，命令会一直等不到回执。
         BubbleCommandBridge.start(dshHome)
+        // 系统栏配色命令信箱：`statusbar` 工具把命令写进 `$DSH_HOME/statusbar-cmd.json`，
+        // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
+        // 信箱还没人守，命令会一直等不到回执。
+        SystemBarCommandBridge.start(dshHome)
         // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」。
         // ⚠️ 判据用**挂载结果**（`privPatch != null`）而不是 `privRunner != null`：
         //   前者才是「`shell` 工具真的注册了」。见 ensurePrivilegedPrompt 的 @param。
@@ -4252,6 +4333,10 @@ class EngineManager private constructor(private val context: Context) {
             // 悬浮球控制工具：同样是 overlay，注册成独立的 `bubble` 工具
             if (bubblePatch != null) {
                 add("--patch"); add(bubblePatch.absolutePath)
+            }
+            // 系统栏配色工具：同样是 overlay，注册成独立的 `statusbar` 工具
+            if (statusBarPatch != null) {
+                add("--patch"); add(statusBarPatch.absolutePath)
             }
             // 桌面宠物状态桥：同样是 overlay（只订阅事件，不注册工具）
             if (petPatch != null) {
@@ -5258,8 +5343,23 @@ class EngineManager private constructor(private val context: Context) {
          *         `assistant`，面板上两条标签样式全一样 ⇒ 看着就是"糊在一起"）。
          *      ⚠️ 必须同时 bump `tools/build-webview-compat.ps1 -CompatVersion`，
          *      否则设备上那棵降级过的 mobile-ui 树不会被覆盖（见 ⑯）。
+         * 1.0.0-57：`mpPageBackground()` 改为**读主题 token** `--dsw-alias-bg-base`
+         *      （取不到才退回 `backgroundColor`）。这是"系统栏默认跟随主题色"的实现 ——
+         *      `backgroundColor` 只是 token 的投影，纯色主题下两者相等，主题一改成
+         *      背景图/渐变就分叉。同 v56 的道理，也必须 bump -CompatVersion。
+         * 1.0.0-58：全面屏让位 —— 内容列 `.pI_x6G_centerCol` 补上
+         *      `padding-top: var(--dsh-android-system-top)`。原来只有侧栏让位，
+         *      内容列靠 WebView 自身避让系统栏活着；全面屏一开那层避让被撤掉
+         *      （窗口 content 由 [0,108] 变 [0,0]），状态栏直接压住汉堡与聊天页
+         *      header。同 v57 的道理，也必须 bump `-CompatVersion`。
+         * 1.0.0-59：上面那条 CSS 规则**压不过修复 66 的 `!important`**，实测
+         *      `getComputedStyle` 仍是 0px、规则完全不生效。改为让
+         *      `mpSyncFloatNavGap()` 在算 `--mp-float-nav-h` 时把状态栏高度一并纳入
+         *      （JS 的 `Math.max` 不受内核版本限制；CSS 的 `max()` 要 Chrome 79，
+         *      而目标内核是 chrome74，老内核上整条声明会静默失效）。
+         *      同 v57/v58 的道理，也必须 bump `-CompatVersion`（现 v15）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-56"
+        private const val MOBILE_UI_VERSION = "1.0.0-59"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -5423,6 +5523,27 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val BUBBLE_TOOL_DIR = "bubble-tool"
+
+        // ── 系统栏配色工具 ───────────────────────────────────────────
+        //
+        // 与 bubble 工具**同一套做法**（独立工具 + 文件信箱 + 刻意在 pnpm 管辖之外），
+        // 差别只在能力：那个改悬浮窗，这个改**状态栏（顶部）与导航栏（底部）的配色**。
+        //
+        // 为什么需要它：那两条栏原先**只由页面底色驱动**（页面侧上报 → 原生一并刷），
+        // 没有任何独立入口 —— 用户改不了，模型更够不着。这个插件把同一条能力注册成
+        // 一个 `statusbar` 工具，并靠 [SystemBarCommandBridge] 的文件信箱把命令送回
+        // 原生。详见 `mobile-ui-plugin/dsh-android-statusbar/lib/index.js`。
+        //
+        // ⚠️ 与 bubble / ui 工具走**不同的信箱文件**：命令可能并发发起，回执按 `id`
+        //   配对，而各插件各自从 1 自增 —— 共用文件会让工具调用收到对方的回执。
+
+        /** 注册 `statusbar` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val STATUSBAR_TOOL_ASSET = "statusbar-tool.zip"
+        private const val STATUSBAR_TOOL_PACKAGE = "dsh-android-statusbar"
+        private const val STATUSBAR_TOOL_PATCH = "statusbar-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
+        private const val STATUSBAR_TOOL_DIR = "statusbar-tool"
 
         // ── UI 调试工具 ──────────────────────────────────────────────
         //
