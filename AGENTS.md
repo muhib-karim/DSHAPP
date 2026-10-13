@@ -4110,12 +4110,28 @@ reason: org.chromium.base.JniAndroid$UncaughtExceptionException: Native stack tr
 抛进我们的默认未捕获处理器。`grep` 全工程 `app/src/**` 确认**零处**处理过它。
 
 做法（`CrashRecorder`）：新增 `isWebViewKernelCrash(err, stack)` —— 要求异常类名含
-`JniAndroid` **且**栈里出现 `TrichromeLibrary` / `libmonochrome` /
-`JniAndroid.handleException`（两个条件同时成立才认，避免误伤本 App 自己的异常），
+`JniAndroid` **且** native 栈里出现内核库名 `TrichromeLibrary` / `libmonochrome`
+（两个条件同时成立才认，避免误伤本 App 自己的异常），
 命中时给 `reason` 加前缀 `【系统 Web 内核崩溃，非本 App】`。
+
+⚠️ **不要再把 `stack.contains("JniAndroid.handleException")` 加回判据里。** 加过一版，
+它是**恒真**的 —— `UncaughtExceptionException` 正是由 `JniAndroid.handleException`
+构造的（chromium 源码里 `new UncaughtExceptionException(nativeStackTrace, throwable)`
+就在该方法体内），必然出现在自己的栈里。恒真条件会把判据短路成「只看类名」，而
+chromium 的 `CheckException(env)` 是 **jni_zero 的通用 JNI 边界检查** —— native 调用
+**任何** Java 方法返回时有未决异常都会触发，不限于内核自己崩。本工程这些回调都是被
+WebView native 经 JNI 调用的（`onPageFinished`、`onStatus`、`onUiReady`、`bubbleApply`…），
+任一处抛未捕获异常就会被**误标成「非本 App」**，与该修复的意图正好相反。
+**要加特征就往「native 栈里出现内核库名」这个方向加。**
 
 ⚠️ **只改归因文案，不改 level、不改 `isHardCrash`。** 界面确实死了（用户看到的是
 App 崩），把它从硬崩溃里摘出去会让 `crash-scenes` 漏报真实后果。**归因准确 ≠ 降低严重度。**
+
+⚠️ **`reason` 里可能带整段 native 栈**（`UncaughtExceptionException` 的 message 就是
+`"Native stack trace:" + 换行 + nativeStackTrace`），所以两个写入点都要防多行：
+现场文件 `writeScene` 把换行折叠成 `\n` 字面量（保住 `key: value` 逐行格式，栈全文仍在
+下方的 stack 段里完整保留），`app.log` 那条只取 `reason` 首行（下一行紧接着就是
+`stack`，否则同一条崩溃在 app.log 里会出现两遍、且这一行被撑成几百行）。
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
