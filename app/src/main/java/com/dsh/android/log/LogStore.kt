@@ -403,6 +403,16 @@ object LogStore {
                 w.write("\n")
                 w.flush()
                 appBytes += line.length + 1
+                // ⚠️ **写成功必须清零，否则「连续」二字是假的。** [noteFailure] 的
+                //   注释与它写进 app.log 的文案都是「**连续**写入失败 N 次」，
+                //   而原来这个计数器只增不减 —— 于是三次**相隔几小时**的瞬时失败
+                //   （磁盘一时满、被别的进程占满、只读挂载抖动）会被算成「连续」，
+                //   日志系统就此**永久**关掉落盘：此后 `appWriter` 一直是 null，
+                //   [writeApp] 直接 return，连重开的机会都没有，所有日志只留在内存
+                //   ring 里，进程一死全没 —— 而磁盘其实早就恢复了。
+                //   清零之后，判据才真正等于「连续」，注释给的理由（磁盘满时每条都
+                //   抛一次 IOException + 栈展开，拖慢整个回合）也才成立。
+                writeFailures = 0
                 if (appBytes >= MAX_FILE_BYTES) rotateApp()
             }
         } catch (t: Throwable) {
