@@ -41,6 +41,29 @@ import java.util.Locale
  *
  * 一次非正常结束是噪声（后台被回收很正常）。**连续**多次才说明是启动即崩的
  * 死循环 —— 那正是最需要立刻告诉用户的场景（App 打不开，用户以为彻底坏了）。
+ *
+ * ## ⚠️ 但「非正常结束」的次数**不是**「启动即崩」的次数（踩过，很严重）
+ *
+ * 计数原先每遇到一次 `clean == false` 就 +1，于是把两类**完全不同**的情况
+ * 混成了一串数字：
+ *
+ * | 实际情况 | 特征 | 该不该算「启动即崩」 |
+ * |---|---|---|
+ * | 启动即崩的死循环 | 本次**从未**加载出界面 | ✅ 该算 |
+ * | 正常用了一阵，返回键退到后台 / 被 LMK 回收 / 断电 | 本次**成功**加载过界面 | ❌ 不该算 |
+ *
+ * 而第二类恰恰是**绝大多数**：`MainActivity` 用返回键退到后台走的是
+ * `moveTaskToBack(true)`，**不 finish Activity** ⇒ 永远走不到 `onDestroy` 的
+ * `markCleanExit` ⇒ 每次正常离开都被记成一次「非正常结束」。
+ *
+ * 真机实测（53 个诊断包）：计数一路涨到 **18**，`last-exit` 因此判 fail
+ * 「疑似启动即崩的死循环」；而同一份 `app.log` 里，10 个会话段有 **8 个**
+ * 明明「引擎就绪 + 界面加载完成」，`crashes/` 也只有 5 份 `main-thread-stall`。
+ * 也就是说**这条结论是错的**，而它正是用户/分析者最先看到的那一行。
+ *
+ * 所以判据改成：**只有「上次启动从头到尾没能加载出界面」才累加计数**。
+ * 加载成功过 ⇒ 计数归零（`clean=false` 这个事实本身仍由 `last-exit` 的
+ * warn 分支独立如实上报，不受影响）。
  */
 object BootState {
 
@@ -84,7 +107,15 @@ object BootState {
 
         // 判定上一次
         val unclean = prev != null && !prev.clean
-        val consecutive = if (unclean) prev!!.consecutiveUncleanCount + 1 else 0
+        // ⚠️ **只有「上次压根没加载出界面」才累加**（见类注释里的踩坑说明）。
+        //   上次加载成功过 ⇒ 那是「用了一阵才离开」，不是「启动即崩」⇒ 归零。
+        //   老状态文件里没有 `uiLoaded` 字段（默认 false）⇒ 一律按「没加载过」
+        //   处理，与旧行为一致，不会把已有的计数洗白。
+        val consecutive = when {
+            !unclean -> 0
+            prev!!.uiLoaded -> 0
+            else -> prev.consecutiveUncleanCount + 1
+        }
 
         state = State(
             bootId = bootId,
@@ -155,6 +186,31 @@ object BootState {
         write()
     }
 
+    /**
+     * 记下「本次启动成功加载出过界面」。
+     *
+     * ⚠️ **必须在每次启动里都调用**（[begin] 会重置它）。它是 [State.uiLoaded]
+     * 的唯一写入点，用途只有一个：让下一次启动能分清
+     *
+     * - 「上次启动从头到尾没出界面」= 启动即崩的死循环 ⇒ 计数 +1
+     * - 「上次出过界面，之后才被回收/断电/退到后台」⇒ 计数归零
+     *
+     * 没有它的时候，返回键退到后台（走 `moveTaskToBack`，**不 finish**，
+     * 永远到不了 `markCleanExit`）会被反复记成「非正常结束」，真机实测累积到
+     * 18 次，于是诊断包给出「疑似启动即崩的死循环」这个**错误结论**。
+     *
+     * ⚠️ 判据取「Web 界面加载完成」而不是「引擎就绪」：引擎起来了但页面白屏
+     * 同样是用户眼里的「打不开」，那种情况不该被算成「成功启动」。
+     *
+     * ⚠️ 只在**第一次**落盘（`uiLoaded` 已是 true 就直接返回）：这个方法会在
+     * 每次页面加载完成时被调用（含内核被回收后的重载），没必要反复写文件。
+     */
+    fun markUiLoaded() {
+        if (state.uiLoaded) return
+        state = state.copy(uiLoaded = true)
+        write()
+    }
+
     /** 当前状态快照（诊断包用）。 */
     fun current(): State = state
 
@@ -195,6 +251,7 @@ object BootState {
                 versionName = o.optString("versionName", ""),
                 versionCode = o.optInt("versionCode", 0),
                 flavor = o.optString("flavor", ""),
+                uiLoaded = o.optBoolean("uiLoaded", false),
             )
         } catch (t: Throwable) {
             // 坏文件不是错误：当成「没有历史」。不删它 —— 万一要人工看。
@@ -221,6 +278,7 @@ object BootState {
                 put("versionName", state.versionName)
                 put("versionCode", state.versionCode)
                 put("flavor", state.flavor)
+                put("uiLoaded", state.uiLoaded)
                 state.lastExit?.let { e ->
                     put(
                         "lastExit",
@@ -256,6 +314,13 @@ object BootState {
         val versionName: String = "",
         val versionCode: Int = 0,
         val flavor: String = "",
+        /**
+         * 本次启动**是否成功加载出过界面**。
+         *
+         * ⚠️ 它是区分「启动即崩」与「用了一阵才离开」的唯一依据 —— 见类注释。
+         * 老状态文件里没有这个字段 ⇒ 读回 false ⇒ 按旧行为处理。
+         */
+        val uiLoaded: Boolean = false,
     )
 
     data class LastExit(

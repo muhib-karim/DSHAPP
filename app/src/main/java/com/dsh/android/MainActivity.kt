@@ -832,6 +832,12 @@ class MainActivity : AppCompatActivity() {
                 bridge = StatusBridge(),
                 onPageFinished = { url ->
                     Log.i(DshApplication.TAG, "Web 界面加载完成: $url")
+                    // ⚠️ 记下「本次启动成功出过界面」。下一次启动靠它区分
+                    //   「启动即崩」与「用了一阵才离开」—— 后者（返回键退到后台、
+                    //   被 LMK 回收、断电）走不到 onDestroy，不记的话会被反复
+                    //   算成「非正常结束」，真机实测累积到 18 次并让诊断包给出
+                    //   「疑似启动即崩的死循环」这个错误结论。见 [BootState.markUiLoaded]。
+                    BootState.markUiLoaded()
                     // ⚠️ **必须在这里补推让位变量**：applyFullscreen 有状态门（配置没变
                     //   就不再写 DOM），而变量是写在页面 documentElement 的**行内样式**上，
                     //   文档一重载就没了 —— 只靠配置变化那一次推，重启 App 后
