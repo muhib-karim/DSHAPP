@@ -45,6 +45,7 @@ import com.dsh.android.web.PageBridge
 import com.dsh.android.web.WebHost
 import com.dsh.android.web.WebHostCallbacks
 import com.dsh.android.web.createWebHost
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -2011,6 +2012,10 @@ class MainActivity : AppCompatActivity() {
                         lifecycleScope.launch {
                             try {
                                 engine.start()
+                            } catch (c: CancellationException) {
+                                // 同 bootEngine()：Activity 被销毁时 lifecycleScope 取消，
+                                // 这不是启动失败，别记成错误、也别弹遮罩。
+                                throw c
                             } catch (t: Throwable) {
                                 Log.e(DshApplication.TAG, "引擎自动重启失败", t)
                                 showOverlay("引擎重启失败", hint = t.message, isError = true)
@@ -2052,6 +2057,25 @@ class MainActivity : AppCompatActivity() {
             try {
                 engine.ensureExtracted(assetStamp)
                 engine.start()
+            } catch (c: CancellationException) {
+                // ⚠️ **协程取消不是异常，必须原样抛出去。**
+                //
+                // `lifecycleScope` 绑在 Activity 生命周期上：用户退出、转屏、被系统回收
+                // 时这个作用域会被 cancel，正在 `start()` 里挂起的这一刻就抛
+                // `JobCancellationException: Job was cancelled; job=SupervisorJobImpl{Cancelling}@…`。
+                //
+                // 原先这里只有 `catch (t: Throwable)`，于是把「正常取消」记成
+                // `[E] 引擎启动异常` 并 `showOverlay(..., isError = true)` ——
+                // 明明是我方主动停的，日志里却是一行错误，用户还可能瞥见一块
+                // 转瞬即逝的红色错误遮罩。
+                // 真机证据：`20261013-233625-59822e09.zip` 的 app.log，
+                // `#109 main 引擎启动异常` + `JobCancellationException`，
+                // 紧接着 `#111` 引擎自己正常输出 `1 entry did not activate` ——
+                // 引擎根本没死，是界面自己走了。
+                //
+                // 吞掉取消异常还有个更隐蔽的后果：Kotlin 协程靠异常传播来标记
+                // 取消状态，吞了它会让「这个协程已被取消」这件事在语义上丢失。
+                throw c
             } catch (t: Throwable) {
                 Log.e(DshApplication.TAG, "引擎启动异常", t)
                 showOverlay("引擎启动异常", hint = t.message, isError = true)
@@ -2168,6 +2192,10 @@ class MainActivity : AppCompatActivity() {
                 //   引擎还是用旧的坏目录起来。
                 engine.ensureExtracted(assetStamp)
                 engine.start()
+            } catch (c: CancellationException) {
+                // 同 bootEngine()：用户点完「安全模式」就退出/转屏时，
+                // 这次取消不是「安全模式启动失败」。
+                throw c
             } catch (t: Throwable) {
                 Log.e(DshApplication.TAG, "安全模式启动失败", t)
                 binding.overlaySafeMode.isEnabled = true
