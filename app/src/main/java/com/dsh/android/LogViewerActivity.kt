@@ -370,7 +370,15 @@ class LogViewerActivity : AppCompatActivity() {
                             " → ${(shared ?: out).absolutePath}",
                     )
                 } else {
-                    toast(getString(R.string.logs_export_failed, "写入失败或磁盘空间不足"))
+                    // ⚠️ **不能猜原因**（2026-10-14 自检发现）。原来这里写死
+                    //   「写入失败或磁盘空间不足」—— 那是编的：`build()` 返回 null 的
+                    //   唯一原因是它 catch 到了异常，而磁盘满只是**可能之一**
+                    //   （还有 outDir 建不出来、zip 流中途抛、OOM…）。本文件的
+                    //   `DiagnosticBundle.runChecks` 里明写「只报事实，不猜原因」，
+                    //   这句正好违反它。现在改为指向**真实原因的去处**：
+                    //   `DiagnosticBundle.build` 的 catch 已把异常落进 `app.log`
+                    //   （tag `Diagnostic`），用户/分析者按 tag 一搜就能看到。
+                    toast(getString(R.string.logs_export_failed, "见日志里的 Diagnostic 条目"))
                 }
             }
         }, "dsh-log-export").apply { isDaemon = true }.start()
@@ -409,7 +417,8 @@ class LogViewerActivity : AppCompatActivity() {
                 DiagnosticBundle.build(logsDir(), dir, "manual", engineStateFiles())
             }.getOrNull()
             if (bundle == null) {
-                handler.post { toast(getString(R.string.logs_export_failed, "打包失败")) }
+                // 同上：不猜原因，指向真实原因的去处（`app.log` 的 `Diagnostic` 条目）。
+                handler.post { toast(getString(R.string.logs_export_failed, "见日志里的 Diagnostic 条目")) }
                 return@Thread
             }
             // 入待传队列：上传失败时它留在 pending/，下次启动自动重试。

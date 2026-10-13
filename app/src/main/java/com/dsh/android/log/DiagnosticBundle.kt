@@ -193,6 +193,17 @@ object DiagnosticBundle {
         } catch (t: Throwable) {
             // 生成失败不抛：调用方会提示用户，而不是让日志界面崩掉。
             android.util.Log.e("DSH/Diagnostic", "诊断包生成失败: ${t.message}", t)
+            // ⚠️ **必须落盘，不能只打 logcat**（2026-10-14 自检发现）。
+            //   logcat 是易失的：用户点了「导出」看到失败提示、重启 App 之后再想
+            //   反馈，这条原因就没了。而本方法返回的只是一个 `null` —— 调用方
+            //   （`LogViewerActivity.exportBundle`）拿不到原因，于是它**自己编了一个**
+            //   「写入失败或磁盘空间不足」贴在界面上（见那里）。那正是本文件
+            //   `runChecks` 里明写的原则「只报事实，不猜原因」被违反的地方。
+            //   在这里把真实异常落盘，界面上那句话才有据可查。
+            LogStore.app(
+                'E', "Diagnostic",
+                "诊断包生成失败（本次导出未产出文件）: ${t.javaClass.simpleName}: ${t.message}",
+            )
             null
         }
     }
