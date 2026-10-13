@@ -117,7 +117,16 @@ param(
     #     ⚠️ mobile-ui 源码改了就必须 bump：不 bump 会命中「两戳都一致 → 整体跳过」，
     #     设备上那棵树继续被旧降级产物覆盖 ⇒ "开了全面屏，顶上一行被时间盖住"，
     #     而原生侧日志看起来一切正常。
-    [string]$CompatVersion = "15",
+    # v15：`fullscreen` 让位修复尝试二 —— 改用 JS（见上）。
+    # v16：设置页新增「运行日志与诊断」分节（`mpLogsSection` +
+    #     `mpRegisterLogsSection`，拉起原生 `LogViewerActivity`）。
+    #     ⚠️ 这一版**看起来**只是加了个设置项、跟"降级编译"无关，但**必须 bump**：
+    #     `mobileui/lib/client.js` 是降级编译的**输入之一**（见本文件头部 v4 起的
+    #     全部先例），改它 ⇒ 降级产物变化 ⇒ 不 bump 会命中「两戳都一致 → 整体跳过」
+    #     ⇒ 设备上那棵树继续被**旧**产物覆盖 ⇒ 设置页里根本看不到这个分节，
+    #     而原生侧日志（`已安装移动端 UI 插件`）看起来一切正常。
+    #     这个失败方式本项目已经踩过至少 8 次（v4~v15 每一版都在记同一件事）。
+    [string]$CompatVersion = "16",
 
     [string]$EngineBin,
     [string]$OutZip

@@ -12,7 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent

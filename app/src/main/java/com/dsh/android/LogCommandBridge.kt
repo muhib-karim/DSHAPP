@@ -1,0 +1,379 @@
+package com.dsh.android
+
+import com.dsh.android.log.BootState
+import com.dsh.android.log.CrashRecorder
+import com.dsh.android.log.DiagnosticBundle
+import com.dsh.android.log.DshLog as Log
+import com.dsh.android.log.LogStore
+import com.dsh.android.log.LogUploader
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipFile
+
+/**
+ * 日志的**命令信箱** —— 让 Node 进程里的模型工具能读到原生侧的日志。
+ *
+ * ## 为什么需要它
+ *
+ * 日志系统的两个入口（设置页分节、启动/崩溃浮层按钮）都是给**人**的。而模型跑在
+ * **Node 进程**里：它看不到原生侧的内存环形缓冲，也看不到 `filesDir/logs` 下的
+ * `app.log` / 崩溃现场。于是「你看看日志」这句话对模型是空的，它只能猜。
+ *
+ * 本类补的就是这一段：`dsh-android-logs` 插件把请求写进 `$DSH_HOME/logs-cmd.json`，
+ * 这里轮询读走、执行、把结果写回 `$DSH_HOME/logs-result.json`。
+ *
+ * ## 与 [BubbleCommandBridge] 的关系：同构，但**刻意不共用文件**
+ *
+ * 协议逐条照抄（自增 id 配对、原子发布、读后即删、粗粒度轮询），因为那套已经被
+ * 真机验过，重造没有收益。但两个信箱的**文件必须分开**：
+ *
+ * 回执是按自增 `id` 配对的，而两个插件跑在两个独立的进程/模块里，各自从 1 开始
+ * 计数。共用一对文件时，同一个 `id=5` 会同时存在两条语义不同的请求 ——
+ * 工具调用收到的可能是另一个的回执。这类错配的表现是
+ * **「AI 说日志里没有这条错误」，而它看起来像真的查过了** —— 比报错危险得多。
+ *
+ * ## 三条不变量（与 bubble 桥一致）
+ *
+ * ① **请求带自增 `id`，回执按 id 配对。**
+ * ② **先写结果、再删请求。** 反过来会丢回执。
+ * ③ **命令文件损坏（写到一半）不是错误。** 插件用「临时文件 + rename」发布，
+ *    这里解析失败就下一轮再读，不记错误日志刷屏。
+ *
+ * ## 轮询间隔为什么是 200ms（比 bubble 的 250ms 略快）
+ *
+ * 这条通道的调用频率比 bubble 高（模型排查问题时会连读几次），而 200ms 的代价
+ * 可以忽略。**不做得更激进**：真要做 inotify 得先确认 app 域能不能 watch
+ * 自己的私有目录，为这点延迟不值得。
+ *
+ * ⚠️ **执行体跑在轮询线程上，不能碰视图。** 这里的四个动作全是文件/内存操作，
+ *   唯一碰 `Context` 的是 `export` 里的环境快照，它内部自己兜了异常。
+ */
+object LogCommandBridge {
+
+    private const val TAG = DshApplication.TAG
+
+    /** 请求文件名。**必须与 `mobile-ui-plugin/dsh-android-logs/lib/index.js` 一致。** */
+    private const val CMD_FILE = "logs-cmd.json"
+
+    /** 回执文件名。同上，两边必须一起改。 */
+    private const val RESULT_FILE = "logs-result.json"
+
+    /** 轮询间隔。见类注释。 */
+    private const val POLL_MS = 200L
+
+    /** 单次 `read` 的返回行数上限。与插件侧的 `MAX_LINES` 一致。 */
+    private const val MAX_LINES = 500
+
+    /** 崩溃现场全文的字符上限。与插件侧的 `MAX_CRASH_CHARS` 一致。 */
+    private const val MAX_CRASH_CHARS = 40000
+
+    private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+
+    private val scheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "dsh-logs-cmd").apply { isDaemon = true }
+    }
+
+    private var task: ScheduledFuture<*>? = null
+
+    /** `$DSH_HOME`，由 [start] 传入；未启动时为 null。 */
+    @Volatile
+    private var home: File? = null
+
+    /**
+     * 启动轮询。由 `EngineManager` 在引擎启动前调用一次（幂等）。
+     *
+     * @param dshHome `$DSH_HOME`（`<filesDir>/home/.dsh`）。不存在时仍然启动 ——
+     *   目录会在引擎初始化时被创建，早启动只是多几次空轮询。
+     */
+    @Synchronized
+    fun start(dshHome: File) {
+        home = dshHome
+        if (task != null) return
+        task = scheduler.scheduleWithFixedDelay(::pollOnce, POLL_MS, POLL_MS, TimeUnit.MILLISECONDS)
+        Log.i(TAG, "日志命令信箱已启动: ${File(dshHome, CMD_FILE).absolutePath}")
+    }
+
+    /** 停掉轮询（给测试/重启留一个干净的入口）。 */
+    @Synchronized
+    fun stop() {
+        task?.cancel(false)
+        task = null
+    }
+
+    /**
+     * 读一次信箱。
+     *
+     * ⚠️ `export` 会在这里**同步**做完整打包（可能几秒）。`scheduleWithFixedDelay`
+     *   保证同一时刻只有一个 `pollOnce` 在跑，所以不会堆积；代价是打包期间
+     *   `read` 会晚一拍 —— 那可以接受（模型要么在读、要么在导，不会同时）。
+     */
+    private fun pollOnce() {
+        val dir = home ?: return
+        val cmd = File(dir, CMD_FILE)
+        if (!cmd.isFile) return
+
+        val text = try {
+            cmd.readText()
+        } catch (t: Throwable) {
+            // 读失败（权限/被删）：下一轮再看，不刷日志
+            return
+        }
+        val json = try {
+            JSONObject(text)
+        } catch (t: Throwable) {
+            // ③：写到一半或坏了，下一轮再读
+            return
+        }
+
+        val id = json.optLong("id", -1L)
+        if (id < 0L) {
+            // 没有 id 的请求无法配对回执，直接丢弃（否则会卡住一个永远等不到答案的调用）
+            Log.w(TAG, "日志命令缺少 id，已丢弃")
+            cmd.delete()
+            return
+        }
+
+        val action = json.optString("action", "summary")
+        val out = JSONObject().apply { put("id", id) }
+        try {
+            when (action) {
+                "read" -> doRead(json, out)
+                "crashes" -> doCrashes(json, out)
+                "export" -> doExport(out)
+                else -> doSummary(out)
+            }
+            out.put("ok", true)
+        } catch (t: Throwable) {
+            // 单个动作失败**不能**让整条通道哑掉：把原因回给模型，它才能自己改参数。
+            Log.w(TAG, "日志命令 $action 执行失败: ${t.message}")
+            out.put("ok", false)
+            out.put("message", "原生侧执行 $action 失败: ${t.javaClass.simpleName} ${t.message ?: ""}")
+        }
+
+        // ②：先写结果，再删请求。
+        writeResult(dir, out)
+        cmd.delete()
+    }
+
+    // ── 四个动作 ──────────────────────────────────────────────────────────────
+
+    /**
+     * 读最近日志。
+     *
+     * ⚠️ **读内存环形缓冲，不读磁盘文件**：磁盘上的 `engine.log` 是异步刷的，
+     *   最后几行可能还没落盘 —— 而模型要查的恰恰经常是"刚刚发生的那一条"。
+     *   缓冲是同步入队的，最新。代价是最多只有 [LogStore.RING_MAX] 条。
+     */
+    private fun doRead(req: JSONObject, out: JSONObject) {
+        val level = req.optString("level", "all")
+        val source = req.optString("source", "all")
+        val query = req.optString("query", "")
+        val lines = req.optInt("lines", 120).coerceIn(1, MAX_LINES)
+
+        val minLevel = when (level) {
+            "error" -> 'E'
+            "warn" -> 'W'
+            else -> null
+        }
+        val needle = query.lowercase(Locale.US)
+
+        val matched = LogStore.entries().filter { e ->
+            (minLevel == null || LogStore.severity(e.level) >= LogStore.severity(minLevel)) &&
+                matchesSource(source, e.tag) &&
+                (needle.isEmpty() || e.tag.lowercase(Locale.US).contains(needle) ||
+                    e.msg.lowercase(Locale.US).contains(needle))
+        }
+
+        val taken = matched.takeLast(lines)
+        val text = taken.joinToString("\n") { e ->
+            "${fmt.format(Date(e.t))} [${e.level}] [${e.tag}] #${e.seq} ${e.msg}"
+        }
+
+        out.put("source", source)
+        out.put("level", level)
+        out.put("returned", taken.size)
+        out.put("logText", text)
+
+        // ⚠️ 截断必须**说出来**。静默只给最后 N 行，模型会把「没看到」当成「没有」。
+        val notes = mutableListOf<String>()
+        if (matched.size > taken.size) {
+            notes += "匹配 $matched.size 条，只返回最近 ${taken.size} 条（上限 $lines）。" +
+                "要更早的请加 query 或收紧 level/source —— 不要靠加大 lines。"
+        }
+        if (taken.isEmpty()) {
+            notes += "当前缓冲里没有匹配的行。**这不等于没发生过**：日志可能已轮转、" +
+                "被限流折叠，或该故障根本没留下日志（例如进程被系统直接杀掉）。" +
+                "结论请写成「日志里没找到」。"
+        }
+        if (LogStore.throttledTotal > 0) {
+            notes += "本次运行已折叠 ${LogStore.throttledTotal} 条重复行（1 秒内同 tag 同内容超过 20 次）。" +
+                "高频重复的报错只留了前 20 条。"
+        }
+        if (notes.isNotEmpty()) out.put("truncatedNote", notes.joinToString("\n"))
+    }
+
+    /** 来源筛选。`crash` 不在缓冲里（现场是独立文件），由 [doCrashes] 负责。 */
+    private fun matchesSource(source: String, tag: String): Boolean = when (source) {
+        "engine" -> tag == "engine"
+        "web" -> tag == "web"
+        "app" -> tag != "engine" && tag != "web"
+        // "crash" 与 "all" 在这里等价：崩溃现场是独立文件，`read` 不虚拟它们。
+        // 想让模型看现场就让它用 action:"crashes" —— 那才是能给出全文的那条路。
+        else -> true
+    }
+
+    /** 列出崩溃现场，或读某一份的全文。 */
+    private fun doCrashes(req: JSONObject, out: JSONObject) {
+        val scenes = CrashRecorder.listScenes()
+        val arr = JSONArray()
+        for (f in scenes) {
+            arr.put(
+                JSONObject().apply {
+                    put("file", f.name)
+                    put("hardCrash", CrashRecorder.isHardCrash(f))
+                    put("sizeBytes", f.length())
+                    put("atText", fmt.format(Date(f.lastModified())))
+                },
+            )
+        }
+        out.put("scenes", arr)
+
+        val want = req.optString("crashFile", "").trim()
+        if (want.isEmpty()) return
+
+        // ⚠️ 只认文件名，不认路径。这个值来自模型，而下面要拿它拼 `crash/<name>`；
+        //   放行 `../` 就等于给模型一个任意文件读取口。
+        if (want.contains('/') || want.contains('\\') || want.contains("..")) {
+            throw IllegalArgumentException("crashFile 必须是纯文件名: $want")
+        }
+        val file = scenes.firstOrNull { it.name == want }
+            ?: throw IllegalArgumentException("找不到现场文件 $want（先不带 crashFile 列一次）")
+
+        val text = try {
+            file.readText()
+        } catch (t: Throwable) {
+            throw IllegalStateException("读取现场失败: ${t.message}")
+        }
+        out.put(
+            "sceneText",
+            if (text.length > MAX_CRASH_CHARS) {
+                text.substring(0, MAX_CRASH_CHARS) +
+                    "\n\n…（现场超过 ${MAX_CRASH_CHARS / 1000} K 字符，已截断）"
+            } else {
+                text
+            },
+        )
+    }
+
+    /**
+     * 一眼结论。**便宜**（只读内存缓冲 + 几个文件的元信息），所以模型可以每次都先调它。
+     *
+     * ⚠️ 措辞必须与 [BootState.Previous.describe] 的分级一致：
+     *   **「非正常结束」不是「崩溃」的同义词** —— 可能是 LMK 回收、ROM 冻结、
+     *   用户强停、断电。这里绝不能替它们下「崩溃」的结论。
+     */
+    private fun doSummary(out: JSONObject) {
+        val entries = LogStore.entries()
+        val warn = entries.count { it.level == 'W' }
+        val error = entries.count { it.level == 'E' }
+        val scenes = CrashRecorder.listScenes()
+        val hardCrashes = scenes.count { CrashRecorder.isHardCrash(it) }
+        val logDir = LogStore.dirOrNull()
+        val pending = logDir?.let { LogUploader.pendingCount(it) } ?: 0
+
+        val prev = BootState.previous()
+        val lastExit = prev.describe()
+
+        out.put(
+            "counts",
+            JSONObject().apply {
+                put("total", entries.size)
+                put("warn", warn)
+                put("error", error)
+                put("crash", scenes.size)
+                put("pending", pending)
+            },
+        )
+        out.put("lastExit", lastExit)
+
+        // headline 的优先级：**硬崩溃 > 非正常结束 > 错误数 > 干净**。
+        // 崩溃最具体、最能直接指向下一步，所以排最前。
+        val newest = scenes.firstOrNull { CrashRecorder.isHardCrash(it) }
+        out.put(
+            "headline",
+            when {
+                newest != null -> "有 $hardCrashes 份崩溃现场，最近一份 ${newest.name}（${fmt.format(Date(newest.lastModified()))}）"
+                prev.unclean -> lastExit
+                error > 0 -> "内存缓冲里有 $error 条错误（缓冲只覆盖本次运行，更早的请看 app.log）"
+                else -> "本次运行未发现错误，也无崩溃现场"
+            },
+        )
+
+        val notes = mutableListOf<String>()
+        if (LogStore.throttledTotal > 0) {
+            notes += "已折叠 ${LogStore.throttledTotal} 条重复行 —— 不要据此断言「某错误从未发生」。"
+        }
+        if (pending > 0) {
+            notes += "有 $pending 个诊断包等待上传（网络恢复或下次启动时自动重试）。"
+        }
+        if (notes.isNotEmpty()) out.put("throttleNote", notes.joinToString(" "))
+        out.put("message", "日志目录: ${logDir?.absolutePath ?: "（落盘不可用，仅内存）"}；" +
+            "缓冲 ${entries.size} 条（上限 ${LogStore.RING_MAX}）。")
+    }
+
+    /**
+     * 生成诊断包。
+     *
+     * ⚠️ `reason` 固定 `"manual"`：这条路的触发者是模型/用户，不是崩溃路径。
+     *   崩溃路径的包由 `LogUploader.stashForCrash()` 在 `CrashRecorder` 里生成，
+     *   那个**不做网络 IO**（崩溃进程做不了）。
+     */
+    private fun doExport(out: JSONObject) {
+        val logDir = LogStore.dirOrNull() ?: throw IllegalStateException("日志落盘不可用，无法生成诊断包")
+        val outDir = File(logDir, "export")
+        val bundle = DiagnosticBundle.build(logDir, outDir, "manual")
+            ?: throw IllegalStateException("诊断包生成失败（见 app.log）")
+
+        out.put("bundlePath", bundle.absolutePath)
+        out.put("bundleBytes", bundle.length())
+
+        // 把包内的自动结论摘要给模型 —— 让它不必再拆一次 zip 才知道结论。
+        // 失败不影响导出本身（包已经在了），所以单独兜住。
+        runCatching {
+            ZipFile(bundle).use { zip ->
+                val entry = zip.getEntry("diagnosis.json") ?: return@use
+                val text = zip.getInputStream(entry).bufferedReader().use { it.readText() }
+                out.put("diagnosisHeadline", DiagnosticBundle.summarize(text))
+            }
+        }
+    }
+
+    // ── 回执 ──────────────────────────────────────────────────────────────────
+
+    /**
+     * 写回执。失败**不重试** —— 插件超时后会自己用 `action:"summary"` 复查，
+     * 而那正是我们想要的语义（宁可让模型多查一次，也不要它拿一个假成功）。
+     */
+    private fun writeResult(dir: File, out: JSONObject) {
+        try {
+            val target = File(dir, RESULT_FILE)
+            // 原子发布：插件可能正好读到这里，半个 JSON 会让它那一轮白等。
+            val tmp = File(dir, "$RESULT_FILE.tmp")
+            val text = out.toString()
+            tmp.writeText(text)
+            if (!tmp.renameTo(target)) {
+                target.writeText(text)
+                tmp.delete()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入日志命令回执失败: ${t.message}")
+        }
+    }
+}

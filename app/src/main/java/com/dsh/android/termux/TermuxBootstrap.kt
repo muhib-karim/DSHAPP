@@ -3,9 +3,8 @@ package com.dsh.android.termux
 import android.content.Context
 import android.os.Build
 import android.system.Os
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import com.dsh.android.BuildConfig
-import com.dsh.android.termux.util.AppLogger
 import com.dsh.android.termux.util.AtomicTextFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -106,7 +105,7 @@ class TermuxBootstrap(private val context: Context) {
     /** Install bootstrap from assets → prefix dir. Safe to call multiple times. */
     suspend fun install() {
         if (isReady) return
-        AppLogger.i("TERMUX", "install start arch=$termuxArch")
+        Log.i("TERMUX", "install start arch=$termuxArch")
         withContext(Dispatchers.IO) {
           // 与 installNodeRuntime / rewriteTermuxPaths 共用同一把锁：三者都会
           // 往 prefix 里写文件，而 install() 开头就有 deleteRecursively()。
@@ -208,7 +207,7 @@ class TermuxBootstrap(private val context: Context) {
         try {
             applyMirrorConfigs(loadMirrors())
         } catch (e: Exception) {
-            AppLogger.w("TERMUX", "ensure mirrors: ${e.message}")
+            Log.w("TERMUX", "ensure mirrors: ${e.message}")
         }
     }
 
@@ -242,7 +241,7 @@ class TermuxBootstrap(private val context: Context) {
     /** [installNodeRuntime] 的实现体，必须已持有 [prefixLock]。 */
     private fun installNodeRuntimeLocked(): Boolean {
         if (!prefixDir.exists()) {
-            AppLogger.w("TERMUX", "installNodeRuntime: prefix 不存在，跳过")
+            Log.w("TERMUX", "installNodeRuntime: prefix 不存在，跳过")
             return false
         }
         if (nodeMarker.exists() && nodeBinary.isFile) {
@@ -257,13 +256,13 @@ class TermuxBootstrap(private val context: Context) {
             // 路径（含「进入安全模式」）都够不着它 —— 用户只能卸载重装，而那会
             // 清掉整个 $DSH_HOME。见 [nodeIsUsable]。
             if (nodeIsUsable()) return true
-            AppLogger.w("TERMUX", "内置 Node 运行时已损坏，重新解包: ${nodeBinary.absolutePath}")
+            Log.w("TERMUX", "内置 Node 运行时已损坏，重新解包: ${nodeBinary.absolutePath}")
             nodeMarker.delete()
             nodeBinary.delete()
         }
 
         return try {
-            AppLogger.i("TERMUX", "安装内置 Node 运行时 $NODE_VERSION")
+            Log.i("TERMUX", "安装内置 Node 运行时 $NODE_VERSION")
             val links = mutableListOf<Pair<String, String>>()
 
             context.assets.open(NODE_RUNTIME_ASSET).use { raw ->
@@ -328,7 +327,7 @@ class TermuxBootstrap(private val context: Context) {
                 val linkPath = File(prefixDir, link)
                 val targetPath = File(linkPath.parentFile, target)
                 if (!targetPath.exists()) {
-                    AppLogger.w("TERMUX", "跳过断链 $link -> $target（目标不存在）")
+                    Log.w("TERMUX", "跳过断链 $link -> $target（目标不存在）")
                     continue
                 }
                 try {
@@ -337,10 +336,10 @@ class TermuxBootstrap(private val context: Context) {
                     Os.symlink(target, linkPath.absolutePath)
                     linked++
                 } catch (e: Exception) {
-                    AppLogger.w("TERMUX", "symlink $link -> $target: ${e.message}")
+                    Log.w("TERMUX", "symlink $link -> $target: ${e.message}")
                 }
             }
-            AppLogger.i("TERMUX", "建立 $linked/${links.size} 个库软链")
+            Log.i("TERMUX", "建立 $linked/${links.size} 个库软链")
 
             // 🔴 必须重写 node 与这批库里的烤死路径。它们全是 Termux 官方构建，
             //    二进制里带着 /data/data/com.termux/files/usr/lib 作为 RUNPATH，
@@ -351,14 +350,14 @@ class TermuxBootstrap(private val context: Context) {
             // 一个坏运行时封印成「已安装」。
             if (nodeBinary.isFile && nodeIsUsable()) {
                 nodeMarker.writeText("ok")
-                AppLogger.i("TERMUX", "Node 运行时就绪: ${nodeBinary.absolutePath}")
+                Log.i("TERMUX", "Node 运行时就绪: ${nodeBinary.absolutePath}")
                 true
             } else {
-                AppLogger.w("TERMUX", "Node 运行时安装后仍不可用: ${nodeBinary.absolutePath}")
+                Log.w("TERMUX", "Node 运行时安装后仍不可用: ${nodeBinary.absolutePath}")
                 false
             }
         } catch (t: Throwable) {
-            AppLogger.w("TERMUX", "安装 Node 运行时失败: ${t.message}")
+            Log.w("TERMUX", "安装 Node 运行时失败: ${t.message}")
             false
         }
     }
@@ -406,7 +405,7 @@ class TermuxBootstrap(private val context: Context) {
                 proc.exitValue() == 0 &&
                 text.trim() == NODE_EXECUTABLE_VERSION
             if (!ok) {
-                AppLogger.w(
+                Log.w(
                     "TERMUX",
                     "node --version 校验失败: rc=${if (proc.isAlive) "timeout" else proc.exitValue()} " +
                         "out=${text.trim().take(120)} err=${err.trim().take(200)}",
@@ -415,7 +414,7 @@ class TermuxBootstrap(private val context: Context) {
             }
             ok
         } catch (t: Throwable) {
-            AppLogger.w("TERMUX", "node --version 校验异常: ${t.message}")
+            Log.w("TERMUX", "node --version 校验异常: ${t.message}")
             false
         }
     }
@@ -444,7 +443,7 @@ class TermuxBootstrap(private val context: Context) {
         // 用与 [installNodeRuntime] 完全相同的判据，别另立一套。
         if (nodeMarker.exists() && nodeBinary.isFile && nodeIsUsable()) return@withLock false
 
-        AppLogger.w("TERMUX", "安全模式：内置 Node 运行时不可用，重新解包 $NODE_VERSION")
+        Log.w("TERMUX", "安全模式：内置 Node 运行时不可用，重新解包 $NODE_VERSION")
         nodeMarker.delete()
         nodeBinary.delete()
         installNodeRuntimeLocked()
@@ -464,7 +463,7 @@ class TermuxBootstrap(private val context: Context) {
             // 上的两条并发路径，都会原地重写同一个 47 MB 的 node 二进制。
             prefixLock.withLock { rewriteTermuxPathsLocked(prefixDir) }
         } catch (e: Exception) {
-            AppLogger.w("TERMUX", "ensure node patched: ${e.message}")
+            Log.w("TERMUX", "ensure node patched: ${e.message}")
         }
     }
 
@@ -476,7 +475,7 @@ class TermuxBootstrap(private val context: Context) {
      */
     fun ensurePathsRewritten() {
         if (prefixDir.exists() && !rewriteMarker.exists()) {
-            AppLogger.i("TERMUX", "rewriting Termux paths")
+            Log.i("TERMUX", "rewriting Termux paths")
             prefixLock.withLock {
             // Same first-install sequence, minus the zip extraction: existing
             // installs need the aliases and the dpkg skeleton too, not just the
@@ -578,14 +577,14 @@ class TermuxBootstrap(private val context: Context) {
             emptySet<String>()
         }
         if (MirrorProbe.isUserCustomizedApt(current, mirrors[MirrorProbe.KEY_APT_WRITTEN], upstreamHosts)) {
-            AppLogger.i("TERMUX", "apt sources.list 被用户改过，保留不动")
+            Log.i("TERMUX", "apt sources.list 被用户改过，保留不动")
             return
         }
         val body = MirrorProbe.aptSourcesList(mapOf(MirrorProbe.ECO_APT to chosen)) ?: return
         try {
             f.writeText(body)
         } catch (e: Exception) {
-            AppLogger.w("TERMUX", "write sources.list: ${e.message}")
+            Log.w("TERMUX", "write sources.list: ${e.message}")
         }
     }
 
@@ -607,7 +606,7 @@ class TermuxBootstrap(private val context: Context) {
                     file.writeText(body)
                 }
             } catch (e: Exception) {
-                AppLogger.w("TERMUX", "write ${file.name}: ${e.message}")
+                Log.w("TERMUX", "write ${file.name}: ${e.message}")
             }
         }
         // apt 单独走一遍：它受「用户是否改过」约束，且失败要留日志。
@@ -650,18 +649,18 @@ class TermuxBootstrap(private val context: Context) {
             script.setExecutable(true, false)
             runProbeScript(script)
         } catch (e: Exception) {
-            AppLogger.w("TERMUX", "mirror probe: ${e.message}")
+            Log.w("TERMUX", "mirror probe: ${e.message}")
             return cached
         }
         val picked = MirrorProbe.parseProbeOutput(raw)
         if (picked.isEmpty()) {
-            AppLogger.w("TERMUX", "mirror probe 没有任何 200 结果，保留当前源")
+            Log.w("TERMUX", "mirror probe 没有任何 200 结果，保留当前源")
             return cached
         }
         val merged = MirrorProbe.merge(cached + picked)
         applyMirrorConfigs(merged)
         saveState(merged)
-        AppLogger.i("TERMUX", "mirror probe 选中: ${picked.entries.joinToString { "${it.key}=${it.value}" }}")
+        Log.i("TERMUX", "mirror probe 选中: ${picked.entries.joinToString { "${it.key}=${it.value}" }}")
         return merged
     }
 
@@ -685,7 +684,7 @@ class TermuxBootstrap(private val context: Context) {
         try {
             AtomicTextFile.write(f, MirrorProbe.encodeState(withApt))
         } catch (e: Exception) {
-            AppLogger.w("TERMUX", "save mirror state: ${e.message}")
+            Log.w("TERMUX", "save mirror state: ${e.message}")
         }
     }
 
@@ -1368,7 +1367,7 @@ DPkg::options { "--instdir=$instdir"; };
             tmp = null
         } catch (t: Throwable) {
             // 保留改前的完整文件，这是本函数这层保护的全部意义。
-            AppLogger.w("TERMUX", "重写 ${file.name} 失败，保留原文件: ${t.message}")
+            Log.w("TERMUX", "重写 ${file.name} 失败，保留原文件: ${t.message}")
             return 0
         } finally {
             tmp?.delete()

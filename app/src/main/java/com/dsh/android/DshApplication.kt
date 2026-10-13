@@ -1,12 +1,20 @@
 package com.dsh.android
 
 import android.app.Application
-import android.util.Log
+import android.content.Context
+import com.dsh.android.log.BootState
+import com.dsh.android.log.CrashRecorder
+import com.dsh.android.log.DshLog
+import com.dsh.android.log.EventLog
+import com.dsh.android.log.LogContext
+import com.dsh.android.log.LogStore
+import com.dsh.android.log.LogUploader
 import com.dsh.android.termux.TermuxBootstrap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import java.io.File
 
 /**
  * 应用入口：在后台把 Termux 环境准备好。
@@ -21,23 +29,99 @@ import kotlinx.coroutines.launch
  */
 class DshApplication : Application() {
 
+    /**
+     * ⚠️ **日志系统必须在这里装，不能等到 `onCreate`。**
+     *
+     * `attachBaseContext` 比 `onCreate` 早一整个阶段，而本 App 的故障有相当一部分
+     * 发生在启动早期（Termux 环境损坏、资产缺失、插件把启动路径搞崩）。
+     * 装在 `onCreate` 里会漏掉这些 —— 而它们恰恰是最需要现场的那一类。
+     *
+     * ⚠️ 这里**只做最少的事**：建目录、开文件、装崩溃处理器。任何耗时操作
+     * （解包、扫描、网络）都会拖慢启动，必须放到 [bootstrapTermux] 那条异步路径上。
+     *
+     * 顺序也不能换：
+     *   ① [LogContext]  —— 后面所有组件都要靠它拿 `filesDir`
+     *   ② [LogStore]    —— 建目录、开 `app.log`（此后日志才开始落盘）
+     *   ③ [DshLog]      —— 把 `DshLog` 接到 `LogStore`（此后 476 处 `DshLog.*` 才落盘）
+     *   ④ [EventLog]    —— 事件时间线
+     *   ⑤ [BootState]   —— 读上次退出状态（要在任何崩溃可能发生之前）
+     *   ⑥ [CrashRecorder] —— 装未捕获处理器与 watchdog
+     */
+    override fun attachBaseContext(base: Context?) {
+        super.attachBaseContext(base)
+        try {
+            val ctx = base ?: return
+            LogContext.install(ctx)
+
+            val logDir = File(ctx.filesDir, LOG_DIR)
+            LogStore.init(logDir)
+
+            // ⚠️ 顺序要紧：DshLog 必须在 LogStore.init 之后接，否则接了个空出口。
+            // 反过来（先接再 init）也能工作，但 init 之前的那几条会丢。
+            DshLog.install { level, tag, msg -> LogStore.app(level, tag, msg) }
+
+            EventLog.init(logDir)
+            BootState.begin(logDir)
+            CrashRecorder.install(logDir)
+
+            LogUploader.configure(LOG_UPLOAD_ENDPOINT, LOG_UPLOAD_TOKEN, logDir)
+
+            // 走到这里日志系统就完整可用了 —— 用 DshLog 而不是 Log，
+            // 这一条必须落进文件（它是「日志系统已就绪」的唯一证据）。
+            DshLog.i(TAG, "日志系统就绪：${logDir.absolutePath}（${BootState.previous().describe()}）")
+            EventLog.record("DshLog.ready", mapOf("dir" to logDir.absolutePath))
+        } catch (t: Throwable) {
+            // ⚠️ 日志系统装不上**绝不能让 App 起不来**。退回「只有 logcat」的
+            // 旧行为，与改造前一致。
+            DshLog.e(TAG, "日志系统初始化失败（退回仅 logcat）", t)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         instance = this
-        Log.i(TAG, "DSH application created")
+        DshLog.i(TAG, "DSH application created")
+        EventLog.record("app.onCreate")
         // ⚠️ 必须在**任何通知发出之前**清理残留（见该方法注释）：上一次配对把进程拖到
         //   ANR 被杀后，那条常驻的「正在配对」通知会留在通知栏且划不掉，
         //   用户重新打开 App 会以为还在配对。放在 onCreate 最前面是为了抢在
         //   EngineService 起前台通知之前 —— 它们用的是不同的通知 id，互不覆盖，
         //   但都该在启动早期就确定状态。
         runCatching { AdbPairingNotifier.clearStaleOnStartup(this) }
-            .onFailure { Log.w(TAG, "清理残留配对状态失败", it) }
+            .onFailure { DshLog.w(TAG, "清理残留配对状态失败", it) }
         // ⚠️ 启动早期就建出配对通知渠道。本 App `targetSdk = 28`，在 Android 13+
         //   上走「旧应用」兼容路径 —— 系统只在**创建第一个通知渠道**时补弹一次
         //   通知权限框，错过就再也不问。原实现渠道要等用户点「配对」才建，
         //   于是首次打开 App 永远拿不到那个弹框，必须退出重进（见方法注释）。
         AdbPairingNotifier.ensureChannel(this)
         bootstrapTermux()
+        // 崩溃后留下的待传诊断包，在这里补传（不阻塞启动，见该方法注释）。
+        uploadPendingBundles()
+    }
+
+    /**
+     * 补传上次崩溃留下的诊断包。
+     *
+     * ⚠️ **必须异步**：它要发网络请求（8MB 在移动网络下几十秒），放在启动路径上
+     * 会拖慢界面出来 —— 而用户此刻正等着看 App 能不能打开。
+     *
+     * ⚠️ **崩溃当场传不出去**（进程马上要死，来不及建连接），所以只能落盘 +
+     * 标记待传、下次启动补传。若用户崩溃后再也不打开 App，这个包就传不出去 ——
+     * 这是平台限制，不是实现缺陷。所以日志界面的**手动上传入口是必需的补充**。
+     */
+    private fun uploadPendingBundles() {
+        applicationScope.launch {
+            runCatching {
+                val logDir = File(filesDir, LOG_DIR)
+                if (!LogUploader.configured) return@runCatching
+                val n = LogUploader.pendingCount(logDir)
+                if (n == 0) return@runCatching
+                DshLog.i(TAG, "发现 $n 份待上传的诊断包，开始补传")
+                LogUploader.retryPending(logDir) { f, ok, msg ->
+                    DshLog.i(TAG, "待传诊断包 ${f.name}: ${if (ok) "成功" else "失败"} $msg")
+                }
+            }.onFailure { DshLog.w(TAG, "补传诊断包失败", it) }
+        }
     }
 
     private fun bootstrapTermux() {
@@ -53,21 +137,50 @@ class DshApplication : Application() {
                 // Node 运行时单独一层：它在 bootstrap 之后铺入，标记也独立
                 val ok = bootstrap.installNodeRuntime()
                 bootstrap.ensureNodeRuntimePatched()
-                Log.i(
+                DshLog.i(
                     TAG,
                     "Termux 引导完成（${System.currentTimeMillis() - t0} ms），" +
                         "node=${if (ok) bootstrap.nodeBinary.absolutePath else "不可用"}",
                 )
+                EventLog.record("termux.done", mapOf("ms" to (System.currentTimeMillis() - t0).toString()))
             } catch (t: Throwable) {
                 // 引导失败不在这里崩溃：EngineManager 启动时会再检查一次并给出
                 // 带具体路径的报错，UI 上能看到，比进程直接挂掉好定位。
-                Log.e(TAG, "Termux 引导失败", t)
+                DshLog.e(TAG, "Termux 引导失败", t)
+                EventLog.record("termux.failed", mapOf("err" to (t.message ?: t.javaClass.simpleName)))
             }
         }
     }
 
     companion object {
         const val TAG = "DSH"
+
+        /** 日志目录名（`filesDir/logs`）。 */
+        const val LOG_DIR = "logs"
+
+        /**
+         * 日志上传服务器端点。
+         *
+         * 部署在 `39.98.163.161:56789`（沙箱唯一的对外隧道），由 `dsh-mux` 按路径
+         * 分流到沙箱内的日志接收服务（127.0.0.1:18900）。
+         *
+         * ⚠️ 未配置（null）时上传按钮会明确提示「尚未配置日志服务器」，
+         * 而不是静默失败（见 [LogUploader] 的类注释）。
+         *
+         * ⚠️ 只能写 `val` 不能写 `const val` —— Kotlin 的 const 只允许非空的基本类型
+         * 与 String，可空类型直接编译不过。
+         */
+        val LOG_UPLOAD_ENDPOINT: String? = "http://39.98.163.161:56789/logs/upload"
+
+        /**
+         * 上传鉴权令牌（Bearer）。服务端校验同一份 token，
+         * 存放于服务器 `/workspace/dsh-logs/token`。
+         *
+         * ⚠️ 这是**写入 APK 的共享密钥**，只能防「路人往接口里灌垃圾」，
+         * 不能防逆向。真要换：改服务端 `token` 文件后重启 logserver，
+         * 再同步改这里重新出包。同理不能写成 `const val`。
+         */
+        val LOG_UPLOAD_TOKEN: String? = "BmN46nQ0nl2neoRYC6ajguYlestQnquEEODw1lCD7wE"
 
         lateinit var instance: DshApplication
             private set

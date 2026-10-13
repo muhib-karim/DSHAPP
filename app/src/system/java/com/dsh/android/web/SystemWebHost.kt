@@ -4,7 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.net.Uri
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager

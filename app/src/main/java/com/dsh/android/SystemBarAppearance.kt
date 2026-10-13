@@ -2,7 +2,7 @@ package com.dsh.android
 
 import android.content.Context
 import android.graphics.Color
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.lang.ref.WeakReference

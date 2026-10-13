@@ -14,7 +14,7 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import android.os.Build
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import androidx.core.graphics.PathParser
 
 /**

@@ -1,6 +1,6 @@
 package com.dsh.android
 
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors

@@ -26,6 +26,7 @@ APK
  ├─ assets/bubble-tool.zip         悬浮球控制工具插件（注册 `bubble` 工具，见 ⑫.3）
  ├─ assets/pet-bridge.zip          桌面宠物状态桥插件（订阅 `session/event`，见 ⑫.4）
  ├─ assets/uiagent-tool.zip        UI 调试工具插件（注册 `ui` 工具，见 ⑫.5）
+ ├─ assets/logs-tool.zip           日志工具插件（注册 `logs` 工具，见 ⑫.6）
  ├─ assets/ui-probe.js             UI 探针（页面世界，**不走转译**，见 ⑫.5）
  ├─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片（补**运行时 API**）
  └─ assets/webview-compat.zip      按 chrome74 降级编译的前端 bundle（补**语法**，见 ⑯）
@@ -43,7 +44,20 @@ APK
  │   ├─ bubble-state.json             运行状态信箱：插件单向写、原生读完即删（见 ⑫.4）
  │   ├─ uiagent-tool/dsh-android-uiagent/  UI 调试工具插件（同上，刻意在 pnpm 之外，见 ⑫.5）
  │   ├─ ui-cmd.json                   UI 命令信箱：插件写、原生 120ms 轮询读（见 ⑫.5）
- │   └─ ui-result.json                同上，回执方向（原生写、插件读）
+ │   ├─ ui-result.json                同上，回执方向（原生写、插件读）
+ │   ├─ logs-tool/dsh-android-logs/   日志工具插件（同上，刻意在 pnpm 之外，见 ⑫.6）
+ │   ├─ logs-cmd.json                 日志命令信箱：插件写、原生 200ms 轮询读（见 ⑫.6）
+ │   └─ logs-result.json              同上，回执方向（原生写、插件读）
+ ├─ logs/                             日志与诊断（见 ⑫.6）
+ │   ├─ app.log / app.log.1           应用日志（同步 + 每行 flush，1MB 轮转，留一代）
+ │   ├─ engine.log / web.log          引擎 stdout / 网页 console（异步缓冲）
+ │   ├─ events.jsonl                  事件时间线（启动→引擎就绪→渲染→崩溃）
+ │   ├─ boot-state.json               上次是否正常退出（ApplicationExitInfo 要 API 30，用不了）
+ │   ├─ crash/<时间>-<类别>.txt        崩溃现场（独立配额 8MB / 20 份，不轮转）
+ │   ├─ device-id                     安装期随机 UUID（匿名指纹，清日志时**保留**）
+ │   ├─ export/                       手动导出的诊断包
+ │   ├─ pending/                      待上传的诊断包（下次启动自动重试）
+ │   └─ failed/                       上传失败（3 次后落这里，不再重试）
  ├─ bubble-frames/                    悬浮球默认动作的帧集（见 ⑫.4）
  │   └─ sets/<动作名>/                各命名动作的帧集（见 ⑫.4）
  ├─ dsh-android-shell.mjs  uid 2000 执行通道（每次启动覆盖写）
@@ -727,7 +741,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-56`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（见 ⑯） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-60`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（现 `16`，见 ⑯） |
 | `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.12`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
@@ -745,6 +759,7 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 | `bubble-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.3） |
 | `pet-bridge.zip` | 无需改（每次启动解包覆盖写，见 ⑫.4） |
 | `uiagent-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.5） |
+| `logs-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.6） |
 | `ui-probe.js` | 无需改（原生每次启动读一次进内存，见 ⑫.5）。⚠️ 但改了语义要同步升 `ui-probe.js` 内部的 `VERSION`（页面上的旧探针靠它判断要不要换） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
@@ -3713,6 +3728,202 @@ composer 的 `text` 字段是 **placeholder**（「发消息或创建任务, / �
 ⚠️ 探针版本号在 `ui-probe-device-check.mjs` 里**从源码正则解析**，不写死。
 写死的后果是「改探针必须记得改这里」，而漏改的表现是「脚本报失败、真机一切正常」，
 最容易被误判成资产没生效。
+
+### ⑫.6 日志与诊断 —— 拿到日志就能定位问题
+
+**这套系统解决的是一个此前一直存在的空洞**：全工程 476 处 `Log.*` 只写 logcat，
+**进程一死现场就没了**。而本项目最需要排查的恰恰是「任务跑一半自己结束了」
+「App 突然闪退」「装了某个插件后打不开」这类**伴随进程消失**的问题 ——
+logcat 里只剩一片空白。
+
+#### 为什么不是「多打点日志」
+
+「极其强壮」在这里有具体含义，四个失败模式各自要堵：
+
+| 失败模式 | 症状 | 对策 |
+|---|---|---|
+| 进程被杀，缓冲没落盘 | 崩溃前最后几行丢了 —— 而那正是要的 | 应用日志**同步写 + 每行 flush** |
+| 高频日志把磁盘写爆 | 用户手机卡、存储满 | 1 MB 轮转 + 32 MB 总配额 + 限流折叠 |
+| 崩溃处理器自己死锁 | 「闪退」变「永久卡死」 | 崩溃路径用 `tryLock`，**绝不阻塞** |
+| 日志把密钥带出去 | 上报即泄漏 | 落盘前统一脱敏（[Redactor]） |
+
+#### 三层存储
+
+| 层 | 文件 | 写入方式 | 为什么 |
+|---|---|---|---|
+| 内存环形缓冲 | （不落盘） | 同步入队 | 4000 条，**最新**。崩溃时磁盘可能还差几行，这里补上 |
+| 应用日志 | `app.log` | **同步 + 每行 flush** | 崩溃安全。代价是慢，所以只给 476 处 `DshLog` 用 |
+| 引擎/网页日志 | `engine.log` / `web.log` | 异步队列（4096，满了丢） | 高频。**绝不能阻塞**引擎的 64 KB stdout 管道 |
+
+⚠️ 三档写入策略是刻意的，不是不统一：`app.log` 慢但丢不了，另两个快但可能丢尾巴 ——
+把它们对调会让引擎的 stdout 管道堵死，症状是「引擎卡住不动」而不是「日志少了」。
+
+#### 476 处调用点一行不改 —— `DshLog` 门面
+
+改造技巧：**换掉 `Log` 这个名字**，而不是改 476 个调用点。
+
+```kotlin
+-import android.util.Log
++import com.dsh.android.log.DshLog as Log
+```
+
+`DshLog` 的方法名/参数顺序/返回类型与 `android.util.Log` **逐一对应**（`v/d/i/w/e/wtf`
+各两档、`println`、`isLoggable`、`getStackTraceString`），所以 `Log.i(TAG, "…")`
+一个字符都不用动。
+
+⚠️ **三参重载的 `tr` 必须是 `Throwable?`**：Java 侧 `android.util.Log` 的参数是平台类型，
+Kotlin 调用点传可空值（实测 `GeckoWebHost.kt:516` 的 `onError` 回调就是 `Throwable?`）。
+写成非空会让 **gecko flavor 编译失败而 system 通过** —— 这种只在单个 flavor 暴露的
+签名问题最容易漏（本系统开发时就漏过一次）。
+
+⚠️ **调用点里不能出现全限定写法**（`android.util.Log.i(...)`），那会绕过门面。
+改造前已 grep 确认零处。
+
+⚠️ `AppLogger.kt` 已删除。它此前与这套**并存**，而它的 `init()` 从来没被调用过
+（只在 `TermuxBootstrap` 里当 tag 用）—— 两套日志系统并存会把日志劈成两半。
+
+#### 四个崩溃入口（都在 `CrashRecorder`）
+
+| 类别 | 现场文件名 | 判据 |
+|---|---|---|
+| 未捕获异常 | `<时间>-uncaught-exception.txt` | 装了默认 `UncaughtExceptionHandler` |
+| 渲染进程崩溃 | `<时间>-renderer-crash.txt` | WebView/GeckoView 报 `didCrash` |
+| 渲染进程被回收 | `<时间>-renderer-reclaimed.txt` | 同上但 `didCrash=false`（**不是崩溃**） |
+| 引擎退出 | `<时间>-engine-exit.txt` | `Process.waitFor` 返回，带退出码与是否预期 |
+| 主线程卡死 | `<时间>-main-thread-stall.txt` | 自建看门狗（500 ms ping，15 s 无响应） |
+
+⚠️ **`ApplicationExitInfo` 用不了** —— 它需要 API 30，而本 App 因硬约束②停在
+`targetSdk 28`。所以「上次怎么退出的」只能**自己记**：`BootState` 在启动时写
+`boot-state.json` 标记「正在运行」，正常退出时改成「干净退出」。下次启动读到
+「不干净」就说明上次没走正常路径。
+
+#### ⚠️ 诚实分级是硬要求：**「非正常结束」不等于「崩溃」**
+
+`BootState.Previous.describe()` 的措辞是「上次未正常结束（时间，**无堆栈**）」，不是
+「崩溃了」。因为「不干净」有五种可能，而它们的排查方向完全不同：
+
+| 真因 | 特征 | 下一步 |
+|---|---|---|
+| 未捕获异常 | 有 `uncaught-exception` 现场 | 看堆栈 |
+| LMK 内存回收 | 无现场，内存快照里 heap 高 | 看内存 |
+| ROM 冻结/后台清理 | 无现场，常在息屏后 | 看保活设置 |
+| 用户强停 / 划掉 | 无现场 | 问用户 |
+| 断电 / 重启 | 无现场，`uptimeMs` 短 | 问用户 |
+
+⚠️ **看门狗记的是「主线程无响应（自建看门狗，非系统 ANR）」**。`targetSdk 28` 下拿不到
+系统 ANR 堆栈，**绝不能伪造一个** —— 编一个看起来像 ANR 的堆栈比不写更糟，
+它会把排查带向错误方向。
+
+⚠️ **`CrashRecorder` 必须用 `tryLock`，永远不能用 `lock`**：崩溃可能发生在**已经持有
+日志锁的那个线程**上，阻塞等待会把「闪退」变成「永久卡死」。拿不到锁也要照写现场文件
+（那条路径不碰锁）。
+
+#### 两个入口（缺一个就有一半场景看不到日志）
+
+| 入口 | 在哪 | 覆盖场景 |
+|---|---|---|
+| ① 浮层按钮 | 加载/崩溃页上的「运行日志与诊断」 | **GUI 打不开**时 |
+| ② 设置页分节 | 设置 →「运行日志与诊断」（`settings.section`，`order: 28`） | GUI 正常时 |
+
+⚠️ **①在浮层上是「所有状态都显示」的**，与 `overlaySafeMode`（`isError` 门控）不同。
+理由：这条入口的存在意义就是「界面不正常」，把它做成错误态才显示等于自相矛盾。
+
+⚠️ **②必须是 `settings.section`，不能做成页面插件**。页面插件跑在 WebView 里，
+而「引擎起不来」「插件把前端搞崩了」恰恰是页面插件一起死掉的场景 ——
+用页面插件等于在最需要日志的时候把入口也弄没了。
+
+⚠️ **`LogViewerActivity` 必须零依赖**：纯原生、不碰引擎、不碰 WebView、不初始化任何东西。
+它是崩溃循环里唯一还能开的界面。所以列表用**框架 `ListView` + `BaseAdapter`**，
+而不是 `RecyclerView` —— `material:1.12.0` 只传递来 `recyclerview:1.0.0`（compile scope），
+用它就得加依赖，而「能开」是这条入口的唯一 KPI。
+
+⚠️ 它读的是 `LogStore.entries()`（内存缓冲）而**不是**磁盘文件：磁盘上的 `engine.log`
+是异步刷的，最后几行可能还没落盘，而用户要看的经常就是「刚刚那一下」。
+
+#### 诊断包（`DiagnosticBundle`）—— 输出本身就要能定位问题
+
+`diagnostic-<时间>-<bootId>.zip`，条目**按价值排序**写，超 8 MB 从低价值端丢：
+
+```
+environment.json   设备/系统/显示/内存/存储/权限/运行时
+diagnosis.json     自动结论 + 7 项检查（含 summary.headline）
+timeline.jsonl     事件时间线（启动→引擎就绪→渲染→崩溃）
+crashes/           崩溃现场全文
+files.json         关键文件的存在性/大小/修改时间
+web.log / engine.log / app.log（含 .1 代）
+manifest.json      最后写 —— 它记录前面实际写进去什么
+```
+
+⚠️ **`manifest.json` 必须最后写**，否则它记录的清单与包内容不符。
+⚠️ **每个条目是全有或全无**：写一半失败就整条丢弃并在 `completeness` 里记 `truncated`。
+半个 zip 条目比没有更糟（解压报错，分析者以为包坏了）。
+⚠️ 超预算时**留尾巴不留头**（日志越新越有价值），并把 `truncated: true` 写进 `completeness`
+—— 静默截断会让分析者把「没看到」当成「没发生」。
+
+`diagnosis.json` 的检查项全部**给证据不给结论**，例如：
+`last-exit` → `warn` / `"上次未正常结束（2026-10-13 19:20:11，无堆栈）"`。
+
+#### 上传（`LogUploader`）
+
+⚠️ **崩溃进程做不了网络 IO**。所以崩溃路径**只落包 + 标 pending**，
+真正的上传由**下次启动**的 `uploadPendingBundles()` 做。
+用户如果从此不再打开 App，包就传不出去 —— 这是平台限制，不是缺陷，文档里要说明。
+
+- 端点/令牌在 `DshApplication.LOG_UPLOAD_ENDPOINT` / `LOG_UPLOAD_TOKEN`
+  （**`val` 不是 `const val`** —— 可空类型不能是 const）。服务器就绪后填这里。
+- ⚠️ **未配置时上传必须显式失败**（「尚未配置日志服务器…」），绝不能静默成功 ——
+  那会让用户以为日志已经发出去了，而实际什么都没发生。
+- ⚠️ **成功与失败都要给 Toast**，并把服务器返回的 `id` 显示出来供用户引用。
+- 手写 `multipart/form-data`（`HttpURLConnection`）—— 本项目没有网络库，
+  不为一个上传接口引入依赖。
+- `device-id` = 安装期生成的随机 UUID。**刻意不用 IMEI/序列号**。
+
+#### 脱敏（`Redactor`）—— 不是可选项
+
+包要离开设备。落盘**之前**统一脱敏，三组模式：
+
+| 模式 | 拦什么 |
+|---|---|
+| `skTokenPattern` | `sk-…` 形式的 API key |
+| `secretKeyPattern` | `api_key=` / `token:` 等键值对 |
+| `urlSecretPattern` | `?token=…` —— **引擎启动那行 URL 就带 token** |
+
+⚠️ 第三条是实测逼出来的：`[engine] dsh web: http://127.0.0.1:3080/?token=…` 是每次启动
+必打的一行，不拦就等于每次上报都泄漏一个可用凭据。
+
+**包内容边界**：含设备/系统/App 版本、脱敏日志、插件/文件/设置状态；
+**不含**会话正文（只含元数据）、凭据、工作区文件内容。
+
+#### `logs` 工具 —— 让模型自己查（⑫.3 的同一套做法）
+
+与 `bubble` / `statusbar` / `ui` 工具同构：`mobile-ui-plugin/dsh-android-logs/` 打包成
+`assets/logs-tool.zip` → `$DSH_HOME/logs-tool/dsh-android-logs/`，
+`EngineManager.ensureLogsTool()` 解包、`writeLogsToolPatch()` 生成 overlay，
+命令走 `LogCommandBridge` 的文件信箱（`logs-cmd.json` / `logs-result.json`，200 ms 轮询）。
+
+| action | 做什么 |
+|---|---|
+| `summary` | 一眼结论（**默认**，便宜，先调它） |
+| `read` | 读最近 N 行，可按 `level`/`source`/`query` 筛 |
+| `crashes` | 列崩溃现场，或按 `crashFile` 读全文 |
+| `export` | 生成诊断包并返回路径 |
+
+⚠️ **必须用独立的信箱文件**（不复用 bubble 那一对）：回执按自增 `id` 配对，而各插件
+各自从 1 开始计数，同一个 `id=5` 会同时存在两条语义不同的请求。这类错配的表现是
+**「AI 说日志里没有这条错误」而它看起来像真的查过了** —— 比报错危险得多。
+
+⚠️ **超时上限 10 s**（bubble 是 4 s）：`export` 要打包几 MB 的 zip，4 s 会稳定超时，
+而超时会被模型当成「导出失败」。
+
+⚠️ **插件描述里必须写死三条边界**，否则模型会把「日志里没有」当成「没发生过」：
+① 文件 1 MB 轮转 + 只留一代，很老的没了；② 重复行会被限流折叠；
+③ 进程被系统直接杀掉可能**完全不留日志**。
+
+⚠️ **`crashFile` 只接受纯文件名**（插件与原生两侧都校验）：这个值来自模型，
+原生侧要拿它拼 `logs/crash/<name>`，放行 `../` 就等于给模型一个任意文件读取口。
+
+⚠️ 插件侧对 `read` 的结果**再截断一次**（500 行 / 256 KB）—— 那是**上下文预算**限制，
+不是能力限制。不截断会把这一轮对话直接撑爆，而模型不会自己意识到该少要点。
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 

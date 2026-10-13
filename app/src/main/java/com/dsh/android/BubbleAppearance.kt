@@ -5,7 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.util.Base64
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import org.json.JSONObject
 import java.io.File
 

@@ -1,7 +1,7 @@
 package com.dsh.android
 
 import android.content.Context
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import java.io.File
 
 /**

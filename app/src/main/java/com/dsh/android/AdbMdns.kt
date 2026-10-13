@@ -3,7 +3,7 @@ package com.dsh.android
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.NetworkInterface

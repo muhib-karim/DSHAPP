@@ -118,6 +118,28 @@
         </service>
 
         <!--
+            运行日志界面（入口②）。
+
+            ⚠️ **必须 `exported="false"`**：它是本进程内的诊断界面，没有任何
+            外部调用场景，导出等于给别的应用开一个读日志的口子（日志里可能含
+            设备信息与路径）。
+
+            ⚠️ **刻意不加 `launchMode="singleTask"`**（MainActivity 是 singleTask，
+            这里不是）：日志界面要能从浮层与设置页各自拉起、各自关闭回原处。
+            用 singleTask 会让第二次拉起点复用已有实例，用户从设置页打开后
+            关掉、再从浮层打开时行为会不一致。
+
+            ⚠️ `excludeFromRecents` 不设：用户从崩溃浮层跳进来看日志时，
+            这个界面出现在最近任务里是合理的（他可能想切出去发截图再切回来）。
+        -->
+        <activity
+            android:name=".LogViewerActivity"
+            android:exported="false"
+            android:label="@string/logs_title"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!--
             接收通知栏「直接回复」里输入的无线调试配对码，以及通知上的「取消」动作。
 
             ⚠️ 必须静态声明（不能动态注册）：通知可能在 App 进程已被系统回收时

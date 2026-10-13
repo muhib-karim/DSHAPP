@@ -6,7 +6,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import android.view.View
 import com.dsh.android.DshApplication
 import java.io.ByteArrayInputStream

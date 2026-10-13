@@ -18,7 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -33,6 +33,12 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.dsh.android.databinding.ActivityMainBinding
+import com.dsh.android.log.BootState
+import com.dsh.android.log.VersionInfo
+import com.dsh.android.log.CrashRecorder
+import com.dsh.android.log.EventLog
+import com.dsh.android.log.LogStore
+import com.dsh.android.log.LogUploader
 import com.dsh.android.web.DownloadRequest
 import com.dsh.android.web.DownloadStream
 import com.dsh.android.web.PageBridge
@@ -308,6 +314,15 @@ class MainActivity : AppCompatActivity() {
             DshApplication.TAG,
             "界面内核$reason，准备重载（第 $rendererRestarts 次）",
         )
+        // ⚠️ 「白屏」最常见的根因就是渲染进程崩溃/被回收，而内核这个回调是**唯一**
+        //   能区分「崩溃」与「被系统回收」的地方 —— 前者是内核 bug，后者是内存压力，
+        //   处置完全不同（前者报 bug，后者降内存占用）。记进崩溃现场文件，
+        //   别只留在 logcat 里（logcat 在用户手机上拿不到）。
+        CrashRecorder.recordRendererGone(didCrash, "第 $rendererRestarts 次重载")
+        EventLog.record(
+            "renderer.gone",
+            mapOf("crash" to didCrash.toString(), "n" to rendererRestarts.toString()),
+        )
 
         // ⚠️ 状态复位：新渲染进程的第一帧还没提交，沿用旧值会让启动层立刻收尾。
         webViewPainted = false
@@ -498,6 +513,10 @@ class MainActivity : AppCompatActivity() {
         // 失败浮层上的唯一出路。⚠️ Button 是 clickable 的子 View，点击不会冒泡到
         // overlay 自己的监听器（那个只负责"点一下收起浮层"），两者不冲突。
         binding.overlaySafeMode.setOnClickListener { enterSafeMode() }
+        // 启动层上的日志入口 —— **任何状态都可用**（见布局里的说明）。
+        // ⚠️ 同样要拦冒泡：不拦的话点它会先触发 overlay 自己的「点一下收起浮层」，
+        //   于是启动层被收掉、白屏露出来，而日志界面还没打开。
+        binding.overlayLogs.setOnClickListener { openLogViewer("overlay") }
 
         setupWebView()
         detectWebViewVersion()
@@ -800,6 +819,10 @@ class MainActivity : AppCompatActivity() {
                     engine.notifyPageLoaded()
                 },
                 onConsole = { line ->
+                    // ⚠️ 网页 console 走**独立的 `web.log`**，理由同引擎输出：
+                    //   前端会打大量逐条渲染/请求日志，混进 1MB 的 `app.log`
+                    //   会把原生侧关键日志冲掉。
+                    LogStore.web(line)
                     Log.i(DshApplication.TAG, "[web] $line")
                 },
                 onExternalUrl = { url ->
@@ -1385,6 +1408,49 @@ class MainActivity : AppCompatActivity() {
                 val result = RootAccess.detect(app, force = true)
                 Log.i(DshApplication.TAG, "root 重新检测结果: ${result.state} ${result.detail}")
             }.start()
+        }
+
+        /**
+         * 设置页点「运行日志与诊断」—— 拉起原生日志界面（入口①）。
+         *
+         * ⚠️ `startActivity` 必须在**主线程**：JS 桥的调用线程是内核的 JS 线程
+         * （gecko 版是 Gecko 线程），在那里起 Activity 会抛
+         * `Calling startActivity() from outside of an Activity context` 之类的错。
+         * 所以 post 到主线程，且立即返回不等结果 —— JS 侧不需要回执。
+         */
+        override fun openLogs() {
+            runOnUiThread { openLogViewer("settings") }
+        }
+
+        /**
+         * 读日志摘要给设置页那一行当副标题。
+         *
+         * ⚠️ **必须便宜**：设置页每次打开都调。所以只数内存缓冲（4000 条以内，
+         * 一次遍历）+ 读 `BootState`（几十字节的 JSON），**不读磁盘日志**。
+         * 完整诊断要读几 MB 的文件算行数，只在用户点「导出诊断包」时跑。
+         *
+         * ⚠️ 全程 `runCatching`：这个方法的返回值直接拼进页面 DOM，抛异常会让
+         * JS 桥把错误吞掉、设置页那一行变成空白 —— 用户以为功能没做。
+         */
+        override fun logSummary(): String = runCatching {
+            val all = LogStore.entries()
+            val prev = BootState.previous()
+            JSONObject().apply {
+                put("total", all.size)
+                put("warn", all.count { it.level == 'W' })
+                put("error", all.count { it.level == 'E' })
+                put("crash", CrashRecorder.sceneCount())
+                put("pending", LogUploader.pendingCount(File(filesDir, DshApplication.LOG_DIR)))
+                put("lastExit", prev.describe())
+                put("uploadConfigured", LogUploader.configured)
+                put("version", VersionInfo.summary())
+            }.toString()
+        }.getOrElse {
+            Log.w(DshApplication.TAG, "读日志摘要失败", it)
+            // 返回一个结构完整的空对象而不是空串：页面侧可以直接读字段，
+            // 不用先判空 —— 少一个出错分支。
+            """{"total":0,"warn":0,"error":0,"crash":0,"pending":0,""" +
+                """"lastExit":"读取失败","uploadConfigured":false,"version":""}"""
         }
     }
 
@@ -2141,6 +2207,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 打开运行日志界面（启动层上的入口）。
+     *
+     * ## 为什么用 `runCatching` 而不是直接 startActivity
+     *
+     * 这个按钮存在的场景是「App 已经不正常了」。而 Activity 启动在异常状态下
+     * 真的会失败（`ActivityNotFoundException` 极少见，但 `TransactionTooLarge`
+     * 与低内存下的启动失败是真实存在的）。失败时**必须给用户回执** ——
+     * 「点了没反应」是最难查的一类反馈，比报错还糟。
+     *
+     * ## 为什么不加 `FLAG_ACTIVITY_NEW_TASK`
+     *
+     * 本界面与 MainActivity 同进程同任务栈，加 NEW_TASK 会让「关闭」退到桌面
+     * 而不是退回启动层 —— 用户从崩溃浮层点进来看完日志，期望是回到浮层，
+     * 而浮层上还有「安全模式」这条路要走。
+     *
+     * @param from 调用来源（`overlay` / `settings`），只进日志，用于排查
+     *   「用户到底从哪条路进来的」。
+     */
+    private fun openLogViewer(from: String) {
+        Log.i(DshApplication.TAG, "打开日志界面（来源 $from）")
+        EventLog.record("logs.open", mapOf("from" to from))
+        runCatching { startActivity(LogViewerActivity.intent(this)) }
+            .onFailure {
+                Log.e(DshApplication.TAG, "打开日志界面失败", it)
+                Toast.makeText(
+                    this,
+                    "无法打开日志界面：${it.message ?: it.javaClass.simpleName}",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+    }
+
+    /**
      * 启动层兜底超时。
      *
      * 插件激活的完成信号（`onUiReady`）来自 WebView 的 JS 桥，**它是不可靠的**：
@@ -2328,6 +2427,27 @@ class MainActivity : AppCompatActivity() {
         //   拆 WebExtension），交给 [WebHost]。必须在 super 之前 ——
         //   super.onDestroy() 之后 binding 里的视图树已经被拆掉。
         if (::web.isInitialized) web.destroy()
+        // ⚠️ **正常退出标记**：这是区分「崩溃」与「被系统杀掉」的唯一依据。
+        //
+        // 本 App 的 `targetSdk = 28`，用不了 API 30 的 `ApplicationExitInfo`
+        // （那个 API 能直接告诉你上次为什么死），所以只能自己记：能走到
+        // onDestroy 且确实是在收尾（`isFinishing`）就说明是好好关掉的。
+        //
+        // ⚠️ **这个判据是有漏报的，必须知道**：
+        //   用户按 Home 退到后台、随后被 LMK 回收 / 被 ROM 冻结 / 断电 ——
+        //   这几种都**不会**走到 onDestroy，于是下次启动会看到「上次非正常结束」。
+        //   但那**不是崩溃**。
+        //
+        //   所以诊断包里那句话刻意写的是「上次非正常结束（无堆栈；可能是崩溃/
+        //   被系统回收/被 ROM 冻结/断电）」而不是「上次崩溃」—— 见
+        //   [com.dsh.android.log.BootState] 的诚实分级说明。
+        //
+        //   取舍是**宁可多报也不漏报**：漏掉一次真崩溃，用户拿到的日志就说不出
+        //   问题；多报一次「非正常结束」，分析者看一眼有没有崩溃现场文件就能排除。
+        if (isFinishing && !isChangingConfigurations) {
+            EventLog.record("activity.destroy")
+            BootState.markCleanExit("activity-destroyed")
+        }
         super.onDestroy()
     }
 

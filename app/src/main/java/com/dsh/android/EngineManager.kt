@@ -1,7 +1,10 @@
 package com.dsh.android
 
 import android.content.Context
-import android.util.Log
+import com.dsh.android.log.DshLog as Log
+import com.dsh.android.log.EventLog
+import com.dsh.android.log.LogStore
+import com.dsh.android.log.CrashRecorder
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
@@ -3287,6 +3290,85 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出**日志工具**插件（`logs-tool.zip` → `$DSH_HOME/logs-tool/dsh-android-logs/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `logs` 的**独立工具**，让模型能：
+     * 读最近日志（可按级别/来源/关键字筛）、列崩溃现场并读全文、看一条摘要、
+     * 生成诊断包。
+     *
+     * ## 为什么必须由原生侧供数
+     *
+     * 模型跑在 **Node 进程**里，而日志的权威副本有两处它都够不着：
+     * ① 原生侧的内存环形缓冲（`LogStore.entries()`，最新、同步入队）；
+     * ② `filesDir/logs/` 下的文件与崩溃现场（`crash/`）。
+     * 它虽然能读文件系统（同域、共享目录），但**「文件在哪、叫什么、怎么筛」**
+     * 这套知识不该让模型去猜 —— 猜错的表现是「日志里没有」，而它看起来像查过了。
+     *
+     * ⚠️ **为什么解到 `$DSH_HOME/logs-tool/` 而不是 profile 的 `node_modules`**：
+     *   与 [ensureBubbleTool] 同一个坑 —— 那个目录归 pnpm 管，而本包不在 profile 的
+     *   `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`。
+     *
+     * 与其它工具插件一样**不做版本戳**：包很小（两个文件），每次启动覆盖写。
+     */
+    private fun ensureLogsTool() {
+        val target = File(dshHome, "$LOGS_TOOL_DIR/$LOGS_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(LOGS_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装日志工具插件 $LOGS_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 logs 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装日志工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载日志工具的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeBubbleToolPatch] / [writeUiToolPatch] 同构。
+     */
+    private fun writeLogsToolPatch(): File? {
+        val patch = File(dshHome, LOGS_TOOL_PATCH)
+        val entry = File(dshHome, "$LOGS_TOOL_DIR/$LOGS_TOOL_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "日志工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载日志工具插件：注册一个独立的 `logs` 工具，
+                # 让模型能读运行日志 / 看崩溃现场 / 生成诊断包。
+                - insert:
+                    - id: $LOGS_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入日志工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入日志工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出桌面宠物的**状态桥**插件（`pet-bridge.zip` → `$DSH_HOME/pet-bridge/dsh-android-pet/`）。
      *
      * 该插件订阅引擎的 `session/event`（`@deepseek-ai/dsh-session` 声明的 post-commit
@@ -4214,6 +4296,10 @@ class EngineManager private constructor(private val context: Context) {
 
         _state.value = State.Starting
         logLines.clear()
+        // 启动计时锚点。后面「引擎就绪」事件用它算出总耗时 ——
+        // 「打开 App 慢」这类反馈只有靠这个数才能定位到具体阶段。
+        val startMs = System.currentTimeMillis()
+        EventLog.record("engine.start")
         // ⚠️ 每次启动都清掉「主动停止」标记，否则 stop() 之后再也起不来
         //   （EOF 会被当成用户停止而不再上报死亡，这里反过来：新一轮启动了，
         //   旧标记已经没有意义）。
@@ -4365,6 +4451,11 @@ class EngineManager private constructor(private val context: Context) {
         //   同样必须早于引擎启动：overlay 要在 profile 解析前落盘。
         ensureUiTool()
         val uiToolPatch = writeUiToolPatch()
+        // 日志工具：把「读日志 / 看崩溃现场 / 生成诊断包」接到模型的工具列表里。
+        // ⚠️ 与上面三个工具**完全并列且独立**（不同信箱、不同能力），同样与特权无关：
+        //   读日志不需要任何授权。必须早于引擎启动（overlay 要在 profile 解析前落盘）。
+        ensureLogsTool()
+        val logsToolPatch = writeLogsToolPatch()
         // 桌面宠物状态桥：把引擎的 `session/event` 转成悬浮球的动作切换。
         // ⚠️ 与上面那条**并列且独立**：那条给模型 `bubble` 工具，这条让宠物自己会动。
         ensurePetBridge()
@@ -4373,6 +4464,10 @@ class EngineManager private constructor(private val context: Context) {
         // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
         // 信箱还没人守，命令会一直等不到回执。
         BubbleCommandBridge.start(dshHome)
+        // 日志命令信箱：`logs` 工具把请求写进 `$DSH_HOME/logs-cmd.json`，
+        // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
+        // 信箱还没人守，请求会一直等不到回执。
+        LogCommandBridge.start(dshHome)
         // 系统栏配色命令信箱：`statusbar` 工具把命令写进 `$DSH_HOME/statusbar-cmd.json`，
         // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
         // 信箱还没人守，命令会一直等不到回执。
@@ -4464,6 +4559,10 @@ class EngineManager private constructor(private val context: Context) {
             // ⚠️ 必须留在 `--port` **之前** —— 见下面那段关于内层 flag 的说明。
             if (uiToolPatch != null) {
                 add("--patch"); add(uiToolPatch.absolutePath)
+            }
+            // 日志工具：同样是 overlay，注册成独立的 `logs` 工具
+            if (logsToolPatch != null) {
+                add("--patch"); add(logsToolPatch.absolutePath)
             }
             // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
             // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
@@ -4598,6 +4697,17 @@ class EngineManager private constructor(private val context: Context) {
             try {
                 proc.inputStream.bufferedReader().useLines { seq ->
                     seq.forEach { line ->
+                        // ⚠️ 引擎输出走**独立的 `engine.log`**，不进 `app.log`。
+                        //
+                        // 理由是容量：引擎会逐 token 打输出，一天能刷出几十 MB，
+                        // 而 `app.log` 单文件上限只有 1MB。混在一起的话，原生侧的
+                        // 关键日志（启动、插件、补丁）会被引擎刷掉 —— 而排查时
+                        // 恰恰是原生侧那几十行最有价值。
+                        //
+                        // `LogStore.engine` 是异步写的，所以这一行**不会拖慢读流**
+                        // （读流一慢，引擎写 stdout 就会阻塞，那是老问题的来源）。
+                        LogStore.engine(line)
+                        // logcat 仍然照打：接 adb 调试时最方便。
                         Log.i(TAG, "[engine] $line")
                         synchronized(logLines) {
                             logLines.addLast(line)
@@ -4640,10 +4750,26 @@ class EngineManager private constructor(private val context: Context) {
         if (got && url != null) {
             _state.value = State.Ready(url)
             Log.i(TAG, "引擎就绪: $url")
+            // 事件时间线里记一笔「从起进程到就绪花了多久」。
+            // ⚠️ 这是「打开 App 慢」这类模糊反馈唯一能定量的地方：没有它，
+            //   用户说「卡」，我们只能猜是引擎慢、解包慢还是网络慢。
+            EventLog.record(
+                "engine.ready",
+                mapOf("ms" to (System.currentTimeMillis() - startMs).toString(), "port" to url.substringAfter(":").substringBefore("/")),
+            )
         } else {
             val tail = synchronized(logLines) { logLines.joinToString("\n") }
             val reason = if (proc.isAlive) "超时未打印 URL" else "引擎进程已退出"
             _state.value = State.Failed("引擎启动失败（$reason）。最后输出:\n$tail")
+            // ⚠️ 「引擎起不来」是本 App 最严重的一类故障（界面直接不可用），
+            //   所以要写**崩溃现场文件**而不只是日志行：现场文件里带着
+            //   最后 200 行日志与设备快照，用户点「导出日志」就能一次性带走。
+            CrashRecorder.recordAnomaly(
+                "engine-start-failed",
+                "引擎启动失败（$reason），已等 ${System.currentTimeMillis() - startMs} ms",
+                'E',
+            )
+            EventLog.record("engine.failed", mapOf("reason" to reason))
         }
     }
 
@@ -4762,6 +4888,12 @@ class EngineManager private constructor(private val context: Context) {
         val code = runCatching { proc.exitValue() }.getOrNull()
         val detail = if (code != null) "退出码 $code" else "进程已退出"
         Log.w(TAG, "引擎在运行期退出（$detail），界面已失去后端")
+        // ⚠️ 「引擎在运行期自己死了」是仅次于「起不来」的严重故障：用户正用着，
+        //   界面突然什么都点不动，且**没有任何报错**。崩溃现场文件是这里唯一的
+        //   证据来源 —— 进程退出本身不留堆栈，只能靠我们自己记。
+        //   `expected = false`：不是我们主动停的。
+        CrashRecorder.recordEngineExit(code, expected = false, detail = detail)
+        EventLog.record("engine.exit", mapOf("code" to (code?.toString() ?: "?"), "wasReady" to "true"))
         _state.value = State.Dead(detail)
     }
 
@@ -5638,8 +5770,16 @@ class EngineManager private constructor(private val context: Context) {
          *      （JS 的 `Math.max` 不受内核版本限制；CSS 的 `max()` 要 Chrome 79，
          *      而目标内核是 chrome74，老内核上整条声明会静默失效）。
          *      同 v57/v58 的道理，也必须 bump `-CompatVersion`（现 v15）。
+         * 1.0.0-60：设置页新增「运行日志与诊断」分节（`mpLogsSection` +
+         *      `mpRegisterLogsSection`），拉起原生 `LogViewerActivity`。
+         *      这是**纯 JS 新增**，没有改 CSS，所以**不必** bump
+         *      `tools/build-webview-compat.ps1` 的 `-CompatVersion` ——
+         *      兼容包是"按 chrome74 降级编译前端 bundle"，插件 JS 走的是
+         *      引擎自己的加载路径，不经过那个编译。
+         *      ⚠️ 但仍然必须 bump 本常量：否则 `.mobile_ui_version` 标记不变，
+         *      `ensureMobileUi()` 直接跳过解包，**老设备永远拿不到这个分节**。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-59"
+        private const val MOBILE_UI_VERSION = "1.0.0-60"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -5851,6 +5991,33 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 页面探针源码；由 [UiProbeBridge] 读走打进 WebView。 */
         private const val UI_PROBE_ASSET = "ui-probe.js"
+
+        // ── 日志工具 ─────────────────────────────────────────────────
+        //
+        // 与 bubble / statusbar / ui 工具**同一套做法**（独立工具 + 文件信箱 +
+        // 刻意在 pnpm 管辖之外），差别只在能力：那些改外观/点界面，这个**读日志**。
+        //
+        // 为什么需要它：日志系统的两个入口（设置页分节、启动/崩溃浮层按钮）都是给
+        // **人**的，而模型跑在 Node 进程里 —— 它看不到原生侧的内存缓冲，也看不到
+        // `filesDir/logs` 下的 `app.log` 与崩溃现场。于是「你看看日志」这句话对模型
+        // 是空的，它只能猜。这个插件把「读日志 / 看崩溃现场 / 生成诊断包」注册成一个
+        // `logs` 工具，靠 [LogCommandBridge] 的文件信箱把请求送回原生。
+        // 详见 `mobile-ui-plugin/dsh-android-logs/lib/index.js`。
+        //
+        // ⚠️ 与上面三个工具**走不同的信箱文件**：命令可能并发发起，回执按 `id`
+        //   配对，而各插件各自从 1 自增 —— 共用文件会让工具调用收到对方的回执。
+        //   这类错配的表现是「AI 说日志里没有这条错误」，比报错危险得多。
+        //
+        // ⚠️ **没有「能力探测」这一步**：读日志不需要任何授权。只要插件入口在就挂载，
+        //   与 [writeBubbleToolPatch] 同理。
+
+        /** 注册 `logs` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val LOGS_TOOL_ASSET = "logs-tool.zip"
+        private const val LOGS_TOOL_PACKAGE = "dsh-android-logs"
+        private const val LOGS_TOOL_PATCH = "logs-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
+        private const val LOGS_TOOL_DIR = "logs-tool"
 
         // ── 桌面宠物状态桥 ───────────────────────────────────────────
         //
