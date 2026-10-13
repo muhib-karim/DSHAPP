@@ -4030,7 +4030,17 @@ ssh ... 'cat /workspace/dsh-logs/index.jsonl'
 现象：62 个诊断包里 **41 个** `device.kernel` 是空串。第一直觉是「老设备没有这个
 文件」，但按 SDK 分组后**恰好相反**：SDK 35 的设备 20/20 全空，SDK 28/31 的反倒有值。
 
-真机实测（CDY-TN90，HarmonyOS，Android 10 / SDK 29，`getenforce` = `Enforcing`）：
+真机实测（CDY-TN90，HarmonyOS，Android 10 / SDK 29，`getenforce` = `Enforcing`）。
+最硬的证据是**内核自己的 avc 记录**，它直接落在 `untrusted_app` 域上：
+
+```
+avc: denied { read } for pid=25826 comm="sofire_pool_thr" name="version" dev="proc"
+  ino=4026532165 scontext=u:r:untrusted_app:s0:c84,c256,c512,c768
+  tcontext=u:object_r:proc_version:s0 tclass=file permissive=0
+```
+
+辅助对照（⚠️ `run-as` 跑的是 `u:r:runas_app` 域，**不是** `untrusted_app`，
+所以下面这组只能当旁证，**不能**当「同一域被拒」的证明 —— 上面那条 avc 才是）：
 
 ```
 run-as com.dsh.android cat /proc/version     → cat: /proc/version: Permission denied
@@ -4049,13 +4059,30 @@ runCatching { File("/proc/version").readText() }.getOrDefault("")
 —— `runCatching` 把 EACCES **静默吞成空串**，于是「权限被拒」在包里长得跟
 「设备没这个信息」一模一样。
 
-做法（`EnvironmentSnapshot.kernelVersion()`）：先试 `/proc/version`，读不到回退
-`ProcessBuilder("/system/bin/uname", "-a")`（该二进制在 app 域**可执行**），
-两条都失败才返回 `""`；同时 `collect()` 在 kernel 为空时补写
-`kernelUnavailable: "read-denied"`，让「没读到」在包里**可区分于「本来就没有」**。
+**做法（`EnvironmentSnapshot.kernelVersion()`）：走 `uname(2)`，不读文件、不起子进程。**
 
-⚠️ 回退路径必须 `waitFor(3, SECONDS)` + 超时 `destroyForcibly()`，否则子进程卡住会
-把 `collect()` 一起拖住（它跑在诊断包构建路径上）。
+1. `android.system.Os.uname()`（API 21+）—— `release` + `version` + `machine` 拼装，
+   与 `uname -a` 等价且是**结构化**的（不用解析字符串）；
+2. `System.getProperty("os.version")` —— 同一条 `uname(2)`：AOSP libcore 的
+   `System.initUnchangeableSystemProperties()` 里就是
+   `p.put("os.version", Libcore.os.uname().release)`，进程启动时填好，零成本；
+3. `/proc/version` 降为**兜底**（Android 10+ 多为 `Permission denied`，所以排最后）。
+
+三条都失败才返回 `""`，此时 `collect()` 补写 `kernelUnavailable: "unavailable"`，
+让「没读到」在包里**可区分于「本来就没有」**。
+
+⚠️ **不要再回去用 `ProcessBuilder("/system/bin/uname", "-a")`。** 用过一版，两个真实缺陷：
+① `redirectErrorStream(true)` 会把 stderr 并进结果 —— toybox 的 uname 参数出错时把错误
+写 stderr，那串会被当成内核版本写进包，且因「非空」直接 `return`，不再降级；
+② 先 `readText()` 再 `waitFor(3, SECONDS)` 是**死代码** —— `readText()` 要等管道关闭
+（子进程已退出）才返回，执行到 `waitFor` 时它必然已 true，`destroyForcibly()` 永不执行，
+「3 秒超时」形同虚设，实际是**无界阻塞** —— 而这段代码跑在崩溃补打包路径上
+（`DshApplication.uploadPendingBundles()`），阻塞的代价不划算。
+`uname(2)` 这两条天然不存在：无子进程、无流、无超时需求。
+
+**真机验收判据**（`0.2.9-tooliso (18) system`，手动导出诊断包）：
+`environment.json` 的 `device.kernel` = `4.14.116 #1 SMP PREEMPT Wed Jun 26 17:43:27 CST 2024 aarch64`，
+且 `kernelUnavailable` **不出现**。同一台设备在修复前该字段是空串。
 
 **② `org.chromium.base.JniAndroid$UncaughtExceptionException` 不是本 App 的崩溃。**
 
