@@ -97,6 +97,14 @@ object CrashRecorder {
      */
     private const val WATCHDOG_FREEZE_MS = WATCHDOG_STALL_MS + WATCHDOG_PING_MS * 2
 
+    /**
+     * 系统 Web 内核抛出的未捕获异常，在 `reason` 前加的归因前缀。
+     *
+     * 见 [isWebViewKernelCrash]。写在 reason 里而不是另立 kind，是为了不动
+     * `isHardCrash` / `crash-scenes` 那套判据（内核崩了，界面确实没了，仍算硬崩溃）。
+     */
+    private const val WEBVIEW_KERNEL_NOTE = "【系统 Web 内核崩溃，非本 App】"
+
     @Volatile
     private var crashDir: File? = null
 
@@ -141,18 +149,25 @@ object CrashRecorder {
         Thread.setDefaultUncaughtExceptionHandler { thread, err ->
             try {
                 val stack = AndroidLog.getStackTraceString(err)
+                // ⚠️ 先分清「这个异常是谁抛的」。见 [isWebViewKernelCrash] ——
+                //   不标出来的后果是把**系统内核的 bug**当成我们自己的 bug 去查。
+                val reason = if (isWebViewKernelCrash(err, stack)) {
+                    "$WEBVIEW_KERNEL_NOTE${err.javaClass.name}: ${err.message}"
+                } else {
+                    "${err.javaClass.name}: ${err.message}"
+                }
                 // ① 先落盘（同步）—— 顺序很重要：先写现场文件，再写 app.log。
                 //    因为 app.log 那条可能因为拿不到锁而跳过，现场文件是主力。
                 writeScene(
                     kind = "uncaught-exception",
-                    reason = "${err.javaClass.name}: ${err.message}",
+                    reason = reason,
                     stack = stack,
                     threadName = thread.name,
                 )
                 // ② 再把堆栈喂给 app.log（拿得到锁才有）。这条让「崩溃」出现在
                 //    正常的日志流里，用户按时间顺序翻日志时不会漏掉它。
                 withLogLock {
-                    LogStore.app('E', "Crash", "未捕获异常 on ${thread.name}: ${err.javaClass.name}: ${err.message}")
+                    LogStore.app('E', "Crash", "未捕获异常 on ${thread.name}: $reason")
                     LogStore.app('E', "Crash", stack)
                 }
                 // ③ 刷盘。异步缓冲里还压着引擎/网页的最后几行。
@@ -167,8 +182,41 @@ object CrashRecorder {
         }
     }
 
-    // ── 四类现场的写入入口 ────────────────────────────────────────────────────
+    /**
+     * 判断这个未捕获异常是不是**系统 Web 内核自己**抛的（不是本 App 的 bug）。
+     *
+     * ## 为什么必须区分
+     *
+     * 真机证据（62 个诊断包，3 份现场）：`JniAndroid$UncaughtExceptionException` 冒到
+     * 默认处理器，被记成 `uncaught-exception` ⇒ `isHardCrash` 判真 ⇒ 诊断包的
+     * `crash-scenes` 报 **fail**。可它的 native 栈 **14 帧全部**落在
+     * `/my_product/app/TrichromeLibrary64CN/TrichromeLibrary64CN.apk`（OPPO 的系统内核），
+     * Java 侧入口是 `ImeAdapterImpl.updateState` → `JniAndroid.handleException` ——
+     * 也就是**输入法状态更新时内核自己 native 崩了**，与本工程一行代码无关。
+     *
+     * 后果是分析方向被带偏：`crash-scenes=fail` 会让人去查我们的 UI/输入处理，
+     * 而真凶是 ROM 自带内核。所以**不改判据**（它确实崩了，如实记），
+     * 只在 `reason` 前加一句归因，让读日志的人一眼看到「这不是我们的栈」。
+     *
+     * ## 判据为什么用两个特征
+     *
+     * - `JniAndroid$UncaughtExceptionException`：chromium 把 native 崩溃转成 Java
+     *   异常的**唯一**载体类，只有内核会抛它。
+     * - `TrichromeLibrary` / `libmonochrome`：native 栈里的内核库名。
+     *
+     * 两个都不出现才判为本 App 的异常 —— 宁可漏判也不能把自家崩溃误标成内核的。
+     *
+     * ⚠️ 与 [isHardCrash] 的关系：这里**只改文案不改等级**。内核崩了照样是
+     * `E` 级硬崩溃现场（对用户而言界面确实没了），只是原因归属不同。
+     */
+    private fun isWebViewKernelCrash(err: Throwable, stack: String): Boolean {
+        val name = err.javaClass.name
+        if (!name.contains("JniAndroid")) return false
+        return stack.contains("TrichromeLibrary") || stack.contains("libmonochrome") ||
+            stack.contains("JniAndroid.handleException")
+    }
 
+    // ── 四类现场的写入入口 ────────────────────────────────────────────────────
     /**
      * 记录**渲染进程崩溃**（WebView 的 `onRenderProcessGone` / GeckoView 的 `onCrash`）。
      *
