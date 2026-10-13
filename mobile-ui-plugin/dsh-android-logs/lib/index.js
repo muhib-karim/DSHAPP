@@ -245,7 +245,14 @@ function renderText(value) {
 	// read 分支
 	if (typeof value.logText === 'string' && value.logText !== '') {
 		lines.push('');
-		lines.push(`—— 日志（${value.returned ?? 0} 行，来源 ${value.source ?? 'all'}，级别 ${value.level ?? 'all'}）——`);
+		// ⚠️ **`source:"crash"` 不能原样复述进标题**（2026-10-14 自检发现）。
+		//   原生侧 `matchesSource` 让 `"crash"` 落进 `else -> true`，与 `"all"` 等价，
+		//   并且会在 `truncatedNote` 里如实纠正。但那个纠正句在**标题下方**，
+		//   而标题写「来源 crash」会先入为主 —— 模型扫一眼标题就开始下结论，
+		//   后面那句「不返回崩溃现场」很容易被跳过。
+		//   标题里只写**实际生效**的来源，误导性取值交给下面那句纠正去解释。
+		const effectiveSource = value.source === 'crash' ? 'all（"crash" 不是筛选条件，见下方说明）' : (value.source ?? 'all');
+		lines.push(`—— 日志（${value.returned ?? 0} 行，来源 ${effectiveSource}，级别 ${value.level ?? 'all'}）——`);
 		lines.push(value.logText);
 	}
 	if (typeof value.truncatedNote === 'string' && value.truncatedNote !== '') {
