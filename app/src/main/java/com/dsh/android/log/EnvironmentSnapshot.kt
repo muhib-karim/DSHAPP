@@ -74,7 +74,10 @@ object EnvironmentSnapshot {
                     //   读不到时**显式记原因**，别让空串被误读成「采集逻辑漏了这个字段」。
                     val kv = kernelVersion()
                     put("kernel", kv)
-                    if (kv.isEmpty()) put("kernelUnavailable", "read-denied")
+                    // ⚠️ 措辞别写死成 "read-denied"：现在是 uname(2) 优先，
+                    //   三条路都失败的原因可能是 API 不可用/属性为空/文件被拒，
+                    //   "unavailable" 才与「我实际掌握的信息」相符。
+                    if (kv.isEmpty()) put("kernelUnavailable", "unavailable")
                     put("locale", java.util.Locale.getDefault().toString())
                     put("timeZone", java.util.TimeZone.getDefault().id)
                 },
@@ -223,46 +226,69 @@ object EnvironmentSnapshot {
      * 也拒了** —— 于是这个字段在 53 个诊断包里 **41 个是空串**，而它恰恰是硬约束②
      * （`execve` 能否用取决于内核 + SELinux）排查时要看的第一行。
      *
-     * 真机证据（CDY-TN90 / Android 10 / `Enforcing`）：
+     * 真机证据（CDY-TN90 / Android 10 / `Enforcing`）。**最硬的一条是内核自己的
+     * avc 记录**，它直接落在 `untrusted_app` 域上：
+     * ```
+     * avc: denied { read } for pid=25826 comm="sofire_pool_thr" name="version"
+     *   dev="proc" ino=4026532165 scontext=u:r:untrusted_app:s0:c84,c256,c512,c768
+     *   tcontext=u:object_r:proc_version:s0 tclass=file permissive=0
+     * ```
+     * 辅助对照（⚠️ `run-as` 跑的是 `u:r:runas_app`，**不是** `untrusted_app`，
+     * 所以它只能当旁证，不能当同一域的证明 —— 上面那条 avc 才是）：
      * ```
      * $ run-as com.dsh.android cat /proc/version
-     * cat: /proc/version: Permission denied          ← app 域被拒
+     * cat: /proc/version: Permission denied
      * $ adb shell cat /proc/version                   ← shell(uid 2000) 能读
      * Linux version 4.14.116 (HarmonyOS@localhost) …
      * ```
      * 同批实测：`/proc/sys/kernel/osrelease`、`/proc/sys/kernel/version`、
      * `/system/build.prop` 也全部 DENIED，而 `/proc/cpuinfo`、`/proc/self/status` 可读。
+     * 关键对照：**同一进程内**读 `/proc/version` 被拒，而 `System.getProperty("os.version")`
+     * 拿到 `4.14.116` —— 后者走 `uname(2)`，不走文件系统。
      *
      * ⚠️ **失败是设备/版本相关的，不是「老设备才这样」**：41 个空串里
      * SDK 35 的 20 个**全部**为空、SDK 28/31 的反而有值。所以判据只能是「读得到就读」。
      *
-     * ## 回退顺序
+     * ## 取值顺序（**先走 JDK/API，最后才读文件**）
      *
-     * 1. `/proc/version` —— 最完整（含编译器与构建时间），能读就用它；
-     * 2. `/system/bin/uname -a` —— 走 `uname(2)` **系统调用**而非读文件，
-     *    SELinux 管不到，app 域实测可 exec。输出略短（无编译器串），但内核版本
-     *    这个关键信息齐全。
+     * 1. `android.system.Os.uname()`（API 21+）—— 直接是 `uname(2)` **系统调用**，
+     *    不碰文件系统，SELinux 管不到；`release` + `version` + `machine` 拼起来
+     *    与 `uname -a` 等价，且是**结构化**的（不用解析字符串）。
+     * 2. `System.getProperty("os.version")` —— 同样是 `uname(2)`：AOSP libcore 的
+     *    `System.initUnchangeableSystemProperties()` 里就是
+     *    `p.put("os.version", Libcore.os.uname().release)`，进程启动时填好，零成本。
+     * 3. `/proc/version` —— 最完整（含编译器与构建时间），但**在 Android 10+ 上
+     *    大概率读不到**（见上），所以只当兜底。
      *
-     * 两条都失败才返回 `""`，此时**额外记一个 `kernelUnavailable` 字段**说明原因 ——
-     * 静默的空串让人以为是采集逻辑漏了，而真因是权限，必须能区分。
+     * ⚠️ **不要再用 `ProcessBuilder("/system/bin/uname")`。** 曾经用过，两个真实缺陷：
+     *    ① `redirectErrorStream(true)` 会把 stderr 并进结果 —— toybox 的 uname
+     *       在参数出错时把错误写 stderr，那串会被当成内核版本写进诊断包；
+     *    ② 先 `readText()` 再 `waitFor(3, SECONDS)` 是**死代码** —— `readText()`
+     *       要等管道关闭（子进程已退出）才返回，所以执行到 `waitFor` 时它必然
+     *       已 true，`destroyForcibly()` 永不执行，「3 秒超时」形同虚设，
+     *       实际是无界阻塞。而这段代码跑在**崩溃补打包**路径上，阻塞的代价不划算。
+     *    `uname(2)` 这两条都天然不存在：无子进程、无流、无超时需求。
+     *
+     * 三条都失败才返回 `""`，此时**额外记一个 `kernelUnavailable` 字段**说明原因 ——
+     * 静默的空串让人以为是采集逻辑漏了，而真因是权限/平台，必须能区分。
      */
     private fun kernelVersion(): String {
+        // 1) uname(2) 结构化取值：release + version + machine
+        runCatching {
+            val u = android.system.Os.uname()
+            val parts = listOf(u.release, u.version, u.machine)
+                .filter { !it.isNullOrBlank() }
+                .joinToString(" ")
+            if (parts.isNotEmpty()) return parts.take(200)
+        }
+
+        // 2) 同一条 uname(2)，但由 libcore 在进程启动时填好，零成本
+        val prop = runCatching { System.getProperty("os.version") }.getOrNull()?.trim()
+        if (!prop.isNullOrEmpty()) return prop.take(200)
+
+        // 3) 兜底：/proc/version（Android 10+ 多为 Permission denied，故排在最后）
         val direct = runCatching { File("/proc/version").readText().trim() }.getOrNull()
         if (!direct.isNullOrEmpty()) return direct.take(200)
-
-        // 回退：uname(2)。真机实测 app 域可 exec，且输出与 /proc/version 首部一致。
-        val viaUname = runCatching {
-            val proc = ProcessBuilder("/system/bin/uname", "-a")
-                .redirectErrorStream(true)
-                .start()
-            val text = proc.inputStream.bufferedReader().use { it.readText() }.trim()
-            if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
-                proc.destroyForcibly()
-                return@runCatching ""
-            }
-            text
-        }.getOrDefault("")
-        if (viaUname.isNotEmpty()) return viaUname.take(200)
 
         return ""
     }
