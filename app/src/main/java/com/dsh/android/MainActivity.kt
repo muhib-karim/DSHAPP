@@ -853,7 +853,16 @@ class MainActivity : AppCompatActivity() {
                     //   前端会打大量逐条渲染/请求日志，混进 1MB 的 `app.log`
                     //   会把原生侧关键日志冲掉。
                     LogStore.web(line)
-                    Log.i(DshApplication.TAG, "[web] $line")
+                    // ⚠️ **logcat 必须绕开 `DshLog` 的 sink**（2026-10-14 自检发现，
+                    //   同族第 23 例）。原来这里是 `Log.i(...)`，本文件顶部是
+                    //   `import com.dsh.android.log.DshLog as Log`，而 `DshLog.i`
+                    //   除转发 logcat 外还会**再落一次盘** —— 上面 `LogStore.web(line)`
+                    //   已经落过了，于是同一条网页 console 在 `app.log`/内存缓冲里
+                    //   各存两份（tag 分别是 `DSH` 与 `web`）。
+                    //   与 `EngineManager` 里引擎输出的那处是同一个缺陷，一并修掉：
+                    //   真机 72/74 个包的 `app.log` 里混着这类重复行。
+                    //   落盘已由 `LogStore.web` 负责，这里只要 logcat，所以用全限定名。
+                    android.util.Log.i(DshApplication.TAG, "[web] $line")
                 },
                 onExternalUrl = { url ->
                     runCatching {

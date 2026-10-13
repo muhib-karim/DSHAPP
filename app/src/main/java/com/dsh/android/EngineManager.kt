@@ -5082,8 +5082,31 @@ class EngineManager private constructor(private val context: Context) {
                         // `LogStore.engine` 是异步写的，所以这一行**不会拖慢读流**
                         // （读流一慢，引擎写 stdout 就会阻塞，那是老问题的来源）。
                         LogStore.engine(line)
-                        // logcat 仍然照打：接 adb 调试时最方便。
-                        Log.i(TAG, "[engine] $line")
+                        // ⚠️ **logcat 照打，但必须绕开 `DshLog` 的 sink**（2026-10-14
+                        //   自检发现，同族第 23 例）。
+                        //
+                        // 原来这里是 `Log.i(TAG, "[engine] $line")`。本文件顶部是
+                        // `import com.dsh.android.log.DshLog as Log`，而 `DshLog.i`
+                        // 除了转发给 `android.util.Log` 之外，还会**再落一次盘**
+                        // （见 `DshLog.emit`）—— 而上面那行 `LogStore.engine(line)`
+                        // 已经落过了。于是同一条引擎输出在 `app.log` 与内存缓冲里
+                        // 各存两份（tag 分别是 `DSH` 与 `engine`）。
+                        //
+                        // 真机证据（服务器上 74 个真实用户包）：**72 个**的 `app.log`
+                        // 里混着引擎输出，占 11%~25% 的行；168 个崩溃现场文件里
+                        // 「tag=[DSH] 且正文以 [engine] 开头」的行数与「tag=[engine]」
+                        // 的行数**比值恒为 1.00** —— 一条不多一条不少，正是重复。
+                        //
+                        // 后果正是上面那段注释要避免的那个：`app.log` 单文件只有 1MB、
+                        // `--- last 200 log lines ---` 只有 200 行预算，两者都被重复行
+                        // 占掉一半，而 `engine-start-failed` 的根因（引擎自己打印的
+                        // `dsh: startup failed: … plugin did not activate`）就挤在这半边里。
+                        //
+                        // ⚠️ **不能用 `Log.i`**（那会走回 sink），要用全限定名
+                        // `android.util.Log.i` —— 这违反 `DshLog` 类注释里「调用点不出现
+                        // 全限定写法」那条，但这里正是**必须**绕开的场合：落盘已经由
+                        // `LogStore.engine` 负责，此处只要 logcat。两处都不丢。
+                        android.util.Log.i(TAG, "[engine] $line")
                         synchronized(logLines) {
                             logLines.addLast(line)
                             while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
@@ -5102,6 +5125,30 @@ class EngineManager private constructor(private val context: Context) {
             } finally {
                 // 流关闭（引擎退出）时也要唤醒等待方，避免白等到超时
                 readyLatch.countDown()
+                // ⚠️ **引擎一死就必须把 `engine.log` 的缓冲刷出去**（2026-10-14 自检发现，
+                //   同族第 24 例）。
+                //
+                // `engine.log` / `web.log` 是**异步档**：`LogStore.writeAsync` 攒着
+                // 不 flush，只靠 `BufferedWriter` 的 8 KB 缓冲与「超 1 MB 才 flush」
+                // 那条阈值（见那里的注释）。引擎**正常**跑时这没问题 —— 它迟早会
+                // 攒够 8 KB。
+                //
+                // 但**引擎起不来时正好相反**：它只来得及打几十行（实测约 5 行、
+                // 不足 2 KB）就退出，缓冲**永远到不了阈值** —— 而那几十行恰恰是
+                // 唯一能解释「为什么起不来」的证据（实测是
+                // `dsh: startup failed: 1 required plugin did not activate` +
+                // `credentials-local: .credentials.yaml is readable beyond …`）。
+                // 进程一退，缓冲随进程消失，`engine.log` 停在 0 字节。
+                //
+                // 真机证据（服务器上 73 个真实用户包）：含 `engine-start-failed`
+                // 现场的包有 **33 个**，其中包内有 `engine.log` 的只有 **6 个** ——
+                // 且那 6 个的时间戳是**上一次运行**留下的残卷（23:53 写的，
+                // 包生成于 04:13），不是本次故障的输出。也就是说这个文件在最需要
+                // 它的场合恰好是空的。
+                //
+                // 放在 `finally` 里是因为三条退出路径都要覆盖：引擎启动失败、
+                // 运行期崩溃退出、以及正常结束。
+                runCatching { LogStore.flushAsync() }
                 // ⚠️ **运行期退出检测就在这一行**。
                 //
                 // stdout 读到 EOF ⇔ 引擎进程真的没了（管道写端全关）。这是唯一
