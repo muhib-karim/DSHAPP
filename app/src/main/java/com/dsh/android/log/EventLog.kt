@@ -161,7 +161,17 @@ object EventLog {
         try {
             val old = File(f.parentFile, "$FILE_NAME.1")
             if (old.exists()) old.delete()
-            f.renameTo(old)
+            // ⚠️ **必须看 renameTo 的返回值**（2026-10-14 自检查出）。
+            //   本文件与 `LogStore.rotateFiles` 同构（先删旧代、再改名），区别在于
+            //   这里**紧接着就用 `FileOutputStream(f, false)` 以 truncate 重开** ——
+            //   与 `rotateApp` 同理：rename 失败只会丢一代历史，不会退化成坏循环，
+            //   所以不必像 `rotateAsync` 那样做降级。
+            //   但**必须留痕**：`AGENTS.md` 与插件描述都写着 events.jsonl
+            //   「1MB 轮转，留一代」，rename 失败时这句承诺就不成立了，而失败
+            //   完全静默（`File.renameTo` 只返回 false、不抛异常）。
+            if (!f.renameTo(old)) {
+                LogStore.app('W', "EventLog", "events.jsonl 轮转失败（rename 未成功），上一代未归档；本次已截断续写")
+            }
             writer = BufferedWriter(OutputStreamWriter(FileOutputStream(f, false), Charsets.UTF_8))
             bytes = 0L
         } catch (_: Throwable) {

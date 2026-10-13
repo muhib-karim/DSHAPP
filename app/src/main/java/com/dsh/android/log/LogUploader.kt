@@ -210,8 +210,24 @@ object LogUploader {
                     val attempts = bumpAttempts(f)
                     if (attempts >= MAX_ATTEMPTS) {
                         val failedDir = File(dir.parentFile, "failed").apply { mkdirs() }
-                        f.renameTo(File(failedDir, f.name))
-                        LogStore.app('W', "Upload", "待传包重试 $attempts 次仍失败，已移入 failed/: ${f.name}")
+                        // ⚠️ **必须看 renameTo 的返回值**（2026-10-14 自检查出）。
+                        //   `File.renameTo()` 失败时只返回 false、不抛异常，而这里的
+                        //   日志原文写死了「已移入 failed/」—— 于是移动失败时：
+                        //   ① 包仍留在 `pending/`，下次启动还会被当成待传（与注释
+                        //      「不再自动重试」矛盾）；② 日志却报告已经移走，
+                        //      分析者据此以为这批包已经归档，实际还在反复占流量。
+                        //   两条都是「结论与事实不符」，只是方向相反。
+                        val moved = runCatching { f.renameTo(File(failedDir, f.name)) }.getOrDefault(false)
+                        if (moved) {
+                            LogStore.app('W', "Upload", "待传包重试 $attempts 次仍失败，已移入 failed/: ${f.name}")
+                        } else {
+                            LogStore.app(
+                                'W', "Upload",
+                                "待传包重试 $attempts 次仍失败，且移入 failed/ 未成功" +
+                                    "（rename 返回 false，多半是磁盘满/权限）：${f.name} 仍留在 pending/，" +
+                                    "下次启动会再试一次",
+                            )
+                        }
                     }
                 }
             } finally {
