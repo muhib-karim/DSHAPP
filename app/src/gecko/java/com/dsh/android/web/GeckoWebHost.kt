@@ -267,6 +267,12 @@ class GeckoWebHost(
             ): GeckoResult<AllowOrDeny>? {
                 val url = request.uri
                 if (url.startsWith(LOCAL_ENGINE_PREFIX) || url.startsWith("about:")) return null
+                // ⚠️ `blob:` / `data:` 不能当外链交给系统浏览器 —— 它们只在**创建它的
+                //   那个页面上下文**里有效，系统里没有任何应用能处理这两个协议，
+                //   `Intent.ACTION_VIEW` 必然 ActivityNotFoundException 且**静默失败**。
+                //   真机证据见 SystemWebHost 同处的注释（同一会话内连续 29 次）。
+                //   回 null = 不接管，按内核默认行为走。
+                if (url.startsWith("blob:") || url.startsWith("data:")) return null
                 callbacks.onExternalUrl(url)
                 // 已交给系统浏览器，内核这边必须拒绝这次导航，
                 // 否则页面会被替换成外链（然后就再也回不来了）。

@@ -132,6 +132,22 @@ class SystemWebHost(
                 val url = request.url.toString()
                 // 只允许留在本地引擎里；外链交给系统浏览器
                 if (url.startsWith(LOCAL_ENGINE_PREFIX)) return false
+                // ⚠️ `blob:` / `data:` 也是**内核自己才能解析**的 URL，不能当外链丢出去。
+                //
+                // blob URL 只在**创建它的那个页面上下文**里有效（由内核维护一张
+                // blob 注册表），系统里没有任何应用能处理 `blob:` 协议 —— 交给
+                // `Intent.ACTION_VIEW` 必然 `ActivityNotFoundException`，而且是
+                // **静默失败**：用户点一次没反应、再点一次还是没反应。
+                //
+                // 真机证据：`20261014-002816-785b5eec.zip` 里同一个会话内
+                // **连续 29 次** `无法打开外部链接: blob:http://127.0.0.1:3080/<uuid>`，
+                // 时间跨 23:36 → 00:11（35 分钟），用户显然在反复点击同一个东西。
+                // 那些 URL 前缀是 `blob:http://127.0.0.1:3080/…` —— 页面**自己的**
+                // 同源 blob，本该由内核处理。
+                //
+                // 回 false = 不接管，让内核按默认行为走（`<a download>` 会走到
+                // 我们的 DownloadListener，普通导航由内核自己渲染）。
+                if (url.startsWith("blob:") || url.startsWith("data:")) return false
                 callbacks.onExternalUrl(url)
                 return true
             }
@@ -309,6 +325,12 @@ class SystemWebHost(
                 // 让内核丢弃这次新窗口请求，页面自身的导航不受影响。
                 if (url.startsWith(LOCAL_ENGINE_PREFIX)) {
                     Log.i(DshApplication.TAG, "window.open 指向本地引擎，忽略: $url")
+                    return false
+                }
+                // 同 shouldOverrideUrlLoading：`blob:` / `data:` 只有内核自己解析得了，
+                // 丢给系统浏览器必然静默失败。回 false 让内核丢弃这次新窗口请求。
+                if (url.startsWith("blob:") || url.startsWith("data:")) {
+                    Log.i(DshApplication.TAG, "window.open 指向内核内 URL（blob/data），忽略: ${url.take(80)}")
                     return false
                 }
                 Log.i(DshApplication.TAG, "window.open 外链转系统浏览器: $url")
