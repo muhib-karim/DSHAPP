@@ -240,8 +240,12 @@ object DiagnosticBundle {
 
         return try {
             if (size <= budget) {
+                // ⚠️ **先取流、再建条目**：反过来时读失败（EACCES 等）会在包里留下
+                //   一个 0 字节僵尸条目，紧接着 catch 又写 `${name}_failed` 说
+                //   「读取失败」—— 两句话互相矛盾，分析者会以为日志本身是空的。
+                val ins = f.inputStream()
                 zos.putNextEntry(ZipEntry(name))
-                f.inputStream().use { it.copyTo(zos) }
+                ins.use { it.copyTo(zos) }
                 zos.closeEntry()
                 written.add(name)
                 recordRange(completeness, name, f, truncated = false, includedBytes = size)
@@ -337,21 +341,38 @@ object DiagnosticBundle {
         val picked = all.take(MAX_STARTUP_LOGS)
         var total = 0L
         var n = 0
+        val failures = JSONArray()
         for (f in picked) {
+            // ⚠️ **失败必须留痕**（与 [writeCrashes] 同族的第三份）。这里比
+            //   [writeCrashes] 稍好：`totalOnDevice` 与 `included` 两个数并排，
+            //   少一份能从 `included < totalOnDevice` 看出来。但**看不出为什么少** ——
+            //   是文件读不了、还是条目写坏了。而这份目录恰恰是「引擎起不来」
+            //   唯一的一手证据（见上方类注释），漏掉哪一份都很可能是关键那份。
+            //   ⚠️ **先取流、再建条目**（与 [writeCrashes] 同）：反过来会在读失败时
+            //   在包里留下一个 0 字节僵尸条目，与「没收进来」的结论矛盾。
             runCatching {
+                val ins = f.inputStream()
                 val entryName = "engine-startup/${f.name}"
                 zos.putNextEntry(ZipEntry(entryName))
-                f.inputStream().use { it.copyTo(zos) }
+                ins.use { it.copyTo(zos) }
                 zos.closeEntry()
                 written.add(entryName)
                 total += f.length()
                 n++
+            }.onFailure { t ->
+                failures.put(
+                    JSONObject().apply {
+                        put("file", f.name)
+                        put("error", "${t.javaClass.simpleName}: ${t.message}")
+                    },
+                )
             }
         }
         // ⚠️ 两个数都要记：只记「收了几份」会让「一共失败过 200 次」看起来像 3 次。
         completeness.put("engineStartupLogs", JSONObject().apply {
             put("totalOnDevice", all.size)
             put("included", n)
+            if (failures.length() > 0) put("failedToWrite", failures)
             put("newest", fmt.format(Date(picked.first().lastModified())))
             put("oldestIncluded", fmt.format(Date(picked.last().lastModified())))
         })
@@ -421,12 +442,19 @@ object DiagnosticBundle {
             //   completeness 只写 `crashScenes = index.length()`（**成功数**）——
             //   于是「本来只有 2 份现场」与「3 份里 1 份读失败」在产物上**完全一样**。
             //   崩溃现场是排查的唯一入口，漏掉一份等于把最关键那次的证据藏起来。
-            //   同文件的 writeLogFile（`${name}_failed`）与 writeEngineStartupLogs
-            //   （totalOnDevice/included 对照）都是正确写法，这里是漏改的第三份。
+            //   同文件的 writeLogFile 用 `${name}_failed` 记失败、writeEngineStartupLogs
+            //   用 totalOnDevice/included 对照 —— 三处现在口径一致（都带 failedToWrite）。
+            //   ⚠️ **顺序要紧：先取流，再建条目。** 反过来（`putNextEntry` →
+            //   `f.inputStream()`）会在读失败时留下一个**已打开但没写内容的 zip 条目**，
+            //   包解出来是个 0 字节文件，而 completeness 又写着「没收进来」——
+            //   产物自相矛盾：`included` 说 4 份、包里有 5 条。分析者看到那个
+            //   0 字节文件会以为「引擎写了个空日志」，而实际是 EACCES。
+            //   先取流则失败发生在建条目之前，包是干净的。
             runCatching {
+                val ins = f.inputStream()
                 val entryName = "crashes/${f.name}"
                 zos.putNextEntry(ZipEntry(entryName))
-                f.inputStream().use { it.copyTo(zos) }
+                ins.use { it.copyTo(zos) }
                 zos.closeEntry()
                 written.add(entryName)
                 total += f.length()
