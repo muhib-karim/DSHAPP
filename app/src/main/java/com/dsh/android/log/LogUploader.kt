@@ -264,7 +264,16 @@ object LogUploader {
      * `crash/.queued` 里记着**已打包过的现场文件名**（排序后）。集合没变就跳过，
      * 于是同一批现场不会被反复打包。有新现场（或清空后又有）才重新打包。
      *
-     * @return 入队的包；没有新现场或失败时返回 null。
+     * ⚠️ **返回 null 有两种含义，必须区分**：①「没有新现场」（正常，常态）；
+     *   ②「有新现场但打包/入队失败」（异常，**必须留痕**）。原来这两者都只是
+     *   一个 `return@runCatching null`，而唯一的调用方
+     *   （`DshApplication.uploadPendingBundles`）**忽略返回值** —— 于是磁盘满 /
+     *   `export/` 建不出来时，那批崩溃现场**永远不会被上传，也一个字都不说**，
+     *   表现与「本来就没有现场」完全相同。崩溃现场是这个系统的核心数据，
+     *   悄悄不传等于把用户的求助信号丢掉。
+     *   ②现在各记一条 Warn（`W` 而不是 `E`：不传不等于崩，但用户/分析者必须知道）。
+     *
+     * @return 入队的包；没有新现场时返回 null（正常）；失败时也返回 null，但会记日志。
      */
     fun collectCrashScenes(logDir: File): File? = runCatching {
         val crashDir = File(logDir, "crash")
@@ -278,16 +287,27 @@ object LogUploader {
         val marker = File(crashDir, QUEUED_MARKER)
         val signature = scenes.joinToString("\n") { it.name }
         val prev = runCatching { marker.takeIf { it.isFile }?.readText() }.getOrNull()
-        if (prev == signature) return@runCatching null // 没有新现场
+        if (prev == signature) return@runCatching null // 没有新现场（常态）
 
         val outDir = File(logDir, EXPORT_DIR).apply { mkdirs() }
-        val bundle = DiagnosticBundle.build(logDir, outDir, "crash") ?: return@runCatching null
-        val queued = enqueue(bundle, logDir) ?: return@runCatching null
+        val bundle = DiagnosticBundle.build(logDir, outDir, "crash")
+        if (bundle == null) {
+            LogStore.app('W', "Upload", "崩溃现场打包失败，本次 ${scenes.size} 份现场不会上传（下次启动会重试）")
+            return@runCatching null
+        }
+        val queued = enqueue(bundle, logDir)
+        if (queued == null) {
+            LogStore.app('W', "Upload", "诊断包入队失败（${bundle.name}），本次 ${scenes.size} 份现场不会上传")
+            return@runCatching null
+        }
         // ⚠️ 标记写在**入队成功之后**：反过来会「标记了但没入队」，那批现场就
         //   永远不会再被尝试。
         runCatching { marker.writeText(signature) }
         LogStore.app('I', "Upload", "崩溃现场已打包入队: ${queued.name}（${scenes.size} 份现场）")
         queued
+    }.onFailure { t ->
+        // 外层兜底：上面任何一步意外抛异常（`listFiles` 权限、OOM…）也要留痕。
+        LogStore.app('W', "Upload", "收集崩溃现场时异常（本次不会上传）: ${t.javaClass.simpleName}: ${t.message}")
     }.getOrNull()
 
     // ── 真正的上传 ────────────────────────────────────────────────────────────
