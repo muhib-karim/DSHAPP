@@ -193,8 +193,10 @@ object LogCommandBridge {
         }
 
         val taken = matched.takeLast(lines)
+        // ⚠️ 线程名要带上，与 `app.log` 的 `时间 [级别] [tag] #seq 线程 正文` 逐字对齐。
+        //   排查「谁卡住了/谁在刷屏」时线程是第一依据；漏掉它，模型只能靠正文猜。
         val text = taken.joinToString("\n") { e ->
-            "${fmt.format(Date(e.t))} [${e.level}] [${e.tag}] #${e.seq} ${e.msg}"
+            "${fmt.format(Date(e.t))} [${e.level}] [${e.tag}] #${e.seq} ${e.thread} ${e.msg}"
         }
 
         out.put("source", source)

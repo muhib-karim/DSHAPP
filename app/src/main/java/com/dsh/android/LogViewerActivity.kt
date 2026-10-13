@@ -230,6 +230,9 @@ class LogViewerActivity : AppCompatActivity() {
                 tag = "crash/$kind",
                 msg = "$head\n…（完整内容：${f.name}）",
                 seq = -(i + 1L),
+                // 这一行代表一个**现场文件**，不是一条日志 —— 它没有「写入线程」。
+                // ⚠️ 不能填 Thread.currentThread().name：那会显示成 UI 线程，纯属编造。
+                thread = "-",
             )
         }
     }.getOrDefault(emptyList())
@@ -484,7 +487,7 @@ class LogViewerActivity : AppCompatActivity() {
     }
 
     private fun formatRow(e: LogStore.Entry): String =
-        "${timeFmt.format(Date(e.t))} [${e.level}] [${e.tag}] #${e.seq} ${e.msg}"
+        "${timeFmt.format(Date(e.t))} [${e.level}] [${e.tag}] #${e.seq} ${e.thread} ${e.msg}"
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 

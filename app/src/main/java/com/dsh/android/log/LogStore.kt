@@ -224,9 +224,10 @@ object LogStore {
         val safe = safeRedact(msg)
         val n = seq.incrementAndGet()
         val now = System.currentTimeMillis()
-        remember(Entry(now, level, tag, safe, n))
+        val th = Thread.currentThread().name
+        remember(Entry(now, level, tag, safe, n, th))
         if (throttled(level, tag, safe, now)) return
-        writeApp(format(now, level, tag, safe, n))
+        writeApp(format(now, level, tag, safe, n, th))
     }
 
     /**
@@ -239,8 +240,9 @@ object LogStore {
         val safe = safeRedact(line)
         val n = seq.incrementAndGet()
         val now = System.currentTimeMillis()
-        remember(Entry(now, 'I', "engine", safe, n))
-        enqueue(QueuedLine.Target.ENGINE, format(now, 'I', "engine", safe, n))
+        val th = Thread.currentThread().name
+        remember(Entry(now, 'I', "engine", safe, n, th))
+        enqueue(QueuedLine.Target.ENGINE, format(now, 'I', "engine", safe, n, th))
     }
 
     /** 记一条**网页 console 日志**。异步 + 限流。 */
@@ -248,14 +250,15 @@ object LogStore {
         val safe = safeRedact(line)
         val n = seq.incrementAndGet()
         val now = System.currentTimeMillis()
-        remember(Entry(now, 'I', "web", safe, n))
+        val th = Thread.currentThread().name
+        remember(Entry(now, 'I', "web", safe, n, th))
         if (throttled('I', "web", safe, now)) return
-        enqueue(QueuedLine.Target.WEB, format(now, 'I', "web", safe, n))
+        enqueue(QueuedLine.Target.WEB, format(now, 'I', "web", safe, n, th))
     }
 
     /** 统一行格式：`时间 [级别] [tag] #seq 线程 正文`。 */
-    private fun format(t: Long, level: Char, tag: String, msg: String, n: Long): String =
-        "${fmt.format(Date(t))} [$level] [$tag] #$n ${Thread.currentThread().name} $msg"
+    private fun format(t: Long, level: Char, tag: String, msg: String, n: Long, thread: String): String =
+        "${fmt.format(Date(t))} [$level] [$tag] #$n $thread $msg"
 
     // ── 内存缓冲 ──────────────────────────────────────────────────────────────
 
@@ -273,7 +276,8 @@ object LogStore {
     fun tail(n: Int, minLevel: Char? = null): List<String> {
         val list = synchronized(ring) { ring.toList() }
         val filtered = if (minLevel == null) list else list.filter { severity(it.level) >= severity(minLevel) }
-        return filtered.takeLast(n.coerceAtLeast(0)).map { format(it.t, it.level, it.tag, it.msg, it.seq) }
+        return filtered.takeLast(n.coerceAtLeast(0))
+            .map { format(it.t, it.level, it.tag, it.msg, it.seq, it.thread) }
     }
 
     /** 级别严重度排序，供筛选比较。 */
@@ -685,7 +689,12 @@ object LogStore {
 
     private fun writeAppThrottleNote(note: String) {
         try {
-            writeApp(format(System.currentTimeMillis(), 'W', "Log", note, seq.incrementAndGet()))
+            writeApp(
+                format(
+                    System.currentTimeMillis(), 'W', "Log", note, seq.incrementAndGet(),
+                    Thread.currentThread().name,
+                ),
+            )
         } catch (_: Throwable) {
         }
     }
@@ -763,13 +772,29 @@ object LogStore {
 
     // ── 数据结构 ──────────────────────────────────────────────────────────────
 
-    /** 一条日志。`seq` 是进程内序号，用于跨文件对齐与排序。 */
+    /**
+     * 一条日志。`seq` 是进程内序号，用于跨文件对齐与排序。
+     *
+     * ⚠️ **`thread` 必须在写入时定格，不能在读取时取**（真机踩过，伪造了证据）。
+     *   在 `214`/`215` 版之前本类没有这个字段，`tail()` 重新格式化时调的是
+     *   `Thread.currentThread().name` —— 于是崩溃现场里那 200 行的线程名全是
+     *   **读取者**（`dsh-log-watchdog`），而不是**写入者**。
+     *
+     *   铁证（同一时间戳、同一 `#1`，两份文件对比）：
+     *   - `app.log`（写入时定格）：`... [W] [Boot] #1 main 上次启动未正常结束…`
+     *   - 现场文件（读取时取）：`... [W] [Boot] #1 dsh-log-watchdog 上次启动未正常结束…`
+     *
+     *   后果很具体：崩溃现场的第 3 段是**信息量最大**的一段（「崩之前最后做的那件事」），
+     *   而线程名正是判断「谁卡住了」的第一依据。把它写成读取者，等于让分析者
+     *   顺着一个**从头到尾没参与过那些日志**的线程去查。
+     */
     data class Entry(
         val t: Long,
         val level: Char,
         val tag: String,
         val msg: String,
         val seq: Long,
+        val thread: String,
     )
 
     // ── 文件名（诊断包与工具都按这些名字找） ──────────────────────────────────
