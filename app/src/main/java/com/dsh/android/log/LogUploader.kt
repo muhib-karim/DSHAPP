@@ -186,7 +186,19 @@ object LogUploader {
         if (files.isEmpty()) return
         // 按时间从旧到新：先传早的，让服务器按顺序看到问题演变。
         for (f in files.sortedBy { it.lastModified() }) {
-            if (!uploading.compareAndSet(false, true)) return
+            // ⚠️ **被别的上传占着时要说话，不能静默放弃整批。**
+            //   原来这里是 `return`：手动导出正在上传时，整批补传一份都不做，
+            //   而且 `onEach` 不触发、一行日志都没有 —— 调用方
+            //   （`DshApplication.uploadPendingBundles`）打完「发现 N 份待上传」
+            //   之后就再无输出，看起来像「传完了」或「本来就没事」。
+            //   现在记一条 Warn 说明原因，并把这次放弃如实说出来。
+            if (!uploading.compareAndSet(false, true)) {
+                LogStore.app(
+                    'W', "Upload",
+                    "已有上传在进行中，本次补传跳过（待传 ${files.size} 份，下次启动会再试）",
+                )
+                return
+            }
             try {
                 val (ok, msg) = doUpload(endpoint!!, f, "startup-retry")
                 onEach?.invoke(f, ok, msg)
@@ -206,13 +218,31 @@ object LogUploader {
         }
     }
 
-    /** 用同名 `.attempts` 文件记重试次数（不改动 zip 本身）。 */
+    /**
+     * 用同名 `.attempts` 文件记重试次数（不改动 zip 本身）。
+     *
+     * ⚠️ **写失败时不能返回 0。** 调用处是 `if (attempts >= MAX_ATTEMPTS)`，返回 0
+     *   会让这个判据**恒假**，于是 `MAX_ATTEMPTS` 与 `failed/` 永不生效 ——
+     *   每个启动都把全部 pending 重试一遍，无限耗流量，且这条失败无任何日志。
+     *   而 `.attempts` 写不进去的典型原因正是**磁盘满**，也就是本系统要处理的核心
+     *   故障场景 —— 最需要它生效的时候它恰好失效。
+     *
+     *   修法：计数先自增、再尝试落盘；**落盘失败也把自增后的值返回**（内存里的判断
+     *   依然正确），并记一条 Warn 让分析者知道持久化没成功（下次启动会从头计）。
+     */
     private fun bumpAttempts(bundle: File): Int = runCatching {
         val f = File(bundle.parentFile, "${bundle.name}.attempts")
         val n = (f.takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull() ?: 0) + 1
-        f.writeText(n.toString())
+        runCatching { f.writeText(n.toString()) }
+            .onFailure { t ->
+                LogStore.app(
+                    'W', "Upload",
+                    "重试计数无法落盘（${t.javaClass.simpleName}: ${t.message}），" +
+                        "本次按第 $n 次处理；下次启动会从头计。",
+                )
+            }
         n
-    }.getOrDefault(0)
+    }.getOrDefault(MAX_ATTEMPTS)
 
     /**
      * 启动时把**尚未打包**的崩溃现场打成诊断包并入队。

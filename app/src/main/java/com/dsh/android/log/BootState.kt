@@ -124,7 +124,20 @@ object BootState {
             consecutiveUncleanCount = consecutive,
             lastExit = prev?.let {
                 LastExit(
-                    at = it.startedAt,
+                    // ⚠️ **这个字段的语义取决于 `clean`，必须按它分流取。**
+                    //
+                    //   `prev` 是**上次**的 State：
+                    //   - `prev.clean == true` ⇒ 上次真的调过 [markCleanExit]，它把
+                    //     `prev.lastExit.at` 覆盖成了**上次退出时刻** ⇒ 取它。
+                    //   - `prev.clean == false` ⇒ 上次**没**调过 [markCleanExit]，
+                    //     `prev.lastExit` 还是上次 `begin()` 写的那个值（即**上上次**
+                    //     的东西，与上次无关）⇒ 只能用 `prev.startedAt`（上次启动时刻）。
+                    //
+                    //   原来这里无条件写 `at = it.startedAt`，于是正常退出的那一刻被
+                    //   整个丢掉 —— 下次 `previous()` 读回 `it.at` 拿到的是**上次启动**
+                    //   时刻，而 `describe()` 的 clean 分支把它当退出时刻报出来。
+                    //   分析者按这个时间去日志里对齐，对齐到的是启动那一行。
+                    at = if (it.clean) (it.lastExit?.at ?: it.startedAt) else it.startedAt,
                     clean = it.clean,
                     bootId = it.bootId,
                     reason = if (it.clean) "clean" else "unclean",

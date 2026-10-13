@@ -223,19 +223,35 @@ class LogViewerActivity : AppCompatActivity() {
      * 把崩溃现场文件的**头部**做成虚拟条目。
      *
      * ⚠️ 只取前若干行：现场文件里附带了「最后 200 行日志」，整个塞进列表会让
-     * 一屏只显示一份现场。用户想看完整内容点进去（见 [showScene]）。
+     * 一屏只显示一份现场。
+     *
+     * ⚠️ **必须是 `take` 而不是 `takeLast`。** `CrashRecorder.listScenes()` 是
+     *   `sortedByDescending { lastModified() }`（**最新在前**），所以尾部才是
+     *   **最旧**的那些。原来写 `takeLast(MAX_CRASH_ROWS)`，于是「崩溃」筛选列出的
+     *   是最旧的 20 份 —— 用户想看的**最新那次崩溃反而不在列表里**，而
+     *   `enforceQuota()` 只在 `LogStore.init()` 调一次，同一次运行内现场可以攒到
+     *   20 份以上，这条路径是能走到的。
+     *   项目里一致的口径是「保留最近的」（见 `LogStore.enforceCrashQuota` 的
+     *   KDoc：「保留**最近**的而不是最早的…最新那几个才是当前问题的现场」）。
      */
     private fun crashEntries(): List<LogStore.Entry> = runCatching {
-        CrashRecorder.listScenes().takeLast(MAX_CRASH_ROWS).mapIndexed { i, f ->
+        CrashRecorder.listScenes().take(MAX_CRASH_ROWS).mapIndexed { i, f ->
             val head = runCatching {
                 f.bufferedReader().useLines { it.take(HEAD_LINES).joinToString("\n") }
             }.getOrDefault("(无法读取)")
-            val kind = f.name.substringAfterLast('-').removeSuffix(".txt")
+            // ⚠️ **必须用 CrashRecorder.kindOf，不能用 substringAfterLast('-')。**
+            //   文件名契约是 `<yyyyMMdd-HHmmss>-<kind>.txt`，而**时间戳自己也含 `-`**；
+            //   切尾段得到的是类别名的后半截：`engine-start-failed`→`failed`、
+            //   `uncaught-exception`→`exception`、`engine-exit`→`exit`。
+            //   于是同屏顶部写 `engine-start-failed×N`、列表标签却是 `crash/failed`，
+            //   而 `crash/exit` 与 `crash/exception` 更是把类别说反了。
+            //   kindOf 用正则 `^\d{8}-\d{6}-(.+)\.txt$`，KDoc 里明写「必须是这个正则」。
+            val kind = CrashRecorder.kindOf(f)
             LogStore.Entry(
                 t = f.lastModified(),
                 level = if (CrashRecorder.isHardCrash(f)) 'E' else 'W',
                 tag = "crash/$kind",
-                msg = "$head\n…（完整内容：${f.name}）",
+                msg = "$head\n…（只显示前 $HEAD_LINES 行；完整内容见 crash/${f.name}）",
                 seq = -(i + 1L),
                 // 这一行代表一个**现场文件**，不是一条日志 —— 它没有「写入线程」。
                 // ⚠️ 不能填 Thread.currentThread().name：那会显示成 UI 线程，纯属编造。

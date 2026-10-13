@@ -178,10 +178,21 @@ object DiagnosticBundle {
     // ── 各项写入 ──────────────────────────────────────────────────────────────
 
     /**
-     * 写一个 zip 条目，返回消耗的字节数（估算）。
+     * 写一个 zip 条目，返回写入的字节数。
      *
-     * ⚠️ 单个条目超预算就**整个跳过**并在 completeness 里记一笔，而不是写一半
-     * —— 半个 JSON 会让分析者以为包是坏的。
+     * ⚠️ **本函数不做体积预算检查，KDoc 原来那句「单个条目超预算就整个跳过并在
+     *   completeness 里记一笔」是假的。** 签名里既没有 `budget` 也没有
+     *   `completeness`，函数体无条件写入 —— 承诺了一个它做不到的保护。这与刚删掉的
+     *   `LogStore.enforceDirQuota(skipDirs)` 完全同构（那个也是「KDoc 自称有保证、
+     *   实现里根本没有」），属本项目已记录的「死代码造成的虚构保证」类。
+     *
+     * ⚠️ **这五个条目不设预算是有意为之，不是遗漏**：`environment.json` /
+     *   `diagnosis.json` / `timeline.jsonl` / `files.json` 都是**小且价值最高**的
+     *   （写它们时 budget 基本没被消耗），且是分析者的入口。宁可它们把 budget
+     *   扣成负数、让后面的大日志被整跳，也不能缺 —— 顺序即优先级（见 [build]）。
+     *   但既然「不做保护」是设计，就不能在文档里说做了保护。
+     *
+     * @return 写入的字节数（UTF-8）。调用方用它递减 budget。
      */
     private fun writeEntry(
         zos: ZipOutputStream,
@@ -403,7 +414,15 @@ object DiagnosticBundle {
         val scenes = CrashRecorder.listScenes()
         var total = 0L
         val index = JSONArray()
+        val failures = JSONArray()
         for (f in scenes) {
+            // ⚠️ **失败必须留痕**，不能裸 `runCatching {}` 静默吞（踩过同构的坑）：
+            //   原来这里失败时 `index` / `written` / `total` 各少一项，而
+            //   completeness 只写 `crashScenes = index.length()`（**成功数**）——
+            //   于是「本来只有 2 份现场」与「3 份里 1 份读失败」在产物上**完全一样**。
+            //   崩溃现场是排查的唯一入口，漏掉一份等于把最关键那次的证据藏起来。
+            //   同文件的 writeLogFile（`${name}_failed`）与 writeEngineStartupLogs
+            //   （totalOnDevice/included 对照）都是正确写法，这里是漏改的第三份。
             runCatching {
                 val entryName = "crashes/${f.name}"
                 zos.putNextEntry(ZipEntry(entryName))
@@ -420,11 +439,27 @@ object DiagnosticBundle {
                         put("hardCrash", CrashRecorder.isHardCrash(f))
                     },
                 )
+            }.onFailure { t ->
+                failures.put(
+                    JSONObject().apply {
+                        put("file", f.name)
+                        put("error", "${t.javaClass.simpleName}: ${t.message}")
+                    },
+                )
             }
         }
         if (index.length() > 0) {
             completeness.put("crashScenes", index.length())
         }
+        // ⚠️ **总数必须一起记**，否则「收了几份」这个数没有对照。
+        completeness.put(
+            "crashScenesOnDevice",
+            JSONObject().apply {
+                put("totalOnDevice", scenes.size)
+                put("included", index.length())
+                if (failures.length() > 0) put("failedToWrite", failures)
+            },
+        )
         return total
     }
 
