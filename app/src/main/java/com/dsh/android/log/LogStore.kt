@@ -133,10 +133,23 @@ object LogStore {
     @Volatile
     private var writeFailures = 0
 
-    /** 上一次限流判据（tag+level 相同即视为同类）。 */
+    /** 上一次限流判据（level + tag + 正文 相同即视为同类）。 */
     private var lastThrottleKey = ""
     private var lastThrottleAt = 0L
-    private var throttleCount = 0
+
+    /**
+     * 本轮（同一 key、同一窗口）已出现的**重复条数** —— 含被放行的那些。
+     * 用来判断有没有超过 [THROTTLE_MAX_REPEAT]。
+     */
+    private var throttleSeen = 0
+
+    /**
+     * 本轮**真正被丢弃**的条数。汇总行与 [throttledTotal] 都只认这个数。
+     *
+     * ⚠️ **不能拿 [throttleSeen] 当丢弃数用** —— 前 [THROTTLE_MAX_REPEAT] 条
+     *   是**放行**的（它们原样进了日志），只有超出部分才真的丢。
+     */
+    private var throttleDropped = 0
 
     /** 被限流丢弃的总条数（写进诊断包，让分析者知道日志被抽过稀）。 */
     @Volatile
@@ -676,24 +689,40 @@ object LogStore {
      *
      * ⚠️ 被丢弃的条数会累积到 [throttledTotal] 并写进诊断包 —— 分析者必须知道
      * 「这份日志被抽过稀」，否则会误判「这件事只发生了一次」。
+     *
+     * ⚠️ **「出现了几条」与「丢了几条」是两个数，必须分开记。** 同一窗口内前
+     *   [THROTTLE_MAX_REPEAT] + 1 条（首条 + 20 条重复）是**放行**的，只有超出
+     *   部分才真的丢。原来只用一个 `throttleCount` 同时干这两件事，于是汇总行与
+     *   `throttledTotal` 报的是「出现次数」而不是「丢弃次数」—— **凭空多报**：
+     *   实测同一 key 连发 5 条（全部放行、一条没丢），日志里却写「…被抑制 4 次」，
+     *   `throttledTotal` 也加了 4；连发 21 条（全部放行）写「被抑制 20 次」。
+     *   两个方向都有害：分析者会以为日志被抽稀过（其实逐条完整），并据此怀疑
+     *   自己看到的不是全部。
      */
     private fun throttled(level: Char, tag: String, msg: String, now: Long): Boolean {
         val key = "$level|$tag|$msg"
         lock.withLock {
             if (key != lastThrottleKey || now - lastThrottleAt > THROTTLE_WINDOW_MS) {
-                // 上一轮若发生过抑制，补一条汇总 —— 否则日志里会凭空少一截
-                if (throttleCount > 0) {
-                    val note = "… 上一条同类日志在 ${THROTTLE_WINDOW_MS}ms 内被抑制 $throttleCount 次"
-                    throttledTotal += throttleCount
-                    throttleCount = 0
+                // 上一轮若**真的丢过**，补一条汇总 —— 否则日志里会凭空少一截。
+                // ⚠️ 判据是 throttleDropped 而不是 throttleSeen：没丢就不该写这一行。
+                if (throttleDropped > 0) {
+                    val note = "… 上一条同类日志在 ${THROTTLE_WINDOW_MS}ms 内被抑制 $throttleDropped 次"
+                    throttledTotal += throttleDropped
+                    throttleDropped = 0
                     writeAppThrottleNote(note)
                 }
+                throttleSeen = 0
                 lastThrottleKey = key
                 lastThrottleAt = now
                 return false
             }
-            throttleCount++
-            return throttleCount > THROTTLE_MAX_REPEAT
+            throttleSeen++
+            return if (throttleSeen > THROTTLE_MAX_REPEAT) {
+                throttleDropped++
+                true
+            } else {
+                false
+            }
         }
     }
 
