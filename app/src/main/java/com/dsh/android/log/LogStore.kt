@@ -451,20 +451,34 @@ object LogStore {
         }
         appWriter = null
         val d = dir ?: return
+        // ⚠️ 这里**故意不检查 rotateFiles 的返回值**：紧接着的 openApp(append = false)
+        //   会以 truncate 模式重开 app.log，无论 rename 成没成，文件都会被清空、
+        //   appBytes 也随 f.length() 归零。所以「rename 失败」在 app.log 这条路上
+        //   只意味着丢了一代历史，不会退化成「每行都重试轮转」的循环 ——
+        //   与 [rotateAsync] 的处境不同，那边必须检查。
         rotateFiles(File(d, APP_LOG))
         openApp(append = false)
     }
 
-    /** 通用的「当前 → .1」轮转。调用方已关闭 writer。 */
-    private fun rotateFiles(cur: File) {
+    /**
+     * 通用的「当前 → .1」轮转。调用方已关闭 writer。
+     *
+     * @return **是否真的把 `cur` 挪走了**。调用方必须看这个返回值 ——
+     *   `File.renameTo()` 失败时只返回 `false`、**不抛异常**，不检查就等于
+     *   把「轮转没做成」当成「轮转做成了」（缺陷族第 ix 条：静默失败）。
+     *   两种调用方的后果不同，见各自的注释。
+     */
+    private fun rotateFiles(cur: File): Boolean {
+        var ok = true
         for (gen in KEEP_GENERATIONS downTo 1) {
             val src = if (gen == 1) cur else File(cur.parentFile, "${cur.name}.${gen - 1}")
             val dst = File(cur.parentFile, "${cur.name}.$gen")
             if (src.exists()) {
                 if (dst.exists()) dst.delete()
-                src.renameTo(dst)
+                if (!src.renameTo(dst)) ok = false
             }
         }
+        return ok
     }
 
     /**
@@ -542,7 +556,14 @@ object LogStore {
         t.start()
     }
 
-    /** 惰性开文件 —— 引擎/网页日志第一次真的出现时才建，避免空文件。 */
+    /**
+     * 惰性开文件 —— 引擎/网页日志第一次真的出现时才建，避免空文件。
+     *
+     * ⚠️ `xxxBytes` 在这里取的是 `f.length()`，即**文件的真实大小**，不是进程内累加值。
+     *   所以只要有人（本进程的 [rotateAsync] 失败分支、或外部）动过这个文件，
+     *   调这个方法就是「让计数与文件同步」的唯一手段。调用前必须先 `writer = null`，
+     *   否则会被上面那行早退挡住。
+     */
     private fun engineWriterOf(): BufferedWriter? {
         engineWriter?.let { return it }
         lock.withLock {
@@ -629,19 +650,69 @@ object LogStore {
     private fun rotateAsync(target: QueuedLine.Target) {
         try {
             lock.withLock {
-                when (target) {
+                val cur: File? = when (target) {
                     QueuedLine.Target.ENGINE -> {
                         runCatching { engineWriter?.close() }
                         engineWriter = null
-                        dir?.let { rotateFiles(File(it, ENGINE_LOG)) }
-                        engineBytes = 0L
+                        dir?.let { File(it, ENGINE_LOG) }
                     }
                     QueuedLine.Target.WEB -> {
                         runCatching { webWriter?.close() }
                         webWriter = null
-                        dir?.let { rotateFiles(File(it, WEB_LOG)) }
-                        webBytes = 0L
+                        dir?.let { File(it, WEB_LOG) }
                     }
+                }
+                if (cur == null) return
+
+                val moved = rotateFiles(cur)
+                if (moved) {
+                    // 正常路径：文件已挪走，计数清零，下一行惰性重开就是新文件。
+                    when (target) {
+                        QueuedLine.Target.ENGINE -> engineBytes = 0L
+                        QueuedLine.Target.WEB -> webBytes = 0L
+                    }
+                } else {
+                    // 🔴 **轮转失败时必须让计数从头开始，而不是与文件长度同步。**
+                    //
+                    // ⚠️ 第一版修法是错的，真机当场证伪（2026-10-14 05:48）：那时我把
+                    //   `engineBytes` 重算成 `f.length()` 的真实值（1,410,707）。看起来
+                    //   「计数与文件一致」很对，但 [writeAsync] 的判据是
+                    //   `next >= MAX_FILE_BYTES` —— 文件本身已经 1.41 MB > 1 MB，
+                    //   于是**下一行照样超标**，仍是每行触发一次
+                    //   「close + rename(必败) + 重开」。真机 logcat 里三条警告相隔
+                    //   **3 毫秒**、字节数只差 150，就是这个坏循环的直接证据。
+                    //
+                    //   正确的语义是「**自上次轮转尝试以来**写入了多少」：失败后归零，
+                    //   于是要再写满 1 MB（文件长到 ~2.41 MB）才会重试一次轮转。
+                    //   既不会每行重试刷屏，也不会永远不再重试。
+                    //
+                    //   不这么做的另一个后果：writer 被置 null 后下一行会走
+                    //   [engineWriterOf] 以 **append** 模式重开（不像 `rotateApp` 那样
+                    //   truncate），所以文件不会被清空、会继续无上限增长 —— 正是这次
+                    //   补轮转要解决的那个问题换了个形态回来。
+                    //
+                    //   触发形态（真机可造）：`engine.log.1` 恰好是个目录，或磁盘满、
+                    //   权限异常 —— `renameTo` 返回 false 而不抛异常。
+                    when (target) {
+                        QueuedLine.Target.ENGINE -> {
+                            // 先重开 writer（这一步会把计数设成 f.length()），再归零覆盖。
+                            // 顺序不能反：不重开的话下一行的惰性重开会把计数设回超标值。
+                            engineWriter = null
+                            engineWriterOf()
+                            engineBytes = 0L
+                        }
+                        QueuedLine.Target.WEB -> {
+                            webWriter = null
+                            webWriterOf()
+                            webBytes = 0L
+                        }
+                    }
+                    AndroidLog.w(
+                        TAG,
+                        "LogStore: ${cur.name} 轮转失败（rename 未成功），" +
+                            "已保持 append 续写；文件已达 ${cur.length()} 字节，" +
+                            "多半是 ${cur.name}.1 被占用（目录/权限/磁盘满）",
+                    )
                 }
             }
         } catch (_: Throwable) {

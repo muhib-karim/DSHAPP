@@ -16,7 +16,21 @@ package com.dsh.android.log
  *
  * 原先这套正则长在 `AppLogger` 里，而日志系统现在有多个写入方（`LogStore`、
  * `EventLog`、`CrashRecorder`、`EnvironmentSnapshot`）。任何一个漏了脱敏就是一个
- * 泄漏口，所以收敛到一处、由所有写入方共用。
+ * 泄漏口，所以收敛到一处、由各写入方共用。
+ *
+ * ⚠️ **「由所有写入方共用」这句话曾经是不成立的**（2026-10-14 对抗式审查查出）：
+ *   那时 [redact] 在全仓库只有 `LogStore.safeRedact` 一个调用点，另外三个写入方
+ *   一个都没接。现已接上两处：
+ *
+ *   | 写入方 | 接入点 | 状态 |
+ *   |---|---|---|
+ *   | `LogStore` | `safeRedact`（`app`/`engine`/`web` 三条路都过） | ✅ 一直有 |
+ *   | `EventLog` | `record()` 写盘前 | ✅ 本次补 |
+ *   | `CrashRecorder` | `writeScene()` 的 `reason` / `stack` | ✅ 本次补 |
+ *   | `EnvironmentSnapshot` | —— | ❌ **仍未接入** |
+ *
+ *   `EnvironmentSnapshot` 收的是设备/系统/内存/磁盘这类结构化字段，**不含用户文本**，
+ *   所以风险低 —— 但「共用」这个词对它仍然不成立。别只改代码不改这张表。
  *
  * ## 设计取舍：宁可多抹，不可漏抹
  *

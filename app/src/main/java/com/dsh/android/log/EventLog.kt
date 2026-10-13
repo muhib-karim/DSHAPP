@@ -108,8 +108,12 @@ object EventLog {
             // ⚠️ **事件行也必须过脱敏网**（2026-10-14 对抗式审查查出）。
             //   `Redactor` 的类注释写着「日志系统有多个写入方（LogStore、EventLog、
             //   CrashRecorder、EnvironmentSnapshot）……收敛到一处、由所有写入方共用」，
-            //   但 `Redactor.redact` 在全仓库**只有 `LogStore.safeRedact` 一个调用点**
-            //   —— 也就是说上面那句承诺里点名的四个写入方，只有第一个真的调了。
+            //   但在那次审查之前，`Redactor.redact` 在全仓库**只有 `LogStore.safeRedact`
+            //   一个调用点** —— 也就是说上面那句承诺里点名的四个写入方，只有第一个
+            //   真的调了。现在已补上本处与 `CrashRecorder.writeScene`（reason/stack）。
+            //   ⚠️ `EnvironmentSnapshot` 至今**仍未**接入：它收集的是设备/系统/内存
+            //   等结构化字段（不含用户文本），风险低，但「四个写入方共用」这句话对它
+            //   仍不成立 —— 要改那句话得连它一起改，别只改代码不改文档。
             //
             //   `EventLog` 这条通道的出口有两个，都会把**原文**带出设备：
             //   ① `DiagnosticBundle.buildTimeline()` 把 `readAll()` 的结果原样拼成
