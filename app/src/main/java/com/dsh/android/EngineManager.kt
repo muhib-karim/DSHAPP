@@ -2767,9 +2767,41 @@ class EngineManager private constructor(private val context: Context) {
             insert(configIndex + 2, keyPoolAgnesYaml(child + 4))
             return lines.joinToString("\n")
         }
-        // 已有内置号池：一个字节都不动（用户/引擎写下的值原样保留）。
-        if (findKey(KEY_PROVIDER + ":", child + 4, providersIndex + 1) >= 0) return body
-        insert(providersIndex + 1, keyPoolAgnesYaml(child + 4))
+        // 已有内置号池：默认一个字节都不动（用户/引擎写下的值原样保留）。
+        //
+        // ⚠️ **但有一个例外：`retryPolicy` 缺失时必须补进去**（踩过）。
+        //   只做「有 agnes: 就整块跳过」的话，**所有老安装永远拿不到新策略** ——
+        //   它们的 `agnes:` 块在上一版就写好了，`mergeKeyPoolProvider` 一看存在
+        //   就直接 return body，于是「抽到坏钥匙自动换一把」这个修复对存量用户
+        //   **完全不生效**，只对全新安装生效。这是最容易漏的一类 bug：代码看着对、
+        //   新装的机器上测也对，就是老用户没反应。
+        //
+        //   补的范围**严格限定在 `retryPolicy:` 这一个键**：只在它整个子树缺失时
+        //   插一笔，已有则一个字节都不动（用户手改过的值照样保留）。
+        val agnesIndex = findKey(KEY_PROVIDER + ":", child + 4, providersIndex + 1)
+        if (agnesIndex < 0) {
+            insert(providersIndex + 1, keyPoolAgnesYaml(child + 4))
+            return lines.joinToString("\n")
+        }
+
+        // `agnes:` 块的范围（到下一个同级或更浅的键为止），用于在它内部找键。
+        var agnesEnd = end
+        for (i in agnesIndex + 1 until end) {
+            val line = lines[i]
+            if (line.isBlank()) continue
+            if (line.indexOfFirst { it != ' ' } <= child + 4) {
+                agnesEnd = i
+                break
+            }
+        }
+        val hasRetryPolicy = (agnesIndex + 1 until agnesEnd).any { i ->
+            val line = lines[i]
+            line.isNotBlank() && line.indexOfFirst { it != ' ' } == child + 6
+                && line.trim() == "retryPolicy:"
+        }
+        if (hasRetryPolicy) return body
+
+        insert(agnesIndex + 1, keyPoolRetryPolicyYaml(child + 6))
         return lines.joinToString("\n")
     }
 
@@ -2888,6 +2920,7 @@ class EngineManager private constructor(private val context: Context) {
             appendLine("$pad  api: openai-completions")
             appendLine("$pad  baseURL: '$KEY_BASE_URL'")
             appendLine("$pad  apiKeyEnv: $KEY_ENV")
+            append(keyPoolRetryPolicyYaml(indent + 2))
             appendLine("$pad  models:")
             for (m in KEY_MODELS) {
                 appendLine("$pad    - id: $m")
@@ -2901,6 +2934,46 @@ class EngineManager private constructor(private val context: Context) {
                 for (e in KEY_EFFORT_LEVELS) {
                     appendLine("$pad        '$e': $e")
                 }
+            }
+        }
+    }
+
+    /**
+     * 号池的重试策略块，[indent] 为 `retryPolicy:` 的缩进。
+     *
+     * ⚠️ **这是「抽到坏钥匙自动换一把」的全部实现**，别删。
+     *
+     * 号池每次请求都在 TLS 层随机换一把钥匙（见 `keyinject.c` 的 `SSL_write`），
+     * 而池子里**确实有死钥匙**（实测 `cn.87` 稳定返回 403「检测到账号存在异常
+     * 活动」）。没有这份策略时，那一次请求的 403 会被引擎归类成 `AUTH`
+     * （`dsh-llm-pi-ai` 的 `classifyPiAiError`：`/\b(?:401|403)\b/` → `"AUTH"`），
+     * 而 `AUTH` **不在** `DEFAULT_RETRYABLE_CODES` 里
+     * （默认只有 EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT），
+     * 于是 `dsh-llm-retry` 直接放行不重试 ⇒ **报错砸到用户脸上**。
+     * 概率是 1/池子大小，池子越大越容易撞上，属于「偶尔抽风」的体验杀手。
+     *
+     * 配上这份策略后：403 → `AUTH` ∈ `retryableCodes` ⇒ 重发请求 ⇒ `SSL_write`
+     * 重新随机抽一把钥匙 ⇒ 绝大多数情况第二次就通了，**用户完全无感**。
+     *
+     * ⚠️ `retryableCodes` 是**整体替换**默认值而不是追加
+     * （`resolveRetryPolicy`：`config.retryableCodes ?? [...DEFAULT_RETRYABLE_CODES]`），
+     * 所以默认那五个必须**原样再列一遍**，漏掉哪个就等于把那类错误的重试关掉了。
+     *
+     * ⚠️ 只对号池这个 provider 生效（写在 `agnes:` 块里），用户自己加的 provider
+     * 一个字节都不受影响。
+     *
+     * ⚠️ `mode: normal` + `maxRetries: 3`：真撞上一整片死钥匙时最多重试 3 次就
+     * 如实报错，不会无限重发。
+     */
+    private fun keyPoolRetryPolicyYaml(indent: Int): String {
+        val pad = " ".repeat(indent)
+        return buildString {
+            appendLine("${pad}retryPolicy:")
+            appendLine("$pad  mode: normal")
+            appendLine("$pad  maxRetries: 3")
+            appendLine("$pad  retryableCodes:")
+            for (code in KEY_RETRYABLE_CODES) {
+                appendLine("$pad    - $code")
             }
         }
     }
@@ -5559,6 +5632,29 @@ class EngineManager private constructor(private val context: Context) {
          * 更省事（引擎若在子进程里做模型发现，缺了它会报 `MISSING_CREDENTIAL`）。
          */
         private const val KEY_ENV = "AGNES_CREDENTIAL"
+
+        /**
+         * 号池重试策略里声明的**可重试错误码**。
+         *
+         * ⚠️ `retryableCodes` 是**整体替换**默认值，不是追加 —— 引擎侧
+         * `resolveRetryPolicy()` 写的是 `config.retryableCodes ?? [...DEFAULT_RETRYABLE_CODES]`，
+         * 一旦我们提供了这个数组，默认那五个就**全都不再生效**。所以必须把它们
+         * **原样再列一遍**（值与 `dsh-llm/lib/types/retry-policy.js` 的
+         * `DEFAULT_RETRYABLE_CODES` 逐字一致），漏掉哪个就等于把那类错误的重试关掉。
+         *
+         * 五个默认值之外**多了一个 `AUTH`** —— 这就是本次改动的全部目的：
+         * 号池抽到死钥匙时上游回 401/403，`dsh-llm-pi-ai` 的 `classifyPiAiError`
+         * 把它归成 `AUTH`，而 `AUTH` 不在默认表里 ⇒ 不重试 ⇒ 报错中断用户。
+         * 加进来之后引擎会重发请求，`SSL_write` 重新随机抽钥匙，用户无感。
+         */
+        private val KEY_RETRYABLE_CODES = listOf(
+            "EMPTY_RESPONSE",
+            "RATE_LIMIT",
+            "SERVER",
+            "TIMEOUT",
+            "TRANSPORT",
+            "AUTH",
+        )
 
         /**
          * 内置号池对外提供的模型清单。
