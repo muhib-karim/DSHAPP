@@ -72,6 +72,31 @@ object CrashRecorder {
     private const val WATCHDOG_PING_MS = 5_000L
     private const val WATCHDOG_STALL_MS = 15_000L
 
+    /**
+     * 「主线程卡死」与「整个进程被冻结」的分界。
+     *
+     * ⚠️ **这不只是措辞问题，是本判据能不能信的问题**（真机 44 份现场实测过）。
+     *
+     * ## 为什么必须有这条线
+     *
+     * watchdog 是**每 [WATCHDOG_PING_MS] 醒一次**再看 `lastPing` 的。所以：
+     *
+     * - 若真的是**主线程**卡住、watchdog 线程照常跑 ⇒ `gap` 只可能落在
+     *   `(WATCHDOG_STALL_MS, WATCHDOG_STALL_MS + WATCHDOG_PING_MS]`
+     *   = **15～20 秒**这个窗口里。它必然 >15 秒才发现，又必然 ≤20 秒，
+     *   因为下一次醒来（+5 秒）就会记录。**这是硬上界，不是经验值。**
+     * - 若 `gap` **远超** 20 秒 ⇒ 连 watchdog 线程自己都没在跑 ⇒ 那是**整个进程
+     *   被系统冻住**（后台/锁屏被冻结、被 swap 出去），主线程根本没「卡」。
+     *
+     * 实测 44 份现场里 36 份的 `gap` 是 60 秒～888 秒（最大 14.8 分钟），
+     * 而每一份的窗口内**整个进程一条日志都没有** —— 与「整进程冻结」完全吻合，
+     * 与「主线程卡死」完全矛盾（真卡死时 watchdog 线程还会继续写 `app.log`）。
+     *
+     * 判错的代价是双向的：把冻结记成卡死 ⇒ 现场里一半是假警报，真问题被淹掉；
+     * 而按「冻结」记下来正好解释了用户口中的「它自己卡住了」。
+     */
+    private const val WATCHDOG_FREEZE_MS = WATCHDOG_STALL_MS + WATCHDOG_PING_MS * 2
+
     @Volatile
     private var crashDir: File? = null
 
@@ -177,8 +202,15 @@ object CrashRecorder {
      * ⚠️ 拿不到系统 ANR 的完整堆栈（`ApplicationExitInfo` 需 API 30，本工程
      * `targetSdk = 28`），所以这里记的是「主线程超过 N 秒没响应」这个**事实** +
      * 内存里的最后若干行日志。不要伪造成「系统 ANR 堆栈」—— 那是编造证据。
+     *
+     * ⚠️ **超过 [WATCHDOG_FREEZE_MS] 的不要走这里**，那是整进程被冻结，
+     * 见 [recordProcessFreeze] 的注释。分错类会让「真卡死」被假警报淹掉。
      */
     fun recordMainThreadStall(stalledMs: Long) {
+        if (stalledMs > WATCHDOG_FREEZE_MS) {
+            recordProcessFreeze(stalledMs)
+            return
+        }
         writeScene(
             kind = "main-thread-stall",
             reason = "主线程超过 ${stalledMs}ms 未响应（自建 watchdog 判定，非系统 ANR）",
@@ -186,6 +218,34 @@ object CrashRecorder {
             threadName = "main",
             level = 'E',
         )
+    }
+
+    /**
+     * 记录**整个进程被系统冻结**（不是主线程卡死）。
+     *
+     * 判据见 [WATCHDOG_FREEZE_MS]：`gap` 超过 watchdog 心跳能解释的上界，
+     * 就只能是 watchdog 线程自己也被挂起了 —— 即进程整体失去 CPU，
+     * 而不是主线程在某个同步调用里转不出来。
+     *
+     * ⚠️ **等级记 `W` 而不是 `E`**，且**不算硬崩溃**（见 [isHardCrash]）：
+     * 被冻结是 Android 对后台进程的**正常治理**，不是我们的 bug。把它标红会让
+     * 用户看到一片「崩溃」，而真崩溃反而找不到。
+     *
+     * ⚠️ 但仍要记下来，因为它**解释了用户抱怨的那个现象**（「它自己卡住了、
+     * 回来就白屏」）。不记的话这类投诉在日志里完全无迹可寻。
+     */
+    fun recordProcessFreeze(frozenMs: Long) {
+        writeScene(
+            kind = "process-freeze",
+            reason = "进程被系统冻结约 ${frozenMs}ms（watchdog 线程自身也停跑了，故非主线程卡死；" +
+                "常见于后台被冻结或整机休眠）",
+            stack = null,
+            threadName = "dsh-log-watchdog",
+            level = 'W',
+        )
+        // 也进时间线：现场文件按时间戳单独命名，翻时间线时看不到「这里冻过一次」，
+        // 而冻结正是「切回来白屏/要重进」这类现象的直接解释。
+        runCatching { EventLog.record("process.freeze", mapOf("ms" to frozenMs.toString())) }
     }
 
     /**
@@ -361,6 +421,10 @@ object CrashRecorder {
      * 判断某个现场文件是不是「真崩溃」（有堆栈的那两类）。
      *
      * 界面据此决定标红还是标黄 —— 渲染进程被回收、引擎正常退出都不该是红色。
+     *
+     * ⚠️ `process-freeze` **刻意不在此列**：进程被系统冻结是后台治理的正常结果，
+     * 不是本 App 的崩溃。它由 watchdog 记下来是为了解释「回来就白屏」这类现象，
+     * 但标红会把真崩溃的比例冲淡（实测 44 份里 36 份是冻结，标红后满屏红）。
      */
     fun isHardCrash(f: File): Boolean =
         f.name.contains("uncaught-exception") || f.name.contains("renderer-crash") ||
