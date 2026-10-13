@@ -146,9 +146,12 @@ class LogViewerActivity : AppCompatActivity() {
      */
     private fun renderHeader() {
         val prev = BootState.previous()
-        val scenes = runCatching { CrashRecorder.sceneCount() }.getOrDefault(0)
-        val hard = runCatching { CrashRecorder.listScenes().count { CrashRecorder.isHardCrash(it) } }
-            .getOrDefault(0)
+        // ⚠️ `listScenes()` 只读一次目录，下面三处共用同一份列表 —— 原来
+        //   `sceneCount()` 与这里各读一次，等于同一件事做两遍（且两次之间
+        //   目录可能变化，两个数会互相矛盾）。
+        val sceneFiles = runCatching { CrashRecorder.listScenes() }.getOrDefault(emptyList())
+        val scenes = sceneFiles.size
+        val hard = sceneFiles.count { CrashRecorder.isHardCrash(it) }
 
         // ⚠️ 结论的措辞必须诚实。「上次非正常结束」**不等于**崩溃 ——
         //   可能是被系统回收、被 ROM 冻结、断电。所以分三档说，且只有真找到
@@ -157,7 +160,11 @@ class LogViewerActivity : AppCompatActivity() {
             hard > 0 -> "⚠ 发现 $hard 份崩溃现场（共 $scenes 份现场文件），详见「崩溃」筛选"
             prev.unstable -> "⚠ 连续 ${prev.consecutiveUncleanCount} 次未正常结束，疑似启动即崩"
             prev.known && !prev.clean -> "上次非正常结束（无堆栈；可能是崩溃/被系统回收/断电），共 $scenes 份现场文件"
-            scenes > 0 -> "共 $scenes 份现场文件（非崩溃类：渲染进程被回收、引擎退出等）"
+            // ⚠️ **不能举例子。** 原来这里写「（非崩溃类：渲染进程被回收、引擎退出等）」，
+            //   而真机 162 份现场里非硬崩溃类共 99 份，其中 `engine-start-failed` 占
+            //   81 份（82%）—— 举例举的是占比最小的那一类，把最大的一类漏掉了。
+            //   例子是猜测，类别是事实。
+            scenes > 0 -> "共 $scenes 份现场文件（非崩溃类：${CrashRecorder.summarizeKinds(sceneFiles)}）"
             else -> "未发现崩溃现场"
         }
 
