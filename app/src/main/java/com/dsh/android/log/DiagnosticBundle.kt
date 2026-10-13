@@ -474,6 +474,16 @@ object DiagnosticBundle {
         }
 
         // ③ 日志被抽稀情况 —— 分析者必须知道
+        //
+        // ⚠️ **两个计数器都是进程内的，所以结论必须限定「本次运行」。**
+        //   `throttledTotal` / `droppedAsync` 都是 `LogStore` 的进程内字段，
+        //   进程一起来就是 0；而同一个包里还带着 `app.log`，那是**跨多次运行
+        //   累积**的（`app.log` 不随启动清空，只按 1MB 轮转）。
+        //   于是出现过这种自相矛盾：`log-completeness` 报「日志未发生限流或丢弃」，
+        //   而包里 `app.log` 里明明躺着「…上一条同类日志在 1000ms 内被抑制 N 次」。
+        //   实测 65 个包里 **9 个**是这样。
+        //   原文案「日志未发生限流或丢弃」把「本次运行没限流」说成了「日志完整」，
+        //   分析者据此会认为 app.log 是逐条完整的 —— 而它被抽过稀。
         runCatching {
             val throttled = LogStore.throttledTotal
             val dropped = LogStore.droppedAsync
@@ -481,11 +491,19 @@ object DiagnosticBundle {
                 checks.add(
                     Check(
                         "log-completeness", "warn",
-                        "日志被抽稀：限流丢弃 $throttled 条，队列满丢弃 $dropped 条（说明有高频重复日志）",
+                        "本次运行日志被抽稀：限流丢弃 $throttled 条，队列满丢弃 $dropped 条" +
+                            "（说明有高频重复日志）。⚠️ 更早的运行没有计数，只能看 app.log 里的抑制行。",
                     ),
                 )
             } else {
-                checks.add(Check("log-completeness", "ok", "日志未发生限流或丢弃"))
+                checks.add(
+                    Check(
+                        "log-completeness", "ok",
+                        "本次运行日志未发生限流或丢弃。" +
+                            "⚠️ 这不等于 app.log 逐条完整：它是跨多次运行累积的，" +
+                            "更早的运行若被抽过稀，只会在里面留下「…被抑制 N 次」的行。",
+                    ),
+                )
             }
         }
 
