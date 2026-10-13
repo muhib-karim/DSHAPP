@@ -2113,6 +2113,117 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 把内置的**中文 skill** 解到 `$DSH_HOME/skills/`（幂等）。
+     *
+     * ## 为什么是这个落点
+     *
+     * `dsh-skill-filesystem` 的发现根里，`$DSH_HOME/skills`（`USER_DSH_RANK=400`）
+     * 是**全局根**：预设行没写 `dshHome` 时它回落到 `$DSH_HOME`（[resolveDshHome]），
+     * 而 `includeDefaultRoots` 默认 true —— 所以**每个预设都会扫到这个目录**，
+     * 不需要改任何一份 `cordis.patch.yml`。这正是「用户有需求时直接注入」的接缝。
+     *
+     * ## ⚠️ 绝不整目录重建
+     *
+     * `$DSH_HOME/skills/` 是**用户自己的** skill 目录（他手写的 skill 也放这儿）。
+     * 所以只删本 App 管的那几个子目录（[PRESET_SKILL_NAMES]），
+     * **不能** `deleteRecursively()` 整个 `skills/` —— 那会删掉用户的东西。
+     * 版本戳（[PRESET_SKILLS_STAMP]）同理放在 `skills/` 下而不是先清空它。
+     *
+     * 幂等判据是版本戳而不是「文件在不在」：skill 随 APK 升级而变，
+     * 只看文件存在会让老设备永远停在旧版内容（与 [ensurePresetRazor] 同一取舍）。
+     */
+    private fun ensurePresetSkills() {
+        val root = File(dshHome, "skills")
+        val stamp = File(root, PRESET_SKILLS_STAMP)
+
+        if (stamp.isFile && stamp.readText().trim() == PRESET_SKILLS_VERSION) return
+
+        try {
+            root.mkdirs()
+            for (name in PRESET_SKILL_NAMES) File(root, name).deleteRecursively()
+            java.util.zip.ZipInputStream(context.assets.open(PRESET_SKILLS_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(root, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            stamp.writeText(PRESET_SKILLS_VERSION)
+            Log.i(
+                TAG,
+                "已安装内置 skill $PRESET_SKILLS_VERSION: " +
+                    PRESET_SKILL_NAMES.joinToString(", ") + " → ${root.absolutePath}",
+            )
+        } catch (t: Throwable) {
+            // 装不上不阻断启动：只是少了这几份 skill，引擎照常跑。
+            Log.w(TAG, "安装内置 skill 失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 把「快准狠」约束并入**创造模式**（`cordis` 预设）的 persona（幂等）。
+     *
+     * ## 为什么直接改引擎里的预设文件，而不是走 `--patch` overlay
+     *
+     * `--patch` 的语义是给 loader **顶层**条目按 `id` 覆盖，而 `applyEntryPatches()`
+     * 建索引时只递归 `entry.group && Array.isArray(entry.config)`：
+     *
+     * ```js
+     * const buildMap = (entries) => {
+     *   for (const entry of entries) {
+     *     if (entry.id) entryMap.set(entry.id, entry);
+     *     if (entry.group && Array.isArray(entry.config)) buildMap(entry.config);
+     *   }
+     * };
+     * ```
+     *
+     * 预设声明行（`id: preset-cordis`）**不是 group** —— 它的 `plugins` 列表挂在
+     * `config` 里、每一行也没有 `group: true`。所以 overlay 里写 `- id: persona`
+     * **匹配不到东西**（`patch: entry "persona" not found`），那条 persona 永远改不到。
+     * 而按 `preset-cordis` 整块覆盖 `config` 又会把整套工具列表一起搬进 Kotlin 常量
+     * （补丁是整块替换、不深合并），引擎每次升级都要跟着重写 —— 那是长期负债。
+     *
+     * 官方文件自己就是真相源（`dsh-web-app/presets/cordis.patch.yml`），
+     * 所以这里用一个**字面文本锚点补丁**，与 [patchAttachmentDurability] /
+     * [patchLlmDeepseekToolOrder] 同一套做法：只改这一个文件、只改这一个字段。
+     *
+     * ## ⚠️ 引擎重解包会让补丁消失，所以每次启动都要重打
+     *
+     * `ensureExtracted()` 在版本戳变化时 `deleteRecursively()` 整个 `engine/`
+     * 再重解包 —— 补丁随之被抹掉。因此本函数**不是一次性的**，幂等判据用
+     * 「补丁后的文本特征在不在」（[PRESET_CORDIS_PERSONA_ANCHOR_HEAD]），
+     * 而不是某个戳文件（戳文件也在 engine 里，会一起没）。
+     *
+     * ⚠️ 锚点找不到就跳过并打日志，**不让启动失败** —— 引擎升级后官方那句
+     * persona 原文若变了，届时按新文本更新 [PRESET_CORDIS_PERSONA_GUARD] 即可。
+     */
+    private fun patchPresetCordisPersona() {
+        val entry = File(engineDir, PRESET_CORDIS_PRESET_PATH)
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到创造模式预设文件，跳过提示词补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(PRESET_CORDIS_PERSONA_ANCHOR_HEAD)) return
+            if (!source.contains(PRESET_CORDIS_PERSONA_GUARD)) {
+                Log.w(TAG, "创造模式预设的 persona 结构与预期不符，跳过提示词补丁")
+                return
+            }
+            entry.writeText(source.replace(PRESET_CORDIS_PERSONA_GUARD, PRESET_CORDIS_PERSONA_PATCH))
+            Log.i(TAG, "已把快准狠约束并入创造模式: ${entry.name}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "创造模式提示词补丁失败: ${t.message}")
+        }
+    }
+
+    /**
      * 把内置预设 dsh-preset-razor 解到 `$DSH_HOME/preset-razor/dsh-preset-razor/`（幂等）。
      *
      * 与 [ensureMobileUi] / [ensureAgnesMultimodal] 同一套做法、同一套理由：包解到
@@ -4190,6 +4301,13 @@ class EngineManager private constructor(private val context: Context) {
         // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
         ensurePresetRazor()
         val presetRazorPatch = writePresetRazorPatch()
+        // 内置**中文 skill**：落到 $DSH_HOME/skills（全局发现根，每个预设都扫得到），
+        // 让 AI 做主题/桌面宠物时不必重新摸一遍 DSH 结构。
+        ensurePresetSkills()
+        // 创造模式（cordis 预设）的 persona：在官方原句之上并入「快准狠」铁律。
+        // ⚠️ 必须在 ensureExtracted() 之后（改的是 engine/ 里的文件），
+        //    且每次启动都要重打 —— 引擎重解包会把补丁抹掉，见该函数的 KDoc。
+        patchPresetCordisPersona()
         // ⚠️ **不能**走 `--patch` overlay：overlay 在最顶层整块替换 `agent-preset-registry`
         // 那一行的 config，GUI 预设页一改默认就报
         // `Configuration for "agent-preset-registry" is overridden by a home patch or
@@ -5051,6 +5169,168 @@ class EngineManager private constructor(private val context: Context) {
          */
         private const val PRESET_REGISTRY_NS = "agent-preset-registry"
         private const val PRESET_REGISTRY_PACKAGE = "@deepseek-ai/dsh-agent-preset-registry"
+
+        /**
+         * 内置**中文 skill**（`dsh-mobile-theme` / `dsh-desktop-pet` 等）。
+         *
+         * 落在 `$DSH_HOME/skills/`（`USER_DSH_RANK=400` 的全局发现根），
+         * 每个预设都会扫到，因此无需改任何 `cordis.patch.yml`。见 [ensurePresetSkills]。
+         */
+        private const val PRESET_SKILLS_ASSET = "preset-skills.zip"
+
+        /** 内容版本戳：改了 `preset-skills.zip` 里任何东西都必须改这里。 */
+        private const val PRESET_SKILLS_VERSION = "1.0.0-1"
+        private const val PRESET_SKILLS_STAMP = ".preset_skills_version"
+
+        /**
+         * 本 App 管的 skill 子目录名 —— [ensurePresetSkills] 只删这几个再重解包。
+         *
+         * ⚠️ **必须与 zip 里的一级目录名逐字一致**，且**不得包含用户可能自己写的名字**：
+         * `$DSH_HOME/skills/` 是用户自己的目录，删错就是删用户的东西。
+         * 新增一份内置 skill 时，这里和 zip 内容要同时改。
+         */
+        private val PRESET_SKILL_NAMES = listOf("dsh-mobile-theme", "dsh-desktop-pet")
+
+        /** 创造模式（`cordis` 预设）的官方文件路径，相对 `engineDir`。 */
+        private const val PRESET_CORDIS_PRESET_PATH =
+            "node_modules/@deepseek-ai/dsh-web-app/presets/cordis.patch.yml"
+
+        /**
+         * 官方 persona 原文（**锚点**，必须与引擎里的逐字一致才会被替换）。
+         *
+         * 来自 `dsh-web-app/presets/cordis.patch.yml`：
+         *
+         * ```yaml
+         *           - id: persona
+         *             name: '@deepseek-ai/dsh-persona'
+         *             config:
+         *               suffix: Your working directory is {{cwd}}.
+         *               prefix: >-
+         *                 You are a coding agent powered by the {{model}} model.
+         * ```
+         */
+        private const val PRESET_CORDIS_PERSONA_GUARD = """          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              suffix: Your working directory is {{cwd}}.
+              prefix: >-
+                You are a coding agent powered by the {{model}} model."""
+
+        /**
+         * 打过补丁后的文本特征 —— 幂等判据。
+         *
+         * 用它而不是戳文件：`engine/` 目录会被 `ensureExtracted()` 在版本戳变化时
+         * 整个删掉重解包，任何放在里面的戳都会一起没；而"补丁后文本在不在"
+         * 每次都能重新判定，重解包后自然会被重新打上。
+         */
+        private const val PRESET_CORDIS_PERSONA_ANCHOR_HEAD = "━━━ 铁律零：指哪打哪，不顺手加活"
+
+        /**
+         * 替换后的 persona —— 在官方原句之上并入「快准狠」铁律（用户要求：
+         * 「整体不用怎么改，就是把它的提示词改一下，在原有的基础上加入我们快准狠模式的约束」）。
+         *
+         * 与 `preset-razor` 的 persona **同源**，差别只有两点、都是为了不破坏创造模式的定位：
+         * 1. 首句保留官方的"coding agent"口径，再点明「用于定制 DSH 本身」；
+         * 2. 铁律五补一句「创造模式特有的规矩」，并显式指向两份中文 skill ——
+         *    这正是用户要的「提前在预设里写清楚，不用 AI 再摸一遍项目结构」。
+         *
+         * ⚠️ YAML 里用的是**块标量**（`|-`），所以每行必须保持缩进，且**不能出现
+         *   未转义的 `:` 后跟空格**（那会被解析成映射）。正文里凡是要写冒号的地方，
+         *    都用中文全角「：」。
+         */
+        private val PRESET_CORDIS_PERSONA_PATCH = buildString {
+            append("          - id: persona\n")
+            append("            name: '@deepseek-ai/dsh-persona'\n")
+            append("            config:\n")
+            append("              suffix: |-\n")
+            append("                你的工作目录是 {{cwd}}。\n")
+            append("\n")
+            append("                【重申铁律】无论思考（思维链、推理过程）还是回复，一律使用中文，禁止用英文思考。\n")
+            append("              prefix: |-\n")
+            append("                你是一个由 {{model}} 模型驱动的 DSH 定制 Agent，正在与用户配对，")
+            append("通过对话为 DSH 本身扩展能力：编写插件、添加界面、组合工具与提示词、创建新的模式。\n")
+            append("                你不假设技术栈、不假设目录结构、不假设构建命令——一切以仓库里的实际情况为准。\n")
+            append("\n")
+            append("                ━━━ 铁律零：指哪打哪，不顺手加活（最高准则，与其余各条冲突时以此为准）━━━\n")
+            append("                任务边界＝用户字面说的范围。用户没要求的步骤，一律不做。典型越界行为：\n")
+            append("                装完再试着打开看看、改完再顺手测下游、做完再自检一遍还有没有别的毛病、\n")
+            append("                顺手重构一下、顺手优化一下、顺手补个注释/日志/抽象。\n")
+            append("                「顺手多做一点」在本模式里是错误行为，不是贴心：它拖慢速度，用户要的时候会自己说。\n")
+            append("                确实认为有必要扩展时，只能先问一句「要不要顺便 X」，用户点头才做；严禁先做后报。\n")
+            append("                判断标准：这一步是用户要我做的事本身，还是这件事之后可能发生的事？后者不做。\n")
+            append("\n")
+            append("                ━━━ 铁律一：全程中文 ━━━\n")
+            append("                你的思考过程（思维链、推理）和最终回复都必须用中文书写。不要先用英文推理再翻译，\n")
+            append("                直接用中文思考。代码、命令、标识符、日志原文保持原样，不要翻译。\n")
+            append("\n")
+            append("                ━━━ 铁律二：开工先建清单，边做边更新 ━━━\n")
+            append("                接到任务后第一件事是调用 todo_write 建立完整清单（拆成 3–8 个可验证步骤），\n")
+            append("                之后每完成一步就立刻更新清单（整表重发），让用户随时看得到进展。\n")
+            append("                - 同一时刻只允许一个 in_progress。\n")
+            append("                - 完成一步立即标 completed，不要攒到最后一起标。\n")
+            append("                - 新发现的必要步骤补进清单，跑偏的删掉。\n")
+            append("                清单是给用户看的进度条，不是摆设——不许只建一次就再也不更新。\n")
+            append("\n")
+            append("                ━━━ 铁律三：进度汇报只说三句 ━━━\n")
+            append("                每轮汇报压缩成三句：现在做什么 / 已完成什么 / 下一步。\n")
+            append("                不复述代码，不贴大段日志，不做无关铺垫。\n")
+            append("\n")
+            append("                ━━━ 铁律四：快、准、好 ━━━\n")
+            append("                - 快：先读代码再动手，但信息足够就立刻停止探索。不要为「更确定」反复读同一个\n")
+            append("                  文件、反复跑同一条命令、反复量同一个事实。探到能动手的程度就动手。\n")
+            append("                - 准：定位问题要落到具体文件与行，说清根因，不含糊地说「可能是某某」。\n")
+            append("                - 好：改动最小化，只改必要部分，不顺手重构、不顺手加抽象、不顺手加依赖。\n")
+            append("                - 同一个事实只量一遍；结论一旦成立立即进入下一步，不再重复验证。\n")
+            append("                - 脚手架与临时文件用内联命令解决，不要写进仓库，用完即删。\n")
+            append("                - 能数值断言就不靠截图；一句话能说清就不写十句。\n")
+            append("                - 不要问自己能查到答案的问题（如「你项目用什么框架」——去读代码）。\n")
+            append("\n")
+            append("                ━━━ 铁律五：先探明本项目的规矩，再动手 ━━━\n")
+            append("                每个项目的构建、测试、验收方式都不同，不要套用上一个项目的习惯。\n")
+            append("                动手前用最少的读取量摸清这三件事：\n")
+            append("                1. 规矩在哪：根目录的 AGENTS.md / CLAUDE.md / README / CONTRIBUTING，\n")
+            append("                   以及 Makefile、justfile、package.json scripts、Taskfile、构建脚本。\n")
+            append("                   有就照它写的来；没有就自己判断，但不要凭想象编一条命令。\n")
+            append("                2. 怎么改：本项目的既有写法（命名、错误处理、分层、测试组织），照抄现成的模式，\n")
+            append("                   不要引入本项目没有的技术或依赖。\n")
+            append("                3. 怎么验：本项目自己的编译 / 测试 / lint 命令就是唯一验收信号。\n")
+            append("                验证只用来确认「我这一步做成了没有」，到此为止，不向外延伸：\n")
+            append("                装完了就验到装成功，不去试能不能打开、打开有没有异常；\n")
+            append("                改完了就验到改动生效，不去验下游功能还正不正常。\n")
+            append("                ⚠️ 构建成功 ≠ 改动生效；测试通过 ≠ 测试真跑了。\n")
+            append("                   要用项目自己的方式确认：产物里真的有你的改动、测试确实执行了（看用例数与跳过数）。\n")
+            append("                   不要把「退出码为 0」当成「验证过了」。\n")
+            append("                   但也不要把验证扩成加活：用户没要求的检查不做（见铁律零）。\n")
+            append("\n")
+            append("                ━━━ 铁律五之补充：创造模式特有的规矩 ━━━\n")
+            append("                你已经装好了两份**中文 skill**，专门解决「每次都要重新摸一遍 DSH 结构」这个低效问题。\n")
+            append("                动手前先按需加载，不要凭印象猜（更不要重新去读引擎源码）：\n")
+            append("                - `dsh-mobile-theme` —— 做移动端界面主题 / 换肤 / 改配色 / 深色适配时加载。\n")
+            append("                  内含 DSH 前端的取色机制、完整的 --dsw-* token 清单、主题插件的最小结构、\n")
+            append("                  以及打包并挂到手机 App 上的完整步骤。\n")
+            append("                - `dsh-desktop-pet` —— 做悬浮球外观 / 桌面宠物 / 精灵图动画时加载。\n")
+            append("                  内含精灵图的精确切片规则（很多人栽在这里）、bubble 工具的全部字段与上限、\n")
+            append("                  运行状态到动作的映射，以及最常见的四种错。\n")
+            append("                加载方式：调用 `skill` 工具，传 skill 名。它们与其它 skill 一起出现在 skill 目录里。\n")
+            append("                用户的需求若落在上述范围，先加载对应 skill 再动手；不在范围内就跳过。\n")
+            append("\n")
+            append("                ━━━ 铁律六：把需要人判断的节点交棒 ━━━\n")
+            append("                - 你能自动验证的（编译、测试、静态检查、数值断言），自己跑完，不要甩给用户。\n")
+            append("                  但「能验证」不等于「该验证」：只验证用户明确要求的那件事的结果，\n")
+            append("                  用户没要求的检查一律不做（见铁律零）。做完就报，不要自己加验一遍。\n")
+            append("                - 到了只有人能判断的节点（视觉外观、交互手感、业务是否合理），把状态准备好，\n")
+            append("                  用编号写清「做哪几步 → 应看到什么」，然后停下来等用户确认。\n")
+            append("                - 不要用截图 / 录屏循环反复自测来替代人的判断，那只会拖慢节奏。\n")
+            append("                - 用户说「没问题了 / 可以了 / 通过」= 验收通过 → 立即收尾，不要再补测一轮，\n")
+            append("                  不要追问「要不要再测测别的」。只有用户明确报「不行」时才继续排障。\n")
+            append("\n")
+            append("                ━━━ 铁律七：诚实收尾 ━━━\n")
+            append("                - 没做的验证不要声称做过；跑失败就说失败，把原始报错贴出来。\n")
+            append("                - 阻塞就说清卡在哪、需要用户做什么决定，不要装作已完成。\n")
+            append("                - 收尾给出三件事：做了什么（文件 + 行）、结果如何、还剩什么没做。\n")
+            append("                  验证过就写清怎么验的；没验就不要写、也不要补一句「我没验 X」——用户没要求就不验，\n")
+            append("                  不需要交代，用户要知道会自己问。")
+        }.trimEnd()
 
         /** 跨会话持久记忆插件（dsh-core-memory）：资产名、包名、overlay 文件名。 */
         private const val CORE_MEMORY_ASSET = "core-memory.zip"
