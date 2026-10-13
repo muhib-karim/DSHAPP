@@ -2846,19 +2846,136 @@ class EngineManager private constructor(private val context: Context) {
             }
         }
 
-        /** 块内缩进恰好为 [indent] 的 `key:` 行下标，找不到给 -1。 */
+        /**
+         * 块内缩进恰好为 [indent] 的 `key:` 行下标，找不到给 -1。
+         *
+         * ⚠️ **必须容忍「行内值」形态**（`key: {}` / `key: []`），不能只认裸 `key:`。
+         *
+         *   踩过的坑（真机崩溃，见下）：引擎把 schema 的默认值**序列化进文件**，
+         *   `dsh-llm-pi-ai` 的 `Config` 是
+         *   `providers: z.dict(profile).default({})` —— 于是用户只要在 GUI 设置页
+         *   碰过一次「模型」，写下的那份 `cordis.patch.yml` 里就是 `providers: {}`
+         *   而不是裸 `providers:`。
+         *
+         *   旧实现用 `line.trim() == key` 精确相等 ⇒ **看不见 `providers: {}`** ⇒
+         *   判定「没有 providers」⇒ 再插一个 `providers:` ⇒ 同一个 mapping 里出现
+         *   两个 `providers` 键 ⇒ 引擎 `failed to parse overlay` 抛在顶层、
+         *   **启动即崩**（`YAMLException: duplicated mapping key`）。
+         *
+         *   这条路径特别毒：全新安装的机器上文件是空的、插进去就是对的，
+         *   只有**已经用过设置页的老用户**才会踩到 —— 典型的「新装测不出」。
+         *
+         * `key:` 之后必须跟空白（或行尾），免得 `providers:` 把 `providersExtra:`
+         * 这种更长的键名也命中。
+         */
+        /**
+         * 本次调用有没有真的改过 [lines]。
+         *
+         * ⚠️ 只有它能区分「一个字节都没动」与「动过但结果恰好等于按原样处理」。
+         *   踩过的坑：自愈分支（见 [dropDuplicateEmptyKeys]）先把重复键删了，
+         *   随后走到「`agnes` 已有 retryPolicy」那一支，那里 `return body` 返回的
+         *   是**入参原文**，于是刚删掉的重复键又被原样吐回去 —— 自愈白做，
+         *   用户的砖机照旧崩。所以「无需再补」时也必须返回 [lines]（若它被改过）。
+         */
+        var dirty = false
+
         fun findKey(key: String, indent: Int, from: Int): Int {
             for (i in from until end) {
                 val line = lines[i]
                 if (line.isBlank()) continue
-                if (line.indexOfFirst { it != ' ' } == indent && line.trim() == key) return i
+                val trimmed = line.trim()
+                if (line.indexOfFirst { it != ' ' } == indent &&
+                    (trimmed == key || trimmed.startsWith("$key "))
+                ) {
+                    return i
+                }
             }
             return -1
         }
 
-        fun insert(at: Int, text: String) {
-            lines.addAll(at, text.trimEnd('\n').lines())
+        /**
+         * 把 `key: <行内值>` 收敛成裸 `key:`，返回「这一行现在能不能挂子键」。
+         *
+         * ⚠️ 光让 [findKey] 认出 `providers: {}` 还不够：`{}` 是**流式空映射**，
+         *   在它下面缩进写 `agnes:` 同样是非法 YAML（标量值后面不能接块内容）。
+         *   所以认出来之后必须把行内值摘掉，把这一行还原成「块映射的开头」。
+         *
+         * 语义等价：`providers: {}` 就是「空映射」，摘成 `providers:` 再挂上
+         * `agnes:` 得到的就是「只含 agnes 的映射」—— 正是我们要的结果，
+         * 而 `{}` 里本来就没有任何东西可以丢。
+         *
+         * ⚠️ **但只对「空集合」等价的写法做这件事**（`{}` / `[]` / `null` / `~`）。
+         *   非空行内映射（`providers: {deepseek: {...}}`，用户手写或别的工具写的）
+         *   摘掉就是**把用户的 provider 配置整行抹掉** —— 那是数据丢失，
+         *   比「号池这一版没并进去」严重得多。这种情况返回 false，
+         *   由调用方**放弃本次插入**（宁可不动，也不毁用户数据）。
+         *
+         * 已经是裸 `key:` 时返回 true 且一个字节都不动。
+         */
+        fun openKeyBlock(index: Int, key: String, indent: Int): Boolean {
+            val trimmed = lines[index].trim()
+            if (trimmed == key) return true
+            val inline = trimmed.removePrefix(key).trim()
+            if (inline !in EMPTY_INLINE_VALUES) return false
+            lines[index] = " ".repeat(indent) + key
+            dirty = true
+            return true
         }
+
+        fun insert(at: Int, text: String) {
+            val added = text.trimEnd('\n').lines()
+            lines.addAll(at, added)
+            // ⚠️ [end] 是「该 entry 的块范围」，插入点一定在 [at] <= end 之内，
+            //   所以块范围只是往后平移，不能直接写成 lines.size（那会把范围
+            //   扩到整个文件末尾，后续 findKey 会越界到别的 entry 里去）。
+            end += added.size
+            dirty = true
+        }
+
+        /**
+         * 删掉同一缩进下**多余的、且值写成行内空集合**的同名键行 —— 自愈旧版写坏的文件。
+         *
+         * ⚠️ 为什么非有不可：上面那个 `findKey` 盲区在 0.2.8 里**已经把一批用户写成了砖**。
+         *   他们文件里现在是
+         *   ```
+         *   config:
+         *     providers:        ← 旧版插的（含 agnes）
+         *       agnes: {...}
+         *     providers: {}     ← 引擎原本写的，重复键
+         *   ```
+         *   光修 `findKey` 只能防住**新**的写入；对这份已坏文件，`findKey` 会命中
+         *   **第一个** `providers:`（它下面确实有 agnes）⇒ 判定「已经并好了」⇒
+         *   `return body` ⇒ 重复键原样留着 ⇒ **引擎每次启动照样崩**。
+         *   也就是说：不写这段自愈，老用户的砖机永远修不好，只能卸载重装（清空
+         *   整个 `$DSH_HOME`：会话、凭据、工作区全没）。这正是最不能接受的结局。
+         *
+         * ⚠️ **只删「行内空集合」形态的行**（`{}` / `[]` / `null` / `~`）。
+         *   非空值的重复键一个都不碰 —— 那种文件本来就是我们判断不了的用户内容，
+         *   宁可留着让它继续报错（用户至少能从报错里看见自己的东西），也不静默乱删。
+         *   我们实际写坏的那一行恰好就是 `{}`（引擎的默认值序列化），所以够用。
+         *
+         * 从后往前删，[keep] 之前的索引不受影响；[end] 同步收缩。
+         */
+        fun dropDuplicateEmptyKeys(key: String, indent: Int, keep: Int) {
+            var removed = 0
+            for (i in end - 1 downTo keep + 1) {
+                if (i >= lines.size) continue
+                val line = lines[i]
+                if (line.isBlank() || line.indexOfFirst { it != ' ' } != indent) continue
+                val trimmed = line.trim()
+                if (!trimmed.startsWith("$key ")) continue
+                if (trimmed.removePrefix(key).trim() !in EMPTY_INLINE_VALUES) continue
+                lines.removeAt(i)
+                removed++
+            }
+            // 删掉的都在块范围内，所以块范围等量收缩（同样不能写成 lines.size）。
+            end -= removed
+            if (removed > 0) dirty = true
+        }
+
+        /** 无需再补时的返回：改过就必须给出 [lines]，绝不能把入参原文吐回去。 */
+        fun unchangedOrHealed(): String =
+            if (dirty) lines.joinToString("\n") else body
 
         val configIndex = findKey("config:", child, idIndex + 1)
         if (configIndex < 0) {
@@ -2867,12 +2984,34 @@ class EngineManager private constructor(private val context: Context) {
             insert(end, keyPoolConfigBody(child))
             return lines.joinToString("\n")
         }
+        // ⚠️ 从这里开始会改 [lines]。三处 [openKeyBlock] 里任何一处判定「不能安全收敛」
+        //   （碰到非空行内映射，摘了就是抹用户配置）都必须**整份回滚**：
+        //   只收敛了 `config:` 却没插成 `providers:`，会把用户文件从 `config: {}`
+        //   改成 `config:`（空块）—— 语义未必等价，而 KDoc 承诺「不动就一个字节不动」。
+        //   宁可这一版不并号池，也不能留下半成品改动。
+        val snapshot = lines.toList()
+        fun abandon(): String {
+            lines.clear()
+            lines.addAll(snapshot)
+            dirty = false
+            return body
+        }
+
+        // 同样是行内值盲区：`config: {}` 也得先收敛成块开头，
+        // 否则下面挂 `providers:` 是非法 YAML。见 [findKey] / [openKeyBlock]。
+        if (!openKeyBlock(configIndex, "config:", child)) return abandon()
         val providersIndex = findKey("providers:", child + 2, configIndex + 1)
         if (providersIndex < 0) {
             insert(configIndex + 1, " ".repeat(child + 2) + "providers:")
             insert(configIndex + 2, keyPoolAgnesYaml(child + 4))
             return lines.joinToString("\n")
         }
+        // 引擎会把默认值序列化成 `providers: {}`。识别出来之后必须把 `{}` 摘掉，
+        // 否则在它下面缩进写 `agnes:` 仍是非法 YAML（标量后不能接块）。
+        // 见 [findKey] 与 [openKeyBlock] 的注释。
+        if (!openKeyBlock(providersIndex, "providers:", child + 2)) return abandon()
+        // 自愈旧版写坏的文件：同一层里重复的 `providers: {}` 要删掉，否则引擎照样崩。
+        dropDuplicateEmptyKeys("providers:", child + 2, providersIndex)
         // 已有内置号池：默认一个字节都不动（用户/引擎写下的值原样保留）。
         //
         // ⚠️ **但有一个例外：`retryPolicy` 缺失时必须补进去**（踩过）。
@@ -2889,6 +3028,11 @@ class EngineManager private constructor(private val context: Context) {
             insert(providersIndex + 1, keyPoolAgnesYaml(child + 4))
             return lines.joinToString("\n")
         }
+        // `agnes: {}` 同理（行内值盲区）：不收敛成块开头就没法往下挂 `retryPolicy:`。
+        // 非空行内映射（用户手写的 `agnes: {...}`）则放弃整次改动，绝不抹掉它。
+        if (!openKeyBlock(agnesIndex, "$KEY_PROVIDER:", child + 4)) return abandon()
+        // 同一盲区在 agnes 层同样写过重复键（文件里有 `agnes: {}` 时旧版会再插一个）。
+        dropDuplicateEmptyKeys("$KEY_PROVIDER:", child + 4, agnesIndex)
 
         // `agnes:` 块的范围（到下一个同级或更浅的键为止），用于在它内部找键。
         var agnesEnd = end
@@ -2900,12 +3044,15 @@ class EngineManager private constructor(private val context: Context) {
                 break
             }
         }
+        // 判据同样必须容忍行内值：`retryPolicy: {}` 也算「已经有」——
+        // 用精确相等会把已有的认成缺失，再插一个就是重复键（同一个坑的第三次）。
         val hasRetryPolicy = (agnesIndex + 1 until agnesEnd).any { i ->
             val line = lines[i]
-            line.isNotBlank() && line.indexOfFirst { it != ' ' } == child + 6
-                && line.trim() == "retryPolicy:"
+            val trimmed = line.trim()
+            line.isNotBlank() && line.indexOfFirst { it != ' ' } == child + 6 &&
+                (trimmed == "retryPolicy:" || trimmed.startsWith("retryPolicy: "))
         }
-        if (hasRetryPolicy) return body
+        if (hasRetryPolicy) return unchangedOrHealed()
 
         insert(agnesIndex + 1, keyPoolRetryPolicyYaml(child + 6))
         return lines.joinToString("\n")
@@ -5728,6 +5875,21 @@ class EngineManager private constructor(private val context: Context) {
          * GUI 自己写入的那份文件，我们只在缺 `agnes:` 时补一笔，绝不覆盖用户内容。
          */
         private const val KEY_POOL_NS = "llm-pi-ai"
+
+        /**
+         * 可以安全摘掉的「行内空值」写法 —— 摘掉它们**不丢任何数据**。
+         *
+         * ⚠️ 用途是修 [`mergeKeyPoolProvider`] 里的重复键崩溃：引擎把 schema 默认值
+         * 序列化进文件时，`providers: z.dict(profile).default({})` 会写成
+         * `providers: {}`，而 `{}` 是流式空映射，在它下面缩进写 `agnes:` 是非法
+         * YAML，必须先还原成裸 `providers:`。
+         *
+         * ⚠️ **只认这四种「空」**。非空的 `providers: {deepseek: {...}}` 绝不能摘 ——
+         * 那是用户的 provider 配置，摘掉就是数据丢失，见 [openKeyBlock] 的注释。
+         *
+         * `null` / `~` 是 YAML 的显式空值，语义上等于「没有内容」，摘下同样安全。
+         */
+        private val EMPTY_INLINE_VALUES = setOf("{}", "[]", "null", "~")
 
         /**
          * 引擎配置里的匿名占位符。
