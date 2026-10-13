@@ -4492,12 +4492,38 @@ class EngineManager private constructor(private val context: Context) {
             // ⚠️ 必须**并发**读走两个流：dump 的输出有 1500+ 行（真机实测），
             // 单线程先 readText() 一个流会让另一个流的 64KB 管道缓冲写满，
             // 引擎卡在 write 上永远不退出 —— 体检就成了新的挂死点。
+            //
+            // ⚠️ **两个线程体都必须自己 try/catch**，不能裸奔。
+            //
+            // 上面那条超时分支会 `destroyForcibly()` 杀掉引擎，此刻正阻塞在
+            // `read()` 上的这条线程会被内核中断，`forEachLine` 抛
+            // `java.io.InterruptedIOException: read interrupted`（真机堆栈：
+            // `Linux.readBytes` ← `BufferedReader.readLine` ←
+            // `kotlin.io.LinesSequence$iterator$1.hasNext`）。
+            //
+            // 这是**预期路径**（超时本来就该杀进程），不是故障；但裸线程里没人接
+            // 这个异常，它会一路冒到 JVM 的默认未捕获处理器，被 `CrashRecorder`
+            // 记成一份 `uncaught-exception` 崩溃现场 —— 于是「体检超时」在日志里
+            // 伪装成「未捕获异常」，把排查方向带偏。
+            // 真机证据：`20261013-221218-uncaught-exception.txt`（vivo V2313A，
+            // `thread: Thread-9`，栈底就是这里）。
             val out = StringBuilder()
             val err = StringBuilder()
-            val outThread = Thread { proc.inputStream.bufferedReader().forEachLine { out.appendLine(it) } }
-                .apply { isDaemon = true; start() }
-            val errThread = Thread { proc.errorStream.bufferedReader().forEachLine { err.appendLine(it) } }
-                .apply { isDaemon = true; start() }
+            val outThread = Thread {
+                try {
+                    proc.inputStream.bufferedReader().forEachLine { out.appendLine(it) }
+                } catch (t: Throwable) {
+                    // 被 destroyForcibly 打断是正常的，只记一句不抛。
+                    Log.w(TAG, "体检 stdout 读取结束: ${t.javaClass.simpleName}")
+                }
+            }.apply { isDaemon = true; start() }
+            val errThread = Thread {
+                try {
+                    proc.errorStream.bufferedReader().forEachLine { err.appendLine(it) }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "体检 stderr 读取结束: ${t.javaClass.simpleName}")
+                }
+            }.apply { isDaemon = true; start() }
             if (!proc.waitFor(PREFLIGHT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 proc.destroyForcibly()
                 outThread.join(1000)
