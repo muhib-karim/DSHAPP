@@ -46,6 +46,18 @@ object LogUploader {
     /** 待传目录（`logs/pending`）。 */
     private const val PENDING_DIR = "pending"
 
+    /** 手动导出目录（`logs/export`）。 */
+    private const val EXPORT_DIR = "export"
+
+    /**
+     * 已打包现场集合的标记文件（`logs/crash/.queued`）。
+     *
+     * ⚠️ **不能以 `.txt` 结尾** —— `CrashRecorder.listScenes()` 与
+     *   [collectCrashScenes] 都按 `.txt` 认现场文件，用 .txt 会让标记文件
+     *   把自己算进集合，签名永远在变、每次启动都重复打包。
+     */
+    private const val QUEUED_MARKER = ".queued"
+
     /** 重试上限。超过就移到 `failed/`，不再自动重试（避免无限占用流量）。 */
     private const val MAX_ATTEMPTS = 3
 
@@ -141,6 +153,14 @@ object LogUploader {
         executor.execute {
             try {
                 val (ok, msg) = doUpload(ep, bundle, reason)
+                // ⚠️ 成功后**必须删掉 pending/ 里的那一份**，否则下次启动
+                //   [retryPending] 会把同一个包再传一遍。
+                //
+                //   这个坑真踩过（服务器上留了铁证）：两份包的 sha256 完全相同，
+                //   一份 reason=manual、一份 reason=startup-retry，间隔 2 分钟 ——
+                //   同一份诊断包被传了两次，白白浪费用户流量，也让服务端多一份重复。
+                //   手动上传与自动补传必须共用「成功即出队」这一个语义。
+                if (ok) runCatching { bundle.delete() }
                 onResult(ok, msg)
             } catch (t: Throwable) {
                 onResult(false, "上传失败：${t.message}")
@@ -193,6 +213,52 @@ object LogUploader {
         f.writeText(n.toString())
         n
     }.getOrDefault(0)
+
+    /**
+     * 启动时把**尚未打包**的崩溃现场打成诊断包并入队。
+     *
+     * ## 为什么必须在这里做，而不是在崩溃处理器里
+     *
+     * 崩溃处理器只有几秒预算，而打一个包要读几 MB 日志、压缩、写盘 —— 是重活。
+     * 原来的设计里 `CrashRecorder` **从来没有调用过** [stashForCrash]（那个方法
+     * 定义了却无人调用），于是 `pending/` 永远空着，`retryPending` 什么都传不出去：
+     * **「崩溃自动上传」这条链路从来没有生效过**。服务器上收到的包 `reason` 只有
+     * `manual` 与 `startup-retry`，没有任何一个 `crash`，就是铁证。
+     *
+     * 所以改成：崩溃当场只写现场文件（快、可靠），**下次启动**在这里补打包 + 入队。
+     * 与 [retryPending] 的注释所述边界一致 —— 用户崩溃后再也不打开 App，
+     * 这个包就传不出去，那是平台限制。
+     *
+     * ## 幂等判据
+     *
+     * `crash/.queued` 里记着**已打包过的现场文件名**（排序后）。集合没变就跳过，
+     * 于是同一批现场不会被反复打包。有新现场（或清空后又有）才重新打包。
+     *
+     * @return 入队的包；没有新现场或失败时返回 null。
+     */
+    fun collectCrashScenes(logDir: File): File? = runCatching {
+        val crashDir = File(logDir, "crash")
+        // ⚠️ 只认 .txt：标记文件本身不能是 .txt，否则会被自己算进「现场集合」。
+        val scenes = crashDir.listFiles()
+            ?.filter { it.isFile && it.name.endsWith(".txt") }
+            ?.sortedBy { it.name }
+            ?: return@runCatching null
+        if (scenes.isEmpty()) return@runCatching null
+
+        val marker = File(crashDir, QUEUED_MARKER)
+        val signature = scenes.joinToString("\n") { it.name }
+        val prev = runCatching { marker.takeIf { it.isFile }?.readText() }.getOrNull()
+        if (prev == signature) return@runCatching null // 没有新现场
+
+        val outDir = File(logDir, EXPORT_DIR).apply { mkdirs() }
+        val bundle = DiagnosticBundle.build(logDir, outDir, "crash") ?: return@runCatching null
+        val queued = enqueue(bundle, logDir) ?: return@runCatching null
+        // ⚠️ 标记写在**入队成功之后**：反过来会「标记了但没入队」，那批现场就
+        //   永远不会再被尝试。
+        runCatching { marker.writeText(signature) }
+        LogStore.app('I', "Upload", "崩溃现场已打包入队: ${queued.name}（${scenes.size} 份现场）")
+        queued
+    }.getOrNull()
 
     // ── 真正的上传 ────────────────────────────────────────────────────────────
 
@@ -264,25 +330,6 @@ object LogUploader {
             Pair(false, "上传失败：${t.message ?: t.javaClass.simpleName}（已留在本地，稍后自动重试）")
         } finally {
             runCatching { conn?.disconnect() }
-        }
-    }
-
-    /**
-     * 崩溃后落盘时调用：生成包、入待传队列。
-     *
-     * ⚠️ 由**崩溃处理器**调用，所以：不联网、不做重活、全程 `runCatching`。
-     * 真正的上传在下次启动（见 [retryPending]）。
-     *
-     * @return 入队的包路径；失败返回 null。
-     */
-    fun stashForCrash(logDir: File, extraFiles: List<File>): File? {
-        return try {
-            val outDir = File(logDir, "export").apply { mkdirs() }
-            val bundle = DiagnosticBundle.build(logDir, outDir, "crash", extraFiles) ?: return null
-            enqueue(bundle, logDir)
-        } catch (t: Throwable) {
-            AndroidLog.w(TAG, "崩溃后暂存诊断包失败: ${t.message}")
-            null
         }
     }
 }

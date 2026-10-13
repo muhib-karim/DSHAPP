@@ -478,4 +478,26 @@ private class SystemPageBridge(private val impl: PageBridge) {
 
     @android.webkit.JavascriptInterface
     fun rootRecheck() = impl.rootRecheck()
+
+    /**
+     * 设置页「运行日志与诊断」→ 拉起原生日志界面。
+     *
+     * ⚠️ **这个白名单是手工维护的**（见类注释：「恰好是页面侧用的那些，不多不少」）。
+     *   往 [PageBridge] 加方法**必须**同步加到这里，否则页面侧
+     *   `window.DSHAndroid.openLogs` 是 `undefined`，而插件里写的是
+     *   「没有原生桥」—— 症状是设置页那一块显示成没有桥，**不报错**。
+     *   这个坑真踩过一次（`openLogs` / `logSummary` 加接口时漏了这里）。
+     */
+    @android.webkit.JavascriptInterface
+    fun openLogs() = impl.openLogs()
+
+    /**
+     * 读日志摘要（JSON 文本）。
+     *
+     * ⚠️ 同上，必须出现在这个白名单里，否则设置页永远显示「没有原生桥」。
+     *   必须返回 String：`@JavascriptInterface` 只支持基本类型与 String，
+     *   返回自定义对象会静默变成 `undefined`。
+     */
+    @android.webkit.JavascriptInterface
+    fun logSummary(): String = impl.logSummary()
 }

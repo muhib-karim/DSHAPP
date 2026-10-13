@@ -4,7 +4,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -322,22 +324,49 @@ class LogViewerActivity : AppCompatActivity() {
     private fun exportBundle() {
         toast(getString(R.string.logs_exporting))
         Thread({
+            // ⚠️ 打包仍写在私有 `logs/export/`（上传链路读的就是那里），但**额外
+            //   复制一份到用户能自己找到的公共目录** —— 否则「导出」对用户等于
+            //   「提示成功但拿不到文件」（私有目录文件管理器进不去）。
             val out = runCatching {
                 val dir = File(logsDir(), "export").apply { mkdirs() }
                 DiagnosticBundle.build(logsDir(), dir, "manual", engineStateFiles())
             }.getOrNull()
+            val shared = out?.let { publishToPublicDir(it) }
             handler.post {
                 if (out != null) {
                     // ⚠️ 把**完整路径**给用户，而不是「已保存」：他要用文件管理器
                     //   找到它、或从聊天软件里发出去，没有路径就没法操作。
-                    toast(getString(R.string.logs_export_ok, out.absolutePath))
-                    LogStore.app('I', "LogViewer", "手动导出诊断包: ${out.name} (${out.length()} 字节)")
+                    toast(getString(R.string.logs_export_ok, (shared ?: out).absolutePath))
+                    LogStore.app(
+                        'I', "LogViewer",
+                        "手动导出诊断包: ${out.name} (${out.length()} 字节)" +
+                            " → ${(shared ?: out).absolutePath}",
+                    )
                 } else {
                     toast(getString(R.string.logs_export_failed, "写入失败或磁盘空间不足"))
                 }
             }
         }, "dsh-log-export").apply { isDaemon = true }.start()
     }
+
+    /**
+     * 把诊断包复制到用户能找到的目录（见 `LogContext.publicExportDirOrNull`）。
+     *
+     * ⚠️ **是复制不是移动**：`logs/export/` 里那一份是上传链路的输入，移走会
+     *   让「导出后上传」失效。多占一份磁盘是必要的代价（包只有几 MB）。
+     *
+     * ⚠️ 失败返回 null，调用方退回私有路径提示 —— 复制失败不该让导出整个报错。
+     */
+    private fun publishToPublicDir(bundle: File): File? = runCatching {
+        val dir = com.dsh.android.log.LogContext.publicExportDirOrNull() ?: return@runCatching null
+        // 已经在公共目录里（无权限时 publicExportDirOrNull 会退回 filesDir，
+        // 而这里就是 filesDir）→ 不必复制。
+        if (dir.absolutePath == bundle.parentFile?.absolutePath) return@runCatching bundle
+        if (dir.absolutePath.startsWith(logsDir().absolutePath)) return@runCatching null
+        val target = File(dir, bundle.name)
+        bundle.copyTo(target, overwrite = true)
+        target
+    }.getOrNull()
 
     /**
      * 上传：先确保有一个新鲜包，再入待传队列并立刻发。

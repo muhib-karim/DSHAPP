@@ -616,6 +616,14 @@ class GeckoWebHost(
                     "bubbleSetEnabled" -> b.bubbleSetEnabled(args.optBoolean(0))
                     "bubbleRequestOverlay" -> b.bubbleRequestOverlay()
                     "rootRecheck" -> b.rootRecheck()
+                    // 日志与诊断（见 ⑫.6）。⚠️ 与 system 版的 `SystemPageBridge`
+                    // 白名单**必须逐条对齐** —— 漏一条的症状是设置页那一块显示成
+                    // 「没有原生桥」，不报错、不崩溃，只是静默失效。
+                    "openLogs" -> b.openLogs()
+                    // `logSummary` 页面侧走快照同步读，这里只处理「请重推一份」。
+                    // ⚠️ 必须重推：用户从日志界面（另一个 Activity）清空/上传后
+                    //   回到设置页，缓存里还是旧数字，不重推就永远不刷新。
+                    "logsRefresh" -> pushSnapshot()
                     // 会话转录：与 onStatus 同一条路，只是体量大得多（见 ChatTranscript）。
                     "onTranscript" -> b.onTranscript(args.optString(0))
                     // 插件下发悬浮球外观。**改完必须重推快照** —— 页面侧读的是
@@ -688,6 +696,9 @@ class GeckoWebHost(
             // 而 native messaging 只能异步 —— 与 root/bubble 同一套缓存语义。
             .put("appearance", callbacks.bridge.bubbleAppearance())
             .put("pairingEnabled", callbacks.bridge.pairingNotificationsEnabled())
+            // 日志摘要（JSON 文本）。页面侧 `logSummary()` 是**同步**读取，所以
+            // 只能经快照缓存 —— 与 root/bubble 完全同一套语义。
+            .put("logSummary", callbacks.bridge.logSummary())
         postToExtension(msg)
     }
 

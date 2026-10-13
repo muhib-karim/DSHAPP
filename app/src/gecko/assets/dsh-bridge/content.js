@@ -73,6 +73,9 @@ const snapshot = {
   bubble: '{}',
   appearance: '{}',
   pairingEnabled: false,
+  // 日志摘要。⚠️ 与 root/bubble 同一套缓存语义：native messaging 只能异步，
+  //   而设置页的 `logSummary()` 是**同步**读取（见 system 版的同名字段）。
+  logSummary: '{}',
 };
 
 /** 是否已经装过（同一次 document 生命周期内只装一次）。 */
@@ -166,6 +169,7 @@ function onNativeMessage(msg) {
     if (typeof msg.bubble === 'string') snapshot.bubble = msg.bubble;
     if (typeof msg.appearance === 'string') snapshot.appearance = msg.appearance;
     if (typeof msg.pairingEnabled === 'boolean') snapshot.pairingEnabled = msg.pairingEnabled;
+    if (typeof msg.logSummary === 'string') snapshot.logSummary = msg.logSummary;
     return;
   }
 
@@ -355,7 +359,7 @@ const PAGE_SHIM_SOURCE = `(function (post) {
  * 而它要调用的那几个原生侧函数以参数形式传进去（它们是 exportFunction 的
  * 返回值，跨边界是合法的）。
  */
-const BRIDGE_INSTALLER_SOURCE = `(function (post, getRoot, getBubble, getPairingEnabled, getAppearance) {
+const BRIDGE_INSTALLER_SOURCE = `(function (post, getRoot, getBubble, getPairingEnabled, getAppearance, getLogSummary) {
   // ⚠️ **无条件覆盖**，不能写成「已有就跳过」。content script 重跑时传进来的
   //   post 是**新的**函数对象（闭包着新的原生端口），而旧 DSHAndroid 里的方法
   //   还指着**旧的** post → 旧端口（可能已断）。保留旧对象的结果是页面调了方法
@@ -384,6 +388,18 @@ const BRIDGE_INSTALLER_SOURCE = `(function (post, getRoot, getBubble, getPairing
     bubbleAppearance: function () { return getAppearance(); },
     rootState: function () { return getRoot(); },
     rootRecheck: function () { post('rootRecheck', []); },
+    // 日志与诊断。⚠️ 与 system 版**逐字对齐**（那边是 addJavascriptInterface 的
+    //   同步方法）：「logSummary()」同步返回 JSON 文本，「openLogs()」拉起原生界面。
+    //   这里同步读的是**快照缓存** —— 原生在 pushSnapshot 里一并推来。
+    //
+    //   ⚠️ 缓存是**旧值**：设置页在用户从日志界面返回时调本方法，而那一刻原生
+    //     还没推新快照（缓存停在握手时那一份），用户会看到清空/上传前的旧数字。
+    //     所以这里**顺带请求一次重推**；页面侧的延迟二次读拿到新值。
+    logSummary: function () {
+      post('logsRefresh', []);
+      return getLogSummary();
+    },
+    openLogs: function () { post('openLogs', []); },
   };
 })`;
 
@@ -459,11 +475,14 @@ function installBridge() {
   const getPairingEnabled = exportFunction(function () { return !!snapshot.pairingEnabled; }, pageWindow);
   // 悬浮球外观配置也走同一套「原生推快照、页面同步读缓存」的语义。
   const getAppearance = exportFunction(function () { return String(snapshot.appearance); }, pageWindow);
+  // 日志摘要同构：原生推快照、页面同步读缓存。设置页那一块靠它判断有没有桥。
+  const getLogSummary = exportFunction(function () { return String(snapshot.logSummary); }, pageWindow);
 
   try {
     // 在页面世界现造安装器，再把导出函数喂进去 —— 对象因此在页面世界出生，
     // 不需要（也不能）克隆。见 BRIDGE_INSTALLER_SOURCE 的说明。
-    pageWindow.eval(BRIDGE_INSTALLER_SOURCE)(post, getRoot, getBubble, getPairingEnabled, getAppearance);
+    pageWindow.eval(BRIDGE_INSTALLER_SOURCE)(
+      post, getRoot, getBubble, getPairingEnabled, getAppearance, getLogSummary);
     log('[dsh-bridge] 桥已装入页面世界: ' + typeof pageWindow.DSHAndroid);
   } catch (e) {
     // 桥装不上 ⇒ 设置页的气泡开关 / root 状态 / 无线调试配对三块静默失效。

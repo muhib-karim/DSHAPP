@@ -741,8 +741,8 @@ pnpm add <本地包>  →  exit=0，node_modules/@local/xxx 就位，
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-60`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（现 `16`，见 ⑯） |
-| `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.12`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-61`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（现 `17`，见 ⑯） |
+| `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.13`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.0-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -3924,6 +3924,63 @@ manifest.json      最后写 —— 它记录前面实际写进去什么
 
 ⚠️ 插件侧对 `read` 的结果**再截断一次**（500 行 / 256 KB）—— 那是**上下文预算**限制，
 不是能力限制。不截断会把这一轮对话直接撑爆，而模型不会自己意识到该少要点。
+
+#### ⚠️ 四个踩过的坑（0.2.8 → 0.2.8-logsfix 修掉，都是「静默失效」类）
+
+**① 两个 flavor 各有一份手工白名单，往 `PageBridge` 加方法必须三处同改。**
+
+`SystemPageBridge`（`app/src/system/.../SystemWebHost.kt`，`addJavascriptInterface`
+要每个方法带 `@android.webkit.JavascriptInterface`）与 gecko 的
+`dispatchInvoke` 的 `when(call)` + `content.js` 的 `BRIDGE_INSTALLER_SOURCE`
+**都是白名单**。`SystemPageBridge` 的类注释写着「恰好是页面侧用的那 16 个，不多不少」——
+只改 `PageBridge` 接口不改白名单，`window.DSHAndroid.logSummary` 就是 `undefined`，
+设置页那一块显示成**「当前环境没有原生桥」**，不报错、不崩溃。
+
+⚠️ gecko 侧还有第三处：`content.js` 里 `window.DSHAndroid = {...}` 那段。
+`logSummary` 走**快照缓存**（native messaging 只能异步，而页面侧是同步读），
+所以它同时要出现在 `pushSnapshot()` 的 JSON 里、`snapshot` 对象里、以及
+`getLogSummary` 那个 `exportFunction` 里 —— 四处。
+
+⚠️ **改 `content.js` 必须 bump `manifest.json` 的 `version`**（否则 GeckoView 用旧扩展）。
+
+**② 手动上传成功后必须删掉 `pending/` 里那一份。**
+
+`LogUploader.upload()` 原来只上传不删，于是下次启动 `retryPending()` 把同一个包再传一遍。
+服务器上留了铁证：两份包 `sha256` 完全相同、间隔 2 分钟，`reason` 分别是
+`manual` 与 `startup-retry`。手动与自动补传必须共用「成功即出队」这一个语义。
+
+**③ 崩溃包原来**从不**生成 —— `stashForCrash()` 定义了却无人调用。**
+
+`CrashRecorder` 只写现场 `.txt`，`pending/` 永远是空的，`retryPending()` 什么都传不出去：
+**「崩溃自动上传」这条链路从来没生效过**。服务器上收到的包 `reason` 只有
+`manual` / `startup-retry`、一个 `crash` 都没有，就是判据。
+
+正确形状是**分两段**：崩溃当场只写现场文件（快、可靠，崩溃进程只有几秒预算），
+**下次启动**由 `LogUploader.collectCrashScenes()` 补打包 + 入队。幂等判据是
+`crash/.queued` 里记的「已打包现场文件名集合」。
+⚠️ 标记文件名**不能以 `.txt` 结尾** —— 现场文件就是按 `.txt` 认的，否则标记会把自己
+算进集合，签名永远在变、每次启动重复打包。
+
+**④ 「导出诊断包」原来落到 app 私有目录，用户根本拿不到。**
+
+`filesDir/logs/export/` 是私有目录，文件管理器进不去 `/data/data/<包名>/`，
+于是「导出」对用户等于**「提示保存成功，但那个文件我永远拿不到」**，
+也就没法通过聊天软件发给开发者 —— 而这个功能存在的全部意义就是让用户把包发出来。
+
+做法：打包仍写在 `logs/export/`（上传链路的输入，**不能移走**），
+额外**复制**一份到 `LogContext.publicExportDirOrNull()`：有存储权限 → `/sdcard/Download/`；
+无权限 → `getExternalFilesDir(DOWNLOADS)`（不需权限，文件管理器仍可达）；
+都拿不到才退回私有目录。`logs` 工具的 `export` 同样返回 `sharedPath`。
+
+#### 判定「崩溃自动上传」到底通没通
+
+```powershell
+# 服务器侧：看有没有 reason=crash 的包
+ssh ... 'cat /workspace/dsh-logs/index.jsonl'
+```
+
+只有 `manual` / `startup-retry` ⇒ 崩溃那条链路没生效（见上面 ③）。
+⚠️ 判断「重复上传」看 `sha256` 是否相同（见 ②），不要只看条数。
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 

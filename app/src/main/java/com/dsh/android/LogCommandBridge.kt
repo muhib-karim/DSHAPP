@@ -4,6 +4,7 @@ import com.dsh.android.log.BootState
 import com.dsh.android.log.CrashRecorder
 import com.dsh.android.log.DiagnosticBundle
 import com.dsh.android.log.DshLog as Log
+import com.dsh.android.log.LogContext
 import com.dsh.android.log.LogStore
 import com.dsh.android.log.LogUploader
 import org.json.JSONArray
@@ -332,8 +333,8 @@ object LogCommandBridge {
      * 生成诊断包。
      *
      * ⚠️ `reason` 固定 `"manual"`：这条路的触发者是模型/用户，不是崩溃路径。
-     *   崩溃路径的包由 `LogUploader.stashForCrash()` 在 `CrashRecorder` 里生成，
-     *   那个**不做网络 IO**（崩溃进程做不了）。
+     *   崩溃路径的包由 [com.dsh.android.log.LogUploader.collectCrashScenes] 在
+     *   **下次启动时**补打包（崩溃进程只有几秒预算，做不了打包这种重活）。
      */
     private fun doExport(out: JSONObject) {
         val logDir = LogStore.dirOrNull() ?: throw IllegalStateException("日志落盘不可用，无法生成诊断包")
@@ -343,6 +344,18 @@ object LogCommandBridge {
 
         out.put("bundlePath", bundle.absolutePath)
         out.put("bundleBytes", bundle.length())
+
+        // ⚠️ 额外复制一份到公共目录并把路径告诉模型：私有目录里的包**用户拿不到**
+        //   （文件管理器进不去 `/data/data/`），而这条路存在的意义就是让用户能把
+        //   包发出来。模型拿到这个路径就能直接告诉用户去哪儿找。
+        runCatching {
+            val pubDir = LogContext.publicExportDirOrNull()
+            if (pubDir != null && pubDir.absolutePath != bundle.parentFile?.absolutePath) {
+                val target = File(pubDir, bundle.name)
+                bundle.copyTo(target, overwrite = true)
+                out.put("sharedPath", target.absolutePath)
+            }
+        }
 
         // 把包内的自动结论摘要给模型 —— 让它不必再拆一次 zip 才知道结论。
         // 失败不影响导出本身（包已经在了），所以单独兜住。

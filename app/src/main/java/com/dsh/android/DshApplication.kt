@@ -108,12 +108,20 @@ class DshApplication : Application() {
      * ⚠️ **崩溃当场传不出去**（进程马上要死，来不及建连接），所以只能落盘 +
      * 标记待传、下次启动补传。若用户崩溃后再也不打开 App，这个包就传不出去 ——
      * 这是平台限制，不是实现缺陷。所以日志界面的**手动上传入口是必需的补充**。
+     *
+     * ⚠️ **先补打包再补传**：崩溃当场只写了现场文件，诊断包是**在这里**打的
+     *   （打包是重活，崩溃进程只有几秒预算）。见 [LogUploader.collectCrashScenes]
+     *   —— 原来 `CrashRecorder` 从来没调用过 `stashForCrash()`，所以
+     *   「崩溃自动上传」这条链路此前从未生效。
      */
     private fun uploadPendingBundles() {
         applicationScope.launch {
             runCatching {
                 val logDir = File(filesDir, LOG_DIR)
                 if (!LogUploader.configured) return@runCatching
+                // ① 把上次崩溃留下的现场打成包并入队（幂等，无新现场则跳过）。
+                LogUploader.collectCrashScenes(logDir)
+                // ② 把 pending/ 里的包传出去。
                 val n = LogUploader.pendingCount(logDir)
                 if (n == 0) return@runCatching
                 DshLog.i(TAG, "发现 $n 份待上传的诊断包，开始补传")

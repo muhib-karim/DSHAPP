@@ -126,7 +126,10 @@ param(
     #     ⇒ 设备上那棵树继续被**旧**产物覆盖 ⇒ 设置页里根本看不到这个分节，
     #     而原生侧日志（`已安装移动端 UI 插件`）看起来一切正常。
     #     这个失败方式本项目已经踩过至少 8 次（v4~v15 每一版都在记同一件事）。
-    [string]$CompatVersion = "16",
+    # v17：日志分节补读一次（`mobileui/lib/client.js` 的 `refreshRef`）——
+    #      改的是 mobile-ui 源码，降级产物随之变化，不 bump 会命中
+    #      「戳一致 → 跳过」，插件继续是旧的（静默）。
+    [string]$CompatVersion = "17",
 
     [string]$EngineBin,
     [string]$OutZip

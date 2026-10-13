@@ -5779,7 +5779,7 @@ class EngineManager private constructor(private val context: Context) {
          *      ⚠️ 但仍然必须 bump 本常量：否则 `.mobile_ui_version` 标记不变，
          *      `ensureMobileUi()` 直接跳过解包，**老设备永远拿不到这个分节**。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-60"
+        private const val MOBILE_UI_VERSION = "1.0.0-61"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

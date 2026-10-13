@@ -6386,8 +6386,14 @@ window.__ModuleLoader__.load({
 			 *
 			 * ⚠️ 桥**可能不存在**（非 App 环境、或桥被清理），先查再调 ——
 			 *   直接调会抛 `TypeError: Cannot read properties of undefined`。
+			 *
+			 * ⚠️ **必须补读一次**（`again=true` 的那趟）：gecko 版的 `logSummary()`
+			 *   读的是**快照缓存**（native messaging 只能异步，见 content.js），
+			 *   第一次拿到的可能是旧值；那边在读取时顺带请求原生重推快照，
+			 *   所以隔一拍再读就是新值。system 版是同步真值，补读无副作用。
 			 */
-			const refresh = React.useCallback(() => {
+			const refreshRef = React.useRef(null);
+			const refresh = React.useCallback((again) => {
 				const bridge = window.DSHAndroid;
 				if (!bridge || typeof bridge.logSummary !== "function") {
 					setState({ phase: "ready", noBridge: true });
@@ -6411,7 +6417,13 @@ window.__ModuleLoader__.load({
 					console.warn("[dsh-android-mobile] 读取日志摘要失败:", e && e.message);
 					setState({ phase: "ready", noBridge: true });
 				}
+				// ⚠️ 用 `!== true` 而不是 `!again`：本函数也挂在事件监听上，
+				//   那时第一个参数是 event 对象（truthy），会把补读吃掉。
+				if (again !== true) {
+					setTimeout(() => { if (refreshRef.current) refreshRef.current(true); }, 300);
+				}
 			}, []);
+			refreshRef.current = refresh;
 
 			React.useEffect(() => { refresh(); }, [refresh]);
 
