@@ -519,6 +519,14 @@ object DiagnosticBundle {
         }
 
         // ⑤ 磁盘空间 —— 解包失败的常见原因
+        //
+        // ⚠️ **这是「打包那一刻」的瞬时值，不是「出故障时」的值。**
+        //   崩溃类诊断包是**下次启动后**才打的（见 `LogUploader.collectCrashScenes`：
+        //   崩溃当场只有几秒预算，打不了包），所以包里的磁盘/内存读数来自一个
+        //   **崩溃之后新起的进程**。实测 `20261013-230025-0dedc366`：包生成于
+        //   23:00:23，而包里 8 份现场的时间戳是 21:46~22:45 —— 相差最久 1 小时 14 分。
+        //   若不写明，分析者会把「剩余 79901MB」「堆占用 12MB」当成故障现场的内存
+        //   与磁盘状况，从而排除掉「磁盘满/内存不足」这两个真正可能的原因。
         runCatching {
             val ctx = LogContext.get()
             if (ctx != null) {
@@ -526,24 +534,41 @@ object DiagnosticBundle {
                 val freeMb = fs.availableBytes / (1024 * 1024)
                 checks.add(
                     if (freeMb < 200) {
-                        Check("disk-space", "warn", "数据分区剩余 ${freeMb}MB，低于 200MB —— 解包可能失败")
+                        Check(
+                            "disk-space", "warn",
+                            "打包时数据分区剩余 ${freeMb}MB，低于 200MB —— 解包可能失败。" +
+                                "⚠️ 这是**打包时刻**的读数，不是故障发生时的。",
+                        )
                     } else {
-                        Check("disk-space", "ok", "数据分区剩余 ${freeMb}MB")
+                        Check("disk-space", "ok", "打包时数据分区剩余 ${freeMb}MB（打包时刻的瞬时值，非故障时刻）")
                     },
                 )
             }
         }
 
         // ⑥ 内存
+        //
+        // ⚠️ 同上：这是**打包那一刻**的堆占用。崩溃包是重启后打的，所以它反映的是
+        //   「重启后这个新进程占了多少」，**不是**崩溃进程死前的占用 ——
+        //   拿它排除 OOM 会得到相反结论（实测崩溃包里的值普遍只有 3~13MB，
+        //   而含 8 份现场的包写的是 159MB，两者都不是崩溃进程的真实占用）。
         runCatching {
             val rt = Runtime.getRuntime()
             val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024)
             val maxMb = rt.maxMemory() / (1024 * 1024)
             checks.add(
                 if (usedMb * 100 / maxMb > 85) {
-                    Check("heap", "warn", "堆占用 ${usedMb}MB / ${maxMb}MB（超过 85%），有 OOM 风险")
+                    Check(
+                        "heap", "warn",
+                        "打包时堆占用 ${usedMb}MB / ${maxMb}MB（超过 85%），有 OOM 风险。" +
+                            "⚠️ 这是**打包时刻**的读数，不是故障发生时的。",
+                    )
                 } else {
-                    Check("heap", "ok", "堆占用 ${usedMb}MB / ${maxMb}MB")
+                    Check(
+                        "heap", "ok",
+                        "打包时堆占用 ${usedMb}MB / ${maxMb}MB" +
+                            "（打包时刻的瞬时值，不是故障进程死前的占用 —— 崩溃包是重启后才打的）",
+                    )
                 },
             )
         }
