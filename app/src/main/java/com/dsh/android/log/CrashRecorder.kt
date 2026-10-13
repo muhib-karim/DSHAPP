@@ -167,7 +167,12 @@ object CrashRecorder {
                 // ② 再把堆栈喂给 app.log（拿得到锁才有）。这条让「崩溃」出现在
                 //    正常的日志流里，用户按时间顺序翻日志时不会漏掉它。
                 withLogLock {
-                    LogStore.app('E', "Crash", "未捕获异常 on ${thread.name}: $reason")
+                    // ⚠️ 只取 reason 的**首行**：完整栈紧接着由下一行写进 app.log，而
+                    //   `UncaughtExceptionException` 的 message 里**已经含**整段 native 栈
+                    //   （chromium 构造时就是 `"Native stack trace:" + 换行 + nativeStackTrace`），
+                    //   内联进这一行会让同一条崩溃在 app.log 里出现两遍、且把这一行撑成几百行。
+                    val head = reason.substringBefore('\n').trim()
+                    LogStore.app('E', "Crash", "未捕获异常 on ${thread.name}: $head")
                     LogStore.app('E', "Crash", stack)
                 }
                 // ③ 刷盘。异步缓冲里还压着引擎/网页的最后几行。
@@ -201,10 +206,23 @@ object CrashRecorder {
      * ## 判据为什么用两个特征
      *
      * - `JniAndroid$UncaughtExceptionException`：chromium 把 native 崩溃转成 Java
-     *   异常的**唯一**载体类，只有内核会抛它。
-     * - `TrichromeLibrary` / `libmonochrome`：native 栈里的内核库名。
+     *   异常的**唯一**载体类。
+     * - `TrichromeLibrary` / `libmonochrome`：native 栈里的**内核库名** —— 这才是
+     *   「崩在内核里」的直接证据。
      *
      * 两个都不出现才判为本 App 的异常 —— 宁可漏判也不能把自家崩溃误标成内核的。
+     *
+     * ⚠️ **不要再把 `stack.contains("JniAndroid.handleException")` 加回判据里。**
+     *   曾经加过，它是**恒真**的：`UncaughtExceptionException` 正是由
+     *   `JniAndroid.handleException` 构造的（chromium 源码里
+     *   `new UncaughtExceptionException(nativeStackTrace, throwable)` 就在该方法体内），
+     *   所以它必然出现在自己的栈里。恒真的条件会把整个判据短路成「只看类名」，
+     *   而 chromium 的 `CheckException(env)` 是 **jni_zero 的通用 JNI 边界检查** ——
+     *   native 调用**任何** Java 方法返回时若有未决异常都会触发，不限于内核自己崩。
+     *   本工程这些回调都是被 WebView native 经 JNI 调用的（`onPageFinished`、
+     *   `onStatus`、`onUiReady`、`bubbleApply` …），任一处抛未捕获异常就会被
+     *   **误标成「系统 Web 内核崩溃，非本 App」** —— 与本节意图正好相反。
+     *   要加特征就往「native 栈里出现内核库名」这个方向加。
      *
      * ⚠️ 与 [isHardCrash] 的关系：这里**只改文案不改等级**。内核崩了照样是
      * `E` 级硬崩溃现场（对用户而言界面确实没了），只是原因归属不同。
@@ -212,8 +230,8 @@ object CrashRecorder {
     private fun isWebViewKernelCrash(err: Throwable, stack: String): Boolean {
         val name = err.javaClass.name
         if (!name.contains("JniAndroid")) return false
-        return stack.contains("TrichromeLibrary") || stack.contains("libmonochrome") ||
-            stack.contains("JniAndroid.handleException")
+        // ⚠️ 只认 native 栈里的**内核库名**。见上面那条 ⚠️：类名单独不足以定性。
+        return stack.contains("TrichromeLibrary") || stack.contains("libmonochrome")
     }
 
     // ── 四类现场的写入入口 ────────────────────────────────────────────────────
@@ -335,7 +353,13 @@ object CrashRecorder {
             sb.append("device: ").append(VersionInfo.deviceSummary()).append('\n')
             sb.append("app: ").append(VersionInfo.summary()).append('\n')
             sb.append("thread: ").append(threadName).append('\n')
-            sb.append("reason: ").append(reason).append('\n')
+            // ⚠️ 换行必须折叠：本文件是 `key: value` 逐行格式，而 `reason` 里可能带整段
+            //   native 栈（chromium 的 `UncaughtExceptionException` 构造时就把
+            //   `"Native stack trace:" + lineSeparator + nativeStackTrace` 塞进了 message）。
+            //   直接内联会让 `reason:` 那一行后面跟几百行，破坏格式、也把
+            //   `LogViewerActivity` 的 12 行预览挤出 `--- stack trace ---` 之后的内容。
+            //   折叠成 `\n` 字面量只是**显示**处理，栈全文仍在下方的 stack 段里完整保留。
+            sb.append("reason: ").append(reason.replace("\r\n", "\\n").replace("\n", "\\n")).append('\n')
 
             if (stack != null) {
                 sb.append("\n--- stack trace ---\n").append(stack).append('\n')

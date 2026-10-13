@@ -146,12 +146,19 @@ object BootState {
 
         if (unclean) {
             // 记一条 Warn：这是「上次为什么没了」在日志里的落点。
-            LogStore.app(
-                'W',
-                "Boot",
-                "上次启动未正常结束（bootId=${prev!!.bootId}，连续第 $consecutive 次）" +
-                    if (consecutive >= UNSTABLE_THRESHOLD) " —— 已达不稳定阈值，界面应提示用户" else "",
-            )
+            //
+            // ⚠️ **两种情形必须分开说，不能共用「连续第 N 次」。** `unclean` 看的是
+            //   `prev.clean`，而 `consecutive` 在 `prev.uiLoaded` 为真时归零 ——
+            //   两者是不同的维度。合在一句里就会打出「上次启动未正常结束…连续第 0 次」
+            //   这种自相矛盾的话，而它恰恰是排查者最先看到的一行。
+            val detail = if (consecutive == 0) {
+                // 上次界面加载成功过 ⇒ 是「用了一阵才离开」，不是「启动即崩」。
+                "界面曾加载成功，不计入连续计数"
+            } else {
+                "连续第 $consecutive 次" +
+                    if (consecutive >= UNSTABLE_THRESHOLD) " —— 已达不稳定阈值，界面应提示用户" else ""
+            }
+            LogStore.app('W', "Boot", "上次启动未正常结束（bootId=${prev!!.bootId}，$detail）")
             EventLog.record("boot.previous-unclean", mapOf("count" to consecutive.toString()))
         } else {
             EventLog.record("boot.start", mapOf("clean" to "true"))
