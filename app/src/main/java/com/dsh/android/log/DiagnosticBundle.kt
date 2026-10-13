@@ -173,9 +173,23 @@ object DiagnosticBundle {
                             "只覆盖 checked 列出的条目（本次实际走过自检的那些，都是新构造的文本）。" +
                                 "**manifest.json 自身不在其中** —— 它承载的就是这份自检结论，" +
                                 "不能自引用（先有结论才能写它）。" +
-                                "流式写的 crashes/ · *.log · engine-startup/ 由各自的写入方" +
-                                "（LogStore.safeRedact / EventLog.record）在写入时脱敏，" +
-                                "**未在打包时复检**；因此 clean=true 的含义是" +
+                                "流式写的 crashes/ 与 *.log 由各自的写入方在写入时脱敏" +
+                                "（app/engine/web 三路走 LogStore.safeRedact，事件走 EventLog.record），" +
+                                "**未在打包时复检**；" +
+                                // ⚠️ **engine-startup/ 必须单独说，不能和前两者并成一句**
+                                //   （2026-10-14 自检发现，同族第 21 例）。
+                                //   原来这句是「crashes/ · *.log · engine-startup/ 由各自的
+                                //   写入方（LogStore.safeRedact / EventLog.record）在写入时脱敏」
+                                //   —— 而 `engine-startup/startup-*.log` 是**引擎进程自己写的**
+                                //   （见本文件 [writeEngineStartupLogs] 的说明：
+                                //   `[engine] Full diagnostics: <$DSH_HOME>/logs/startup-…log`）。
+                                //   引擎是个独立的 Node 进程，**根本不经过任何 Kotlin 函数**，
+                                //   那两条 `safeRedact` / `record` 对它一点作用都没有。
+                                //   所以这句话把一个**从未脱敏**的来源报成了「已脱敏」——
+                                //   方向是假报安全，比漏报更糟：分析者据此可以放心地把包外发。
+                                "engine-startup/ 例外：那是**引擎自己写的**（独立 Node 进程，" +
+                                "不经过本 App 的任何脱敏函数），本包对它**未做任何脱敏、也未复检**。" +
+                                "因此 clean=true 的含义是" +
                                 "「新构造的文本没有漏网」，不等于「包内每个字节都已复检」。",
                         )
                     })
