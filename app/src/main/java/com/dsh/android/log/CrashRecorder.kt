@@ -4,6 +4,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log as AndroidLog
+import com.dsh.android.DshApplication
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -436,10 +437,21 @@ object CrashRecorder {
 
             // 时间线尾部：回答「崩在哪一步」
             sb.append("\n--- recent events ---\n")
+            // ⚠️ **不能用 `LogStore.dirOrNull()`**（2026-10-14 自检发现，同族第 20 例）。
+            //   `EventLog.init(logDir)` 持的是**自己的**目录，与 `LogStore.dir` 无关；
+            //   而 `LogStore.init` 失败时 `dir = null` —— 于是这一整段在那种状态下
+            //   静默消失：`if (d != null)` 不成立，连下面那句
+            //   「(事件时间线不可读)」都不会打（那不是异常，是空分支）。
+            //   现场文件里就凭空少了一整段，而 `--- recent events ---` 这个标题
+            //   还在、下面空着，读的人只会以为「这次没有事件」。
+            //   本类的 `crashDir` 就是同一个 `logDir` 下的 `crash/`，用它拼回父目录
+            //   最可靠（不依赖任何别处的状态）。
             runCatching {
-                val d = LogStore.dirOrNull()
+                val d = crashDir?.parentFile ?: LogContext.filesDirOrNull()?.let { File(it, DshApplication.LOG_DIR) }
                 if (d != null) {
                     EventLog.readAll(d).takeLast(20).forEach { sb.append(EventLog.describe(it)).append('\n') }
+                } else {
+                    sb.append("(取不到日志目录：LogContext 未安装，事件时间线不可读)\n")
                 }
             }.onFailure { sb.append("(事件时间线不可读: ${it.message})\n") }
 
