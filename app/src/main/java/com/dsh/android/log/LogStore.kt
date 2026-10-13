@@ -708,19 +708,32 @@ object LogStore {
     fun enforceQuota() {
         val d = dir ?: return
         try {
-            enforceDirQuota(d, TOTAL_QUOTA_BYTES, skipDirs = setOf("crash", "pending", "export"))
+            enforceDirQuota(d, TOTAL_QUOTA_BYTES)
             crashDirOrNull()?.let { enforceCrashQuota(it) }
         } catch (_: Throwable) {
         }
     }
 
     /**
-     * 目录超配额就删最老的文件，直到降回配额以内。
+     * 顶层日志文件超配额就删最老的，直到降回配额以内。
      *
-     * ⚠️ `skipDirs` 里的子目录**整个跳过**：`pending/` 是待上传的诊断包（删了
-     * 就永远传不出去），`export/` 是用户刚导出的（删了等于骗用户）。
+     * ⚠️ **只管顶层文件，不管任何子目录。** `candidates` 被 `it.isFile` 滤过，
+     *   而 `crash/`、`pending/`、`export/`、`failed/` 都是目录 —— 于是它们
+     *   **一个都不在清理范围内**。这正好是我们想要的结果（删了 `pending/` 就永远
+     *   传不出去，删了 `export/` 等于骗用户），但它是 `it.isFile` 的**副产品**，
+     *   不是靠某个白名单实现的。
+     *
+     * ⚠️ 原来的签名带一个 `skipDirs: Set<String>` 参数，注释写「`skipDirs` 里的
+     *   子目录整个跳过」—— 那是**虚构的保证**：该参数从头到尾没参与过任何判断，
+     *   唯一的用处是一句 `skipDirs.forEach { }`（空操作）。读者会以为「不在
+     *   `skipDirs` 里的子目录会被清理」，从而以为 `failed/` 有配额兜底 ——
+     *   实际上它和别的子目录一样完全不受管，上传持续失败时会一直涨。
+     *   **已删掉这个死参数**，如实写在这里。
+     *
+     * ⚠️ 崩溃现场另有 [enforceCrashQuota] 单独把关（8MB / 20 份）；
+     *   `pending/` 靠「上传成功即出队」收敛；**`failed/` 目前没有任何上限**。
      */
-    private fun enforceDirQuota(d: File, quota: Long, skipDirs: Set<String>) {
+    private fun enforceDirQuota(d: File, quota: Long) {
         val files = d.listFiles() ?: return
         val candidates = files.filter { it.isFile }.sortedBy { it.lastModified() }
         var total = candidates.sumOf { it.length() }
@@ -733,7 +746,6 @@ object LogStore {
             val len = f.length()
             if (f.delete()) total -= len
         }
-        skipDirs.forEach { /* 显式声明跳过，语义留给读代码的人 */ }
     }
 
     /**
