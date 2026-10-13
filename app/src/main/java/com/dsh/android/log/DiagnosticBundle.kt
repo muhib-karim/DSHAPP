@@ -77,6 +77,25 @@ object DiagnosticBundle {
         checks: List<Check> = emptyList(),
     ): File? {
         return try {
+            // ⚠️ **打包前必须先把异步日志刷下去**（踩过，代价是 19 份真机诊断包全部缺
+            //   `engine.log` / `web.log`）。
+            //
+            //   `engine.log` / `web.log` 是**异步缓冲**写的（见 `LogStore.writeAsync`：
+            //   「异步档**攒着不 flush**」），它们只在累积到 1MB 时才 flush 一次。
+            //   而 `build()` 是**进程内即时读文件**的：此刻这两份文件在磁盘上要么
+            //   还不存在，要么长度是 0 —— 于是 `writeLogFile` 第 186/188 行的
+            //   `if (!f.isFile) return 0L` / `if (size <= 0) return 0L` **静默跳过**，
+            //   包里连条目都没有，`completeness` 里也一个字都不记。
+            //
+            //   症状极具误导性：`app.log` 里明明有几百行 `[engine] …`（那是
+            //   `Log.i(TAG, "[engine] $line")` 打给 logcat 的副本，同步落盘），
+            //   让人以为引擎日志已经收进来了，而真正带完整上下文的那份从来没进过包。
+            //
+            //   放在 `build()` 入口而不是各个调用点，是因为调用点有三个
+            //   （`LogViewerActivity` 两处、`LogCommandBridge`、`LogUploader`），
+            //   逐个加必然漏 —— 这里加一次就全覆盖。
+            LogStore.flushAsync()
+
             if (!outDir.exists()) outDir.mkdirs()
             val now = System.currentTimeMillis()
             val name = "diagnostic-${fileFmt.format(Date(now))}-${BootState.bootId}.zip"
@@ -183,9 +202,20 @@ object DiagnosticBundle {
         completeness: JSONObject,
     ): Long {
         val f = File(logDir, name)
-        if (!f.isFile) return 0L
+        // ⚠️ **缺文件必须留痕**，不能静默 return（踩过）：19 份真机诊断包全都没有
+        //   `engine.log` / `web.log`，而 `completeness` 里一个字都没记，导致
+        //   「包里没有」和「日志系统没记」两种情况**从产物上无法区分**，
+        //   白烧了一轮排查。现在把「不存在 / 空 / 跳过」三种情况都写进 completeness，
+        //   分析者一眼能看出是哪一种。
+        if (!f.isFile) {
+            completeness.put("${name}_absent", "文件不存在")
+            return 0L
+        }
         val size = f.length()
-        if (size <= 0) return 0L
+        if (size <= 0) {
+            completeness.put("${name}_empty", "文件存在但长度为 0")
+            return 0L
+        }
 
         return try {
             if (size <= budget) {

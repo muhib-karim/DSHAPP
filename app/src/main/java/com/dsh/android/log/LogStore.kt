@@ -528,10 +528,30 @@ object LogStore {
     /**
      * 把异步缓冲刷下去。**崩溃路径必须调用它**（见 [CrashRecorder]）——
      * 否则引擎日志的最后几行永远留在用户态缓冲里。
+     *
+     * ⚠️ 光 flush writer 是**不够**的：`enqueue()` 只是把行放进 `queue`，由
+     * `dsh-log-writer` 线程慢慢取。调用它的线程与那个 worker 之间没有任何同步，
+     * 所以此刻队列里可能还压着一批**根本没写进 writer** 的行 —— 它们不在
+     * BufferedWriter 里，flush 自然刷不出来。
+     *
+     * 这里先自己把队列排干（`writeAsync` 内部有 `lock`，与 worker 并发是安全的），
+     * 再 flush。排干的是「本方法被调用这一刻已经入队的行」，之后新入队的行照旧
+     * 走 worker —— 打包这种一次性动作要的正是「此刻为止的完整快照」。
      */
     fun flushAsync() {
         try {
             lock.withLock {
+                // ① 排干队列：直接自己写，不等 worker 调度。
+                while (true) {
+                    val item = queue.poll() ?: break
+                    when (item.target) {
+                        QueuedLine.Target.ENGINE ->
+                            writeAsync(engineWriterOf(), item.line, { n -> engineBytes = n }, { engineBytes })
+                        QueuedLine.Target.WEB ->
+                            writeAsync(webWriterOf(), item.line, { n -> webBytes = n }, { webBytes })
+                    }
+                }
+                // ② 再 flush 已经攒在 BufferedWriter 里的。
                 engineWriter?.flush()
                 webWriter?.flush()
             }

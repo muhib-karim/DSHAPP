@@ -331,7 +331,40 @@ function logsTool(home) {
 				},
 			},
 		},
-		render: (_args, value) => [{ type: 'text', text: renderText(value) }],
+		// ⚠️ **`render` 必须嵌在 `output` 里，不能放在工具定义顶层**（踩过）。
+		//   `dsh-tools` 的 `register()`（lib/index.js 的 `const output = definition.output;`
+		//   那一行）校验的是 `definition.output.render`，顶层 `render` 它**根本看不到**：
+		//
+		//     if (output === void 0 || typeof output !== 'object'
+		//         || typeof output.render !== 'function' || …)
+		//         throw new TypeError(`tool "${name}" must declare output { schema, render, presentationMeta? }`);
+		//
+		//   症状极具误导性：**插件装好了、日志里能看到「已安装日志工具插件」
+		//   ` + 「已写入日志工具 overlay」，但 `logs` 工具从没出现在工具列表里**，
+		//   而且整个 entry 注册失败（`dsh: warning: 1 entry did not activate`）。
+		//   19 份真机诊断包全是这个报错 —— 也就是说这个工具**从未在真机上可用过一次**。
+		//
+		// ⚠️ `schema` 也**不能收窄**：返回形状随 action 变（summary 是统计、
+		//   read 带 `logText`、crashes 带 `sceneText`、export 带 `bundlePath`），
+		//   写成固定形状会让真机以 `ToolOutputError` 炸在渲染之前。
+		//   引擎侧 `assertSupportedJsonSchema` 只要求 object-rooted，与
+		//   `dsh-android-uiagent` / `dsh-android-bubble` 同一写法。
+		output: {
+			schema: {
+				type: 'object',
+				properties: {
+					ok: { type: 'boolean' },
+					message: { type: 'string' },
+					logText: { type: 'string' },
+					sceneText: { type: 'string' },
+					bundlePath: { type: 'string' },
+					// 原始回执：形状随 action 变，不收窄。
+					details: {},
+				},
+				required: ['ok'],
+			},
+			render: (_args, value) => [{ type: 'text', text: renderText(value) }],
+		},
 		presentCall: (args) => ({
 			card: 'generic',
 			title: (args?.action ?? 'summary') === 'read'
