@@ -329,7 +329,14 @@ object LogCommandBridge {
 
         val notes = mutableListOf<String>()
         if (LogStore.throttledTotal > 0) {
-            notes += "已折叠 ${LogStore.throttledTotal} 条重复行 —— 不要据此断言「某错误从未发生」。"
+            // ⚠️ **必须限定「本次运行」** —— `throttledTotal` 是 `LogStore` 的进程内
+            //   计数器，进程一起来就是 0；而 `app.log` 是跨多次运行累积的。不限定的话
+            //   读者会把这个数当成「整个包 / 整份 app.log 被折叠的条数」，从而以为
+            //   日志被抽稀的程度就这么点。同一文件的 [doRead] 里那句话是有这个限定的
+            //   （「本次运行已折叠 …」），这里原来漏了，两句口径不一致。
+            notes += "本次运行已折叠 ${LogStore.throttledTotal} 条重复行（1 秒内同 tag 同内容超过 20 次）" +
+                "—— 不要据此断言「某错误从未发生」。⚠️ 这个数只覆盖本次运行；app.log 里" +
+                "更早的运行若也被折叠过，只会在其中留下「…被抑制 N 次」的行。"
         }
         if (pending > 0) {
             notes += "有 $pending 个诊断包等待上传（网络恢复或下次启动时自动重试）。"
