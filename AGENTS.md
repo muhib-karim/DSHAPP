@@ -4026,7 +4026,7 @@ ssh ... 'cat /workspace/dsh-logs/index.jsonl'
 只有 `manual` / `startup-retry` ⇒ 崩溃那条链路没生效（见上面 ③）。
 ⚠️ 判断「重复上传」看 `sha256` 是否相同（见 ②），不要只看条数。
 
-#### ⚠️ 两处「不是本 App 的错，但会被记成本 App 的错」的归因修正
+#### ⚠️ 三处「归因写错了」的修正（前两处不是本 App 的错，第三处是本 App 自己的）
 
 诊断包的 `environment.json` / `crashes/*.txt` 是排查的**唯一入口**。下面两条会让
 入口本身指向错误的方向 —— 不是功能坏了，是**归因错了**，代价是排查时间全花在
@@ -4132,6 +4132,44 @@ App 崩），把它从硬崩溃里摘出去会让 `crash-scenes` 漏报真实后
 现场文件 `writeScene` 把换行折叠成 `\n` 字面量（保住 `key: value` 逐行格式，栈全文仍在
 下方的 stack 段里完整保留），`app.log` 那条只取 `reason` 首行（下一行紧接着就是
 `stack`，否则同一条崩溃在 app.log 里会出现两遍、且这一行被撑成几百行）。
+
+**③ 崩溃现场「最后 200 行」的线程名曾经是读取者，不是写入者 —— 伪造了最关键那段证据。**
+
+前两条是别人的代码记错了归因，这一条是**本 App 自己**记错了：现场文件里
+`--- last 200 log lines ---` 那一段（类注释里写明「这是**最关键的一段**」）**每一行的
+线程名都是假的**。
+
+铁证是同一时间戳、同一 `#1` 在两份文件里的对比：
+
+```
+app.log（写入时定格）  ... [W] [Boot] #1 main 上次启动未正常结束（bootId=…）
+现场文件（读取时取）    ... [W] [Boot] #1 dsh-log-watchdog 上次启动未正常结束（bootId=…）
+```
+
+**根因**：`LogStore.Entry` 只有 `t/level/tag/msg/seq`，**没有线程名字段**；而
+`tail()` 是拿 `Entry` **重新**调 `format()` 渲染的，`format()` 里取的是
+`Thread.currentThread().name` —— 也就是**调用 `tail()` 的那个线程**（写现场的是
+`dsh-log-watchdog`），而不是当初写这条日志的线程。
+
+**为什么这条比其他两条更值得修**：现场第 3 段是全文件信息量最大的一段
+（「崩之前最后做的那件事」），而线程名是判断「**谁**卡住了 / 谁在刷屏」的**第一依据**。
+写成读取者，等于让分析者顺着一个从头到尾没参与过那些日志的线程去查 —— 方向和线索
+一起错。而且它**不会报错、不会告警**，只是静静地显示一个看似合理的线程名。
+
+**做法**：`Entry` 增加 `thread` 字段，在三个写入入口（`app`/`engine`/`web`）与
+`writeAppThrottleNote` 里用 `Thread.currentThread().name` **定格**，`tail()` 读该字段。
+顺带把 `logs` 工具（`LogCommandBridge`）与日志界面（`LogViewerActivity.formatRow`）的行
+格式补上线程名 —— 它们此前都不带，模型/用户只能靠正文猜是谁写的。
+`LogViewerActivity.crashEntries()` 里代表「现场文件」的合成行走 `thread = "-"`：
+那不是一条日志、没有写入线程，填 `Thread.currentThread().name` 会显示成 UI 线程，同属编造。
+
+⚠️ **判据是「两份文件里同一行必须逐字相同」**。真机验收（`0.2.9-tooliso (18) system`、
+`logs` 工具 `read` 动作）：`03:49:05.258 [I] [DSH] #76 main [web] [dsh-android-mobile]
+onUiReady…` 与 `app.log` 尾部逐字一致；`thread` 字段真实呈现为 `main` / `Thread-11` /
+`DefaultDispatcher-worker-3` / `dsh-engine-output` / `NsdManager` / `JavaBridge`。
+
+⚠️ **`Entry` 是 data class**，加字段会改掉 `copy()` / `componentN()` 的签名 ——
+编译期会全部报出来（这正是本轮能一次改完 5 处的依据），不会静默漏改。
 
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
