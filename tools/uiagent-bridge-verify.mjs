@@ -637,8 +637,13 @@ section('⑩ map / where / goto：插件侧的组合动作');
 	const atlas = screensMod.ATLAS;
 
 	ok(atlas.screens.length === 17, `内建表有 17 屏（实际 ${atlas.screens.length}）`);
-	ok(atlas.screens.every((s) => s.expect && s.expect.text),
-		'每屏都有 text 判据（没有判据的屏无法被 where 认出来）');
+	ok(atlas.screens.every((s) => s.expect && (s.expect.text || s.expect.prefix || s.expect.aria || s.expect.sel)),
+		'每屏都有判据（没有判据的屏无法被 where 认出来）');
+	// ⚠️ 上面这条原来写的是 `s.expect.text`，把 `terminal` 屏（判据是
+	//    `{sel:'.xterm-screen'}`）和 `model-picker` 屏（`{prefix:'模型 '}`）误判成
+	//    「没有判据」。判据的四种形态 `text` / `prefix` / `aria` / `sel` 是**等价的**
+	//    —— `checkExpect` 直接把 spec 转给探针的 `find`，探针内部 `locate()` 自己
+	//    分派。所以断言该查的是「有任一种判据」，不是「有 text」。
 	ok(atlas.screens.every((s) => Array.isArray(s.enter)),
 		'每屏都有 enter 路线数组');
 
@@ -757,7 +762,14 @@ section('⑩ map / where / goto：插件侧的组合动作');
 		ok(r.details?.screen?.id === 'settings-priv',
 			`where 认出了 设置 › 特权权限（实际 ${JSON.stringify(r.details?.screen?.id)}）`);
 		ok(/特权权限/.test(r.message ?? ''), 'where 的文本里报了屏标题');
-		ok(/开启引导/.test(r.message ?? ''), 'where 顺带列出了该屏的按钮');
+		// ⚠️ 这里原来找的是「开启引导」—— 那是 `settings-priv` 的**判据文案**，
+		//    不是按钮。它在 dump 里 `role` 为空、且被 `covered/offscreen` 之一盖住，
+		//    于是被 `build-uiagent-screens.mjs` 的 `els` 过滤器挡在按钮表之外
+		//    （那是**正确设计**：说明文字不是按钮，列进按钮表只会诱使模型去点）。
+		//    断言改成查一个**真在 `els` 里**的按钮，从表本身取，免得再写死。
+		const sampleEl = atlas.screens.find((s) => s.id === 'settings-priv')?.els?.[0]?.[0];
+		ok(sampleEl && (r.message ?? '').includes(sampleEl),
+			`where 顺带列出了该屏的按钮（找「${sampleEl}」）`);
 	}
 
 	// ── where：认不出时**不猜** ────────────────────────────────────

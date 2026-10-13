@@ -52,7 +52,7 @@ function (CMD) {
   'use strict';
 
   /** 探针版本。**改了本文件的语义就要 +1** —— 页面上的旧探针靠它判断要不要换。 */
-  var VERSION = 6;
+  var VERSION = 7;
 
   /** 结果里单个元素的文本/类名截断长度（防超大 JSON 撑爆 IPC）。 */
   var MAX_TEXT = 120;
@@ -622,6 +622,46 @@ function (CMD) {
   }
 
   /**
+   * 按**稳定前缀**找可交互元素 —— 「文案里嵌着会变的值」那类元素的唯一抓手。
+   *
+   * ⚠️ 存在的理由（真机实测的缺陷，不是锦上添花）：
+   *
+   * DSH 界面上有一类元素，文案是「**固定标签 + 当前值**」拼出来的：
+   *
+   *     模型 agnes-3.0-flash
+   *     推理等级 Default
+   *     访问模式，当前：完全权限
+   *     选择模型，当前 agnes-3.0-flash，推理等级 Default
+   *
+   * 它们**没有** `aria-label`（实测这几个都报 `text`），所以只能按文案找。
+   * 而按文案找的两条路都用不了：
+   *   · `text` 精确 —— 值一变整串就变（用户换个模型就永不命中）；
+   *   · `text` 子串 —— 「模型」会命中每屏都在的那句长文案（等于没判）。
+   *
+   * 唯一稳定的东西是**前缀**。所以这里按前缀匹配。
+   *
+   * ⚠️⚠️ **`want` 不能 `trim()`** —— 这是本函数与前两个定位函数的**唯一但要害**
+   *    的差别，删了就退化成子串匹配。
+   *    反例实测：判据想表达「以『模型 』开头」以区分
+   *        「模型 agnes-3.0-flash」（面板里那行）
+   *        「选择模型，当前 agnes-3.0-flash，…」（每屏都有的触发按钮）
+   *    靠的就是那个**尾空格**。`trim()` 会把它吃掉，两条就都命中了。
+   *    （`labelOf` 的结果本身是 `trunc()` 过的、首尾已无空白，所以只需不动 `want`。）
+   */
+  function byPrefix(text) {
+    if (text === undefined || text === null || text === '') return null;
+    var want = String(text).toLowerCase();
+    var found = toArray(document.querySelectorAll(INTERACTIVE));
+    for (var i = 0; i < found.length; i++) {
+      var el = found[i];
+      if (!isVisible(el)) continue;
+      var label = labelOf(el).toLowerCase();
+      if (label && label.indexOf(want) === 0) return el;
+    }
+    return null;
+  }
+
+  /**
    * 统一的元素定位。**顺序即优先级**：
    *
    * ① `ref`/`sel` —— 精确（`ref` 是上一次 `dump` 给的，见下面的解析）
@@ -652,6 +692,17 @@ function (CMD) {
         bySel('[title="' + want.replace(/"/g, '\\"') + '"]');
     }
     if (!el && spec.text) el = byText(spec.text, spec.exact === true);
+    // ⚠️ `prefix` 与 `text` 是**并列的两个入口**，不是包含关系 —— 差别在
+    //    「子串」与「以它开头」，以及 `prefix` **不吃尾空格**（`text` 会 trim）。
+    //    见 [byPrefix] 的注释：就是那个尾空格让「模型 agnes-3.0-flash」能与
+    //    每屏都有的「选择模型，当前 …」区分开。
+    //
+    //    位置说明：实际排在 `text` **之后**。两者语义上有重叠（前缀必是子串），
+    //    但 `prefix` 更严格 —— 理论上该先试严格的。这里不调换，是因为
+    //    **判据（`expect`）每次只给一个键**，两个分支不会同时命中，
+    //    顺序对结果没有影响；调换反而要重跑一遍全部真机回归。
+    //    （原先此处注释写成「排在 text 之前」，与代码不符，已改正。）
+    if (!el && spec.prefix !== undefined) el = byPrefix(spec.prefix);
     // ⚠️ `role` 是**最后**的兜底，不是首选。它存在的理由是官方 composer：
     //   那个输入框是个 `contenteditable` 的 div，`text` 取到的是**占位符**
     //   （「发消息或创建任务, / 调用指令, @ 文件或对话」），而占位符会随文案
@@ -1176,14 +1227,14 @@ function (CMD) {
 
     // ── key：按键 ──────────────────────────────────────────────────
     if (action === 'key') {
-      var kel = cmd.sel || cmd.text || cmd.aria || cmd.role ? locate(cmd) : null;
+      var kel = cmd.sel || cmd.text || cmd.prefix || cmd.aria || cmd.role ? locate(cmd) : null;
       var fired = pressKey(kel, String(cmd.key || 'Enter'), cmd);
       return ok({ dispatched: fired, target: kel ? describe(kel, 0) : null });
     }
 
     // ── scroll：滚动 ───────────────────────────────────────────────
     if (action === 'scroll') {
-      var anchor = cmd.sel || cmd.text || cmd.role ? locate(cmd) : null;
+      var anchor = cmd.sel || cmd.text || cmd.prefix || cmd.role ? locate(cmd) : null;
       var box = cmd.container ? bySel(cmd.container) : findScrollable(anchor);
       var dy = typeof cmd.dy === 'number' ? cmd.dy : 0;
       var dx = typeof cmd.dx === 'number' ? cmd.dx : 0;
@@ -1237,7 +1288,7 @@ function (CMD) {
 
     // ── wait：等条件成立（**单次检查**，重试由原生侧做）─────────────
     if (action === 'wait') {
-      var hit = cmd.sel || cmd.text || cmd.testid || cmd.aria || cmd.role ? locate(cmd) : null;
+      var hit = cmd.sel || cmd.text || cmd.prefix || cmd.testid || cmd.aria || cmd.role ? locate(cmd) : null;
       var needVisible = cmd.visible !== false;
       var satisfied = !!(hit && (!needVisible || isVisible(hit)));
       // ⚠️ 被遮挡的元素**不算「等到了」**：调用方等它出现是为了点它，而它现在

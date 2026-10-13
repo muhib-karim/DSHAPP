@@ -24,6 +24,34 @@
  * ⚠️ **光靠肉眼审不出来**（我这轮就先看漏了两处）：必须机械地对**全部元素**跑
  *    一遍探针的匹配语义。
  *
+ * ## 第五处（`access-mode`）—— 判据取的是「当前状态」
+ *
+ * 上面 4 处都是「看着独有、其实撞车」，第 5 处的成因不同，更隐蔽：
+ *
+ * | 屏 | 原判据 | 为什么撞车 |
+ * |---|---|---|
+ * | `access-mode` | `完全权限` | 它正是用户**当前的权限值**，于是 composer 那个常驻按钮的 aria 成了「访问模式，当前：完全权限」，`byText` 的子串兜底把它算进去 ⇒ **16 屏全中** |
+ *
+ * 修法不是换一个枚举项（换 `仅可查看` 只是把「当前值恰好是它」的概率降到更低，
+ * 没有消除依赖），而是加 **`exact: true`**：菜单项的 `text` 恰好等于枚举项，
+ * 而 composer 那个按钮的 `text` 永远是「访问模式，当前：<任意值>」长串，
+ * 精确相等**永远**不成立。判据从此与「用户当前选的是哪一档」彻底解耦。
+ *
+ * ## `sel` 判据：本脚本**审不了**，如实跳过
+ *
+ * `terminal` 屏的判据是 `{sel:'.xterm-screen'}`。这里**不判它合格与否**，原因是
+ * 本脚本只能看 JSON 里的元素表，而：
+ *
+ * 1. `dump` 只收 `INTERACTIVE` 候选集（button/a/input/[role]…），`.xterm-screen`
+ *    是**普通 `<div>`**，压根不在里面；
+ * 2. 就算在，JSON 里记的 `sel` 是**完整 cssPath**（`html>body>div:…`），
+ *    与 `.xterm-screen` 这种简短选择器永不相等。
+ *
+ * 原实现直接比 `e.sel === want`，于是恒报「命中 0」并把整轮审计**永远染红**——
+ * 红久了就没人看了，比少审一条更糟。所以这里改成**跳过并说明**，唯一性交给真机
+ * 实测（`tools/_diag17.mjs`：`right-sidebar` / `workfiles` 两屏 `.xterm-screen`
+ * 计数都是 **0**，只有 `terminal` 屏非 0 ⇒ 判据唯一）。
+ *
  * ## 与探针口径的一致性 —— 这是本脚本的要害
  *
  * 判据最终是交给探针的 `wait` / `tap` 去执行的，所以这里必须**逐条复刻**它的语义，
@@ -65,7 +93,8 @@ const gen = fs.readFileSync(GEN, 'utf8');
 function expectsFromGenerator() {
   const out = {};
   // 匹配 `id: 'xxx', ... expect: { text: 'yyy', exact: true, clickable: true },`
-  const re = /id: '([a-z-]+)',[\s\S]*?expect: \{ (text|aria|sel): '([^']+)'((?:, (?:exact|clickable): true)*) \}/g;
+  // ⚠️ `prefix` 也算——它是「文案里嵌着会变的值」那类元素的唯一抓手，见 [byPrefixLike]。
+  const re = /id: '([a-z-]+)',[\s\S]*?expect: \{ (text|aria|sel|prefix): '([^']+)'((?:, (?:exact|clickable): true)*) \}/g;
   for (const mm of gen.matchAll(re)) {
     const flags = mm[4] ?? '';
     out[mm[1]] = {
@@ -76,6 +105,15 @@ function expectsFromGenerator() {
     };
   }
   return out;
+}
+
+/** 复刻探针 `byPrefix`：只看**开头**，且**不 trim**（尾空格有语义，见探针注释）。 */
+function byPrefixLike(screen, want) {
+  const w = String(want).toLowerCase();
+  for (const e of screen.elements) {
+    if ((e.text || '').toLowerCase().indexOf(w) === 0) return e;
+  }
+  return null;
 }
 
 /** 复刻探针 `byText`：先精确、再子串。返回命中的元素或 null。 */
@@ -97,11 +135,26 @@ function hitsOf(spec) {
   for (const s of map.screens) {
     let el = null;
     if (spec.kind === 'text') el = byTextLike(s, spec.want, spec.exact);
+    else if (spec.kind === 'prefix') el = byPrefixLike(s, spec.want);
     else if (spec.kind === 'aria') el = s.elements.find((e) => e.text === spec.want) ?? null;
     else if (spec.kind === 'sel') {
-      // `sel` 判据在 dump 里没有等价字段（dump 不回落选择器匹配），
-      // 所以这里只能查「图谱里记的 sel 一模一样」，属于弱校验，单独标出来。
-      el = s.elements.find((e) => e.sel === spec.want) ?? null;
+      // ⚠️⚠️ **`sel` 判据离线审不了，只能标成「跳过」，不能标成「不合格」。**
+      //
+      //    原实现比的是 `e.sel === spec.want`，而 `e.sel` 是 dump 报出来的
+      //    **完整 cssPath**（`html>body>div:nth-of-type(3)>…`），与
+      //    `.xterm-screen` 这种简短选择器**永不相等** ⇒ 恒报「命中 0」。
+      //
+      //    更根本的是：`dump` 只收 `INTERACTIVE` 候选集（button/a/input/[role]…），
+      //    而 `terminal` 屏的 `.xterm-screen` 是一个**普通 `<div>`**，压根不在
+      //    候选集里 —— 就算把比较改成「子串」，离线也照样看不见它。
+      //
+      //    所以这里**如实标成跳过**，并把唯一性的判定权交回真机：
+      //    见 `tools/_diag17.mjs`（实测 `right-sidebar` / `workfiles` 两屏
+      //    `.xterm-screen` 计数都是 0，只有 `terminal` 屏非 0 ⇒ 判据唯一）。
+      //    把它算成「不合格」会让整个审计**永远红着**，红久了就没人看了 ——
+      //    那比少审一条更糟。
+      outs.push({ skipped: true, screen: s.id });
+      continue;
     }
     if (!el) continue;
     if (spec.clickable === true && (el.covered || el.offscreen)) continue;
@@ -123,12 +176,15 @@ for (const s of map.screens) {
     continue;
   }
   const hits = hitsOf(spec);
-  const ok = hits.length === 1 && hits[0] === s.id;
-  if (!ok) problems.push(`${s.id}: 判据「${spec.want}」在 ${hits.length} 屏成立（${hits.join(', ') || '一屏都不成立'}）`);
+  const skipped = hits.length > 0 && hits[0]?.skipped === true;
+  const names = skipped ? [] : hits;
+  const ok = skipped || (names.length === 1 && names[0] === s.id);
+  if (!ok) problems.push(`${s.id}: 判据「${spec.want}」在 ${names.length} 屏成立（${names.join(', ') || '一屏都不成立'}）`);
 
   const flag = `[${spec.kind}${spec.exact ? '+exact' : ''}${spec.clickable ? '+clickable' : ''}]`;
   console.log(`  ${ok ? '✅' : '⚠️'} ${s.id.padEnd(18)} ${flag.padEnd(18)} `
-    + `${JSON.stringify(spec.want).slice(0, 40).padEnd(42)} 命中 ${hits.length}: ${hits.join(' ') || '无'}`);
+    + `${JSON.stringify(spec.want).slice(0, 40).padEnd(42)} `
+    + (skipped ? '跳过（sel 判据离线审不了，见 hitsOf 注释）' : `命中 ${names.length}: ${names.join(' ') || '无'}`));
 }
 
 console.log('');
