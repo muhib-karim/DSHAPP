@@ -4213,6 +4213,41 @@ onUiReady…` 与 `app.log` 尾部逐字一致；`thread` 字段真实呈现为 
 诊断包 crash-scenes = 有 2 份非崩溃现场（engine-exit×1, engine-start-failed×1），详见 crashes/
 ```
 
+### ⑫.7 ⚠️ 第五处：**文档/签名承诺了实现里不存在的保证**（同一次对抗式审查查出 3 个副本）
+
+第四处是「给结论的地方举例子」；这一处是**给保护的地方说空话** —— 代码能跑、
+不报错、单测全过，但**它承诺的性质根本不存在**。比第四处更危险：第四处会让分析者
+查错方向，这一处会让分析者**以为某类故障已被防住而不再查**。
+
+| 副本 | 位置 | 承诺 | 实际 |
+|---|---|---|---|
+| ① | `LogStore.enforceDirQuota(d, quota, skipDirs)` | 参数 `skipDirs` 让调用方指定豁免目录 | 函数体**从没用过它**，只靠 `it.isFile` 兜住子目录。已删参数 |
+| ② | `DiagnosticBundle.writeEntry` 的 KDoc | 「单个条目超预算就**整个跳过**并在 completeness 里记一笔」 | 签名里**既没有 `budget` 也没有 `completeness`**，函数体无条件写入 |
+| ③ | `LogUploader.bumpAttempts` | 失败返回 0 ⇒ 配合 `attempts >= MAX_ATTEMPTS` 触发 `failed/` | `0 >= 3` **恒假**，`MAX_ATTEMPTS` 与 `failed/` 永不生效；而 `.attempts` 写不进去的典型原因正是**磁盘满** —— 最需要它生效时恰好失效 |
+
+还有一个同族的**静默吞异常**副本（性质相同：承诺"丢不了"，实际丢了不吭声）：
+
+| 副本 | 位置 | 问题 |
+|---|---|---|
+| ④ | `DiagnosticBundle.writeCrashes` | 裸 `runCatching {}` 无 `onFailure`；只记成功数不记总数 ⇒「本来只有 2 份」与「3 份里 1 份读失败」在产物上**完全一样** |
+| ⑤ | `LogUploader.retryPending` | `uploading` 被占用时 `return`（而非 `continue`）⇒ 静默放弃整批，一行日志都没有，调用方看起来像"传完了" |
+
+⚠️ **判据（写 KDoc 时就地问一句）**：这句话所说的事，**这个函数的签名与函数体里有没有对应的代码**？
+没有就删掉承诺或补上实现，**不能留着**。①的教训是删参数而不是补实现（该保护另有机制）。
+
+⚠️ **同族判据（静默失败）**：每个 `runCatching` / 每个提前 `return`，都要能回答
+「失败/放弃时，**谁会知道**？」。答案是"没人"就是缺陷 —— 崩溃现场漏一份、
+整批补传不作声，都是分析者最需要信号时恰好没有信号。
+
+⚠️ **已修**（`ab9d413`，8 条对抗式发现；基线 `e0ea1fb`）。每条都独立复现过判据：
+`BootState` 的 clean 分支时刻用数值断言（clean 场景修复前 1000 / 修复后 5000）；
+`kindOf` 与 `substringAfterLast('-')` 对 4 个类别名逐一比对，
+`engine-start-failed`→`failed`、`engine-exit`→`exit` 均不同（时间戳自己也含 `-`）。
+
+**真机验收**（`0.2.9-tooliso (18) system`、种入 `startedAt=05:00` / `lastExit.at=05:30`
+的 clean 状态）：重启后 summary 报「上次正常退出（**05:30:00**.000）」，修复前会报 05:00:00。
+25 份现场导出诊断包 → `totalOnDevice=20` / `included=20` / 包内 `crashes/` 20 条，三个数一致。
+
 ### ⑬ 「添加插件」对话框少了「npm 官方源」—— 不是漏配，是被去重合并掉了
 
 **症状**：手机端对话框的「安装源」下拉只有**一项**（中国大陆镜像源）+ 自定义地址，
