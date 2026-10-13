@@ -62,6 +62,15 @@ object DiagnosticBundle {
      */
     private const val MAX_STARTUP_LOGS = 5
 
+    /**
+     * 读崩溃现场的 `bootId:` 时最多看几行。
+     *
+     * 格式见 [CrashRecorder.writeScene]：`time:` / `kind:` / `bootId:` 三行，
+     * 所以第 3 行就该命中。给到 8 行是留余量（万一将来头部加了字段），
+     * 同时避免为了一个 id 把整个现场文件（真机实测最大 28 KB）读进内存。
+     */
+    private const val HEADER_LINES_FOR_BOOT_ID = 8
+
     private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val fileFmt = SafeDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
@@ -650,6 +659,37 @@ object DiagnosticBundle {
      */
     private fun sceneKindSummary(scenes: List<File>): String = CrashRecorder.summarizeKinds(scenes)
 
+    /**
+     * 读一份崩溃现场里的 `bootId:`，用来判断它属于哪一次启动。
+     *
+     * ## 为什么要读文件
+     *
+     * 现场文件是**跨运行累积**的，只看「有没有这类文件」分不清「现在还是坏的」
+     * 与「早就修好了」。而每份现场里 `[CrashRecorder.writeScene]` 都写了
+     * `bootId:`（第 3 行，紧跟 `time:`/`kind:`），拿它与
+     * `BootState.previous().bootId` 对齐，就能确定「最近一次启动是否失败」。
+     *
+     * ⚠️ **只读头部若干行，不整份读**：现场文件里带着最后 200 行日志，
+     *   真机实测单份可达 28 KB；而这个字段在第 3 行。用 `bufferedReader`
+     *   逐行找、找到就停，避免为了一个 id 把几十 KB 读进内存 —— 这段代码
+     *   跑在**崩溃路径与导出路径**上（铁律①：那里不做无谓的重活）。
+     *
+     * ⚠️ 读不到就返回 `null`，**不编一个**：`null` 在比较时天然不等于任何
+     *   真实 bootId，于是「读不出来」不会被误判成「最近一次启动失败了」。
+     *   反过来编一个占位符则可能撞上真值（本缺陷族的典型形态）。
+     */
+    private fun sceneBootId(f: File): String? = runCatching {
+        f.bufferedReader().use { r ->
+            repeat(HEADER_LINES_FOR_BOOT_ID) {
+                val line = r.readLine() ?: return@use null
+                if (line.startsWith("bootId:")) {
+                    return@use line.substring("bootId:".length).trim().ifEmpty { null }
+                }
+            }
+            null
+        }
+    }.getOrNull()
+
     private fun runChecks(logDir: File, extra: List<Check>): JSONObject {
         val checks = mutableListOf<Check>()
 
@@ -670,11 +710,55 @@ object DiagnosticBundle {
         }
 
         // ② 崩溃现场
+        //
+        // ## 🔴 为什么「引擎起不来」必须单独判 fail（2026-10-14 自检发现，同族第 26 例）
+        //
+        // `engine-start-failed` 刻意**不算** hard crash（见 [CrashRecorder.isHardCrash]
+        // 的论证：它没崩溃过，算进去会让「崩溃现场」这个计数失去意义）—— 那个论证
+        // 成立，本处不改它。
+        //
+        // 但由此产生了一个后果：**App 完全打不开**这件事，在 6 个检查里
+        // **没有任何一个**判 fail。`EngineManager` 自己的注释写着它是
+        // 「本 App 最严重的一类故障（界面直接不可用）」，而诊断包给出的是
+        // `fail: 0` + headline「发现 N 项需要注意的情况」。
+        //
+        // 真机实测（服务器 40 个含 `engine-start-failed` 的包）：**14 个**是
+        // `fail=0`。最典型的一台是 Xiaomi 24122RKC7C / Android 16：用户装了 40 个
+        // 第三方插件，引擎核心插件 `typert-loader` 被拖挂 ⇒ 连续 2 次启动失败 ⇒
+        // **App 打不开**；而它导出的诊断包写的是「发现 2 项需要注意的情况」、
+        // `crash-scenes: warn`、「有 2 份**非崩溃**现场」。分析者据此会跳过它。
+        //
+        // ## 判据必须按 bootId 对齐，不能是「有现场就报 fail」
+        //
+        // 现场文件是**跨运行累积**的（`crash/` 不随启动清空，只按配额淘汰），
+        // 所以「存在 `engine-start-failed` 文件」只说明**历史上**发生过。
+        // 实测这 40 个包里 **9 个**含超过 1 小时的旧现场、最旧 7.8 小时 ——
+        // 一有现场就报 fail，会把「早就修好了」说成「现在还是坏的」，
+        // 那正是本缺陷族的另一种形态（拿一个总体/时刻的结论去描述另一个）。
+        //
+        // 正确判据：**「最近一次启动」是否产出过 `engine-start-failed` 现场**。
+        // 对齐链已经现成：
+        //   - 每份现场里都写着 `bootId:`（[CrashRecorder.writeScene] 写的）；
+        //   - `BootState.previous().bootId` 给出「上一次启动」的 id。
+        // 两者相等 ⇒ 那次启动的引擎没起来 ⇒ 用户此刻面对的就是「打不开」。
+        //
+        // ⚠️ 现场里的 bootId **永远不会**等于 `BootState.bootId`（本次启动）：
+        //   失败发生在**上一次**启动里，而诊断包是在用户重开 App 之后才导出的。
+        //   真机核对过 40 个包，无一例外。所以只能跟 `previous()` 比。
         runCatching {
             val scenes = CrashRecorder.listScenes()
             val hard = scenes.count { CrashRecorder.isHardCrash(it) }
+            val startFailed = scenes.filter { CrashRecorder.kindOf(it) == "engine-start-failed" }
+            val prevBoot = runCatching { BootState.previous().bootId }.getOrNull()
+            val latestFailed = startFailed.filter { sceneBootId(it) == prevBoot }
             checks.add(
                 when {
+                    // 「最近一次启动的引擎起不来」= 界面直接不可用 ⇒ 必须 fail。
+                    latestFailed.isNotEmpty() -> Check(
+                        "crash-scenes", "fail",
+                        "最近一次启动的引擎**没能起来**（界面打不开）：${latestFailed.size} 份 " +
+                            "engine-start-failed 现场属于该次启动，详见 crashes/",
+                    )
                     scenes.isEmpty() -> Check("crash-scenes", "ok", "没有崩溃现场文件")
                     hard > 0 -> Check("crash-scenes", "fail", "有 $hard 份崩溃现场（共 ${scenes.size} 份），详见 crashes/")
                     // ⚠️ **必须列出实际类别，不能举例子。** 原来这里写的是
@@ -684,9 +768,19 @@ object DiagnosticBundle {
                     //   `EngineManager` 自己注释成「本 App 最严重的一类故障」的事，
                     //   报告成了「引擎正常退出等」—— 分析者据此会直接跳过它。
                     //   例子是猜测，类别是事实；这里只报事实。
+                    //
+                    // ⚠️ 走到这一支时 `engine-start-failed` 只可能是**历史**的
+                    //   （最近一次启动没失败），所以文案必须把「何时」说清楚，
+                    //   否则又会把历史说成当前。
                     else -> Check(
                         "crash-scenes", "warn",
-                        "有 ${scenes.size} 份非崩溃现场（${sceneKindSummary(scenes)}），详见 crashes/",
+                        if (startFailed.isEmpty()) {
+                            "有 ${scenes.size} 份非崩溃现场（${sceneKindSummary(scenes)}），详见 crashes/"
+                        } else {
+                            "有 ${scenes.size} 份非崩溃现场（${sceneKindSummary(scenes)}），" +
+                                "其中 engine-start-failed×${startFailed.size} 属于**更早的启动**" +
+                                "（最近一次启动的引擎起来了），详见 crashes/"
+                        },
                     )
                 },
             )
