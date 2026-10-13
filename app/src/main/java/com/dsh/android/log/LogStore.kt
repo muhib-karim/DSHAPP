@@ -741,7 +741,15 @@ object LogStore {
             //   靠「worker 下一行会轮转」兜底：如果此后**再没有新行**（打包完就退出、
             //   或引擎安静了），文件就永远停在超限状态，而 `engine.log` 恰好是
             //   唯一不受 `enforceDirQuota` 管的那两个之一（见 [rotateAsync]）。
-            var rotateTarget: QueuedLine.Target? = null
+            //
+            // ⚠️ **必须收成一个集合，不能只留最后一个。** 第一版用单个
+            //   `var rotateTarget: Target?`，超限时 `rotateTarget = item.target` ——
+            //   两路**同时**超限时前者会被后者覆盖。而下面注释原本写着「下一轮再处理
+            //   另一路」，这句是不成立的：下一轮是 worker 取下一条消息，它只看**那一条**
+            //   的目标；若此后不再有 ENGINE 的新行（引擎安静了），`engine.log` 就永远
+            //   停在超限状态 —— 而它恰好是唯一不受 `enforceDirQuota` 管的两个之一。
+            //   这与本方法要解决的正是同一个问题，不能留这个缺口。
+            val rotateTargets = mutableSetOf<QueuedLine.Target>()
             lock.withLock {
                 // ① 排干队列：直接自己写，不等 worker 调度。
                 while (true) {
@@ -752,14 +760,14 @@ object LogStore {
                         QueuedLine.Target.WEB ->
                             writeAsync(webWriterOf(), item.line, { n -> webBytes = n }, { webBytes })
                     }
-                    if (need) rotateTarget = item.target
+                    if (need) rotateTargets.add(item.target)
                 }
                 // ② 再 flush 已经攒在 BufferedWriter 里的。
                 engineWriter?.flush()
                 webWriter?.flush()
             }
-            // ③ 锁外轮转（只可能有一路超限；两路同时超限时下一轮再处理另一路）。
-            rotateTarget?.let { rotateAsync(it) }
+            // ③ 锁外轮转（两路都可能超限，逐路处理）。
+            rotateTargets.forEach { rotateAsync(it) }
         } catch (_: Throwable) {
         }
     }
