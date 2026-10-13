@@ -343,6 +343,16 @@ object BootState {
         val clean: Boolean,
         val consecutiveUncleanCount: Int,
         val bootId: String?,
+        /**
+         * ⚠️ **这个字段有两种语义，取决于 [clean]**，不是「上次结束的时刻」：
+         *
+         * - `clean == true`（走 [markCleanExit]）⇒ **退出时刻**
+         * - `clean == false`（走 [begin]，从上次的 `startedAt` 抄来）⇒ **上次启动的时刻**
+         *
+         * 非正常结束时**根本不知道进程是什么时候没的**（被杀/断电没有回调），
+         * 所以只能退而给出「它是什么时候起来的」。把两者混为一谈会让分析者拿
+         * 一个启动时刻去日志里找崩溃，找到的是启动那一行 —— 见 [describe]。
+         */
         val startedAt: Long,
     ) {
         /** 上次非正常结束。⚠️ **不等于崩溃**，见类注释的诚实分级。 */
@@ -354,9 +364,15 @@ object BootState {
         /** 给界面的一句话（中文）。 */
         fun describe(): String = when {
             !known -> "首次启动，无历史记录"
+            // 这一支的 startedAt 是**退出时刻**（markCleanExit 写的），说「退出」是对的。
             clean -> "上次正常退出（${fmt.format(Date(startedAt))}）"
             unstable -> "连续 $consecutiveUncleanCount 次未正常结束，建议查看日志"
-            else -> "上次未正常结束（${fmt.format(Date(startedAt))}，无堆栈）"
+            // ⚠️ **必须说成「上次启动于」**：这一支的 startedAt 是上次**启动**的时刻。
+            //   原来写「上次未正常结束（<时刻>，无堆栈）」，读者会把它当成故障发生
+            //   的时刻，去日志里按这个时间去对齐 —— 而它其实是启动那一行的时间。
+            //   真机实测：lastExit.at = 04:04:44.898（上次启动），而本次启动是
+            //   04:07:01.997，真正的消失发生在两者之间，日志里根本没有那个时刻。
+            else -> "上次未正常结束（上次启动于 ${fmt.format(Date(startedAt))}，无堆栈）"
         }
     }
 
