@@ -1252,6 +1252,25 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 从引擎打印的 URL 里取出端口号，取不到给空串。
+     *
+     * ⚠️ **不能写成 `url.substringAfter(":").substringBefore("/")`**（踩过，真机全中）：
+     *   `substringAfter(":")` 命中的是 `http:` 里那个冒号，于是对
+     *   `http://127.0.0.1:3080/?token=...` 得到 `//127.0.0.1:3080/?token=...`，
+     *   再 `substringBefore("/")` 就是**空串**。实测 53 份诊断包的时间线里
+     *   `engine.ready` 的 `port` 字段**无一例外都是空**，等于白记了一个字段。
+     *
+     *   后果很具体：「端口撞车」这条分支（3080 空闲就沿用默认值 / 被占用就改由
+     *   内核分配空闲端口）在时间线上无法区分，只能去翻 app.log 正文。
+     *   而端口撞车恰恰是「引擎起不来」的一大类原因（EADDRINUSE → webserver
+     *   激活失败 → 必需插件缺失 → 引擎退出）。
+     *
+     * 用正则抓 `:<端口>` 而不是按 `:` 切分，天然躲开协议名的冒号。
+     */
+    private fun portOf(url: String): String =
+        Regex(""":(\d{2,5})(?:[/?]|$)""").find(url)?.groupValues?.get(1) ?: ""
+
+    /**
      * 修掉 `$DSH_HOME/.credentials.yaml` 过宽的权限位（`0600` 之外的组/其他位）。
      *
      * **症状（致命）**：引擎**起不来**，界面上是「引擎启动失败（引擎进程已退出）」，
@@ -5084,7 +5103,7 @@ class EngineManager private constructor(private val context: Context) {
             //   用户说「卡」，我们只能猜是引擎慢、解包慢还是网络慢。
             EventLog.record(
                 "engine.ready",
-                mapOf("ms" to (System.currentTimeMillis() - startMs).toString(), "port" to url.substringAfter(":").substringBefore("/")),
+                mapOf("ms" to (System.currentTimeMillis() - startMs).toString(), "port" to portOf(url)),
             )
         } else {
             val tail = synchronized(logLines) { logLines.joinToString("\n") }
