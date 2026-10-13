@@ -205,6 +205,8 @@ object EventLog {
 
     /**
      * 时间线的一行人类可读摘要。日志界面与诊断包的 `summary` 用。
+     *
+     * ⚠️ **单条调用时看不出运行边界** —— 需要铺开一串事件时用 [describeAll]。
      */
     fun describe(o: JSONObject): String {
         val elapsed = o.optLong("elapsedMs", 0L)
@@ -214,6 +216,64 @@ object EventLog {
             fields.keys().asSequence().joinToString(" ") { "$it=${fields.optString(it)}" }
         return "[+${elapsed}ms] $name ${detail}".trim()
     }
+
+    /**
+     * 把一串事件铺成人类可读摘要，**并在运行边界处插分隔标记**。
+     *
+     * ## 🔴 为什么必须补这一处（2026-10-14 自检发现，同族第 25 例）
+     *
+     * `elapsedMs` 是**相对本次启动**的耗时（[record] 里取 `BootState.uptimeMs()`），
+     * 而 [readAll] 读的是 `events.jsonl` **全量** —— 它跨运行累积，从不按启动切分。
+     * 于是「取尾部若干条」这种做法一旦跨过运行边界，`[+Nms]` 就会在中途**突然变小**，
+     * 而输出里没有任何东西提示「这里换了一次运行」。
+     *
+     * 后果是读的人会把多次运行**当成一次**：真机上 `termux.done` 在一个包里出现
+     * **29 次**，第一眼就是「一次运行里引导了 29 遍」—— 而实际是这台设备启动过
+     * 29 次、每次引导一遍（完全正常）。这个误判我自己就犯过，并且据此把它当成了
+     * 一个待查缺陷。
+     *
+     * 真机实测（服务器 77 个包、209 份崩溃现场）：**171 份（82%）** 的
+     * `--- recent events ---` 段跨运行边界，**全部无标记**。
+     *
+     * `bootId` 每条事件都记着（见 [record]），这里只需把它取出来。前缀取短形式
+     * （`b-…f094`）而不是完整值：完整 bootId 是 `b-1791931838773-f094` 这种 21 字符，
+     * 20 行都带会把表格挤歪；而这一段里只需要「跟上一行是不是同一次运行」这一个
+     * 信息，末 4 位足够区分。
+     *
+     * ⚠️ **只在边界处打印**，不是每行都打 —— 否则 20 行里重复 20 次同一前缀，
+     * 噪音盖过内容。边界标记就该出现在边界上。
+     *
+     * @param events 已按时间顺序排好的事件（通常是 [readAll] 的尾部若干条）。
+     */
+    fun describeAll(events: List<JSONObject>): String {
+        if (events.isEmpty()) return ""
+        val sb = StringBuilder()
+        var prevBoot: String? = null
+        for (e in events) {
+            val boot = e.optString("bootId", "")
+            if (boot != prevBoot) {
+                if (prevBoot == null) {
+                    sb.append("── 运行 ").append(shortBootId(boot)).append(" ──\n")
+                } else {
+                    sb.append("── 运行边界：以上属于 ").append(shortBootId(prevBoot))
+                        .append("，以下属于 ").append(shortBootId(boot))
+                        .append("（elapsedMs 各自从 0 重新计）──\n")
+                }
+                prevBoot = boot
+            }
+            sb.append(describe(e)).append('\n')
+        }
+        return sb.toString()
+    }
+
+    /**
+     * `b-1791931838773-f094` → `b-…f094`。
+     *
+     * ⚠️ 空值时**原样返回空串**，不编一个占位符 —— 编出来的东西会被当成真实
+     * 标识读（本族缺陷的典型形态）。
+     */
+    private fun shortBootId(bootId: String): String =
+        if (bootId.length <= 6) bootId else "b-…" + bootId.takeLast(4)
 
     /**
      * 文件被外部删掉后重开（[LogStore.clearAll] 删了 `events.jsonl` 时调用）。

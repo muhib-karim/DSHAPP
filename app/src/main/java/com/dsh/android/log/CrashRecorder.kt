@@ -449,7 +449,19 @@ object CrashRecorder {
             runCatching {
                 val d = crashDir?.parentFile ?: LogContext.filesDirOrNull()?.let { File(it, DshApplication.LOG_DIR) }
                 if (d != null) {
-                    EventLog.readAll(d).takeLast(20).forEach { sb.append(EventLog.describe(it)).append('\n') }
+                    // ⚠️ **用 `describeAll` 而不是逐条 `describe`**（2026-10-14 自检发现，
+                    //   同族第 25 例）。`EventLog.readAll` 读的是 `events.jsonl` 全量，
+                    //   它**跨运行累积**；`takeLast(20)` 一旦跨过运行边界，`[+Nms]`
+                    //   就会在中途突然变小，而逐条 `describe` 不会提示这一点 ——
+                    //   读的人会把多次运行当成一次。
+                    //
+                    //   真机实测（服务器 209 份现场）：**171 份（82%）** 跨运行边界。
+                    //   最典型的是 `termux.done` 在一个现场里出现多次，看起来像
+                    //   「一次运行里引导了好几遍」，实际是设备启动过好几次、每次一遍。
+                    //
+                    //   `describeAll` 在边界处插一行 `── 运行边界：… ──`，把这件事
+                    //   写成显式事实。分段本身仍由 bootId 决定（每条事件都记着）。
+                    sb.append(EventLog.describeAll(EventLog.readAll(d).takeLast(20)))
                 } else {
                     sb.append("(取不到日志目录：LogContext 未安装，事件时间线不可读)\n")
                 }
