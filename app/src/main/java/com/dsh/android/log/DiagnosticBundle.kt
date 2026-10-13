@@ -55,6 +55,13 @@ object DiagnosticBundle {
     /** 诊断包体积上限。超过就按优先级丢内容，见 [build]。 */
     private const val MAX_BUNDLE_BYTES = 8L * 1024L * 1024L
 
+    /**
+     * 最多收几份引擎启动诊断（`startup-*.log`）。
+     *
+     * 引擎每次启动失败写一份，攒久了上百份；最近 5 份足以覆盖「最近为什么起不来」。
+     */
+    private const val MAX_STARTUP_LOGS = 5
+
     private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val fileFmt = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
@@ -135,6 +142,9 @@ object DiagnosticBundle {
                 budget -= writeLogFile(zos, logDir, LogStore.ENGINE_LOG, budget, entriesWritten, completeness)
                 budget -= writeLogFile(zos, logDir, "${LogStore.APP_LOG}.1", budget, entriesWritten, completeness)
                 budget -= writeLogFile(zos, logDir, LogStore.APP_LOG, budget, entriesWritten, completeness)
+
+                // ── ④.5 引擎自己写的启动诊断 ──
+                budget -= writeEngineStartupLogs(zos, entriesWritten, completeness)
 
                 // ── ⑤ manifest 最后写（此时才知道完整情况）──
                 val manifest = JSONObject().apply {
@@ -242,9 +252,89 @@ object DiagnosticBundle {
                 recordRange(completeness, name, f, truncated = true)
                 0L
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            // ⚠️ **不能静默吞**（原来是 `catch (_: Throwable) { 0L }`）：那样这个
+            //   日志文件会**从包里消失且 completeness 里一个字都没有**，
+            //   分析者看到的现象与「这个文件本来就不存在」完全一样 ——
+            //   又是一次「包在骗人」。现在把异常类型记进 completeness。
+            completeness.put("${name}_failed", "读取失败: ${t.javaClass.simpleName}: ${t.message}")
             0L
         }
+    }
+
+    /**
+     * 收**引擎自己写的**启动诊断（`$DSH_HOME/logs/startup-*.log`）。
+     *
+     * ## 🔴 为什么必须收：这是「引擎起不来」唯一的一手证据
+     *
+     * 引擎启动失败时，它自己在 stderr 最后一行打出：
+     *
+     * ```
+     * [engine] Full diagnostics: <$DSH_HOME>/logs/startup-2026-10-13T15-51-43.032Z-<uuid>.log
+     * ```
+     *
+     * 那份文件里是引擎的**完整**自检（哪些插件激活了、哪些在等哪个服务、
+     * 哪个 provider 注册失败）。而我们包里的 `engine.log` 只有 stdout/stderr
+     * 的**前若干行**，恰好在那行 `Full diagnostics` 之后就断了 ——
+     * 也就是说 80 场 `engine-start-failed` 里，**决定性的那份文件从来没被收进来过**。
+     *
+     * ## 为什么要单独写，不能复用 [writeLogFile]
+     *
+     * [writeLogFile] 的入参是 `logDir` 下的固定文件名；而这一批在**另一个目录**
+     * （`$DSH_HOME/logs`，不是 `logsDir`），文件名还带时间戳与 uuid。
+     *
+     * ## 只收最近 N 份
+     *
+     * 引擎**每次启动失败**都写一份，攒久了会有几百份。收最近 [MAX_STARTUP_LOGS]
+     * 份即可覆盖「最近几次为什么起不来」，再多只是让包变大。
+     * 按 mtime 倒序取，并在 `completeness` 里如实记下「一共几份、收了几份」——
+     * 不能让分析者以为「包里只有 3 份 = 只失败过 3 次」。
+     */
+    private fun writeEngineStartupLogs(
+        zos: ZipOutputStream,
+        written: MutableList<String>,
+        completeness: JSONObject,
+    ): Long {
+        val ctx = LogContext.get()
+        if (ctx == null) {
+            completeness.put("engineStartupLogs_absent", "LogContext 未装，取不到 filesDir")
+            return 0L
+        }
+        val dir = File(ctx.filesDir, "home/.dsh/logs")
+        if (!dir.isDirectory) {
+            completeness.put("engineStartupLogs_absent", "目录不存在（引擎从未写过启动诊断）")
+            return 0L
+        }
+        val all = dir.listFiles { f: File -> f.isFile && f.name.startsWith("startup-") }
+            ?.sortedByDescending { it.lastModified() }
+            ?: emptyList()
+        if (all.isEmpty()) {
+            completeness.put("engineStartupLogs_empty", "目录存在但没有任何 startup-*.log")
+            return 0L
+        }
+
+        val picked = all.take(MAX_STARTUP_LOGS)
+        var total = 0L
+        var n = 0
+        for (f in picked) {
+            runCatching {
+                val entryName = "engine-startup/${f.name}"
+                zos.putNextEntry(ZipEntry(entryName))
+                f.inputStream().use { it.copyTo(zos) }
+                zos.closeEntry()
+                written.add(entryName)
+                total += f.length()
+                n++
+            }
+        }
+        // ⚠️ 两个数都要记：只记「收了几份」会让「一共失败过 200 次」看起来像 3 次。
+        completeness.put("engineStartupLogs", JSONObject().apply {
+            put("totalOnDevice", all.size)
+            put("included", n)
+            put("newest", fmt.format(Date(picked.first().lastModified())))
+            put("oldestIncluded", fmt.format(Date(picked.last().lastModified())))
+        })
+        return total
     }
 
     /**

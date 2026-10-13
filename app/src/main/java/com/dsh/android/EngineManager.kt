@@ -5107,14 +5107,38 @@ class EngineManager private constructor(private val context: Context) {
             )
         } else {
             val tail = synchronized(logLines) { logLines.joinToString("\n") }
-            val reason = if (proc.isAlive) "超时未打印 URL" else "引擎进程已退出"
+            // ⚠️ **判据是「等满了没有」，不是「进程还活着没有」。**
+            //
+            // 这里原来写 `if (proc.isAlive) "超时未打印 URL" else "引擎进程已退出"`，
+            // 是**错的**，会把最常见的一种情况报成「超时」：
+            //
+            // `readyLatch` 除了「正则匹配到 URL」之外，还在读 stdout 那条线程的
+            // `finally` 里被 countDown（见上面 `流关闭（引擎退出）时也要唤醒等待方`）。
+            // 于是引擎一退出，`await` **立刻**返回，而此刻 `proc.isAlive` 往往还是
+            // true（`Process.isAlive` 要等子进程被 reap 之后才翻假）。结果：
+            // 引擎明明**刚启动就死了**，界面却写「超时未打印 URL」——
+            // 把「启动即崩」误导成「起得慢」，排查方向直接带偏。
+            //
+            // 真机证据（53 个诊断包、80 场 engine-start-failed）：`READY_TIMEOUT_MS`
+            // 是 120_000，而全部 9 场「超时未打印 URL」的实际等待只有
+            // **6873 / 6911 / 6911 / 6911 / 7356 / 8009 / 10699 ms** ——
+            // 没有一场等满过 120 秒，所以它们**全都不是超时**。
+            //
+            // 改判据后文案才与事实一致，并且把等待时长一并写进原因里
+            // （原来只有崩溃现场文件里才有，日志行里看不到）。
+            val waited = System.currentTimeMillis() - startMs
+            val reason = if (waited >= READY_TIMEOUT_MS) {
+                "等待 ${waited / 1000} 秒仍未打印 URL（确为超时）"
+            } else {
+                "引擎进程在打印 URL 之前就结束了（等了 ${waited} ms）"
+            }
             _state.value = State.Failed("引擎启动失败（$reason）。最后输出:\n$tail")
             // ⚠️ 「引擎起不来」是本 App 最严重的一类故障（界面直接不可用），
             //   所以要写**崩溃现场文件**而不只是日志行：现场文件里带着
             //   最后 200 行日志与设备快照，用户点「导出日志」就能一次性带走。
             CrashRecorder.recordAnomaly(
                 "engine-start-failed",
-                "引擎启动失败（$reason），已等 ${System.currentTimeMillis() - startMs} ms",
+                "引擎启动失败（$reason），已等 $waited ms",
                 'E',
             )
             EventLog.record("engine.failed", mapOf("reason" to reason))
