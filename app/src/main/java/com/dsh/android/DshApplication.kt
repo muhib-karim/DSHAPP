@@ -2,6 +2,7 @@ package com.dsh.android
 
 import android.app.Application
 import android.content.Context
+import android.os.Build
 import com.dsh.android.log.BootState
 import com.dsh.android.log.CrashRecorder
 import com.dsh.android.log.DshLog
@@ -49,6 +50,11 @@ class DshApplication : Application() {
      */
     override fun attachBaseContext(base: Context?) {
         super.attachBaseContext(base)
+        // ⚠️ 非主进程直接返回，一行日志系统都不装 —— 理由见 [isMainProcess]。
+        if (!isMainProcess(base)) {
+            android.util.Log.i(TAG, "非主进程启动，跳过日志系统与 Termux 引导")
+            return
+        }
         try {
             val ctx = base ?: return
             LogContext.install(ctx)
@@ -79,6 +85,7 @@ class DshApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        if (!isMainProcess(this)) return
         instance = this
         DshLog.i(TAG, "DSH application created")
         EventLog.record("app.onCreate")
@@ -162,6 +169,48 @@ class DshApplication : Application() {
 
     companion object {
         const val TAG = "DSH"
+
+        /**
+         * 本进程是不是**主进程**。
+         *
+         * ## 🔴 为什么必须判：gecko 版有 39 个子进程，全都跑过 Application
+         *
+         * `geckoview-arm64-v8a` 的 AAR 声明了 **39 个 `android:process` 子进程**
+         * （`:tab0`…`:tab39`、`:gpu`、`:media`、`:socket`、`:crashhelper` …）。
+         * 每个子进程都会实例化本类，于是 `attachBaseContext` 与 `onCreate` 各跑一遍 ——
+         * 也就是说**每个子进程都会**：
+         *
+         * - 初始化日志系统（多个进程**同时写同一个 `app.log`**，行内容交错）；
+         * - 跑 `BootState.begin()`（把 `clean=false` 写进去 → 别的进程读到就以为
+         *   「上次没正常退出」，`boot.previous-unclean` 被顶到 8 次，而实际只崩过 1 次）；
+         * - 跑 `bootstrapTermux()`（**并发解包同一个 prefix**，见
+         *   [com.dsh.android.termux.TermuxBootstrap.install] 的注释）。
+         *
+         * 真机证据：`20261014-010259-8fbc8515`（gecko）里 `app.onCreate` 出现 **15 次**、
+         * `boot.previous-unclean` 在 4 秒内从 1 涨到 4，并伴随
+         * `dpkg.cfg: open failed: ENOENT`。判别性很强 —— **system flavor 的 50 个包
+         * 没有一次**这种放大（它没有子进程）。
+         *
+         * ## 为什么不能用 `Application.getProcessName()` 一个 API 了事
+         *
+         * 它是 **API 28** 才有的，而本 App 的 `minSdk = 26`。API 26/27 退回读
+         * `/proc/self/cmdline`（内核给的 `argv[0]` 就是进程名）。
+         *
+         * ⚠️ **读不到时按主进程处理**（返回 true）：宁可多跑一遍，也不要因为一个
+         * 探测失败让真主进程跳过引导 —— 那会让 App 完全起不来。
+         */
+        private fun isMainProcess(base: Context?): Boolean {
+            val ctx = base ?: return false
+            val expected = ctx.packageName
+            val actual = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                Application.getProcessName()
+            } else {
+                runCatching {
+                    File("/proc/self/cmdline").readText().substringBefore('\u0000')
+                }.getOrNull()
+            }
+            return actual == null || actual == expected
+        }
 
         /** 日志目录名（`filesDir/logs`）。 */
         const val LOG_DIR = "logs"

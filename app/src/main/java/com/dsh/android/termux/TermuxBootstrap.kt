@@ -13,6 +13,7 @@ import kotlin.concurrent.withLock
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.TimeUnit
@@ -102,6 +103,57 @@ class TermuxBootstrap(private val context: Context) {
      */
     private val probeTtlMs = 7L * 24 * 60 * 60 * 1000
 
+    /**
+     * 跨进程排他锁 —— 锁在 `dataDir/termux/.prefix.lock` 上。
+     *
+     * ## 🔴 为什么 [prefixLock] 不够：这是真机炸过的坑
+     *
+     * [prefixLock] 是 `ReentrantLock`，**只在进程内互斥**。而 gecko flavor 依赖的
+     * `geckoview-arm64-v8a` AAR 声明了 **39 个 `android:process` 子进程**
+     * （`:tab0`…`:tab39`、`:gpu`、`:media`、`:socket`、`:crashhelper` …），
+     * 每个子进程都会实例化 `DshApplication`，于是**每个子进程都完整跑一遍** [install]。
+     *
+     * 真机证据（gecko 版诊断包 `20261014-010151-de8734c5`，2026-10-14）：
+     *
+     * ```
+     * #6 main app.onCreate                      ← 进程内序号反复归零 = 多个进程
+     * #6 main app.onCreate
+     * #7 worker-1 install start
+     * #8 worker-1 Extracting Termux bootstrap from assets
+     * #7 worker-3 install start                 ← 时间与上面重叠，进程内锁不可能允许
+     * java.io.FileNotFoundException: …/usr/etc/dpkg/dpkg.cfg: open failed: ENOENT
+     *   at TermuxBootstrap.writeAptConfig(TermuxBootstrap.kt:753)
+     *   at TermuxBootstrap.installLocked(TermuxBootstrap.kt:187)
+     * ```
+     *
+     * 机制：多个进程各自执行 `prefixDir.deleteRecursively()`，把别人刚解出来的
+     * `etc/dpkg/` 删掉，于是 `dpkg.cfg` 写不进去。判别性极强 ——
+     * **system flavor 的 50 个包一个都没有**这个现象（没有子进程），
+     * **gecko 的 3 个包全部都有**。
+     *
+     * ## 为什么是 `FileChannel.lock()`
+     *
+     * 它在 Android 上落到 `fcntl(F_SETLKW)`，**随进程退出自动释放** —— 持锁进程被
+     * 系统杀掉不会留下死锁。`ReentrantLock` 没有这个性质，而引导路径恰好会被杀
+     * （见 `CrashRecorder` 的 `process-freeze`）。
+     *
+     * ⚠️ **必须先持有 [prefixLock] 再进这里**：同一进程重复对同一文件加锁会抛
+     * `OverlappingFileLockException`。进程内锁保证同进程串行、文件锁保证跨进程串行，
+     * 两层缺一不可。
+     */
+    private inline fun <T> withPrefixFileLock(block: () -> T): T {
+        val lockFile = File(rootDir, ".prefix.lock")
+        lockFile.parentFile?.mkdirs()
+        return RandomAccessFile(lockFile, "rw").use { raf ->
+            val lock = raf.channel.lock()
+            try {
+                block()
+            } finally {
+                runCatching { lock.release() }
+            }
+        }
+    }
+
     /** Install bootstrap from assets → prefix dir. Safe to call multiple times. */
     suspend fun install() {
         if (isReady) return
@@ -109,8 +161,13 @@ class TermuxBootstrap(private val context: Context) {
         withContext(Dispatchers.IO) {
           // 与 installNodeRuntime / rewriteTermuxPaths 共用同一把锁：三者都会
           // 往 prefix 里写文件，而 install() 开头就有 deleteRecursively()。
+          // ⚠️ 外层进程内锁 + 内层跨进程文件锁，两层都要（见 withPrefixFileLock）。
           prefixLock.withLock {
-            installLocked()
+            withPrefixFileLock {
+              // 抢到文件锁时别的进程可能已经装完了 —— 必须重新判一次，否则
+              // 这里会再 deleteRecursively() 一遍刚装好的 prefix。
+              installLocked()
+            }
           }
         }
     }
@@ -235,7 +292,7 @@ class TermuxBootstrap(private val context: Context) {
      * @return true 表示运行时已就位（含本就已安装的情况）。
      */
     suspend fun installNodeRuntime(): Boolean = withContext(Dispatchers.IO) {
-        prefixLock.withLock { installNodeRuntimeLocked() }
+        prefixLock.withLock { withPrefixFileLock { installNodeRuntimeLocked() } }
     }
 
     /** [installNodeRuntime] 的实现体，必须已持有 [prefixLock]。 */
@@ -439,15 +496,20 @@ class TermuxBootstrap(private val context: Context) {
      * @return true = 确实做了修复（调用方据此更新「已推开哪些东西」的提示）。
      */
     fun repairNodeRuntimeIfNeeded(): Boolean = prefixLock.withLock {
-        if (!prefixDir.exists()) return@withLock false
-        // 用与 [installNodeRuntime] 完全相同的判据，别另立一套。
-        if (nodeMarker.exists() && nodeBinary.isFile && nodeIsUsable()) return@withLock false
-
-        Log.w("TERMUX", "安全模式：内置 Node 运行时不可用，重新解包 $NODE_VERSION")
-        nodeMarker.delete()
-        nodeBinary.delete()
-        installNodeRuntimeLocked()
-        true
+        withPrefixFileLock {
+            if (!prefixDir.exists()) {
+                false
+            } else if (nodeMarker.exists() && nodeBinary.isFile && nodeIsUsable()) {
+                // 用与 [installNodeRuntime] 完全相同的判据，别另立一套。
+                false
+            } else {
+                Log.w("TERMUX", "安全模式：内置 Node 运行时不可用，重新解包 $NODE_VERSION")
+                nodeMarker.delete()
+                nodeBinary.delete()
+                installNodeRuntimeLocked()
+                true
+            }
+        }
     }
 
     /**
@@ -461,7 +523,7 @@ class TermuxBootstrap(private val context: Context) {
         try {
             // 走锁：本方法与 DshApplication 的 installNodeRuntime 是**两个不同实例**
             // 上的两条并发路径，都会原地重写同一个 47 MB 的 node 二进制。
-            prefixLock.withLock { rewriteTermuxPathsLocked(prefixDir) }
+            prefixLock.withLock { withPrefixFileLock { rewriteTermuxPathsLocked(prefixDir) } }
         } catch (e: Exception) {
             Log.w("TERMUX", "ensure node patched: ${e.message}")
         }
@@ -477,6 +539,7 @@ class TermuxBootstrap(private val context: Context) {
         if (prefixDir.exists() && !rewriteMarker.exists()) {
             Log.i("TERMUX", "rewriting Termux paths")
             prefixLock.withLock {
+            withPrefixFileLock {
             // Same first-install sequence, minus the zip extraction: existing
             // installs need the aliases and the dpkg skeleton too, not just the
             // path rewrite.
@@ -490,6 +553,7 @@ class TermuxBootstrap(private val context: Context) {
             // alone because the user or `pkg` may have repointed the mirror.
             writeAptConfig()
             rewriteMarker.writeText("ok")
+            }
             }
         }
     }
