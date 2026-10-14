@@ -179,7 +179,7 @@ class EngineManager private constructor(private val context: Context) {
      * 降级前端是否已就位（见 [ensureWebViewCompat]）。
      *
      * 供 [MainActivity] 决定要不要因内核过旧而拦截加载：降级生效后门槛就降到
-     * `chrome74`，不再一律卡 94。
+     * `chrome73`，不再一律卡 94。
      *
      * ⚠️ 由 IO 线程写、主线程读（`observeEngine` 的 `Ready` 分支），必须 `@Volatile`。
      */
@@ -483,7 +483,7 @@ class EngineManager private constructor(private val context: Context) {
     private fun ensureWebViewCompat() {
         // 内置内核版整个跳过：这一整套的存在理由是「设备上的系统 WebView 太旧」，
         // 而内置内核的版本在编译期就定了（GeckoView 140），永远不可能过旧。
-        // 跑了反而有害 —— 前端会被换成按 chrome74 降级、砍掉语法糖的版本。
+        // 跑了反而有害 —— 前端会被换成按 chrome73 降级、砍掉语法糖的版本。
         if (BuildConfig.BUILT_IN_WEB_ENGINE) {
             Log.i(TAG, "内置 Web 内核版：不需要 WebView 降级前端，跳过")
             return

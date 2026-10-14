@@ -29,7 +29,7 @@ APK
  ├─ assets/logs-tool.zip           日志工具插件（注册 `logs` 工具，见 ⑫.6）
  ├─ assets/ui-probe.js             UI 探针（页面世界，**不走转译**，见 ⑫.5）
  ├─ assets/webview-polyfill.js     旧 WebView 内核兼容垫片（补**运行时 API**）
- └─ assets/webview-compat.zip      按 chrome74 降级编译的前端 bundle（补**语法**，见 ⑯）
+ └─ assets/webview-compat.zip      按 chrome73 降级编译的前端 bundle（补**语法**，见 ⑯）
 
 运行期（filesDir 下）
  ├─ usr/            $PREFIX —— Termux 环境（含 bin/pnpm）
@@ -4915,6 +4915,44 @@ pdf.js 用到 `segments.containing(index)`，必须实现这个方法。
 `\p{Extended_Pictographic}` 若不被某老内核认识，抛的是 **SyntaxError**，
 那会让**整个 polyfill 文件**解析失败、连带上面所有补丁一起失效。
 用 try/catch 包住并退化成「按码点切」。
+
+#### v19：降级目标 74 → **73**（真实用户卡在 73，差一级界面永远打不开）
+
+**症状**（服务器上的真实用户包，三星 `y2q`，`com.android.webview 73.0.3683.120`）：
+该设备 **4 个包**（含最新的 `0.2.9-rescue (21)`）全是同一个结局 ——
+
+```
+Web 内核: com.android.webview 73.0.3683.120（主版本 73；官方 bundle 门槛 94，降级后 74）
+已应用 WebView 降级前端: dist=3, engine=68, mobileui=1 个文件（chrome74-v18）
+WebView 内核 73 < 门槛 74（降级前端已生效），前端无法解析，跳过加载
+```
+
+降级前端**明明已经装好**（`chrome74-v18` 就位），却因为门槛是 74 而**一次都没被用上** ——
+启动层只显示「系统 WebView 内核过旧」，界面永远打不开。**差一级卡死一台设备**。
+
+**根因**：`MIN_WEBVIEW_MAJOR_COMPAT = 74` 与降级目标 `chrome74` 是同一个数，
+两者都取自「反馈设备是 83，往下留一档」。但真实世界里存在 **73**（三星那批 ROM
+的 WebView 长期停在 73），而 73 恰好还能被降级产物救回来。
+
+**做法**：`-Target chrome73` 重新生成 + `MIN_WEBVIEW_MAJOR_COMPAT = 73`，`-CompatVersion` bump 到 19。
+
+⚠️ **为什么 73 能收、而且只能收到 73**：脚本的两道门禁已经替我们验过 ——
+
+| 门禁 | chrome73 结果 |
+|---|---|
+| 3.5 语法复检（`check-frontend-syntax.mjs`，独立解析器） | **71 个 js 产物全部通过** |
+| 3.6 运行时 API 审计（对照 polyfill） | **缺口 0 个**，跳过 3 个 |
+
+而**再往下不行**：跳过名单里的 `queueMicrotask` 门槛是 **Chrome 71**，跳过理由正是
+「Chrome 71 ≤ 目标内核，原生支持」。它是宿主调度原语、纯 JS 补不了，所以 73 是
+「再降无益」的位置 —— 降到 71 以下时这条豁免的前提就不成立了。
+
+⚠️ **`-CompatVersion` 必须 bump（18 → 19）**，理由同 v2 起的所有先例：老设备的
+dist 里已经落了 `chrome74-v18` 的戳，`$Target` 变了、戳字符串也变了，
+但**不 bump 就没法区分「目标变了」与「同一目标的又一次生成」** ⇒
+将来若要在同一目标上重新生成，会命中「戳一致 → 跳过」。现在戳是 `chrome73-v19`。
+
+实测产物：**73 个条目**（dist 3 + engine 68 + mobileui 1 + 戳 1），**10,515,574 字节（10.03 MB）**。
 
 ## 后台保活（任务切到后台不能断）
 

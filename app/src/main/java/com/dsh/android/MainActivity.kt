@@ -181,7 +181,7 @@ class MainActivity : AppCompatActivity() {
      * 内核低于**当前实际生效的门槛** —— 前端 bundle 的语法它解析不了。
      *
      * 门槛不是固定的：`EngineManager.ensureWebViewCompat()` 会把官方 bundle 换成
-     * 按 `chrome74` 降级编译的版本，换成功之后 83 这种旧内核也能解析。
+     * 按 `chrome73` 降级编译的版本，换成功之后 83 这种旧内核也能解析。
      * 所以这里按「降级到底生效了没有」动态判定，见 [effectiveMinWebViewMajor]。
      *
      * 为 true 时不再 `loadUrl`（那只会在 12 秒后露出一片白屏），
@@ -192,7 +192,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 当前生效的内核门槛。
      *
-     * - 降级前端已就位 → [MIN_WEBVIEW_MAJOR_COMPAT]（chrome74，实测 83 也跑得动）
+     * - 降级前端已就位 → [MIN_WEBVIEW_MAJOR_COMPAT]（chrome73，实测 83 也跑得动）
      * - 降级没打上（资产缺失/解包失败）→ [MIN_WEBVIEW_MAJOR]（官方 bundle 的 94）
      *
      * ⚠️ 降级**失败**时必须退到 94：那时跑的就是官方 bundle，语法缺口原样存在。
@@ -2926,10 +2926,20 @@ class MainActivity : AppCompatActivity() {
         /**
          * 降级前端生效后的实际门槛。
          *
-         * `EngineManager.ensureWebViewCompat()` 会把 bundle 换成按 **chrome74** 降级
-         * 编译的版本（class static block 被展开、逻辑赋值被改写），于是门槛降到 74。
-         * 取 74 而不是 83（反馈设备那个版本）是留一档余量：esbuild 的 `chrome74`
-         * 目标保证不生成 74 之后才有的语法。
+         * `EngineManager.ensureWebViewCompat()` 会把 bundle 换成按 **chrome73** 降级
+         * 编译的版本（class static block 被展开、逻辑赋值被改写），于是门槛降到 73。
+         *
+         * ⚠️ **为什么从 74 挪到 73**：服务器上真实用户包里有一台三星（`y2q`，
+         *   `com.android.webview 73.0.3683.120`）卡在 **73**，而门槛是 74 ⇒
+         *   `前端无法解析，跳过加载` ⇒ 启动层直接报「系统 WebView 内核过旧」，
+         *   界面**永远打不开**（该设备 4 个包全是这个结局，含最新的 (21) 包）。
+         *   差一级就卡死一个人，而 73 这个目标 esbuild 完全接得住（实测见下）。
+         *
+         * ⚠️ 73 能收：`tools/build-webview-compat.ps1 -Target chrome73` 的两道门禁
+         *   全过 —— 71 个 js 产物语法复检通过，运行时 API 审计**缺口 0**。
+         *   再往下就不行了：`queueMicrotask` 的门槛是 **Chrome 71**，而它已在
+         *   跳过名单里（理由正是「≤ 目标内核，原生支持」），降到 71 以下时
+         *   polyfill 补不了它（它是宿主调度原语）。所以 73 是「再降无益」的位置。
          *
          * ⚠️ **降级范围是「dist + 全部插件的 client bundle」**（v2 起）。只降 dist
          *   是不够的 —— 实测 71 个插件 bundle 里 68 个在 chrome74 下有语法缺口，
@@ -2945,7 +2955,7 @@ class MainActivity : AppCompatActivity() {
          * ⚠️ 降级**没打上**时不能放行：那时跑的是官方 bundle，
          *   门槛必须退回 [MIN_WEBVIEW_MAJOR]（见 `effectiveMinWebViewMajor`）。
          */
-        const val MIN_WEBVIEW_MAJOR_COMPAT = 74
+        const val MIN_WEBVIEW_MAJOR_COMPAT = 73
 
         /**
          * 等待 WebView 提交首帧的兜底超时（ms）。
