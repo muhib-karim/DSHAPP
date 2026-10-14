@@ -349,6 +349,22 @@ class MainActivity : AppCompatActivity() {
         }
 
         val reason = if (didCrash) "崩溃" else "被系统回收"
+        // ⚠️ **已经放弃自动恢复就到此为止**：不再计数、不再写现场、不再重贴提示。
+        //   上界分支（见下面的 `rendererRestarts > MAX_RENDERER_RESTARTS`）只挡住了
+        //   「新排一条重载链」，而**本函数是排重载的另一个入口** —— 内核此后每崩溃
+        //   /被回收一次都会再走一遍这里，于是 `rendererRestarts` 继续往上涨、又写一份
+        //   现场文件、并把用户刚要读的那条「界面反复出错」提示换成新的一份。
+        //   真机证据（CDY-TN90 / v21 system，`3c52fcd` 修复前）：
+        //   ```
+        //   02:37:46.914 界面内核反复崩溃，停止自动重载     ← 已宣称放弃
+        //   02:37:54.692 界面内核崩溃，准备重载（第 5 次）  ← 却又记了一次（n=5）
+        //   ```
+        //   ⚠️ `3c52fcd` 只给 [reloadWithRetry] 加了守卫，那个守卫管不到这里 ——
+        //   两处入口都要挡，少一处就还是「说了停却还在记」。
+        if (rendererGaveUp) {
+            Log.i(DshApplication.TAG, "已停止自动恢复，忽略内核$reason")
+            return
+        }
         // 已经排好一次重载就不要再排 —— 一次崩溃可能同时从几个回调报上来。
         if (rendererReloadQueued) {
             Log.i(DshApplication.TAG, "界面内核$reason，已有重载在排队，忽略")
