@@ -466,16 +466,9 @@ class MainActivity : AppCompatActivity() {
         )
 
         // ⚠️ 状态复位：新渲染进程的第一帧还没提交，沿用旧值会让启动层立刻收尾。
-        //
-        // ⚠️ **同时撤销在飞的「首帧兜底超时」**（[paintTimeoutRunnable]）。它到点会
-        //   执行 `hideOverlay()` —— 而下面 gaveUp 分支刚用 `showOverlay` 贴上
-        //   「界面反复出错」这条**终态错误提示**，残留计时器 1.5 秒后把它收走，
-        //   用户只看到一闪。L483 的 `invalidateOverlayTimeout()` 只管
-        //   `overlayTimeoutRunnable`，管不到这一个 —— 两个计时器都要作废。
-        //   （与 [reloadWithRetry] 里那三件套对齐；那里一直是清全的。）
-        overlayHandler.removeCallbacks(paintTimeoutRunnable)
-        webViewPainted = false
-        paintPending = false
+        //   （同时作废在飞的「首帧兜底超时」—— 它到点会 `hideOverlay()`，把下面
+        //   gaveUp 分支刚贴上的终态错误提示收走；见 [resetFirstFrameAwait]。）
+        resetFirstFrameAwait()
 
         if (rendererRestarts > MAX_RENDERER_RESTARTS) {
             Log.e(DshApplication.TAG, "界面内核反复$reason，停止自动重载")
@@ -574,14 +567,11 @@ class MainActivity : AppCompatActivity() {
         //   被满足，「界面已恢复」是假的，而下面那个重试分支也永远命中
         //   `if (webViewPainted) return`（真机全量 53 包：`界面未恢复，再试一次` 0 次）。
         //   证据与时序见 WebHost.resetFirstFrame 的 KDoc。
-        // ⚠️ 三个状态都要清干净，少一个都会让下面的 awaitWebViewPainted 注册不上：
-        //   - paintPending：若还停在 true，它会走 `if (paintPending) return` 直接返回，
-        //     动作根本不会注册；
-        //   - webViewPainted：见上面；
-        //   - 在飞的兜底超时：它到点会把 webViewPainted 置回 true 并收起启动层。
-        overlayHandler.removeCallbacks(paintTimeoutRunnable)
-        paintPending = false
-        webViewPainted = false
+        // ⚠️ **三个状态都要清干净，少一个都会让下面的 awaitWebViewPainted 注册不上**
+        //   （见 [resetFirstFrameAwait] 的 KDoc）。这里比那三件套多两件事：
+        //   `firstFrameReallyArrived` 与内核侧的 `resetFirstFrame()`—— 它们按
+        //   `requestId` 作废旧回调，必须紧挨着 reload()，所以留在调用点上。
+        resetFirstFrameAwait()
         firstFrameReallyArrived = false
         web.resetFirstFrame()
         // ⚠️ **重载必须排在「重新武装首帧等待」之前。**
@@ -2335,22 +2325,13 @@ class MainActivity : AppCompatActivity() {
                         // ⚠️ 页面此刻是**活的**，但它连的是已经没人监听的端口 ——
                         //   必须等引擎起来后重新加载，否则界面永远连不上。
                         // ⚠️ 清掉 webViewPainted 让新一轮的「等首帧」重新生效。
-                        //
-                        // ⚠️ **同时撤销在飞的「首帧兜底超时」**（与 [reloadWithRetry]
-                        //   里那三件套一致，这里原先少了这一件）。它是
-                        //   [paintTimeoutRunnable]，到点会执行 `hideOverlay()` 并打一行
-                        //   「等待 Web 内核首帧超时，仍收起启动动画」。
-                        //   而本分支刚用 `showOverlay` 贴上「引擎已停止，正在重新
-                        //   启动…」这个**提示**（不是启动动画）—— 上一轮遗留的计时器
-                        //   1.5 秒后把它收走，用户只看到一闪，还以为提示没出现过。
-                        //   这与 `ab457d4` 修的 `overlayTimeoutRunnable` 残留是同一族
-                        //   缺陷，只是那条盖住的是「界面就绪回调超时」。
-                        //   ⚠️ 全量 558 份诊断包里「引擎已停止，正在重新启动」出现
-                        //   **0 次**，所以这是对照 [reloadWithRetry] 推出的构造性缺陷，
-                        //   不是实测复现；改动本身零风险（少留一个计时器）。
-                        overlayHandler.removeCallbacks(paintTimeoutRunnable)
-                        webViewPainted = false
-                        paintPending = false
+                        //   还要撤销在飞的「首帧兜底超时」—— 它到点会执行
+                        //   `hideOverlay()`，把刚贴上的「引擎已停止，正在重新启动…」
+                        //   这个**提示**（不是启动动画）收走，用户只看到一闪。
+                        //   下面那句 `invalidateOverlayTimeout()` 只管
+                        //   `overlayTimeoutRunnable`，管不到这一个 —— 两个计时器
+                        //   都要作废，所以走同一个入口 [resetFirstFrameAwait]。
+                        resetFirstFrameAwait()
                         // ⚠️ 还要把页面阶段退回 None：否则 `uiStage` 停在 UiReady，
                         //   而 StateFlow 相同值不重复发射 ⇒ 新一轮的「等首帧再收
                         //   启动层」分支一次都跑不到 ⇒ 启动层永远收不起来。
@@ -2441,6 +2422,34 @@ class MainActivity : AppCompatActivity() {
                 showOverlay("引擎启动异常", hint = t.message, isError = true)
             }
         }
+    }
+
+    /**
+     * 重新武装「等内核首帧」：把 [awaitWebViewPainted] 用到的三个状态全部归零。
+     *
+     * ## 为什么要有这个入口（而不是在各调用点各写一遍）
+     *
+     * 这三个状态**必须一起清**，少一个都会静默失效；而它们原先散在四五个调用点，
+     * 已经漂开过两次：
+     *
+     * | 少清哪个 | 症状 |
+     * |---|---|
+     * | [paintPending] | 还停在 true ⇒ `awaitWebViewPainted` 走 `if (paintPending) return`，**动作根本不注册**，首帧永远等不到 |
+     * | [webViewPainted] | 还停在 true ⇒ 新一轮 `UiReady` 一到就**立刻**收启动层，不等新首帧，退回「DOM 就绪但像素没上屏」那约 1.6 秒白屏 |
+     * | 在飞的 [paintTimeoutRunnable] | 到点会把 `webViewPainted` 置回 true **并 `hideOverlay()`** —— 若那一刻刚贴的是一条终态错误提示（「界面反复出错」/「引擎已停止，正在重新启动…」），提示会被收走，用户只看到一闪 |
+     *
+     * 前两条是本方法要保的**功能正确性**；第三条在 2026-10-15 才被逐处核对出来
+     * （`71d986b`），此前只有 [reloadWithRetry] 一处是清全的 —— 也就是说
+     * 「清干净」这件事**一直是靠人记得**，这正是它漂开的机制。
+     *
+     * ⚠️ 内核侧的 `web.resetFirstFrame()` **刻意不放进来**：它按 `requestId` 作废
+     *   在飞的旧回调，必须紧挨着 `reload()`/`loadUrl()` 调用，顺序有讲究
+     *   （见 [reloadWithRetry] 里那段说明），所以留在各自调用点上。
+     */
+    private fun resetFirstFrameAwait() {
+        overlayHandler.removeCallbacks(paintTimeoutRunnable)
+        paintPending = false
+        webViewPainted = false
     }
 
     /**
@@ -2561,6 +2570,11 @@ class MainActivity : AppCompatActivity() {
     private fun autoEnterSafeMode() {
         binding.overlaySafeMode.isEnabled = false
         invalidateOverlayTimeout()
+        // ⚠️ **这一轮之后要重新加载界面，首帧等待必须重新武装。** 见
+        //   [resetFirstFrameAwait]。少这一步就退化成「新页面 DOM 一就绪就收启动层」，
+        //   中间那段白屏（实测约 1.6 秒）又回来了 —— 正是 [awaitWebViewPainted]
+        //   存在要解决的那个问题。
+        resetFirstFrameAwait()
         overlayDismissed = false
         showOverlay(
             "连续多次没能启动，正在自动进入安全模式…",
@@ -2601,6 +2615,8 @@ class MainActivity : AppCompatActivity() {
         //   overlayDismissed 为真时会直接返回（那是防动画闪回的守卫），提示文案
         //   就贴不上去了。作废计时器是同一件事的另一半：这次也要重新加载界面。
         invalidateOverlayTimeout()
+        // ⚠️ 同 [autoEnterSafeMode]：这一轮之后要重新加载界面，首帧等待必须重新武装。
+        resetFirstFrameAwait()
         overlayDismissed = false
         showOverlay(
             "正在进入安全模式…",
