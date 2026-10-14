@@ -22,6 +22,7 @@ import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -3349,27 +3350,50 @@ class FloatingBubble(private val context: Context) {
             // 也不能让输入框藏在键盘底下。
             applyImeHeight(if (hasFocus) keyboardHeightPx() else 0)
             if (hasFocus) {
-                panelInput?.post {
-                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
-                        as? android.view.inputmethod.InputMethodManager
-                    imm?.showSoftInput(
-                        panelInput,
-                        android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT,
-                    )
-                }
+                panelInput?.post { showInputMethod() }
             }
         }
 
         // 点一下输入框本身也要触发上面那条 —— 已经聚焦时再点不会触发
         // onFocusChange，但用户很可能就是"再点一次想唤出键盘"。
-        panelInput?.setOnClickListener {
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
-                as? android.view.inputmethod.InputMethodManager
-            imm?.showSoftInput(
-                panelInput,
-                android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT,
-            )
-        }
+        panelInput?.setOnClickListener { showInputMethod() }
+    }
+
+    /**
+     * 拉一次输入法（幂等；任何一步不可用都安静返回）。
+     *
+     * ⚠️ **这里每一个 `?` 都不是多余的，去掉任意一个都会崩主线程。**
+     *
+     * 真机现场（`20261014-083111-uncaught-exception.txt`，Xiaomi 24122RKC7C /
+     * Android 16，`thread: main`）：
+     *
+     * ```
+     * java.lang.NullPointerException: Attempt to invoke virtual method
+     *   'android.view.ViewRootImpl android.view.View.getViewRootImpl()'
+     *   on a null object reference
+     *   at android.view.inputmethod.InputMethodManager.showSoftInput(…:2558)
+     *   at com.dsh.android.FloatingBubble.installPanelActions$lambda$…
+     * ```
+     *
+     * **根因**：`showSoftInput(View, int)` 的第一个参数在 Java 侧没有 `@NonNull`
+     * 标注 ⇒ Kotlin 看到的是**平台类型 `View!`** ⇒ 传 null **编译期不报错**。
+     * 于是「展开态被收起 / 面板被销毁（`panelInput = null`）」与 `post{}` 回调
+     * 之间那几毫秒的竞争，就把一个 null 送进了系统方法，在**主线程**上炸掉。
+     *
+     * 而 `panelInput?.post { … }` 那个安全调用**只保证了「谁去 post」不为空，
+     * 不保证「回调跑的时候」还不为空** —— 这正是一眼看去以为已经防住了的陷阱。
+     *
+     * 所以取参数必须用**局部变量 + 空判断**重取一次，不能用捕获时的那个字段。
+     */
+    private fun showInputMethod() {
+        val input = panelInput ?: return
+        // 视图没挂到窗口上时（收起动画、已 detach）showSoftInput 同样会走到
+        // getViewRootImpl()，所以先确认它真的还在窗口里。
+        if (input.windowToken == null) return
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            ?: return
+        runCatching { imm.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT) }
+            .onFailure { Log.w(TAG, "唤起输入法失败（面板可能已收起）: ${it.javaClass.simpleName}") }
     }
 
     private fun doSend() {
