@@ -6584,6 +6584,58 @@ class EngineManager private constructor(private val context: Context) {
                 "engine.ready",
                 mapOf("ms" to (System.currentTimeMillis() - startMs).toString(), "port" to portOf(url)),
             )
+        } else if (userStopped || process !== proc) {
+            // ⚠️ **我们自己停掉的，不是启动失败。**（2026-10-15 修，同族第 25 例）
+            //
+            // `readyLatch` 有三条唤醒路径，上面那条注释只交代了前两条：
+            //   ① 正则匹配到 URL ⇒ 引擎起来了
+            //   ② stdout 读到 EOF ⇒ 引擎死了
+            //   ③ **`stop()` 主动 destroy 旧进程** —— 也会让 stdout 立刻 EOF
+            //
+            // 第 ③ 条与「引擎自己崩了」在 `await` 这一侧**完全同形**，于是一路走到
+            // 下面那个 `else`，被记成「引擎启动失败」。而 `stop()` 明明已经把状态
+            // 设成了 [State.Idle]，紧接着被 `State.Failed` 覆盖 —— 用户看到失败
+            // 浮层，更糟的是 `RescueBoot.recordFailure` 把「连续启动失败」+1。
+            //
+            // 真机现场（服务器 `20261014-173741-e2020a5e`，OPPO PKJ110 / Android 16 /
+            // v21 system，`20261014-165820-engine-start-failed.txt`）：
+            //
+            // ```
+            // 16:58:16.174 main                用户请求退出降级态（当前 rescue）
+            // 16:58:16.176 main                请求界面重启引擎：用户请求退出降级态
+            // 16:58:16.177 main                停止引擎            ← stop()
+            // 16:58:16.479 main                引擎已退出: …，准备自动重启（第 2 次）
+            // 16:58:16.483 main                [connection] connection lost, retry #1
+            // 16:58:17.195 DefaultDispatcher-2 启动引擎: …              ← 新 start()
+            // 16:58:18.443 main                界面就绪回调超时（WebView 内核 138）
+            // 16:58:20.152 DefaultDispatcher-1 停止引擎            ← enterSafeMode → stop()
+            // 16:58:20.153 main                [rescue-auto] 连续失败仅 0 次（需 ≥3）
+            // 16:58:20.160 DefaultDispatcher-2 已记录现场: crash/…-engine-start-failed.txt
+            //                                  —— 引擎启动失败（引擎进程在打印 URL 之前就结束了（等了 3672 ms））
+            // 16:58:20.160 DefaultDispatcher-2 engine.failed reason=引擎进程在打印 URL 之前就结束了（等了 3672 ms）
+            // 16:58:23.155 DefaultDispatcher-1 安全模式：已隔离损坏的文件 cordis.patch.yml → …
+            // ```
+            //
+            // 两次 `停止引擎` 都是**主动**的（`requestRestart` 与 `enterSafeMode`），
+            // 而那条 3672 ms 的「启动失败」纯粹是第 ③ 条唤醒路径的产物 ——
+            // 引擎**从未**失败过，是被人叫停的。
+            //
+            // ⚠️ 后果不止一行错日志：这次假失败触发了 `enterSafeMode`（推开用户的
+            //    `cordis.patch.yml` / `package.json`、摘掉 7 个第三方 bundle、删掉
+            //    引擎版本戳），代价是用户重解包 15 秒 + 插件配置全丢。也就是说
+            //   这条误判把「切个 profile」变成了**破坏性操作**。
+            //
+            // 判据与 [markEngineDeadIfCurrent] 完全同源（那里早就在用 `userStopped`），
+            // 只是这里漏了：
+            //   · `userStopped` ⇒ 是我们自己停的，状态已由 [stop] 设为 [State.Idle]
+            //   · `process !== proc` ⇒ 这一轮已被另一次启动接管（stop 之后又 start 了），
+            //     这一轮的任何结论都不该落到全局状态上
+            // 两者都成立时**必须原样返回**，不能改状态、不能记失败。
+            Log.i(
+                TAG,
+                "启动等待被主动停止打断（已等 ${System.currentTimeMillis() - startMs} ms），不算启动失败",
+            )
+            return@withContext
         } else {
             val tail = synchronized(logLines) { logLines.joinToString("\n") }
             // ⚠️ **判据是「等满了没有」，不是「进程还活着没有」。**
