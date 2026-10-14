@@ -4702,13 +4702,34 @@ class EngineManager private constructor(private val context: Context) {
      * @return true = 确实隔离了；false = 路径本来就不存在或改名失败。
      */
     private fun quarantine(file: File, reason: String): Boolean {
-        // ⚠️ 判据是 `exists()` 而**不是** `isFile`：L1 隔离要摘的是
+        // ⚠️ **判据是 `exists()` 而**不是** `isFile`：L1 隔离要摘的是
         //   `profiles/web/node_modules/@deepseek-ai/<名>` —— 那是**目录**。
         //   用 `isFile` 的话它直接返回 false，而调用方看到的是
         //   「一个都没能隔离」⇒ 修复静默失效（真机踩过：日志里明明
         //   「发现 1 个遮蔽副本」，下一行却是「遮蔽副本一个都没能隔离」）。
         //   改名对目录与文件是同一个系统调用，语义完全一致。
-        if (!file.exists()) return false
+        //
+        // ⚠️ **这一条也必须打日志，不能静默 return false**（2026-10-15 修）。
+        //   上面那三种 false 里，`renameTo` 失败与抛异常**都留了痕**，唯独
+        //   「路径不存在」原本是一行字都没有的 —— 于是真机出现了这样一对
+        //   自相矛盾的日志（vivo V2232A / 20261015-054819-f2d62a77，03:16:39）：
+        //
+        //     #67 L1 隔离：全摘第三方仍起不来，但发现 1 个遮蔽副本（…/dsh-llm）⇒ 摘掉它们再试
+        //     #68 L1 隔离：遮蔽副本一个都没能隔离，继续按原判据走
+        //
+        //   两行相隔 2 毫秒、中间没有任何一行解释，而 `#67` 打印的那个目录
+        //   恰恰就是 `quarantine` 收到的那个对象。**同一天 03:23 的同一轮，
+        //   同一个路径却隔离成功**（`已隔离损坏的文件 dsh-llm → dsh-llm.bak-…`
+        //   → `摘掉 1 个遮蔽副本后能正常启动`），所以这不是「代码没写对」，
+        //   而是「某个时刻那个目录不在了，而代码没说」。
+        //
+        //   这正是本项目缺陷族（结论与它描述的对象不是同一个）的又一实例：
+        //   日志给出的结论是「摘不掉」，而它描述的事实可能是「已经不需要摘」。
+        //   把真实原因说出来，下一次现场就能直接分辨这两种情况。
+        if (!file.exists()) {
+            Log.w(TAG, "$reason：${file.name} 不在（${file.absolutePath}）—— 无需隔离，跳过")
+            return false
+        }
         val base = "${file.name}.bak-${System.currentTimeMillis()}"
         var target = File(file.parentFile, base)
         var ordinal = 0
@@ -5392,12 +5413,47 @@ class EngineManager private constructor(private val context: Context) {
             //     删掉它                                              ⇒ 引擎立刻就绪
             //   所以这一处不是推测，是实测出来的因果。
             if (shadowed.isNotEmpty()) {
+                // ⚠️ **必须重算，不能复用上面的 `shadowed`**（2026-10-15 修）。
+                //
+                //   `shadowed` 是 [L5333] 处算的，而到这一行之间**至少跑过一次
+                //   `probeBoot`**（上一步的 `baseline-all-removed`）—— 真机实测间隔
+                //   **7.1 秒**（vivo V2232A / 20261015-054819-f2d62a77：`#61` 03:16:31.861
+                //   算出快照，`#67` 03:16:39.008 才用它）。
+                //
+                //   而 `probeBoot` 就是一次**真实的引擎启动**，它会动那个 profile 的
+                //   `node_modules`（本项目已知：引擎/插件管理会把「多余依赖」挪进
+                //   `node_modules/.ignored/`，见 AGENTS.md ⑥）。于是隔离操作实际作用的
+                //   是**一个 7 秒前的目录列表**：清单里那个路径此刻可能已经不在，
+                //   `quarantine` 返回 false，而调用方读到的结论是「一个都没能隔离」。
+                //
+                //   真机现场正是这样一对自相矛盾的日志 —— 两行相隔 **2 毫秒**、
+                //   中间一个字都没有，而 `#67` 打印的那个目录就是 `quarantine`
+                //   收到的那个对象；同一天 03:23 的同一轮同一路径却隔离成功：
+                //
+                //     #67 …但发现 1 个遮蔽副本（…/dsh-llm）⇒ 摘掉它们再试
+                //     #68 …遮蔽副本一个都没能隔离，继续按原判据走
+                //
+                //   ⚠️ 说清界限：这 7 秒里**只跑过 `probeBoot` 一件事**，所以
+                //     「引擎启动动过 node_modules」是**唯一的候选解释**，而我没有
+                //     拿到直接证据（现场包里的 engine.log 没有任何 prune/ignored 痕迹，
+                //     设备上也没有可复现的 node_modules 布局）。**所以这里不写成
+                //     「根因已确认」** —— 修的是「拿过期快照去操作」这个**确定**的
+                //     结构问题：重算之后，日志里打印的清单与实际要隔离的对象一致，
+                //     无论那 7 秒里发生了什么，现场都不会再出现这种自相矛盾。
+                val fresh = shadowingOfficialCopies()
+                if (fresh.size != shadowed.size) {
+                    Log.w(
+                        TAG,
+                        "L1 隔离：遮蔽副本清单在这段时间内发生了变化" +
+                            "（快照 ${shadowed.size} 个 → 现在 ${fresh.size} 个），以现在的为准",
+                    )
+                }
                 Log.w(
                     TAG,
-                    "L1 隔离：全摘第三方仍起不来，但发现 ${shadowed.size} 个遮蔽副本" +
-                        "（${shadowed.joinToString()}）⇒ 摘掉它们再试",
+                    "L1 隔离：全摘第三方仍起不来，但发现 ${fresh.size} 个遮蔽副本" +
+                        "（${fresh.joinToString()}）⇒ 摘掉它们再试",
                 )
-                val moved = shadowed.filter { quarantine(it, "L1 隔离") }
+                val moved = fresh.filter { quarantine(it, "L1 隔离") }
                 if (moved.isNotEmpty()) {
                     val ok = tryWith(emptyList(), "shadowed-official-copies")
                     if (ok) {
@@ -5410,8 +5466,32 @@ class EngineManager private constructor(private val context: Context) {
                             true,
                         )
                     }
+                    // ⚠️ **这一条以前是漏的**（2026-10-15 修）：摘成功了但试启动仍失败时，
+                    //   流程直接落到下面那句「全摘之后仍起不来 ⇒ 不是（仅）插件问题」——
+                    //   而那句话**没有提遮蔽副本已经摘掉**。读者会以为遮蔽副本没被处理过，
+                    //   于是下一次继续按「不是插件问题」的方向查，重复烧一轮。
+                    //   本项目缺陷族（结论与它描述的事实不符）在**结论粒度**上的又一例：
+                    //   事实是「摘掉了 N 个、仍然起不来」，结论写的是「摘不掉／没摘」。
+                    Log.w(
+                        TAG,
+                        "L1 隔离：已摘掉 ${moved.size} 个遮蔽副本" +
+                            "（${moved.joinToString { it.name }}），但试启动仍起不来",
+                    )
+                } else if (fresh.isEmpty()) {
+                    // ⚠️ 重算之后一个都不剩：说明那段时间里遮蔽副本**自己没了**
+                    //   （被引擎/pnpm 挪走），所以此刻没有可摘的对象。
+                    //   必须与「摘了但摘不掉」分开说 —— 两者的下一步动作完全不同。
+                    Log.w(
+                        TAG,
+                        "L1 隔离：遮蔽副本此刻已不存在（快照里有 ${shadowed.size} 个），" +
+                            "无对象可摘，继续按原判据走",
+                    )
                 } else {
-                    Log.w(TAG, "L1 隔离：遮蔽副本一个都没能隔离，继续按原判据走")
+                    Log.w(
+                        TAG,
+                        "L1 隔离：${fresh.size} 个遮蔽副本一个都没能隔离" +
+                            "（逐个原因见上一行 quarantine 的日志），继续按原判据走",
+                    )
                 }
             }
             Log.w(TAG, "L1 隔离：全摘之后仍起不来 ⇒ 不是（仅）插件问题，交 L2")
