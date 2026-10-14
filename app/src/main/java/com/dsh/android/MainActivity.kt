@@ -2302,6 +2302,12 @@ class MainActivity : AppCompatActivity() {
                         if (engineRestarts > MAX_ENGINE_RESTARTS) {
                             Log.e(DshApplication.TAG, "引擎反复退出，停止自动重启")
                             invalidateOverlayTimeout()
+                            // ⚠️ **同 [onRendererGone] 的 gaveUp 分支**：这是终态，
+                            //   刚贴上的「引擎反复停止」是**错误提示**，而在飞的
+                            //   [paintTimeoutRunnable] 到点会 `hideOverlay()` 把它收走，
+                            //   用户只看到一闪。[invalidateOverlayTimeout] 管的是另一个
+                            //   计时器（`overlayTimeoutRunnable`），管不到这一个。
+                            resetFirstFrameAwait()
                             overlayDismissed = false
                             showOverlay(
                                 "引擎反复停止",
