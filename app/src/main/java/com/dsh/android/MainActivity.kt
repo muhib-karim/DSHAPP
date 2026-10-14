@@ -466,6 +466,14 @@ class MainActivity : AppCompatActivity() {
         )
 
         // ⚠️ 状态复位：新渲染进程的第一帧还没提交，沿用旧值会让启动层立刻收尾。
+        //
+        // ⚠️ **同时撤销在飞的「首帧兜底超时」**（[paintTimeoutRunnable]）。它到点会
+        //   执行 `hideOverlay()` —— 而下面 gaveUp 分支刚用 `showOverlay` 贴上
+        //   「界面反复出错」这条**终态错误提示**，残留计时器 1.5 秒后把它收走，
+        //   用户只看到一闪。L483 的 `invalidateOverlayTimeout()` 只管
+        //   `overlayTimeoutRunnable`，管不到这一个 —— 两个计时器都要作废。
+        //   （与 [reloadWithRetry] 里那三件套对齐；那里一直是清全的。）
+        overlayHandler.removeCallbacks(paintTimeoutRunnable)
         webViewPainted = false
         paintPending = false
 
@@ -2327,6 +2335,20 @@ class MainActivity : AppCompatActivity() {
                         // ⚠️ 页面此刻是**活的**，但它连的是已经没人监听的端口 ——
                         //   必须等引擎起来后重新加载，否则界面永远连不上。
                         // ⚠️ 清掉 webViewPainted 让新一轮的「等首帧」重新生效。
+                        //
+                        // ⚠️ **同时撤销在飞的「首帧兜底超时」**（与 [reloadWithRetry]
+                        //   里那三件套一致，这里原先少了这一件）。它是
+                        //   [paintTimeoutRunnable]，到点会执行 `hideOverlay()` 并打一行
+                        //   「等待 Web 内核首帧超时，仍收起启动动画」。
+                        //   而本分支刚用 `showOverlay` 贴上「引擎已停止，正在重新
+                        //   启动…」这个**提示**（不是启动动画）—— 上一轮遗留的计时器
+                        //   1.5 秒后把它收走，用户只看到一闪，还以为提示没出现过。
+                        //   这与 `ab457d4` 修的 `overlayTimeoutRunnable` 残留是同一族
+                        //   缺陷，只是那条盖住的是「界面就绪回调超时」。
+                        //   ⚠️ 全量 558 份诊断包里「引擎已停止，正在重新启动」出现
+                        //   **0 次**，所以这是对照 [reloadWithRetry] 推出的构造性缺陷，
+                        //   不是实测复现；改动本身零风险（少留一个计时器）。
+                        overlayHandler.removeCallbacks(paintTimeoutRunnable)
                         webViewPainted = false
                         paintPending = false
                         // ⚠️ 还要把页面阶段退回 None：否则 `uiStage` 停在 UiReady，
