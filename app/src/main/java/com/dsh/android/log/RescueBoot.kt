@@ -380,7 +380,27 @@ object RescueBoot {
                 if (SECTION_END_RE.containsMatchIn(cur)) break
                 val trimmed = cur.trim()
                 if (trimmed.startsWith("Package:")) {
-                    if (pendingWasTwoSpace) pendingName?.let { n -> if (n !in names) names += n }
+                    if (pendingWasTwoSpace) {
+                        // ⚠️ 条目行**不一定**是裸包名：真机上 `modules` 这类 entry id
+                        //   会带一个 ` (required)` / ` (optional)` 后缀，
+                        //   形如 `  modules (required)` —— 它过不了 PACKAGE_RE，
+                        //   于是 pendingName 为 null，整条被丢掉，最后报出
+                        //   `失败插件 0 个，引擎声称 1 vs 0`：**引擎明明列了 1 个，
+                        //   却被我们记成 0 个**，读的人会以为引擎没给名字。
+                        //   真机证据（CDY-TN90 / v21，注入坏插件复现 client 组合失败）：
+                        //   ```
+                        //   Failed plugins (1):
+                        //     modules (required)                    ← 过不了 PACKAGE_RE
+                        //       Package: @deepseek-ai/dsh-client-modules   ← 真包名在这
+                        //   ```
+                        //   所以行首名字解析不出来时，退用 `Package:` 里的真实包名 ——
+                        //   那才是「哪个插件没起来」的权威答案。
+                        //   行首名字**能**解析时仍用它（老格式真机就是 `  typert-loader`），
+                        //   保持既有行为不变。
+                        val pkg = trimmed.removePrefix("Package:").trim()
+                        val name = pendingName ?: pkg.takeIf { PACKAGE_RE.matches(it) }
+                        name?.let { n -> if (n !in names) names += n }
+                    }
                     pendingName = null
                     pendingWasTwoSpace = false
                     continue
