@@ -560,6 +560,14 @@ class GeckoWebHost(
                 override fun onDisconnect(p: WebExtension.Port) {
                     if (port === p) port = null
                     Log.w(DshApplication.TAG, "GeckoView 桥端口已断开，等待扩展重连")
+                    // ⚠️ **不要在这里清 `pendingEvals`**（2026-10-15 核对后放弃的一个改动）。
+                    //   断连期间 `postToExtension` 会把 eval 消息排进 `pendingUntilReady`，
+                    //   重连时 `flushPendingUntilReady()` 重放它们，结果回来再按 id 兑现
+                    //   —— 这是一条**完整且正确**的恢复路径，清掉 map 反而会
+                    //   让重放回来的结果被丢弃（`pendingEvals.remove(id)` 拿到 null）。
+                    //   全量实测 617 次建立 / 479 次断开，断连是常态、且确实会重连，
+                    //   所以「断开后永不重连导致 map 泄漏」这个假设不成立。
+                    //   Activity 销毁那条兜底在 [destroy] 里（`pendingEvals.clear()`）。
                 }
             })
             Log.i(DshApplication.TAG, "GeckoView 桥端口已建立")
