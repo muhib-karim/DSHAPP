@@ -416,7 +416,36 @@ object VersionInfo {
         if (BuildConfig.BUILT_IN_WEB_ENGINE) "gecko" else "system"
     }.getOrDefault("")
 
-    val applicationId: String = runCatching { BuildConfig.APPLICATION_ID }.getOrDefault("")
+    /**
+     * 本 App 的包名 —— **取运行时真实值，不是 `BuildConfig.APPLICATION_ID`**。
+     *
+     * ## 为什么必须区分这两个
+     *
+     * `BuildConfig.APPLICATION_ID` 是**编译期**常量（= 构建时 manifest 里声明的
+     * 包名）。在**被改过包名**的安装上，它与设备上真实生效的包名会分叉，
+     * 而诊断包里两者都出现时就会**自相矛盾**，把真因盖住。
+     *
+     * 真机铁证（`20261014-144021-fd859918`，Xiaomi 2312DRA50C / Android 16）：
+     * 该包 `app.log` 里的路径全是 `/data/user/0/com.dsh.androie/`
+     * （`com.dsh.android` 出现 0 次、`com.dsh.androie` 21 次），
+     * 而 `environment.json` 的 `applicationId` 却写着 `com.dsh.android` ——
+     * 分析者照它去查，会以为「包名没问题」，从而错过真正的根因
+     * （ELF 路径被改写成不存在的 `/data/data/com.dsh.android/`，
+     * 症状是 `CANNOT LINK EXECUTABLE … library "libz.so.1" not found`）。
+     *
+     * 取值来源与 `TermuxBootstrap.elfRootReplacement` 保持同一套判据：
+     * `filesDir` 的父目录名 = 系统按真实生效包名给出的目录名。
+     * 拿不到就退回 `BuildConfig.APPLICATION_ID`（与改造前一致），
+     * 绝不让一次探测失败影响诊断包生成。
+     *
+     * ⚠️ **不要用 `context.packageName`**：它读的是 manifest 的声明值，
+     *   与 `BuildConfig.APPLICATION_ID` 同源，在被改过包名的安装上一样分叉。
+     */
+    val applicationId: String = runCatching {
+        LogContext.filesDirOrNull()?.parentFile?.name
+            ?.takeIf { it.isNotEmpty() }
+            ?: BuildConfig.APPLICATION_ID
+    }.getOrDefault("")
 
     /** `0.2.7 (14) system` 这种一行摘要。 */
     fun summary(): String = "$versionName ($versionCode) $flavor"

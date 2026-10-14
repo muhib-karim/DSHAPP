@@ -39,6 +39,53 @@ class TermuxBootstrap(private val context: Context) {
     val homeDir get() = File(rootDir, "home")
     private val marker get() = File(prefixDir, ".bootstrap_done")
 
+    /**
+     * `OLD_TERMUX_ROOT` 在 ELF 二进制里被替换成的字符串。
+     *
+     * ⚠️ 必须**恰好 27 字节**才能与 [OLD_TERMUX_ROOT] 等长 —— 末尾那个斜杠就是
+     *   用来凑长度的，而「等长」正是这个补丁安全的全部理由（纯覆盖，
+     *   偏移不移动）。改这里要重新数字节，别用眼睛估。更长会破坏 ELF；
+     *   更短会把一个 NUL 截掉、并让任何共享该后缀的字符串被削掉尾巴。
+     *
+     * ## ⚠️ 必须取「运行时真实数据目录」，不能用 `BuildConfig.APPLICATION_ID`
+     *
+     * 原来这里派生自 `BuildConfig.APPLICATION_ID`（编译期常量，也是 manifest 里
+     * 声明的那个包名）。两者**平时**一致，但在被改过包名的安装上会分叉，
+     * 而分叉的后果极难查 —— 因为等长断言**照样通过**：
+     * `com.dsh.android` 与 `com.dsh.androie` 都是 15 字符，[installDebFixHook]
+     * 里的 `check(...)` 只看长度，看不出内容已经不是这台设备上的真实目录。
+     *
+     * 真机铁证（服务器诊断包 `20261014-144021-fd859918`，
+     * Xiaomi 2312DRA50C / Android 16 / `0.2.9-tooliso (18) system`）：
+     * 设备上真实数据目录是 `/data/user/0/com.dsh.androie/`
+     * （该包 `app.log` 里 `com.dsh.android` 出现 **0 次**、`com.dsh.androie`
+     * **21 次**），而 ELF 被改写成 `/data/data/com.dsh.android/` ——
+     * 一个**不存在**的路径。症状正是
+     * `CANNOT LINK EXECUTABLE … library "libz.so.1" not found`，
+     * 引擎永远起不来（现场文件 `20261014-143950-engine-start-failed.txt`）。
+     * 而同一份包的 `environment.json` 里 `applicationId` 却写着
+     * `com.dsh.android`（那也来自 `BuildConfig`），于是诊断包**自相矛盾**，
+     * 把真因盖住了 —— 本项目缺陷族「结论与它描述的对象不是同一个」的又一例。
+     *
+     * `context.filesDir` 是系统按**这台设备上真实生效的包名**给的，
+     * 所以从它反推最可靠：`filesDir` = `/data/user/0/<pkg>/files`。
+     *
+     * ⚠️ **不能用 `context.packageName` 代替**：它是**编译期 manifest 的声明值**，
+     *   与 `BuildConfig.APPLICATION_ID` 同源，在改过包名的安装上一样会分叉。
+     */
+    private val elfRootReplacement: String = run {
+        val fallback = "/data/data/${BuildConfig.APPLICATION_ID}/"
+        val real = runCatching { context.filesDir?.parentFile?.name }.getOrNull()
+        if (real.isNullOrEmpty()) {
+            fallback
+        } else {
+            val candidate = "/data/data/$real/"
+            // 长度不对就退回：宁可回到「改造前那个已知会分叉的行为」，
+            // 也不要用一个会破坏 ELF 的替换串。
+            if (candidate.length == OLD_TERMUX_ROOT.length) candidate else fallback
+        }
+    }
+
     val isReady: Boolean get() = marker.exists()
 
     /**
@@ -896,12 +943,12 @@ DPkg::options { "--instdir=$instdir"; };
     private fun installDebFixHook() {
         // The sweep rewrites the official prefix inside ELF binaries, which is
         // only safe because the two strings are the same length (pure
-        // overwrite — no offsets shift). The sweep interpolates ELF_ROOT_REPLACEMENT
+        // overwrite — no offsets shift). The sweep interpolates elfRootReplacement
         // into itself, so assert the invariant here: refuse to write a hook that
         // would silently corrupt every binary it touched.
-        check(OLD_TERMUX_ROOT.length == ELF_ROOT_REPLACEMENT.length) {
+        check(OLD_TERMUX_ROOT.length == elfRootReplacement.length) {
             "Termux path rewrite must be equal length: " +
-                "${OLD_TERMUX_ROOT.length} != ${ELF_ROOT_REPLACEMENT.length}"
+                "${OLD_TERMUX_ROOT.length} != ${elfRootReplacement.length}"
         }
         try {
             val hookDir = File(prefixDir, "etc/apt/hooks")
@@ -1046,12 +1093,12 @@ DPkg::options { "--instdir=$instdir"; };
         #    would make the rewriter substitute the longer real prefix, the
         #    lengths would stop matching, and every binary this loop touched
         #    would be silently corrupted.
-        #    ⚠️ ELF_NEW is interpolated from ELF_ROOT_REPLACEMENT so there is a
+        #    ⚠️ ELF_NEW is interpolated from elfRootReplacement so there is a
         #    single source of truth for the 27-byte spelling;
         #    [installDebFixHook] refuses to write this script at all unless that
         #    constant matches OLD_TERMUX_ROOT in length.
         ELF_OLD=/data/data/${'$'}T/files
-        ELF_NEW=$ELF_ROOT_REPLACEMENT
+        ELF_NEW=$elfRootReplacement
         for d in bin libexec lib; do
           [ -d "${'$'}PREFIX/${'$'}d" ] || continue
           for f in ${'$'}(grep -rl -a "${'$'}ELF_OLD" "${'$'}PREFIX/${'$'}d" 2>/dev/null); do
@@ -1353,7 +1400,7 @@ DPkg::options { "--instdir=$instdir"; };
         if (OLD_TERMUX_ROOT == textNew) return
 
         val elfOld = OLD_TERMUX_ROOT.toByteArray(Charsets.ISO_8859_1)
-        val elfNew = ELF_ROOT_REPLACEMENT.toByteArray(Charsets.ISO_8859_1)
+        val elfNew = elfRootReplacement.toByteArray(Charsets.ISO_8859_1)
         var patched = 0
 
         prefixDir.walkTopDown()
@@ -1492,28 +1539,6 @@ DPkg::options { "--instdir=$instdir"; };
          * so anchoring on the root covers all of them with one rule.
          */
         private const val OLD_TERMUX_ROOT = "/data/data/com.termux/files"
-
-        /**
-         * What [OLD_TERMUX_ROOT] becomes inside ELF binaries.
-         *
-         * ⚠️ Must be **exactly 27 bytes** to match [OLD_TERMUX_ROOT] — the
-         * trailing slash is what makes the lengths equal, and equal length is
-         * the whole reason this patch is safe (pure overwrite, no offsets
-         * move). If you ever change this, re-derive the byte count, do not
-         * eyeball it. Longer is impossible without breaking the ELF; shorter
-         * would clip a NUL and corrupt any string that shares the suffix.
-         *
-         * ⚠️ **从 `BuildConfig.APPLICATION_ID` 派生，不写死。** 本工程出两个
-         * flavor，包名不同（`com.dsh.android` / `com.dsh.webview`，都是 15 字符）。
-         * 写死其中一个，另一个 flavor 会把二进制里的路径重写成**别的应用**的
-         * 私有目录 —— 那里既不存在也不可读，症状是 `dpkg: Permission denied` /
-         * `CANNOT LINK EXECUTABLE`，且 [installDebFixHook] 的等长断言**不会**报错
-         * （长度是对的，只是内容错了），非常难查。
-         *
-         * `check(...)` 在 [installDebFixHook] 里仍然守着 27 字节这条不变量：
-         * 谁把包名改成非 15 字符，启动时立刻抛，而不是静默产出坏环境。
-         */
-        private val ELF_ROOT_REPLACEMENT: String = "/data/data/${BuildConfig.APPLICATION_ID}/"
 
         /** Plain-text files larger than this are left alone (they are data, not scripts). */
         private const val MAX_TEXT_BYTES = 2L * 1024 * 1024
