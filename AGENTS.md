@@ -3834,7 +3834,7 @@ Kotlin 调用点传可空值（实测 `GeckoWebHost.kt:516` 的 `onError` 回调
 | 渲染进程崩溃 | `<时间>-renderer-crash.txt` | WebView/GeckoView 报 `didCrash` |
 | 渲染进程被回收 | `<时间>-renderer-reclaimed.txt` | 同上但 `didCrash=false`（**不是崩溃**） |
 | 引擎退出 | `<时间>-engine-exit.txt` | `Process.waitFor` 返回，带退出码与是否预期 |
-| 主线程卡死 | `<时间>-main-thread-stall.txt` | 自建看门狗（500 ms ping，15 s 无响应） |
+| 主线程卡死 | `<时间>-main-thread-stall.txt` | 自建看门狗（5 s ping，15 s 无响应）；**含主线程栈快照** |
 
 ⚠️ **`ApplicationExitInfo` 用不了** —— 它需要 API 30，而本 App 因硬约束②停在
 `targetSdk 28`。所以「上次怎么退出的」只能**自己记**：`BootState` 在启动时写
@@ -3857,6 +3857,26 @@ Kotlin 调用点传可空值（实测 `GeckoWebHost.kt:516` 的 `onError` 回调
 ⚠️ **看门狗记的是「主线程无响应（自建看门狗，非系统 ANR）」**。`targetSdk 28` 下拿不到
 系统 ANR 堆栈，**绝不能伪造一个** —— 编一个看起来像 ANR 的堆栈比不写更糟，
 它会把排查带向错误方向。
+
+⚠️ **但现场文件里现在有一段真抓的快照，别把它当成伪造的 ANR 栈**：`main-thread-stall`
+的 `--- stack trace ---` 段下是 `--- main thread stack (watchdog snapshot) ---`
+（主线程 Java 栈，`Thread.getStackTrace()`）+ `--- main looper queue ---`
+（`Looper.dump()`，会打出队列里**正在分派**的那条消息）。两段各自标注了是谁抓的。
+
+- 为什么是**限时**抓：`Thread.getStackTrace()` 抓**别的**线程要等它走到 safepoint；
+  主线程若卡在 native 里可能**永远**到不了，抓栈调用自己会无限阻塞 —— 那会把 watchdog
+  线程一起拖死（watchdog 死了就再也发现不了卡死）。所以两段都跑在独立线程里、
+  最多等 1 秒，超时写一句**有结论**的话（「到不了 safepoint」把「卡在 Java 代码里」
+  这一整类排除了），而不是留空。
+- `Looper.dump(Printer, String)` 在 SDK 里是 **`@hide`**，编译期直接引用会
+  `Unresolved reference`，必须反射；且它要抢 `MessageQueue` 锁，所以同样必须限时。
+
+**这条快照是补出来的，不是一开始就有**（2026-10-15）：服务器侧 4 次独立的真实用户
+`main-thread-stall`（`20261014-225014` / `-225538` / `20261015-010934` / `-012538`，
+均 `debuggable:false`）`gap` 是 15070 / 19248 / 19622ms —— 全部落在
+`(15s, 20s]` 这个硬上界窗口里，即**主线程真的卡了**，可四份现场一份堆栈都没有，
+定位只能靠猜。补上之后真机验证（人为阻塞主线程 20 秒）现场文件直接指到了
+`MainActivity.onCreate(MainActivity.kt:640)` 与积压的 26 条 Looper 消息。
 
 ⚠️ **`CrashRecorder` 必须用 `tryLock`，永远不能用 `lock`**：崩溃可能发生在**已经持有
 日志锁的那个线程**上，阻塞等待会把「闪退」变成「永久卡死」。拿不到锁也要照写现场文件

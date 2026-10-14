@@ -94,6 +94,15 @@ object CrashRecorder {
     private const val WATCHDOG_STALL_MS = 15_000L
 
     /**
+     * 抓主线程栈时最多等多久（ms）。见 [mainThreadStack]。
+     *
+     * 1 秒的依据：主线程正常时抓栈是**微秒级**（走到一次 safepoint 就拍完），
+     * 1 秒是三个数量级的余量；而卡在 native 里的主线程**永远**等不到，多等只是
+     * 让现场文件晚落盘 —— 崩溃路径总共只有几秒预算，不能再多。
+     */
+    private const val MAIN_STACK_WAIT_MS = 1_000L
+
+    /**
      * 「主线程卡死」与「整个进程被冻结」的分界。
      *
      * ⚠️ **这不只是措辞问题，是本判据能不能信的问题**（真机 44 份现场实测过）。
@@ -300,8 +309,10 @@ object CrashRecorder {
      * 记录**主线程卡死**（ANR 形态）。
      *
      * ⚠️ 拿不到系统 ANR 的完整堆栈（`ApplicationExitInfo` 需 API 30，本工程
-     * `targetSdk = 28`），所以这里记的是「主线程超过 N 秒没响应」这个**事实** +
-     * 内存里的最后若干行日志。不要伪造成「系统 ANR 堆栈」—— 那是编造证据。
+     * `targetSdk = 28`），所以这里记的是「主线程超过 N 秒没响应」这个**事实**，
+     * 外加**自建 watchdog 抓的一次快照**（主线程 Java 栈 + Looper 消息队列，
+     * 见 [mainThreadStack]）。不要伪造成「系统 ANR 堆栈」—— 那是编造证据；
+     * 快照里每一段都如实标注了它是谁抓的、以及抓不到时意味着什么。
      *
      * ⚠️ **超过 [WATCHDOG_FREEZE_MS] 的不要走这里**，那是整进程被冻结，
      * 见 [recordProcessFreeze] 的注释。分错类会让「真卡死」被假警报淹掉。
@@ -314,10 +325,113 @@ object CrashRecorder {
         writeScene(
             kind = "main-thread-stall",
             reason = "主线程超过 ${stalledMs}ms 未响应（自建 watchdog 判定，非系统 ANR）",
-            stack = null,
+            stack = mainThreadStack(),
             threadName = "main",
             level = 'E',
         )
+    }
+
+    /**
+     * 抓**主线程此刻在哪**——卡死现场里唯一能定位的那段。
+     *
+     * ## 为什么必须补这一段
+     *
+     * 原先 `recordMainThreadStall` 传的是 `stack = null`，于是「主线程卡死」这类
+     * 现场**只有**元信息 + 最后 200 行日志 + 时间线。而这三段在卡死场景下几乎
+     * 没有信息量：卡死期间主线程**本来就不打日志**，所以「最后 200 行」停在卡住
+     * 之前的那一刻，只能证明「它是在这里之后卡住的」，说不出卡在哪。
+     *
+     * 真机实测（服务器侧真实用户包，`debuggable:false`，v21）：4 次独立的
+     * `main-thread-stall`（`20261014-225014` / `-225538` / `20261015-010934` /
+     * `-012538`），`gap` 分别是 15070 / 19248 / 19622ms —— **全部落在
+     * `(WATCHDOG_STALL_MS, WATCHDOG_FREEZE_MS]` 这个硬上界窗口里**，即
+     * watchdog 线程自己照常每 5 秒醒来（否则会走 `process-freeze` 分支）。
+     * 也就是说**主线程真的卡了 15~19 秒**，可 4 份现场一份堆栈都没有，
+     * 定位只能靠猜。补这一段就是为了让下一次有据可查。
+     *
+     * ## 为什么是这两样，以及它们的诚实边界
+     *
+     * ① **主线程 Java 栈**：`Thread.getStackTrace()` 对**另一个**线程调用时，
+     *    VM 需要等目标线程走到 safepoint 才能拍栈。主线程若卡在 native 里
+     *    （本 App 大量回调都是 WebView/GV 经 JNI 进来的），它可能**永远**
+     *    到不了 safepoint ⇒ 抓栈调用自己会无限阻塞。所以这里**放到独立线程里
+     *    并限时 [MAIN_STACK_WAIT_MS]**，超时就如实写「超时」——宁可没有，
+     *    也不能让 watchdog 线程陪着一起卡死（watchdog 死了就再也发现不了卡死）。
+     * ② **主线程 Looper 的消息队列**：`Looper.dump()` 就是系统 ANR trace 用的
+     *    同一套机制，它会打印出队列里**正在分派**的那条消息
+     *    （`>>>>> Dispatching to Handler (…) {…}`）。它不依赖主线程配合，
+     *    所以即便 ① 超时，这一段通常仍能回答「卡在哪条消息上」。
+     *
+     *    ⚠️ **两处坑，都踩过**：
+     *    - `Looper.dump(Printer, String)` 在 SDK 里是 **`@hide`**，编译期直接
+     *      引用会 `Unresolved reference`。必须走反射。
+     *    - 它内部要拿 `MessageQueue` 的**监视器锁**。主线程若正好卡在那把锁上
+     *      （本 App 主线程大量 `post`/`removeCallbacks` 都碰它），反射调用会
+     *      把 watchdog 线程一起卡死 —— 而 watchdog 死了就再也发现不了卡死。
+     *      所以这一段**同样放到独立线程里并限时**，与 ① 一个规格。
+     *
+     * ⚠️ **这不是系统 ANR 堆栈，不要伪造成那个样子**。它是「自建 watchdog 抓的
+     *   一次快照」，与 `reason` 里那句「非系统 ANR」是同一个诚实口径。
+     * ⚠️ 栈里的字符串同样要过脱敏网 —— 它可能含用户路径、`?token=`。
+     *   `writeScene` 已经对 `stack` 统一脱敏（见那里的注释），这里不必重复。
+     */
+    private fun mainThreadStack(): String {
+        val sb = StringBuilder()
+
+        // ① 主线程 Java 栈 —— 限时，见上面 ①。
+        sb.append("--- main thread stack (watchdog snapshot) ---\n")
+        sb.append(boundedDump("dsh-main-stack-dump") { out ->
+            val t = Looper.getMainLooper().thread
+            out.append("main thread state: ").append(t.state).append('\n')
+            val st = t.stackTrace
+            if (st.isEmpty()) {
+                out.append("(主线程栈为空 —— 它多半正阻塞在 native 里，")
+                    .append("或还没走到任何 Java 帧)\n")
+            } else {
+                st.forEach { out.append("    at ").append(it).append('\n') }
+            }
+        })
+
+        // ② Looper 消息队列 —— 见上面 ②（反射 + 限时）。
+        sb.append("\n--- main looper queue ---\n")
+        sb.append(boundedDump("dsh-main-looper-dump") { out ->
+            val dump = Looper::class.java.getMethod(
+                "dump", android.util.Printer::class.java, String::class.java,
+            )
+            val printer = android.util.Printer { line -> out.append(line).append('\n') }
+            dump.invoke(Looper.getMainLooper(), printer, "")
+        })
+
+        return sb.toString()
+    }
+
+    /**
+     * 在独立线程里跑 [body]，最多等 [MAIN_STACK_WAIT_MS]；超时就返回一句**如实的
+     * 结论**而不是空串。
+     *
+     * 抽出来是因为抓栈与抓 Looper 队列**有同一个规格**：都可能无限阻塞，都
+     * 不能连累 watchdog 线程，超时的措辞也应当一致。见 [mainThreadStack]。
+     *
+     * ⚠️ 超时的文案必须说清「这意味着什么」——「抓栈超时」本身对读日志的人没有
+     *   意义，而「主线程到不了 safepoint」把「卡在 Java 代码里」这一整类**排除**
+     *   掉了，那是可用的结论。
+     */
+    private fun boundedDump(tag: String, body: (StringBuilder) -> Unit): String {
+        val out = StringBuilder()
+        val worker = Thread({
+            runCatching { body(out) }
+                .onFailure { out.append("($tag 失败: ${it.javaClass.simpleName}: ${it.message})\n") }
+        }, tag).apply { isDaemon = true }
+        worker.start()
+        // ⚠️ `join` 而不是轮询：join 有 happens-before 保证，`out` 在这里读到的
+        //   一定是子线程写完的内容（或者它压根没写完 —— 那种情况下面如实标注）。
+        runCatching { worker.join(MAIN_STACK_WAIT_MS) }
+        return if (worker.isAlive) {
+            "(抓取超时 ${MAIN_STACK_WAIT_MS}ms —— 主线程到不了 safepoint，" +
+                "通常意味着它阻塞在内核/native 调用或 MessageQueue 锁上)\n"
+        } else {
+            out.toString()
+        }
     }
 
     /**
@@ -605,8 +719,11 @@ object CrashRecorder {
      * 还有时间戳）。
      *
      * ⚠️ **KDoc 原先写的是「有堆栈的那两类」，那是错的**（2026-10-14 自检发现）：
-     *   它描述的是一个**不存在的总体**。三类里只有 `uncaught-exception` 带堆栈 ——
-     *   [recordRendererGone] 与 [recordMainThreadStall] 都把 `stack` 显式传 `null`。
+     *   它描述的是一个**不存在的总体**。三类里只有 `uncaught-exception` 带
+     *   **真正的异常栈** —— [recordRendererGone] 把 `stack` 显式传 `null`，
+     *   而 [recordMainThreadStall] 传的是 [mainThreadStack] 抓的**快照**
+     *   （`--- main thread stack (watchdog snapshot) ---` + Looper 队列），
+     *   它不是异常栈、也没有「谁抛了什么」。
      *   照「有堆栈」去理解，分析者会以为 `renderer-crash` 里有内核栈可读，翻遍
      *   现场文件找不到，进而怀疑现场写坏了。实测 `20261014-054414-renderer-crash.txt`
      *   （13,031 字节）确实**没有** `--- stack trace ---` 段。
