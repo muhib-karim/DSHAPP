@@ -3,6 +3,7 @@ package com.dsh.android.log
 import android.util.Log as AndroidLog
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
@@ -55,6 +56,15 @@ object LogUploader {
 
     /** 待传目录（`logs/pending`）。 */
     private const val PENDING_DIR = "pending"
+
+    /**
+     * 补传用的**跨进程**锁文件（`logs/pending/.retry.lock`）。
+     *
+     * ⚠️ **必须以 `.lock` 结尾**：[pendingCount] 与 `retryPendingLocked` 都只把
+     *   `.zip` 当待传包，用别的后缀（尤其是 `.zip`）会让锁文件自己被当成一个
+     *   永远传不出去的包，每次启动都白传一次。
+     */
+    private const val PENDING_LOCK_FILE = ".retry.lock"
 
     /** 手动导出目录（`logs/export`）。 */
     private const val EXPORT_DIR = "export"
@@ -194,6 +204,85 @@ object LogUploader {
     fun retryPending(logDir: File, onEach: ((File, Boolean, String) -> Unit)? = null) {
         if (!configured) return
         val dir = File(logDir, PENDING_DIR)
+        // ⚠️ **补传必须跨进程互斥，只有 `uploading` 是不够的。**
+        //
+        //   `uploading` 是 `AtomicBoolean`，**只在进程内有效**。而崩溃循环里
+        //   会有**多个主进程实例在时间上重叠**，各自跑一遍
+        //   `uploadPendingBundles()` → 各扫一遍同一个 `pending/`，
+        //   于是同一个包被两个进程同时处理。
+        //
+        //   服务器上有铁证（`20261014-125152-8e063967`，gecko flavor）：
+        //   同一个 `diagnostic-20261014-122723-…-3a7c.zip`
+        //     12:27:23.321  [Upload] #15 worker-3  诊断包上传成功 code=200
+        //     12:27:23.335  [Upload] #8  worker-1  诊断包上传异常 … open failed: ENOENT
+        //   相隔 14 ms。两条日志的 `#seq` 分属**两条独立的序号流**（`#15` 之后
+        //   又出现 `#8`），而 `LogStore.seq` 是**进程内**计数 —— 同进程内它只增
+        //   不减，所以这必然是**两个进程**。
+        //
+        //   是「多个主进程实例重叠」而不是「GeckoView 的内容进程」：
+        //   `DSH application created` 打在 `onCreate` 里、且**位于
+        //   `if (!isMainProcess(this)) return` 之后**，同一份 app.log 里它出现
+        //   19 次 ⇒ 19 次都是主进程。再对着时序看，前一个实例还没走完
+        //   （`#15` 上传成功）后一个实例已经在跑（`#8` 上传异常），
+        //   即**新旧主进程实例在时间上重叠** —— 崩溃循环里系统会重新拉起进程，
+        //   而上一个还没死透。
+        //   ⚠️ 别拿「日志里没有『非主进程启动』」当反证：那一行走的是
+        //      `android.util.Log.i`，只进 logcat，**不落 app.log**，
+        //      在诊断包里必然是 0 次，证明不了任何事。
+        //
+        //   判别性很强：**全量 554 个包里含该异常的 51 个全部是 gecko，
+        //   system flavor 一个都没有**（gecko 启动更慢，重叠窗口更大）。
+        //
+        //   危害有三条，都不只是噪音：
+        //   ① 报出「上传失败」但那个包其实**已经传成功了**（结论与事实相反）；
+        //   ② 该包已不存在，`bumpAttempts()` 却仍在 `pending/` 里给它写一个孤儿
+        //      `.attempts` 文件，越积越多；
+        //   ③ 白打一条误导性日志，把真正的问题（进程重叠）掩盖成「网络/IO 抖动」。
+        //
+        //   机制照抄本项目既有的 `TermuxBootstrap.withPrefixFileLock`（那里用同一
+        //   手法解决多进程并发引导 prefix，KDoc 写了「进程内锁保证同进程
+        //   串行、文件锁保证跨进程串行，两层缺一不可」）：`FileChannel.lock()` 在
+        //   Android 上落到 `fcntl(F_SETLKW)`，**随进程退出自动释放**，不会因为
+        //   持锁进程被系统杀掉而留下死锁 —— 这一点对崩溃循环尤其要紧。
+        //
+        //   ⚠️ 用 `tryLock()` 而不是 `lock()`：这是**启动路径**上的补传，让第二个
+        //      进程在这里阻塞等几十秒（8MB 在移动网络下的耗时）会拖慢它的启动，
+        //      而用户此刻正等着界面出来。拿不到就如实跳过，下次启动再试。
+        //   ⚠️ 锁文件放在 `pending/` 里、以 `.lock` 结尾：`pendingCount()` 与
+        //      `retryPendingLocked` 都只认 `.zip`，不会被它算成待传包。
+        val lockFile = File(dir, PENDING_LOCK_FILE)
+        lockFile.parentFile?.mkdirs()
+        val raf = runCatching { RandomAccessFile(lockFile, "rw") }.getOrNull() ?: return
+        raf.use { handle ->
+            val lock = runCatching { handle.channel.tryLock() }.getOrNull()
+            if (lock == null) {
+                // ⚠️ 文案**不能**写死「另一个进程」：同一个进程内重复进这里时，
+                //   `FileChannel.tryLock()` 会抛 `OverlappingFileLockException`
+                //   （同一 JVM 不允许对同一文件重复加锁），也会走到这个分支。
+                //   两种情形都如实概括，别把其中一种说成另一种 —— 本项目的
+                //   缺陷族里「结论与它描述的对象不是同一个」占了大半。
+                LogStore.app(
+                    'W', "Upload",
+                    "另一个上传正在进行（可能是另一进程的补传），本次跳过" +
+                        "（待传 ${pendingCount(logDir)} 份，下次启动会再试）",
+                )
+                return
+            }
+            try {
+                retryPendingLocked(dir, onEach)
+            } finally {
+                runCatching { lock.release() }
+            }
+        }
+    }
+
+    /**
+     * [retryPending] 的实现体，**必须已持有跨进程锁**。
+     *
+     * ⚠️ 单独抽出来只是为了把锁的获取/释放收在 [retryPending] 一个出口，
+     *   不要在别处调用它。
+     */
+    private fun retryPendingLocked(dir: File, onEach: ((File, Boolean, String) -> Unit)?) {
         val files = dir.listFiles()?.filter { it.isFile && it.name.endsWith(".zip") } ?: return
         if (files.isEmpty()) return
         // 按时间从旧到新：先传早的，让服务器按顺序看到问题演变。
@@ -212,6 +301,15 @@ object LogUploader {
                 return
             }
             try {
+                // ⚠️ 判据是「文件还在不在」，不是「能不能打开」。跨进程锁已经
+                //   保证不会有两个补传同时跑，但**手动上传**（`upload()`，用户点
+                //   日志界面的按钮）走的是另一条路、不持这把锁，它完全可能在
+                //   这里两行之间把包传完删掉。少这一句就会在同一个地方报出
+                //   一模一样的假 ENOENT。
+                if (!f.isFile) {
+                    LogStore.app('I', "Upload", "待传包已被别的上传处理掉，跳过: ${f.name}")
+                    continue
+                }
                 val (ok, msg) = doUpload(endpoint!!, f, "startup-retry")
                 onEach?.invoke(f, ok, msg)
                 if (ok) {
@@ -227,9 +325,13 @@ object LogUploader {
                         //      「不再自动重试」矛盾）；② 日志却报告已经移走，
                         //      分析者据此以为这批包已经归档，实际还在反复占流量。
                         //   两条都是「结论与事实不符」，只是方向相反。
-                        val moved = runCatching { f.renameTo(File(failedDir, f.name)) }.getOrDefault(false)
+                        val moved = runCatching { f.renameTo(File(failedDir, f.name)) }
+                            .getOrDefault(false)
                         if (moved) {
-                            LogStore.app('W', "Upload", "待传包重试 $attempts 次仍失败，已移入 failed/: ${f.name}")
+                            LogStore.app(
+                                'W', "Upload",
+                                "待传包重试 $attempts 次仍失败，已移入 failed/: ${f.name}",
+                            )
                         } else {
                             LogStore.app(
                                 'W', "Upload",
