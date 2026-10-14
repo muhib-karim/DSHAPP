@@ -286,13 +286,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 已经为「内核进程死亡」重载过几次。
+     * **短时间内连续**为「内核进程死亡」重载过几次。
      *
      * ⚠️ **必须有上界**：如果重载之后立刻又崩（比如某个必然让渲染进程 OOM 的
      *   页面状态），无限重载就变成一个「白屏 ↔ 重载」的死循环，比直接告诉用户
      *   出了什么事更难排查 —— 而且日志会被刷屏。
+     *
+     * ⚠️ **但「连续」必须真的判成连续**：它原先是个纯计数器、从头到尾不归零，
+     *   于是统计的是「本次运行累计死过几次」。而「内核被系统回收」在内存压力下
+     *   是**正常且分散**的 —— 服务器诊断包实测同一个用户三次回收分别隔了
+     *   31 分、32 分、4.8 小时（V2357A，每次都在 0.4 秒内恢复成功）。攒够 4 次
+     *   就宣告「界面反复出错，已停止自动恢复」，而实际上每一次都自愈了。
+     *
+     *   真出问题的形态完全不同：服务器上唯一的「反复」样本是**秒级连发**——
+     *   `02:37:31 → 36 → 41 → 46 → 54`（14 个包同一现场，堆内存压垮渲染进程），
+     *   相邻间隔 5~8 秒。两类之间隔着两个数量级，所以判据用时间窗是稳的。
+     *
+     *   与引擎重启的 [ENGINE_RESTART_WINDOW_MS] 是**同一个模式**（那里已经这么做了，
+     *   见它的 KDoc），渲染重载这条路当时漏了。
      */
     private var rendererRestarts = 0
+
+    /**
+     * 上一次「内核没了」的时刻（见 [RENDERER_RESTART_WINDOW_MS]）。
+     *
+     * ⚠️ 与 [lastEngineDeadAt] **同一个模式**：只靠计数器、没有时间窗的话，
+     *   它统计的就成了「本次运行累计死过几次」而不是「是不是在反复死」。
+     */
+    private var lastRendererGoneAt = 0L
 
     /** 重载界面的退避 handler（见 [onRendererGone]）。 */
     private val rendererHandler = Handler(Looper.getMainLooper())
@@ -422,6 +443,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // ⚠️ 计数只统计**短时间内连续**的死亡（见 RENDERER_RESTART_WINDOW_MS）：
+        //   一次长期运行之后被系统回收（实测有隔了 4.8 小时的）是**正常的**，
+        //   把它算进「反复崩溃」会让用户无端看到「界面反复出错」并失去自动恢复。
+        //   与引擎重启那条路径（见 `State.Dead` 分支）保持同一套判据。
+        val now = System.currentTimeMillis()
+        if (now - lastRendererGoneAt > RENDERER_RESTART_WINDOW_MS) rendererRestarts = 0
+        lastRendererGoneAt = now
         rendererRestarts++
         Log.w(
             DshApplication.TAG,
@@ -3211,6 +3239,20 @@ class MainActivity : AppCompatActivity() {
          * 反复崩溃是真的有问题，静默重载会让用户以为「什么都没发生」。
          */
         const val MAX_RENDERER_RESTARTS = 3
+
+        /**
+         * 「连续崩溃」的判定窗口（ms），用于 [rendererRestarts]。
+         *
+         * 两次「内核没了」间隔超过它 ⇒ 计数归零、重新开始数。依据同
+         * [ENGINE_RESTART_WINDOW_MS]：「用了一阵才被回收」与「刚重载完就又崩」
+         * 是两种不同的事 —— 前者是内存压力下的正常回收（实测间隔 31 分~4.8 小时，
+         * 每次都自愈），后者才说明页面状态真的有问题。
+         *
+         * 取 90 秒（与引擎那个窗口同值）：远大于「重载 + 拿到首帧」的耗时
+         * （实测约 0.4 秒，见 `界面已恢复（第 N 次尝试拿到首帧）`），所以「刚恢复
+         * 就又崩」必定落在窗口内；而真实反复崩溃是 5~8 秒一次，也在窗口内。
+         */
+        const val RENDERER_RESTART_WINDOW_MS = 90_000L
 
         /**
          * 允许**自动**重启引擎的次数上界。
