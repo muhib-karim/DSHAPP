@@ -409,11 +409,28 @@ class MainActivity : AppCompatActivity() {
         webViewPainted = false
         firstFrameReallyArrived = false
         web.resetFirstFrame()
+        // ⚠️ **重载必须排在「重新武装首帧等待」之前。**
+        //   `WebHost.reload()` 内部会把「在飞的等首帧动作」清掉
+        //   （SystemWebHost.reload() 里 `pendingPaintAction = null`，
+        //   GeckoWebHost 同理）—— 那是为了不让重载前的旧回调把 painted 置回 true。
+        //   顺序反了的话，刚注册进去的 `done()` 会被紧接着的 reload() 丢掉：
+        //   真首帧回调照常到来，却**没有任何动作被调用**，`firstFrameReallyArrived`
+        //   永远是 false ⇒ 每次都走到「界面未恢复 / 仍未恢复为可用状态」，
+        //   哪怕页面其实早就正常渲染了。
+        //   真机证据（CDY-TN90 / v21 system，内核崩溃触发的重载）：
+        //   ```
+        //   02:39:14.951 重载界面（第 1 次尝试）
+        //   02:39:16.460 等待 Web 内核首帧超时，仍收起启动动画   ← 兜底先到
+        //   02:39:16.904 Web 界面加载完成                       ← 页面其实好了
+        //   02:39:22.991 界面未恢复，再试一次                    ← 却判失败
+        //   ```
+        //   `resetFirstFrame()` 仍留在 reload() 之前（它要按 requestId 作废旧回调，
+        //   放后面就作废不掉新注册的那个了）。
+        web.reload()
         awaitWebViewPainted {
             // 首帧回来了 = 界面真的恢复到可用状态
             Log.i(DshApplication.TAG, "界面已恢复（第 $attempt 次尝试拿到首帧）")
         }
-        web.reload()
         rendererHandler.postDelayed({
             if (firstFrameReallyArrived) return@postDelayed
             if (attempt < MAX_RELOAD_ATTEMPTS) {
@@ -422,7 +439,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 Log.e(DshApplication.TAG, "界面重载 $attempt 次仍未恢复为可用状态")
             }
-        }, PAINT_TIMEOUT_MS + RENDERER_RELOAD_DELAY_MS)
+        }, RELOAD_RECOVERY_TIMEOUT_MS)
     }
 
     /**
@@ -2220,9 +2237,22 @@ class MainActivity : AppCompatActivity() {
         paintPending = true
 
         val done = {
+            // ⚠️ 「真首帧到了没有」必须**无条件**记账，不能和下面的收启动层共用一个
+            //   守卫。兜底超时（[paintTimeoutRunnable]，1.5 秒）会把 webViewPainted
+            //   提前置 true —— 那个标志只代表「可以收启动层了」，**不代表首帧到了**。
+            //   原先两者共用 `if (!webViewPainted)`，于是兜底一旦先跑（页面要 2~4 秒
+            //   才出来，必然先跑），真首帧到达时这个分支为假 ⇒ firstFrameReallyArrived
+            //   永远是 false ⇒ [reloadWithRetry] 拿它判「界面恢复了没有」永远是
+            //   「没恢复」。真机证据（服务器诊断包 15/29，v21 gecko）：
+            //   ```
+            //   00:27:40.191 重载界面（第 1 次尝试）
+            //   00:27:41.692 等待 Web 内核首帧超时，仍收起启动动画   ← +1501ms，兜底
+            //   00:27:42.096 界面未恢复，再试一次                    ← +1905ms，判失败
+            //   ```
+            //   两件事叠加才让用户彻底卡住，只放宽判定窗口治不了本。
+            firstFrameReallyArrived = true
             if (!webViewPainted) {
                 webViewPainted = true
-                firstFrameReallyArrived = true
                 paintPending = false
                 overlayHandler.removeCallbacks(paintTimeoutRunnable)
                 Log.i(DshApplication.TAG, "Web 内核已提交首帧，收起启动动画")
@@ -2962,6 +2992,33 @@ class MainActivity : AppCompatActivity() {
 
         /** 单次恢复最多重载几次（见 [reloadWithRetry]）。 */
         const val MAX_RELOAD_ATTEMPTS = 2
+
+        /**
+         * 重载之后，等多久判断「界面恢复了没有」（ms）。
+         *
+         * ⚠️ **不能用 [PAINT_TIMEOUT_MS] + [RENDERER_RELOAD_DELAY_MS]**（= 1900ms）。
+         *   那个口径只覆盖「一次帧提交」，而重载要等的是**整页重新加载 + 插件
+         *   重新激活**，两者不是一个量级。真机实测（gecko flavor，`引擎就绪 →
+         *   加载 Web GUI → 提交首帧`）：包 29 是 2225ms、包 15 是 2080ms，
+         *   注释里另一处独立记的启动实测值也是「共约 3.8 秒」。
+         *   1900ms 的窗口**必然**在页面出来之前就先判失败。
+         *
+         * ⚠️ 后果不是「多试一次」，而是**越试越糟**：判定超时后进入
+         *   `reloadWithRetry(attempt + 1)`，而它会再 `web.reload()` 一次 ——
+         *   把上一次仍在飞的加载**打断并重新起算**。两轮都在 1.9 秒时被打断，
+         *   于是页面永远到不了首帧，最后落进
+         *   `界面重载 2 次仍未恢复为可用状态`，用户只剩「重开 App」。
+         *   真机证据（服务器诊断包 15 / 29，RE5C4FL1，v21 gecko）：
+         *   ```
+         *   00:27:40.191 重载界面（第 1 次尝试）
+         *   00:27:42.096 界面未恢复，再试一次        ← 1905ms，判太早
+         *   00:27:42.097 重载界面（第 2 次尝试）
+         *   00:27:44.000 界面重载 2 次仍未恢复为可用状态
+         *   ```
+         *   取 8 秒：与 [armOverlayTimeout] 的口径一致（同为「等页面可用」），
+         *   给足 3.8 秒实测值两倍余量，又不至于让用户觉得卡住不动。
+         */
+        const val RELOAD_RECOVERY_TIMEOUT_MS = 8000L
 
         /**
          * 允许**自动**恢复的次数上界。
