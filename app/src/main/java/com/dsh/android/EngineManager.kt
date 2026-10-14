@@ -6476,6 +6476,43 @@ class EngineManager private constructor(private val context: Context) {
             } else {
                 "引擎进程在打印 URL 之前就结束了（等了 ${waited} ms）"
             }
+            // ⚠️ **顺序是要害：先落盘「为什么失败」，再广播 `State.Failed`。**
+            //
+            //   这两个动作的**读者是不同线程**，而广播会**同步**唤醒 main 线程上
+            //   的收集者（`MainActivity` 的 `collect { }` 里那句
+            //   `engine.shouldAutoEnterSafeMode()`），后者立刻去读
+            //   `RescueBoot.lastFailure()`。
+            //
+            //   原先的顺序是反的（先广播、后记录），于是 main 读到的永远是**上一次**
+            //   的失败记录 —— 真机现场（`20261015-013148-76dfff48.zip`，
+            //   Xiaomi 24117RK2CC / Android 17 / v21 gecko）：
+            //
+            //   ```
+            //   01:31:31.462 [I] #101 main                 [rescue-auto] 连续失败仅 0 次（需 ≥3）
+            //   01:31:31.470 [E] #102 DefaultDispatcher-2  已记录现场: engine-start-failed
+            //   ```
+            //
+            //   同一场失败，读记录的线程比写记录的线程**早 8 ms**。后果是
+            //   `consecutiveFailures` 每次都被读成比实际小 1 —— 判据里的门
+            //   （`>= 3`）**永远差一次**，于是自动进安全模式（L3）这条兜底
+            //   整条阶梯**整体推迟一轮**：引擎本该在第 3 次失败时自救，实际要等到
+            //   第 4 次。而这一轮里用户面对的是引擎起不来、界面完全不可用，
+            //   只能自己反复重开 App 去凑那个数。这正是本项目缺陷族
+            //   「结论与它描述的对象不是同一个」在**时序**上的又一例。
+            //
+            //   ⚠️ 说清界限：这是「晚一轮」而**不是**「永不触发」。`tier` 升到
+            //      RESCUE 后 tier 这一条会长期成立，所以下一轮 streak 追上时仍会
+            //      触发。别把它写成「永不」—— 那本身又是一次同族失真。
+            //
+            //   把记录提到广播之前即可根除：广播之后任何时刻读，记录都已就位。
+            //   ⚠️ 别改成「广播后再补一次记录」—— 那会让同一场失败被记两次，
+            //      计数翻倍，L1/L2/L3 全部提前触发（另一种失真）。
+            val tailList = synchronized(logLines) { logLines.toList() }
+            RescueBoot.recordFailure(
+                bootId = BootState.bootId,
+                exitCode = runCatching { proc.exitValue() }.getOrNull(),
+                tailLines = tailList,
+            )
             _state.value = State.Failed("引擎启动失败（$reason）。最后输出:\n$tail")
             // ⚠️ **P0：把「真实启动失败」变成可读的状态**（见 RescueBoot 的类注释）。
             //
@@ -6491,12 +6528,7 @@ class EngineManager private constructor(private val context: Context) {
             // ⚠️ 顺序：必须在 CrashRecorder 之前 —— 下面那步要写崩溃现场，
             //   而现场文件里会读事件时间线；先把「为什么失败」的结构化事实落盘，
             //   保证即使现场写入失败也留下了线索。
-            val tailList = synchronized(logLines) { logLines.toList() }
-            RescueBoot.recordFailure(
-                bootId = BootState.bootId,
-                exitCode = runCatching { proc.exitValue() }.getOrNull(),
-                tailLines = tailList,
-            )
+            //   （记录本身已提到上面 `State.Failed` 之前，见那段说明。）
             // ⚠️ 「引擎起不来」是本 App 最严重的一类故障（界面直接不可用），
             //   所以要写**崩溃现场文件**而不只是日志行：现场文件里带着
             //   最后 200 行日志与设备快照，用户点「导出日志」就能一次性带走。
