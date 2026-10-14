@@ -1,6 +1,19 @@
 package com.dsh.android.log
 
-import android.util.Log
+// ⚠️ **必须是 DshLog 而不是 android.util.Log**（2026-10-15 修，本类是全工程最后一处漏网）。
+//
+//   本类 13 处 `Log.*` 原先直接 `import android.util.Log` —— 那是**只写 logcat**，
+//   而救援阶梯恰恰是「App 起不来」时唯一在跑的东西：进程一退，logcat 就没了，
+//   用户能带出来的只有诊断包。后果在服务器侧被实测钉死：
+//
+//   **567 个诊断包里，凡带 `engine-start-failed` 场景的，`救援：已记录启动失败`
+//   出现次数全部为 0。** 也就是说 L1/L2/L3 的每一次判断与推进，在现场**一个字
+//   都没留下** —— 排查的人只能看到「引擎起不来」，看不到「救援试过什么、为什么
+//   没接住」。这与本项目缺陷族（结论与它描述的对象不是同一个）同源：
+//   日志写着"已记录启动失败"，而那个「记录」这件事**只对 logcat 成立**。
+//
+//   `DshLog` 的方法签名与 `android.util.Log` 逐一对应，所以调用点一个字符都不用改。
+import com.dsh.android.log.DshLog as Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -247,6 +260,20 @@ object RescueBoot {
     fun installUnder(dshHome: File) {
         install(File(dshHome, DIR_NAME))
     }
+
+    /**
+     * 记录目录（未安装时为 null）。给诊断包用 —— 它要把这里面的状态文件带走。
+     *
+     * ⚠️ **存在的理由**：`diagnosis.json` 的 `boot-tier` 检查项明确写着
+     * 「已摘除的 bundle 见 rescue/state.json」/「详见 rescue/state.json」，
+     * 而在本方法出现之前，那个目录**从来没有进过诊断包** —— 于是分析者被
+     * 指向一个拿不到的文件。这正是本项目缺陷族（结论与它描述的对象不是同一个）
+     * 的又一实例：**结论指向的证据不在产物里**。
+     *
+     * ⚠️ 让调用方自己去拼 `$DSH_HOME/rescue` 是不行的：`dir` 由 [installUnder]
+     *   装进来，只有本对象知道它到底在哪。复制一份路径拼接就是复制一份真相。
+     */
+    fun dirOrNull(): File? = dir
 
     /**
      * 记录一次真实启动失败（覆盖写，只保留最近一次）。

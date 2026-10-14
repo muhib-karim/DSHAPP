@@ -71,6 +71,14 @@ object DiagnosticBundle {
      */
     private const val HEADER_LINES_FOR_BOOT_ID = 8
 
+    /**
+     * `rescue/attempts/` 最多带几份（L1 二分逐步记录）。
+     *
+     * 与 [MAX_STARTUP_LOGS] 同一取舍：试探次数随隔离轮次增长，最近几份足以
+     * 还原「摘到哪一个 bundle 时好了」。按修改时间取最近的。
+     */
+    private const val MAX_RESCUE_ATTEMPTS = 8
+
     private val fmt = SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val fileFmt = SafeDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
@@ -136,6 +144,10 @@ object DiagnosticBundle {
 
                 // ── ② 崩溃现场（价值高、体量中等）──
                 budget -= writeCrashes(zos, logDir, entriesWritten, completeness)
+
+                // ── ②.5 救援阶梯状态（小而关键：`diagnosis.json` 的 boot-tier 项
+                //    明确指向 `rescue/state.json`，此前那个目录从未进过包）──
+                budget -= writeRescueState(zos, entriesWritten, completeness)
 
                 // ── ③ 关键文件状态 ──
                 if (extraFiles.isNotEmpty()) {
@@ -619,6 +631,99 @@ object DiagnosticBundle {
             JSONObject().apply {
                 put("totalOnDevice", scenes.size)
                 put("included", index.length())
+                if (failures.length() > 0) put("failedToWrite", failures)
+            },
+        )
+        return total
+    }
+
+    /**
+     * 把救援阶梯的状态文件打进包（`$DSH_HOME/rescue/`）。
+     *
+     * ## 为什么必须有
+     *
+     * `runChecks()` 的 `boot-tier` 检查项对降级态明确写着「已摘除的 bundle 见
+     * rescue/state.json」「详见 rescue/state.json」，而**那个目录此前从未进过
+     * 诊断包** —— 服务器侧 567 个包里，`rescue/` 条目数为 0，`last-boot-failure.json`
+     * 一次都没出现过。分析者被结论指向一个拿不到的文件，于是「引擎为什么起不来」
+     * 这件事在产物里**无从判断**：`state.json` 说当前是 normal/rescue，
+     * `last-boot-failure.json` 说连续失败几次、哪几个 required 插件没激活 ——
+     * 这两份正是 L1/L2/L3 每一次判断的**输入**，缺了它们，救援阶梯的行为
+     * 在事后完全不可复盘。
+     *
+     * ⚠️ 与 `crash/` 同理：这三份文件都是**小且价值最高**的，放在 ② 段写，
+     *   保证不会被日志挤掉预算。
+     * ⚠️ `attempts/` 是 L1 二分的逐步记录（`0001.json`…），数量随试探次数增长，
+     *   这里按修改时间只带最近 [MAX_RESCUE_ATTEMPTS] 份 —— 与
+     *   [MAX_STARTUP_LOGS] 同一取舍。
+     */
+    private fun writeRescueState(
+        zos: ZipOutputStream,
+        written: MutableList<String>,
+        completeness: JSONObject,
+    ): Long {
+        val dir = RescueBoot.dirOrNull()
+        if (dir == null) {
+            completeness.put("rescue_absent", "RescueBoot 未安装记录目录")
+            return 0L
+        }
+        if (!dir.isDirectory) {
+            // ⚠️ 区分「目录不存在」与「存在但没有文件」：前者是「从未降级过」，
+            //   后者是「降级过但状态没写下去」—— 两者对排查的意义完全相反。
+            completeness.put("rescue_absent", "目录不存在（从未进入过降级/救援）")
+            return 0L
+        }
+        val all = dir.listFiles { f: File -> f.isFile }?.sortedBy { it.name } ?: emptyList()
+        val attemptsDir = File(dir, "attempts")
+        val attempts = attemptsDir.listFiles { f: File -> f.isFile && f.name.endsWith(".json") }
+            ?.sortedByDescending { it.lastModified() }
+            ?.take(MAX_RESCUE_ATTEMPTS)
+            ?: emptyList()
+        if (all.isEmpty() && attempts.isEmpty()) {
+            completeness.put("rescue_empty", "目录存在但没有任何状态文件（从未降级过）")
+            return 0L
+        }
+
+        var total = 0L
+        val index = JSONArray()
+        val failures = JSONArray()
+        for (f in all + attempts) {
+            val entryName = if (f.parentFile == attemptsDir) "rescue/attempts/${f.name}" else "rescue/${f.name}"
+            // ⚠️ 先取流、再建条目（与 [writeCrashes] / [writeEngineStartupLogs] 同口径）：
+            //   反过来会在读失败时留下 0 字节僵尸条目，与「没收进来」的结论矛盾。
+            runCatching {
+                val ins = f.inputStream()
+                zos.putNextEntry(ZipEntry(entryName))
+                ins.use { it.copyTo(zos) }
+                zos.closeEntry()
+                written.add(entryName)
+                total += f.length()
+                index.put(
+                    JSONObject().apply {
+                        put("file", entryName)
+                        put("sizeBytes", f.length())
+                        put("at", f.lastModified())
+                        put("atText", fmt.format(Date(f.lastModified())))
+                    },
+                )
+            }.onFailure { t ->
+                failures.put(
+                    JSONObject().apply {
+                        put("file", entryName)
+                        put("error", "${t.javaClass.simpleName}: ${t.message}")
+                    },
+                )
+            }
+        }
+        val attemptsAll = attemptsDir.listFiles { f: File -> f.isFile } ?: emptyArray()
+        completeness.put(
+            "rescueFiles",
+            JSONObject().apply {
+                put("totalOnDevice", all.size + attemptsAll.size)
+                put("included", index.length())
+                // ⚠️ 当前层级一并写进 completeness：它是「此刻是不是降级态」这个
+                //   问题最直接的答案，与 `boot-tier` 那条检查互相印证。
+                put("tier", RescueBoot.tier().tier.id)
                 if (failures.length() > 0) put("failedToWrite", failures)
             },
         )
