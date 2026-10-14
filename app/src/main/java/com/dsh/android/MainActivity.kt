@@ -153,14 +153,30 @@ class MainActivity : AppCompatActivity() {
             "界面就绪回调超时（WebView 内核 $webViewMajor，页面错误: " +
                 "${webError.ifEmpty { "无" }}）",
         )
-        // 优先显示页面自己报出来的原因（最准确）；没有就退到「内核可能过旧」的推断。
+        // 优先显示页面自己报出来的原因（最准确）；没有就只说「还没就绪」。
+        //
+        // ⚠️ **这里不能推断「内核过旧」** —— 那个结论在构造上永远为假。
+        //   `observeEngine` 的 `Ready` 分支里，`webViewMajor < effectiveMinWebViewMajor`
+        //   时会直接 `return@collect`：**既不 `loadUrl`、也就不会调 [armOverlayTimeout]**
+        //   （唯一调用点在 loadUrl 之后）。所以能走到这里的设备，内核**必然已达门槛**。
+        //
+        //   原文案却写「可能是系统 WebView 内核过旧（当前 N，需要 73+）」，
+        //   于是真机上出现自相矛盾的提示：内核 150 的设备被劝去「更新 Android
+        //   System WebView」—— 而它已经是最新的，用户照做也永远解决不了问题。
+        //
+        //   真机取证（8 个真实用户、6 家厂商、内核 114/132/138/140/143/150/153/154）：
+        //   **每一条**「界面就绪回调超时」后面 0.4~9.3 秒内都紧跟着
+        //   `插件已激活（onUiReady）` + `Web 内核已提交首帧，收起启动动画`。
+        //   也就是说这不是错误，只是「解析 5.5MB 前端 + 挂载 React」比 12 秒慢，
+        //   红层随后自己就收掉了。真正的错误由 `webViewMajor` 门槛与
+        //   `State.Failed` 两条路各自负责提示。
         if (webError.isNotEmpty()) {
             showOverlay("界面加载失败", hint = "$webError（点一下这里可继续）", isError = true)
         } else {
             showOverlay(
-                "界面没有加载出来",
-                hint = "可能是系统 WebView 内核过旧（当前 $webViewMajor，需要 $MIN_WEBVIEW_MAJOR+）。" +
-                    "请更新后重开 App；点一下这里可继续",
+                "界面加载较慢",
+                hint = "已等 ${UI_READY_TIMEOUT_MS / 1000} 秒仍未就绪，页面可能还在解析。" +
+                    "稍等一下；点一下这里可继续",
                 isError = true,
             )
         }
