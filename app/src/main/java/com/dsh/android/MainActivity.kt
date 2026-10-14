@@ -250,6 +250,26 @@ class MainActivity : AppCompatActivity() {
     private var rendererReloadQueued = false
 
     /**
+     * 是否已经放弃自动恢复（见 [onRendererGone] 的上界分支）。
+     *
+     * ⚠️ **光靠「不再排新的重载」停不下来**：判定是「先排重载、再等
+     *   [RELOAD_RECOVERY_TIMEOUT_MS] 看首帧」，所以在飞的那条链（[reloadWithRetry]
+     *   的 `postDelayed`）并不知道上界已经触发，它会照常往下走 —— 再次
+     *   `web.reload()`，把刚贴给用户的「已停止自动恢复」提示顶掉，日志上表现为
+     *   「说了停却还在重载」。
+     *   真机证据（CDY-TN90 / v21 system，堆内存压垮渲染进程）：
+     *   ```
+     *   02:37:46.893 界面内核崩溃，准备重载（第 4 次）
+     *   02:37:46.914 界面内核反复崩溃，停止自动重载      ← 宣称已停
+     *   02:37:47.964 界面重载 2 次仍未恢复为可用状态    ← 旧链仍在跑
+     *   02:37:50.171 界面未恢复，再试一次               ← 而且又排了一次
+     *   02:37:50.176 重载界面: http://127.0.0.1:3080/…  ← 真的又重载了
+     *   ```
+     *   置位后 [reloadWithRetry] 的每一处入口与延时回调都会立刻放弃。
+     */
+    private var rendererGaveUp = false
+
+    /**
      * 引擎重启后，即使 URL 与上次相同也**必须**重新加载页面。
      *
      * ## 为什么需要它
@@ -356,6 +376,10 @@ class MainActivity : AppCompatActivity() {
 
         if (rendererRestarts > MAX_RENDERER_RESTARTS) {
             Log.e(DshApplication.TAG, "界面内核反复$reason，停止自动重载")
+            // ⚠️ 必须置位：在飞的那条重载链（reloadWithRetry 的 postDelayed）不会
+            //   因为这里 return 而停下，它会继续 reload() 并把下面这条提示顶掉。
+            //   见 rendererGaveUp 的 KDoc。
+            rendererGaveUp = true
             // 把出路摆给用户：不再自动重载，但说清发生了什么、以及该做什么。
             // ⚠️ 这里显式放开 `overlayDismissed`（见 showOverlay 的第一行守卫），
             //   否则界面早就收起过启动层，这条提示永远贴不上去。
@@ -393,6 +417,12 @@ class MainActivity : AppCompatActivity() {
      *   它同时也是「重载成功了没有」的观测点。
      */
     private fun reloadWithRetry(attempt: Int) {
+        // ⚠️ 已放弃自动恢复（见 rendererGaveUp）就一步都不许再走 —— 包括在飞的
+        //   重试链。这里必须在最前面，晚一步就已经 loadUrl 出去了。
+        if (rendererGaveUp) {
+            Log.i(DshApplication.TAG, "已停止自动恢复，放弃重载（第 $attempt 次尝试）")
+            return
+        }
         Log.i(DshApplication.TAG, "重载界面（第 $attempt 次尝试）")
         // ⚠️ **必须在 reload() 之前重置首帧记忆**，否则 awaitFirstFrame 会因为
         //   `painted` 早就是 true 而**同步立刻**回调 —— 判据在 reload 还没发生时就
