@@ -5,6 +5,8 @@ import com.dsh.android.log.DshLog as Log
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
 import com.dsh.android.log.CrashRecorder
+import com.dsh.android.log.BootState
+import com.dsh.android.log.RescueBoot
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
@@ -212,6 +214,19 @@ class EngineManager private constructor(private val context: Context) {
         private set
 
     /**
+     * 救援 profile 本次启动是否可用（[ensureRescueProfile] 建出来了）。
+     *
+     * ⚠️ 与 [rootToolMounted] 同构：由启动协程写、主线程/桥读，必须 `@Volatile`。
+     *
+     * 用途：降级阶梯在决定「要不要退到 L2」之前必须问一句 ——
+     * 救援 profile 建不出来时退到 L2 只会**再失败一次**，那比直接退 L3 更糟
+     * （用户多等一轮、日志里多一条误导性的失败）。所以这个事实必须能被读到。
+     */
+    @Volatile
+    var rescueAvailable = false
+        private set
+
+    /**
      * 本次引擎启动时，uid 2000（`shell`）通道是否**真的挂上了**。
      *
      * 与 [rootToolMounted] 同构：`shell` 工具同样走 `--patch`，同样是启动时定死。
@@ -231,8 +246,14 @@ class EngineManager private constructor(private val context: Context) {
     /** 引擎运行所需的可写 HOME（DSH 在此存放配置、凭据、会话）。 */
     private val homeDir get() = File(context.filesDir, "home")
 
-    /** DSH_HOME：DSH 自己的数据目录。 */
-    private val dshHome get() = File(homeDir, ".dsh")
+    /** DSH_HOME：DSH 自己的数据目录。
+     *
+     * ⚠️ 路径字面量来自 [DshApplication.DSH_HOME_REL]（**单一真相源**）：
+     *   `attachBaseContext()` 里装 [com.dsh.android.log.RescueBoot] 时
+     *   `EngineManager` 实例还不存在，只能从常量拼。两边各写一份的话，
+     *   改一处漏一处就是两个组件看不同的目录，症状只是「读不到状态」。
+     */
+    private val dshHome get() = File(context.filesDir, DshApplication.DSH_HOME_REL)
 
     /**
      * `$DSH_HOME` 的**只读**对外视图 —— 给宿主侧的信箱桥用
@@ -2523,8 +2544,8 @@ class EngineManager private constructor(private val context: Context) {
      * **整体覆盖**，所以残留行会自动消失，不需要额外清理 —— 但**新写的 overlay 里
      * 绝不能再出现这一行**，否则 bug 原样复活。
      */
-    private fun ensurePresetDefault() {
-        val patch = File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME")
+    private fun ensurePresetDefault(profile: String = PROFILE_NAME) {
+        val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
             if (patch.isFile) patch.readText() else ""
         } catch (t: Throwable) {
@@ -2787,7 +2808,7 @@ class EngineManager private constructor(private val context: Context) {
      * 的一部分，用户删掉它就等于弄丢了号池，所以每次启动都要确保它在。但**只补缺**
      * （见 [mergeKeyPoolProvider]），已有 `agnes:` 时一个字节都不动。
      */
-    private fun ensureKeyPoolProvider(inject: File?): Boolean {
+    private fun ensureKeyPoolProvider(inject: File?, profile: String = PROFILE_NAME): Boolean {
         // 老版本把内置号池写成 --patch overlay（keyinject.patch.yml）。那个写法会
         // 在最顶层整块替换 `llm-pi-ai` 那行，把用户自己的 provider 一起盖掉 ——
         // 见 [KEY_POOL_NS]。这份残留**必须无条件删掉**（与号池资产在不在无关）：
@@ -2797,7 +2818,7 @@ class EngineManager private constructor(private val context: Context) {
         }
         if (inject == null) return false
 
-        val patch = File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME")
+        val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
             if (patch.isFile) patch.readText() else ""
         } catch (t: Throwable) {
@@ -3089,8 +3110,8 @@ class EngineManager private constructor(private val context: Context) {
      * 判据与 [ensureKeyPoolProvider] 一致：**只补缺，不覆盖**。行已存在就一个字节
      * 都不动 —— 那意味着用户在设置页里选过模型，属于用户意图。
      */
-    private fun ensureDefaultModel() {
-        val patch = File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME")
+    private fun ensureDefaultModel(profile: String = PROFILE_NAME) {
+        val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
             if (patch.isFile) patch.readText() else ""
         } catch (t: Throwable) {
@@ -3963,8 +3984,71 @@ class EngineManager private constructor(private val context: Context) {
      * 改一项，hook `window.fetch` 抓到 `settings/mutate` 的 payload 与落盘结果，
      * 再用 `settings/describe` 核对 schema 里的可选项与 `base`/`user` 分层。
      */
-    private fun seedDefaultSettings() {
-        val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
+    /**
+     * 确保救援 profile 存在且**可用**（P2，见 `docs/RESCUE-BOOT-PLAN.md` §4.4.1）。
+     *
+     * ## 为什么 App 要自己写这个 profile
+     *
+     * 引擎**不会**为 `rescue` 初始化 profile：`dsh-app-boot/lib/index.js` L973-975
+     * 只认 `PROFILE_TEMPLATES` 里的五个内置名字，别的名字直接抛
+     * `dsh: profile "rescue" does not exist; create it with 'dsh plugin --profile rescue add <package>'`。
+     *
+     * 而 `initProfile()`（同文件 L576）其实只需要一个 `package.json` ——
+     * 它自己也是这么写的（`{name, private, dependencies:{}, dsh:{profile:{bundles}}}`）。
+     * 所以 App 照同一格式写一份即可。真机实测（CDY-TN90 / Android 10）确认可用：
+     * `--profile rescue --dump-config` 打出完整条目表，
+     * `--profile rescue --no-open --port 0` 打出 `dsh web: http://127.0.0.1:<port>/?token=…`。
+     *
+     * ## ⚠️ 三条要害
+     *
+     * 1. **模板不能取自用户的 `profiles/web/package.json`** —— 那份文件正是
+     *    可能已经坏掉的东西（用户装了 40 个插件、某个拖挂了核心插件）。
+     *    拿它当模板等于把病灶复制进救援环境。所以 bundles 逐字取自引擎的
+     *    `PROFILE_TEMPLATES.web.bundles`，见 [RESCUE_BUNDLES]。
+     * 2. **只在文件不存在时写**（与引擎 `initProfile` 同一判据）：救援 profile
+     *    一旦被写坏，用户/AI 可能正在里面修东西，每次启动覆盖会把他们的活抹掉。
+     * 3. **写失败要如实报出来**：救援 profile 建不出来 ⇒ 救援启动一定失败。
+     *    这时**不能**假装没事继续走救援路径，必须让调用方回落到 L3（安全模式）。
+     *    返回 null 就是「建不出来」的信号。
+     *
+     * @return 写好的 profile 目录；null = 建不出来（调用方应回落 L3）。
+     */
+    private fun ensureRescueProfile(): File? {
+        val dir = File(dshHome, "profiles/$RESCUE_PROFILE_NAME")
+        val manifest = File(dir, "package.json")
+        if (manifest.isFile) return dir
+
+        return try {
+            dir.mkdirs()
+            // ⚠️ 格式逐字对齐引擎 `initProfile()` 的输出（含 2 空格缩进与结尾换行）：
+            //   引擎会读回这份文件（`readProfileManifest`），格式不一致虽然多数情况
+            //   仍能解析，但没有理由给自己制造差异。`name` 也用引擎的命名规则
+            //   `dsh-profile-<目录名>`。
+            val json = JSONObject()
+                .put("name", "dsh-profile-$RESCUE_PROFILE_NAME")
+                .put("private", true)
+                .put("dependencies", JSONObject())
+                .put(
+                    "dsh",
+                    JSONObject().put(
+                        "profile",
+                        JSONObject().put("bundles", JSONArray(RESCUE_BUNDLES)),
+                    ),
+                )
+            // 同 [stripThirdPartyBundles] 的理由：`JSONObject` 会把 `/` 转义成 `\/`，
+            // 那在 JSON 里合法但看起来像坏了。这里全是 `@deepseek-ai/...` 包名，
+            // 转义后一眼就能看出不对，还原回去。
+            manifest.writeText(json.toString(2).replace("\\/", "/") + "\n")
+            Log.i(TAG, "已创建救援 profile: ${manifest.absolutePath}（bundles=${RESCUE_BUNDLES.joinToString(", ")}）")
+            dir
+        } catch (t: Throwable) {
+            Log.e(TAG, "创建救援 profile 失败（救援启动将不可用）: ${t.message}")
+            null
+        }
+    }
+
+    private fun seedDefaultSettings(profile: String = PROFILE_NAME) {
+        val profileDir = File(dshHome, "profiles/$profile")
         val patch = File(profileDir, PROFILE_PATCH_FILENAME)
         if (patch.exists() && !isEmptyProfilePatch(patch)) {
             Log.i(TAG, "profile 用户配置已存在，保留用户设置: ${patch.absolutePath}")
@@ -4049,6 +4133,46 @@ class EngineManager private constructor(private val context: Context) {
             end = PRIVILEGED_PROMPT_END,
             body = if (available) PRIVILEGED_PROMPT_ENABLED else PRIVILEGED_PROMPT_DISABLED,
             label = "特权身份说明（uid 2000）",
+        )
+    }
+
+    /**
+     * 把「你正处于降级态、可以这样修」写进 agent 指令（方案 §4.4 的 P4）。
+     *
+     * ## 为什么是条件注入
+     *
+     * 正常态下这段整个不写（`writePromptSection` 不能删段落，所以正常态写一段
+     * **空的**替代文本 —— 见下）。理由有两条：
+     *
+     * ① 它描述的是一个**当下成立的事实**（"你的插件被隔离了"）。正常态下这句话
+     *    是假的，而把一个假前提塞进系统提示词会让模型做出错误判断 —— 那正是
+     *    本项目缺陷族的形态（"结论与它描述的对象不符"）。
+     * ② 它不短（约 2KB）。降级态下是值得的，正常态下纯属浪费上下文。
+     *
+     * ⚠️ 不能用「从没写过」来表示正常态：那样从降级态恢复后，旧文本会**永远
+     *    留在 `AGENTS.md` 里**，模型此后一直以为自己处在救援模式。
+     *    所以正常态要写一段**显式的否定**。
+     */
+    private fun ensureRescuePrompt() {
+        val st = RescueBoot.tier()
+        val degraded = st.tier != RescueBoot.Tier.NORMAL
+        // 单独打一行：AGENTS.md 的验收手法查的就是这条（同 [ensurePrivilegedPrompt]）。
+        Log.i(TAG, "降级态说明: 层级=${st.tier.id}，注入=${degraded}")
+        writePromptSection(
+            begin = RESCUE_PROMPT_BEGIN,
+            end = RESCUE_PROMPT_END,
+            body = if (degraded) {
+                RESCUE_PROMPT
+            } else {
+                """
+                ## 启动状态：正常
+
+                本机**没有**处于降级启动模式，用户的插件配置完好。
+                若用户说他打不开 App、或有插件没生效，读 `${'$'}DSH_HOME/rescue/state.json`
+                与 `${'$'}DSH_HOME/rescue/last-boot-failure.json` 看有没有历史记录。
+                """.trimIndent()
+            },
+            label = "降级态说明",
         )
     }
 
@@ -4160,18 +4284,56 @@ class EngineManager private constructor(private val context: Context) {
      *
      * @return true = 做过修复（调用方据此提示用户）；false = profile 本来就是好的。
      */
-    private suspend fun preflight(): Boolean {
+    /**
+     * 启动前体检的结论。
+     *
+     * ⚠️ **为什么不能再用 `Boolean`**：`false` 同时表示「静态干净」和「体检压根没跑成」，
+     * 而这两件事的**可信度完全不同** —— 前者至少解析过一遍配置，后者什么都不知道。
+     * 调用方（以及读日志的人）看到 `false` 会以为"体检说没问题"，于是
+     * 引擎接下来死掉时，第一反应是往别处查。
+     *
+     * 真机证据（2026-10-14，Xiaomi 24122RKC7C / Android 16 / v18，8 次连续启动失败）：
+     * `--dump-config` 退出码 **0**、4 个 required 条目**全在**，体检因此放行，
+     * 引擎照死。**静态干净 ≠ 已验证** —— 这就是新增 [StaticOnly] 的理由。
+     *
+     * ⚠️ [Clean] / [StaticOnly] 都**不代表引擎能起来**：`--dump-config` 只解析配置，
+     * 不执行插件的 `apply()`，而真机上杀死引擎的异常正是在 `apply()` 期抛的。
+     * 真正"能起来"的唯一证据是引擎打印了 URL（见 `start()` 里的 `engine.ready`）。
+     */
+    private enum class PreflightResult(val label: String) {
+        /** 静态解析过了，没有可疑文件要隔离。**运行期仍未验证。** */
+        Clean("静态干净"),
+
+        /** 体检跑不了（node 缺失、profile 还没建）—— 对配置一无所知。 */
+        StaticOnly("未做静态检查"),
+
+        /** 体检发现并隔离/重解包了东西，复检通过。 */
+        Repaired("已修复"),
+    }
+
+    /**
+     * 启动前体检：profile 与 patch 层都是模型可写的，改坏会让引擎直接 exit 1，
+     * 而 App 没有任何自救路径（用户只能卸载重装，那会清掉全部会话与凭据）。
+     *
+     * ⚠️ **本方法看不见插件的 `apply()` 期异常** —— 它跑的是 `--dump-config`，
+     * 只解析配置。所以它的结论**不能**用来担保"引擎能起来"（见 [PreflightResult]）。
+     *
+     * @return 三态结论，见 [PreflightResult]。
+     */
+    private suspend fun preflight(): PreflightResult {
         val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
         if (!profileDir.isDirectory) {
-            // 还没有 profile：引擎首次启动会自己按模板初始化，没什么可体检的
-            return false
+            // 还没有 profile：引擎首次启动会自己按模板初始化，没什么可体检的。
+            // ⚠️ 这不是 Clean —— 一次 dump-config 都没跑过，运行期零验证。
+            return PreflightResult.StaticOnly
         }
 
         val first = runDumpConfig()
         if (first == null) {
-            // 跑不起来（node 缺失等）：体检本身失效，放行让引擎报它自己的错
+            // 跑不起来（node 缺失等）：体检本身失效，放行让引擎报它自己的错。
+            // ⚠️ 同样不是 Clean —— 见上面那条。
             Log.w(TAG, "启动前体检无法执行，跳过（不影响启动）")
-            return false
+            return PreflightResult.StaticOnly
         }
 
         val suspects = LinkedHashSet<File>()
@@ -4204,24 +4366,88 @@ class EngineManager private constructor(private val context: Context) {
             return rebuildEngine(emptyList())
         }
 
-        if (suspects.isEmpty()) return false
+        if (suspects.isEmpty()) return PreflightResult.Clean
 
         var quarantined = 0
         for (file in suspects) {
             if (quarantine(file, "启动前体检")) quarantined++
         }
-        if (quarantined == 0) return false
+        if (quarantined == 0) return PreflightResult.Clean
 
         // 复检：隔离完再跑一次，确认真的修好了
         val second = runDumpConfig()
         if (second != null && second.exitCode == 0 && missingRequiredEntries(second.stdout).isEmpty()) {
             Log.i(TAG, "启动前体检：已隔离 $quarantined 个损坏的 profile 文件，复检通过")
-            return true
+            return PreflightResult.Repaired
         }
 
         // 隔离了还不够：坏的不止那几个文件，退到整棵重解包
         Log.w(TAG, "启动前体检：隔离后复检仍未通过，改走整棵重解包")
         return rebuildEngine(emptyList())
+    }
+
+    /**
+     * P6：判断「该不该**自动**进安全模式」（方案 §4.5）。
+     *
+     * ## 为什么要有这道门
+     *
+     * 安全模式此前**只能用户点**，而真机证据（那台 Xiaomi 的两个诊断包里
+     * `安全模式` 出现 **0 次**，同期 `启动前体检` 出现 110 次）说明：用户根本
+     * 不会点它 —— 界面在启动失败时只是停在浮层上，用户以为"再等等就好了"。
+     * 于是「App 一定打得开」这条承诺在**用户不配合**时就断了。
+     *
+     * ## 为什么门槛定得这么高（三个条件全满足才自动进）
+     *
+     * L3 是**破坏性**的：推开用户的插件配置 + 删版本戳重解包（约 15 秒）。
+     * 现有的克制（"拿不准就别动"）是对的，不能因为要好用就把它变成默认行为。
+     * 所以要求**同时**满足：
+     *
+     * | # | 条件 | 为什么 |
+     * |---|---|---|
+     * | ① | `consecutiveFailures >= 3` | 连续 3 次真实启动失败。1~2 次可能是偶发（系统内存紧张、端口占用），不值得推开配置 |
+     * | ② | `tier == RESCUE` | **L1 与 L2 都已经试过**。这是最要紧的一条：`tier` 只有在「L1 二分没收敛」时才会被升成 RESCUE（见 [maybeIsolateBadBundles] 末尾），所以 `tier == RESCUE` **本身就是**「L1 试过且失败」的机器可判证据。而在救援 profile 下再失败，等于 L2 也试过了 |
+     *
+     * ⚠️ 条件②**不能**写成「`tier != NORMAL`」：ISOLATED 态意味着 L1 **成功**
+     *   摘掉了致命插件，那时该做的是让用户用着（哪怕少了几个插件），而不是把
+     *   他剩下的插件**也**推开。判据必须精确指向「L1 已经没辙了」这个状态。
+     *
+     * ⚠️ 条件②同时也覆盖了「已经在安全模式里」：`SAFE_MODE != RESCUE`，所以
+     *   安全模式下这道门自动关闭，不会每次启动都重解包 15 秒。
+     *   **不要再补一条 `tier != SAFE_MODE`** —— 那是永远不成立的死判据
+     *   （本族已 30 例：写了一条与它要拦的对象对不上的条件）。
+     *
+     * ⚠️ 也不能只看 `consecutiveFailures`：一个装了坏插件的用户，L1 每次都能
+     *   成功隔离（`tier == ISOLATED`），失败计数会因 `clearFailure` 归零 ——
+     *   那种情况**本来就不需要**安全模式。加上条件②才不会误伤。
+     *
+     * ## 第三种日志标记
+     *
+     * `[preflight]`（自动修）与用户点击（无前缀，见 [quarantine] 的 `reason`）
+     * 已经分得清，本方法必须新增**第三种**，否则事后复盘会把「系统自动推开了
+     * 用户的配置」误读成「用户自己点的安全模式」—— 两者对用户的责任完全不同。
+     * 标记用 `[rescue-auto]`，与那两种都不撞。
+     *
+     * @return true = 本次确实自动进了安全模式（调用方应据此提示用户）。
+     */
+    internal fun shouldAutoEnterSafeMode(): Boolean {
+        val f = RescueBoot.lastFailure()
+        val st = RescueBoot.tier()
+        val streak = f?.consecutiveFailures ?: 0
+
+        val reasons = ArrayList<String>()
+        if (streak < AUTO_SAFE_MODE_MIN_FAILURES) reasons += "连续失败仅 $streak 次（需 ≥$AUTO_SAFE_MODE_MIN_FAILURES）"
+        if (st.tier != RescueBoot.Tier.RESCUE) reasons += "层级是 ${st.tier.id} 而不是 rescue（L1/L2 还没试过）"
+
+        if (reasons.isEmpty()) {
+            Log.w(TAG, "[rescue-auto] 连续 $streak 次启动失败且 L1/L2 都没能救回来，自动进入安全模式")
+            EventLog.record(
+                "rescue.degrade.l3",
+                mapOf("consecutiveFailures" to streak.toString(), "trigger" to "auto"),
+            )
+            return true
+        }
+        Log.i(TAG, "[rescue-auto] 不自动进安全模式：${reasons.joinToString("；")}")
+        return false
     }
 
     /**
@@ -4288,6 +4514,23 @@ class EngineManager private constructor(private val context: Context) {
             Log.w(TAG, "安全模式：内置 Node 运行时已重新解包")
             changed = true
         }
+
+        // ⚠️ 必须把层级记成 SAFE_MODE，不能只做改动不记状态。两个后果都会真实发生：
+        //
+        //   ① **横幅会说谎**（违反不变量 I4）：`refreshRescueBanner` 读的就是这个
+        //      `tier`，不记的话它仍显示「救援模式」而实际跑的是安全模式 ——
+        //      又一处「结论与它描述的对象不是同一个」（本族已 30 例）。
+        //   ② **P6 的自动触发会重复**：那道门的判据是 `tier == RESCUE`，
+        //      不记的话它一直是 RESCUE，下次失败又自动推开一次配置（破坏性动作
+        //      重复执行，且每次白等 15 秒重解包）。
+        //
+        //   位置在最后：`changed == false` 时也记 —— 安全模式**本来就是**「推开
+        //   坏配置」，三样都干净只是说明这次没东西可推，但「用户/系统选择了安全
+        //   模式」这个事实仍成立，界面必须照实显示。
+        RescueBoot.setTier(
+            RescueBoot.Tier.SAFE_MODE,
+            "安全模式：推开损坏的配置并重新解包引擎（改动=$changed）",
+        )
 
         Log.w(TAG, "安全模式：已推开损坏的配置（改动=$changed），准备重启引擎")
         changed
@@ -4388,7 +4631,7 @@ class EngineManager private constructor(private val context: Context) {
      *
      * @param missing 体检发现缺失的 required 条目 id（仅用于日志）。
      */
-    private suspend fun rebuildEngine(missing: List<String>): Boolean {
+    private suspend fun rebuildEngine(missing: List<String>): PreflightResult {
         // 用户配置层也可能是共犯（比如它 patch 的目标行已随 bundle 一起消失）
         quarantine(File(dshHome, "profiles/$PROFILE_NAME/$PROFILE_PATCH_FILENAME"), "启动前体检")
 
@@ -4396,7 +4639,7 @@ class EngineManager private constructor(private val context: Context) {
         if (stamp == null) {
             // 没拿到版本戳（ensureExtracted 还没被调用过）：只能删戳，让下次启动重解包
             if (stampFile.delete()) Log.w(TAG, "启动前体检：已删除引擎版本戳，下次启动将重新解包")
-            return true
+            return PreflightResult.Repaired
         }
 
         Log.w(
@@ -4411,11 +4654,11 @@ class EngineManager private constructor(private val context: Context) {
             val stillMissing = check?.let { missingRequiredEntries(it.stdout) }.orEmpty()
             if (check != null && check.exitCode == 0 && stillMissing.isEmpty()) {
                 Log.i(TAG, "启动前体检：重解包完成，复检通过")
-                true
+                PreflightResult.Repaired
             } else {
                 // 重解包都修不好 ⇒ 不是 engine/ 的问题（多半是设备环境），如实报出来
                 Log.e(TAG, "启动前体检：重解包后仍未通过（缺 ${stillMissing.joinToString(", ")}）")
-                true
+                PreflightResult.Repaired
             }
         } catch (t: Throwable) {
             // ensureExtracted 自己会把 State 置成 Failed 并抛出；这里不再吞掉它，
@@ -4458,6 +4701,815 @@ class EngineManager private constructor(private val context: Context) {
 
     /** [runDumpConfig] 的结果。 */
     private class DumpResult(val exitCode: Int, val stdout: String, val stderr: String)
+
+    /**
+     * 一次「试启动」的结果（P1 二分法 / P3 `try-boot` 共用）。
+     *
+     * ⚠️ **`internal` 而不是 `private`**：`RescueCommandBridge` 要把它转成
+     *   JSON 回执给 AI。做成 `private` 的话桥就只能自己重新解析一次引擎输出 ——
+     *   那是同一件事的两份实现，正是本项目缺陷族的温床。
+     *
+     * @param ready 引擎是否打印了带 token 的 URL —— **这是"能起来"的唯一证据**。
+     *   不变量 I6：任何静态检查的结论都不能替代它。
+     * @param requiredDidNotActivate 引擎自称没激活的 required 插件数；没提到时为 null。
+     * @param tail 引擎输出的尾部（已截断），给 AI 与人看。
+     */
+    internal class ProbeResult(
+        val ready: Boolean,
+        val exitCode: Int?,
+        val requiredDidNotActivate: Int?,
+        val tail: List<String>,
+    ) {
+        /** 是不是「插件问题导致起不来」——判据见 [RescueBoot.Failure.looksLikePluginProblem]。 */
+        val looksLikePluginProblem: Boolean
+            get() = requiredDidNotActivate != null && requiredDidNotActivate > 0
+    }
+
+    /**
+     * 用给定 profile **真跑一次引擎**，看它能不能到「打印 URL」那一步，然后立刻杀掉。
+     *
+     * ## 这是本方案唯一可信的验证手段
+     *
+     * `--dump-config`（[runDumpConfig]）只解析配置、**不执行插件的 `apply()`**，
+     * 而真机上杀死引擎的异常正是在 `apply()` 期抛的 —— 8 次真实启动失败里，
+     * `dump-config` 退出码全是 0、4 个 required 条目全在。所以判据只能是真跑。
+     * 这就是不变量 I6。
+     *
+     * ## 三条要害
+     *
+     * 1. **端口必须传 0**：正在运行的引擎占着 3080，探测进程再抢它就会得到
+     *    `EADDRINUSE` → `startup failed: 2 required plugins did not activate`，
+     *    把「插件坏」误报成「端口占用」。`--port 0` 让内核挑空闲端口
+     *    （真机实测可行，A2 记录里那次打的是 44057）。
+     * 2. **必须杀掉进程**：探测完不杀就会留一个占着端口、跑着插件的引擎。
+     *    真机验证过 `--port 0` 起完再 kill，`ps -A | grep -c bin.js` = 0。
+     * 3. **超时是 60 秒而不是 [READY_TIMEOUT_MS] 的 120 秒**：失败路径实测
+     *    17~22 秒就返回了，60 秒足够，且二分会跑很多次，120 秒会让总时长失控。
+     *
+     * @param profile 用哪个 profile 试。
+     * @param overlays `--patch` 列表。**必须与真实启动一致**（见 [buildEngineArgs]）。
+     * @param timeoutMs 单次上限。
+     * @return null = 压根跑不起来（node 缺失等）—— 与「跑起来但失败」是两回事，
+     *   调用方必须区分：前者不是插件问题。
+     */
+    private fun probeBoot(
+        profile: String,
+        overlays: List<File>,
+        timeoutMs: Long = PROBE_TIMEOUT_MS,
+    ): ProbeResult? {
+        val nodeBin = bootstrap.nodeBinary
+        val binJs = File(engineDir, "node_modules/@deepseek-ai/dsh/lib/bin.js")
+        if (!nodeBin.isFile || !binJs.isFile) return null
+
+        val cmd = buildEngineArgs(nodeBin, binJs, profile, overlays, port = 0)
+        // ⚠️ **环境变量必须与真实启动逐项相同**，所以直接用 [activeEnv]（[start] 存下的
+        //   那一份），而不是在这里再拼一遍。
+        //
+        //   再拼一遍的后果是**必须靠人肉比对才能发现差异**，而差异的症状是
+        //   「试启动能过、真启动过不了」—— 这类差异几乎无法排查，因为两边的
+        //   参数看起来都"对"。真机上真实存在的例子：漏掉 `LD_PRELOAD` 时
+        //   转译层不生效，试启动会因为 link EACCES 而报出一堆与插件无关的错，
+        //   探测结论于是**指向错误的方向**。
+        //
+        //   空 = 还没启动过 ⇒ 无法同构，直接放弃探测（见 [activeEnv] 的说明）。
+        val env = activeEnv
+        if (env.isEmpty()) {
+            Log.w(TAG, "试启动放弃：尚无真实启动的环境变量基线（activeEnv 为空）")
+            return null
+        }
+        Log.i(TAG, "试启动（$profile）: ${cmd.joinToString(" ")}")
+        return try {
+            val pb = ProcessBuilder(cmd)
+                .directory(workspaceDir)
+                .redirectErrorStream(true)
+            pb.environment().apply {
+                clear()
+                putAll(env)
+            }
+            val proc = pb.start()
+            val lines = java.util.Collections.synchronizedList(ArrayList<String>())
+            // ⚠️ 用 `AtomicBoolean` 而不是 `@Volatile var`：Kotlin **不允许**把
+            //   `@Volatile` 用在局部变量上（它只作用于有幕后字段的属性），
+            //   而这里必须保证读取线程写、主线程读之间有可见性 ——
+            //   否则可能出现"引擎明明打印了 URL，主线程永远看不到 ready"，
+            //   症状是一次**假失败**，二分法据此摘掉一个好插件。
+            val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+            val reader = Thread {
+                try {
+                    proc.inputStream.bufferedReader().forEachLine { line ->
+                        lines.add(line)
+                        if (URL_PATTERN.containsMatchIn(line)) ready.set(true)
+                    }
+                } catch (t: Throwable) {
+                    // 被 destroyForcibly 打断是预期路径，见 [runDumpConfig] 的同款说明
+                    Log.w(TAG, "试启动输出读取结束: ${t.javaClass.simpleName}")
+                }
+            }.apply { isDaemon = true; start() }
+
+            // ⚠️ **不能只 `waitFor(timeoutMs)` 等它退出。** 引擎是个**常驻 HTTP 服务**：
+            //   成功时它打印 URL 之后**永不退出**，`waitFor` 必然一路等到超时 ——
+            //   于是每次*成功*的探测都白烧满 60 秒，而 L1 的二分法上限是 3 分钟总时长，
+            //   6 轮根本跑不完（第一轮就吃掉 60 秒）。
+            //
+            //   所以判据是"**三者先到先算**"：
+            //     - 打印了 URL ⇒ 成功，立刻杀掉（这就是"能起来"的定义）
+            //     - 进程自己退出了 ⇒ 失败，收集输出后返回
+            //     - 到点了 ⇒ 超时，杀掉（失败路径实测 17~22 秒就该有结论了）
+            //
+            //   轮询粒度 100ms：失败实测 17~22 秒，粒度对结论毫无影响；成功路径则
+            //   决定"省多少时间"，100ms 足够细。
+            val deadline = System.currentTimeMillis() + timeoutMs
+            var exited = false
+            while (System.currentTimeMillis() < deadline) {
+                if (ready.get()) break
+                if (!proc.isAlive) {
+                    exited = true
+                    break
+                }
+                Thread.sleep(100)
+            }
+            // 成功 ⇒ 立刻杀；失败/超时 ⇒ 杀掉（此时它多半已经死了，destroyForcibly 幂等）
+            val ok = ready.get()
+            if (proc.isAlive) {
+                proc.destroyForcibly()
+                proc.waitFor(5, TimeUnit.SECONDS)
+            }
+            // 等读取线程把管道里剩下的输出收干净，否则 tail 会缺最后几行 ——
+            // 而失败原因恰恰常常在最后几行。
+            reader.join(2000)
+
+            Log.i(
+                TAG,
+                if (ok) "试启动成功（已结束探测进程）"
+                else if (!exited) "试启动超时（${timeoutMs} ms），已强制结束"
+                else "试启动失败（进程已退出）",
+            )
+
+            val snapshot = synchronized(lines) { ArrayList(lines) }
+            val exitCode = if (exited) runCatching { proc.exitValue() }.getOrNull() else null
+            val parsed = RescueBoot.parseFailure(
+                bootId = BootState.bootId,
+                exitCode = exitCode,
+                tailLines = snapshot,
+                at = System.currentTimeMillis(),
+            )
+            ProbeResult(
+                ready = ok,
+                exitCode = exitCode,
+                requiredDidNotActivate = parsed.requiredDidNotActivate,
+                tail = parsed.tail,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "试启动执行失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 当前生效的 `--patch` overlay 列表（由 [start] 在启动时算好后存下）。
+     *
+     * ⚠️ **刻意"存下来"而不是"再算一遍"**：`--patch` 列表由 `start()` 里十几个
+     *   `ensureXxx`/`writeXxxPatch` 的返回值组成，重算一遍要再调一遍那十几个函数
+     *   （它们有副作用：解包、写文件、起进程）。更要紧的是——**重算出来的可能与
+     *   真实启动用的不是同一份**，于是「试启动能过、真启动过不了」这种差异
+     *   就无法排查了。存下来的那一份与真实启动**逐项相同**（不变量 I1 的另一面：
+     *   探测必须与它要预测的那件事同构）。
+     *
+     * ⚠️ 空列表 = 还没启动过。试启动在这种情况下**不是**"没有 overlay"，
+     *   而是"不知道真实启动用了什么"，所以 [probeBoot] 的调用方（救援信箱）
+     *   保证只在引擎起来之后才发探测。
+     */
+    @Volatile
+    private var activeOverlays: List<File> = emptyList()
+
+    /**
+     * 真实启动**实际用的**那一份环境变量（由 [start] 算好后存下）。
+     *
+     * ⚠️ **这是"试启动与真实启动同构"的结构性保证**，不是缓存优化。
+     *
+     * 试启动（[probeBoot]）的结论要用来预测"改完配置之后真实启动能不能过"。
+     * 如果两边各自拼一遍环境变量，差异就只能靠人肉比对才能发现，而症状是
+     * **「试启动能过、真启动过不了」**——那时人已经不知道该信哪一个了。
+     *
+     * 真机上会让两边分叉的例子（都是 `start()` 里有、想当然重拼时会漏的）：
+     *
+     * | 变量 | 漏掉的后果 |
+     * |---|---|
+     * | `LD_PRELOAD` | link 转译层不生效 ⇒ 试启动报一堆 link EACCES，**指向错误方向** |
+     * | `BOO_SANDBOX_LIB` | 沙箱 runner 失效 ⇒ 报沙箱后端不可用，同样与插件无关 |
+     * | `DSH_PRIV_RUNNER` / `DSH_ROOT_RUNNER` | 特权和 root 插件读不到通道路径 |
+     * | `AGNES_CREDENTIAL` | 号池注入层拿不到凭据引用 |
+     * | `TERMUX_PKG_NO_MIRROR_SELECT` 等镜像组 | 探测进程可能去连慢源，**超时被误判成插件问题** |
+     *
+     * ⚠️ 空 = 还没真实启动过。此时 [probeBoot] **拒绝探测**（返回 null）而不是
+     *   用一份"差不多"的环境凑合 —— 那样出来的结论不可信，而不可信的探测
+     *   比没有探测更糟：L1 的二分法会据此摘错插件。
+     */
+    @Volatile
+    private var activeEnv: Map<String, String> = emptyMap()
+
+    /**
+     * 供 `RescueCommandBridge` 调用的试启动入口。
+     *
+     * ⚠️ **阻塞十几秒**，只能在后台线程调用（桥已经把 probe 放在
+     *   `dsh-rescue-probe` 单线程池里）。
+     *
+     * @param bundleFilter 非空时：**临时**把 `web` 清单的 bundles 换成
+     *   `core + 这些名字`，跑一次试启动，然后**无条件还原**原来的清单。
+     *   这就是方案 §4.4.4 的 `bundleFilter`，也是 §8 承诺的
+     *   「try-boot 不直接改 web profile」的实现方式 —— 用户磁盘上的配置
+     *   在探测前后**逐字节相同**。
+     */
+    internal fun probeBootForBridge(
+        profile: String,
+        bundleFilter: List<String>? = null,
+    ): ProbeResult? {
+        if (bundleFilter == null) {
+            // 探测是**只读**的：不写 [RescueBoot.recordFailure]（见上）。
+            return probeBoot(profile = profile, overlays = activeOverlays)
+        }
+        return probeWithBundleFilter(profile, bundleFilter)
+    }
+
+    /**
+     * 带 `bundleFilter` 的试启动：临时改写清单 → 探测 → **无条件还原**。
+     *
+     * ## ⚠️ 为什么不能另开一个 profile 名
+     *
+     * 直觉做法是「写一个 `profiles/probe/package.json`，用它试启动」——**错的**。
+     * [resolveBundleDir] 的解析锚点只有两个：dsh 安装目录、`<profileDir>/package.json`。
+     * 第三方插件装在 `profiles/web/node_modules/` 下，换一个 profile 名就解析不到，
+     * 而解析不到**不是报错**：`loadProfileDirectory` 把它塞进 `skippedBundles`
+     * 然后**照常启动成功**。于是探测报「能起来」、真实 web 起不来 —— 一个
+     * 教科书式的假成功，且几乎无法排查（两边参数看起来都对）。
+     *
+     * 所以必须**在 `web` 目录上**做临时改写，让 `node_modules` 解析路径不变。
+     *
+     * ## ⚠️ 还原必须无条件
+     *
+     * 用 `try/finally` 而不是「探测成功才还原」：探测中途抛异常、被取消、
+     * 或 App 被杀，都不能把用户配置留在半改状态。`finally` 覆盖前两者，
+     * 被杀则靠 `.bak-l1`（[ensureManifestBackup] 已就位）兜底。
+     *
+     * @return 与 [probeBoot] 同义；`null` = 压根跑不起来或**没能建立起试验条件**。
+     */
+    private fun probeWithBundleFilter(profile: String, keep: List<String>): ProbeResult? {
+        val manifest = File(dshHome, "profiles/$profile/package.json")
+        if (!manifest.isFile) {
+            Log.w(TAG, "试启动（bundleFilter）：找不到 $profile 清单")
+            return null
+        }
+        // 备份用**独立的固定后缀**，避免与 L1 的 `.bak-l1` 互相覆盖（两者语义
+        // 不同：`.bak-l1` 是"隔离前的原始配置"，`.bak-probe` 是"一次探测的现场"）。
+        val backup = File(manifest.parentFile, "${manifest.name}.bak-probe")
+        val original = try {
+            manifest.readText()
+        } catch (t: Throwable) {
+            Log.w(TAG, "试启动（bundleFilter）：读清单失败: ${t.message}")
+            return null
+        }
+        try {
+            backup.writeText(original)
+        } catch (t: Throwable) {
+            Log.w(TAG, "试启动（bundleFilter）：备份失败，放弃（绝不覆盖用户配置）: ${t.message}")
+            return null
+        }
+        return try {
+            val core = ArrayList<String>()
+            run {
+                val bundles = JSONObject(original).optJSONObject("dsh")
+                    ?.optJSONObject("profile")?.optJSONArray("bundles") ?: return@run
+                for (i in 0 until bundles.length()) {
+                    val n = bundles.optString(i, "")
+                    if (n.startsWith("@deepseek-ai/")) core += n
+                }
+            }
+            if (core.isEmpty()) {
+                Log.w(TAG, "试启动（bundleFilter）：清单里没有核心 bundle，放弃")
+                return null
+            }
+            if (!writeBundles(manifest, core, keep)) return null
+            Log.w(TAG, "试启动（bundleFilter）：临时改成 core(${core.size}) + ${keep.size} 个指定 bundle")
+            probeBoot(profile = profile, overlays = activeOverlays)
+        } finally {
+            try {
+                // 写回**原样字节**（不是重新序列化）：探测不该在用户配置里留下
+                // 任何格式差异，否则每探测一次配置就漂一点。
+                manifest.writeText(original)
+                backup.delete()
+                Log.i(TAG, "试启动（bundleFilter）：已还原 $profile 清单")
+            } catch (t: Throwable) {
+                Log.e(TAG, "试启动（bundleFilter）：还原清单失败！备份在 ${backup.absolutePath}: ${t.message}")
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P1：L1 自动隔离（基线 + 二分）
+    // ─────────────────────────────────────────────────────────────────────
+
+    /** [isolateBadBundles] 的结果，供写 `rescue/state.json` 与日志用。 */
+    internal class IsolationResult(
+        /** 最终被摘掉的第三方 bundle（只写**已证实致命**的那些）。 */
+        val removed: List<String>,
+        /** 给人看的一句话结论。 */
+        val reason: String,
+        /** 做了几次真实试启动（基线算一次）。 */
+        val attempts: Int,
+        /** 摘掉之后是否**确实**能起来（收尾确认过）。 */
+        val verified: Boolean,
+    )
+
+    /**
+     * L1 自动隔离的**触发闸门**（真正的算法在 [isolateBadBundles]）。
+     *
+     * 把「该不该做」与「怎么做」分开，是因为触发条件本身就是本方案最容易写错的
+     * 一处：方案原稿写的「同一 bootId 内连续失败 ≥2 次」在真机上**永不成立**，
+     * 已由 30 个诊断包实测证伪（见 [RescueBoot.Failure.consecutiveFailures]）。
+     *
+     * ## 四条闸门，缺一不可
+     *
+     * ① `tier == NORMAL`：救援态/隔离态下没有可隔离的对象（救援 profile 压根
+     *    不含第三方插件）。不判这一条会在救援态反复跑二分，把界面搅乱。
+     * ② `consecutiveFailures >= 2`：单次失败可能是系统回收 —— 与现有
+     *    `MAX_ENGINE_RESTARTS = 2` 的口径一致。
+     * ③ `looksLikePluginProblem`：引擎**自己**说了「required plugin did not
+     *    activate」。不说这句就不是插件问题，二分毫无意义（还会白改用户配置）。
+     *    ⚠️ 不能用「日志里有 Failed plugins 段落」代替 —— 那一段里绝大多数是
+     *    正常的 skip，真机上 `Failed plugins (40)` 时引擎仍能起来过。
+     * ④ 环境基线（[activeEnv]）就绪：二分靠 [probeBoot] 判真假，而它的结论只有在
+     *    与真实启动同构时才可信 —— 同构的载体就是那一份环境变量表。
+     *
+     *    ⚠️ **不要**在这里判 `activeOverlays.isEmpty()`。空 overlay 列表是**合法**
+     *    状态（一个 patch 都没写出来时真实启动也是空的，两边仍然同构），
+     *    把它当"未就绪"会让一种正常配置永远无法进入 L1 —— 又一个"判据与对象不符"。
+     *
+     * @return 做了什么；没触发时返回 null。
+     */
+    private suspend fun maybeIsolateBadBundles(): IsolationResult? {
+        val st = RescueBoot.tier()
+        if (st.tier != RescueBoot.Tier.NORMAL) {
+            Log.i(TAG, "L1 隔离：当前层级 ${st.tier.label}，跳过")
+            return null
+        }
+        val f = RescueBoot.lastFailure() ?: return null
+        if (f.consecutiveFailures < 2) {
+            Log.i(TAG, "L1 隔离：连续失败 ${f.consecutiveFailures} 次（<2），本次不触发")
+            return null
+        }
+        if (!f.looksLikePluginProblem) {
+            // ⚠️ 这里**必须真的推进到 L2**，不能只打一行日志就返回。
+            //
+            //   原先的代码正是「日志写『直接交 L2』、代码却只 `return null`」——
+            //   于是 tier 停在 NORMAL，没有任何一处会把它改成 RESCUE，结果是
+            //   **每次启动都从头再来一遍**（等 20 秒 → 失败 → 计数 +1 → 还是
+            //   NORMAL），永远到不了救援模式、也永远到不了 L3。
+            //   用户看到的是「App 一直起不来」，而日志里那句「直接交 L2」
+            //   让排查的人以为已经交过去了 —— 这正是本项目缺陷族
+            //   （结论/日志与它描述的事实不符）的第 31 例。
+            //
+            //   方案 §4.3 对此有明确要求：「失败 ⇒ 不是插件问题（或不止插件问题），
+            //   跳到 L2」。L2 是**非破坏性**的（换一个最小 profile，不动用户配置，
+            //   有常驻横幅 + 一键退出），所以即使这次判断偏保守也不会造成损害；
+            //   而停在 NORMAL 是**确定**打不开。
+            //
+            //   ⚠️ 判据仍要求 `consecutiveFailures >= 2`（上面那道门），所以
+            //     单次偶发失败不会把用户丢进救援模式。
+            Log.w(
+                TAG,
+                "L1 隔离：连续失败 ${f.consecutiveFailures} 次，但引擎没报 required 插件未激活" +
+                    " ⇒ 不是插件问题，降级到 L2 救援模式",
+            )
+            escalateToRescue(
+                "连续 ${f.consecutiveFailures} 次启动失败，且引擎未报 required 插件未激活（不是插件问题）",
+            )
+            return null
+        }
+        if (activeEnv.isEmpty()) {
+            // 调用点已在 [activeEnv] 赋值之后，所以这条是纯防御（理论上到不了）。
+            // 真的到了也不能硬跑：没有同构基线的探测结论会指向错误的方向。
+            Log.w(TAG, "L1 隔离：环境基线为空，无法做同构探测，本轮不触发")
+            return null
+        }
+
+        Log.w(
+            TAG,
+            "L1 隔离启动：连续 ${f.consecutiveFailures} 次启动失败，" +
+                "引擎报 ${f.requiredDidNotActivate} 个 required 插件未激活",
+        )
+        EventLog.record(
+            "rescue.isolate.start",
+            mapOf("consecutiveFailures" to f.consecutiveFailures.toString()),
+        )
+
+        val r = isolateBadBundles()
+        if (r == null) {
+            // ⚠️ `isolateBadBundles` 返回 null 意味着「L1 放弃了」：清单缺失、
+            //   清单解析失败、或备份失败。**这三种都必须推进到 L2**，理由与上面
+            //   那条「不是插件问题」完全相同 —— 不推进的话 tier 停在 NORMAL，
+            //   下一次启动又从头跑一遍、又放弃，永远到不了 L2、也永远到不了 L3。
+            //
+            //   这不是新加的策略，而是本方法**唯一的目的**：只要 L1 没解决问题，
+            //   就必须把控制权交给下一层。方案 §4.2 的「一定打得开」正是靠这条
+            //   链子成立的（L1 → L2 → L3，每一环都必须真的接上）。
+            //
+            //   ⚠️ 注意 L2 **不改用户的任何配置**（它只是换一个最小 profile 启动，
+            //     有常驻横幅 + 一键退出），所以这里推进不会造成损害；而停在
+            //     NORMAL 是**确定**打不开。
+            Log.w(TAG, "L1 隔离：未能给出结论（见上面那行）⇒ 降级到 L2 救援模式")
+            escalateToRescue("L1 无法给出结论（清单缺失/解析失败/备份失败）")
+            return null
+        }
+        Log.w(TAG, "L1 隔离结论：${r.reason}（试启动 ${r.attempts} 次，已验证=${r.verified}）")
+        EventLog.record(
+            "rescue.isolate.done",
+            mapOf(
+                "removed" to r.removed.size.toString(),
+                "attempts" to r.attempts.toString(),
+                "verified" to r.verified.toString(),
+            ),
+        )
+        // 有插件被摘 ⇒ 记 ISOLATED 态（I4：降级必须常驻可见 + 可一键退出）。
+        // ⚠️ 只在**确实摘了东西**时才记：`isolateBadBundles` 在"不是插件问题"时
+        //   返回空列表，那种情况下不该让用户看到"有插件被隔离了"。
+        if (r.removed.isNotEmpty()) {
+            RescueBoot.setTier(
+                tier = RescueBoot.Tier.ISOLATED,
+                reason = r.reason,
+                removedBundles = r.removed,
+                restorePoint = "profiles/$PROFILE_NAME/package.json.bak-l1",
+            )
+            return r
+        }
+
+        // ── L1 没摘到东西 ⇒ **必须往前推进到 L2** ──────────────────────────
+        //
+        // ⚠️ 这一步不是可选的。不推进的话 tier 停在 NORMAL，于是**每次启动都
+        //   重跑一遍完整的 L1**（基线 + 最多 6 轮二分 ≈ 3 分钟），而结论永远是
+        //   "解决不了" —— 用户看到的是「每次打开 App 都要黑屏等三分钟，然后还是
+        //   起不来」。那比现在（至少界面能出来）更糟，而且**永远到不了 L2**，
+        //   直接违背本方案的唯一硬承诺「一定打得开」。
+        //
+        // 走到这里只有两种情形，**两种都该进 L2**：
+        //   a) 全摘之后仍起不来（`removed` 为空）⇒ 不是插件问题，web profile 这条路
+        //      已经证明走不通，只能换干净的 rescue profile。
+        //   b) 二分没收敛 / 预算耗尽（`removed` 为空）⇒ 可能是多致命插件或耗时过长，
+        //      再花三分钟重跑一遍的期望收益是负的，同样该先进 L2 把界面给用户。
+        //
+        // ⚠️ 用 `RESCUE` 而不是别的层级：语义就是"这次不用用户配置，用最小配置起"。
+        //   代价是用户这次看不到自己的插件 —— 但那正是"一定打得开"的定价，
+        //   而且 `state.json` 里记着原因、界面常驻提示、可一键退出（I4）。
+        Log.w(TAG, "L1 隔离未能定位致命插件（${r.reason}）⇒ 降级到 L2 救援模式")
+        escalateToRescue("${r.reason}（试启动 ${r.attempts} 次）")
+        return r
+    }
+
+    /**
+     * 把层级推进到 L2 救援模式（L1 没解决问题时的**唯一**出口）。
+     *
+     * ## 为什么单独抽出来
+     *
+     * L1 有**四条**「我解决不了」的路径（不是插件问题 / 清单缺失 / 清单解析失败 /
+     * 备份失败 / 二分不收敛），它们**必须做完全相同的一件事**：把 tier 记成
+     * RESCUE，让下一次启动走最小 profile。
+     *
+     * ⚠️ 早先的写法是每条路径各写一遍，结果是**有的路径忘了写** ——
+     *   日志说「直接交 L2」而代码只 `return null`，于是 tier 停在 NORMAL，
+     *   每次启动都重跑一遍 L1 然后放弃，**永远到不了 L2**（也就永远到不了 L3）。
+     *   四条路径共用一个函数，这类「漏了一条」的缺陷在结构上就不可能再发生。
+     *
+     * ⚠️ 这里**只改 `rescue/state.json`，不碰用户的任何配置**。L2 是
+     *   非破坏性的（换一个最小 profile 启动，原配置原地不动、有常驻横幅、
+     *   可一键退出），所以这条路径可以放心走。
+     */
+    private fun escalateToRescue(reason: String) {
+        EventLog.record("rescue.degrade.l2", mapOf("from" to "l1", "reason" to reason))
+        RescueBoot.setTier(tier = RescueBoot.Tier.RESCUE, reason = "自动降级：$reason")
+    }
+
+    /**
+     * L1 自动隔离：从真实启动失败的日志出发，**用真实启动验证**找出致命插件，
+     * 只摘掉它们，让用户的其余插件照常工作。
+     *
+     * ## 为什么不能靠"日志里的失败插件名"直接摘
+     *
+     * 那 40 项里绝大多数是正常的 `skipping profile bundle`（版本不兼容，引擎自愿
+     * 跳过、**不致命**）。真机反例：那台设备 `Failed plugins (40)` 但引擎**有时
+     * 仍能起来**（07:14 成功启动过两次）。按日志名字摘 = 把用户 40 个插件全卸了，
+     * 而真正致命的可能只有 1 个。
+     *
+     * 更要紧的是：日志里被点名的是**受害者**不是**元凶**。真机那次的因果链是
+     * 「某个第三方插件重复注册了 `mcpManager/list` 端点 → 拖挂了核心插件
+     * `typert-loader`」—— 而 `Failed plugins` 段落里排在最前、堆栈最长的正是
+     * `typert-loader`（核心包）。照着它摘，摘的是核心包，摘完更起不来。
+     *
+     * ## 算法（全部结论都来自真实启动）
+     *
+     * ```
+     * third = web 清单里非 @deepseek-ai/ 的 bundle
+     * third 为空                      ⇒ 不是插件问题，交 L2
+     * 基线：摘掉全部 third → 试启动
+     *   失败 ⇒ 不是（仅）插件问题，交 L2
+     *   成功 ⇒ 确认"插件问题"，继续
+     * 二分（候选集 C 初始 = third）：
+     *   每轮把 C 分两半 C1/C2，摘掉 C1（保留 C2 与其余全部）→ 试启动
+     *     成功 ⇒ 致命的**都在** C1 里 ⇒ C = C1
+     *     失败 ⇒ C1 里没有（全部）致命的 ⇒ 致命的在 C2 里 ⇒ C = C2
+     *   |C| == 1 ⇒ 找到一个致命插件
+     * 收尾：摘掉找到的那个 → 试启动确认
+     *   成功 ⇒ 完成（只摘了 1 个）
+     *   失败 ⇒ 还有别的致命插件，但预算已尽 ⇒ 保留已知结论，交 L2
+     * ```
+     *
+     * ## ⚠️ 三条安全约束（都是"不能省"而不是"最好有"）
+     *
+     * ① **只由 [maybeIsolateBadBundles] 调用**（它负责判"该不该做"）。
+     *    不要绕过闸门直接调用 —— 闸门里的四条判断（层级/连续失败数/是不是插件问题/
+     *    基线是否就绪）每一条都对应一种"跑了反而有害"的场景。
+     *
+     *    ⚠️ 这里原先写的是「只在救援态（`tier == RESCUE`）调用」，那是**错的**：
+     *    救援态走的是 rescue profile，它压根不含第三方 bundle，没有任何可隔离的对象 ——
+     *    按那条写，L1 就永远没有适用场景。真正的适用场景恰恰是**正常态**：
+     *    用户自己的 web profile 里某个第三方插件致命时，摘掉它而不是整包放弃。
+     * ② **写清单前必须先备份成功**。备份失败就**什么都不做** —— 否则会把用户
+     *    唯一一份原始清单覆盖掉（沿用 [stripThirdPartyBundles] 的既有约定）。
+     * ③ **总时长上限** [ISOLATION_BUDGET_MS]。单次失败实测 17~22 秒，
+     *    6 轮 + 基线约 2.5 分钟。超预算立刻放弃并保留已确认的结论，
+     *    **绝不**让用户对着"正在启动…"无限等下去。
+     *
+     * ## ⚠️ 与正在运行的引擎共存
+     *
+     * 试启动会真的起一个引擎进程，与当前那个**共享 `$DSH_HOME`**。已经处理的两点：
+     * `--port 0`（不抢端口）、探测完立刻杀掉（不留僵尸）。
+     * 残余风险：探测进程启动时会初始化存储目录，理论上可能与当前引擎的
+     * 跨进程写声明（flock）相撞。**实测未观察到**（A2 那次 `--profile rescue
+     * --port 0` 起停干净），但它没有强保证 —— 这是本方案已知的取舍，
+     * 不假装它不存在。
+     *
+     * @return 摘了什么、试了几次、有没有验证过。**不抛异常**。
+     */
+    private suspend fun isolateBadBundles(): IsolationResult? = withContext(Dispatchers.IO) {
+        val manifest = File(dshHome, "profiles/$PROFILE_NAME/package.json")
+        if (!manifest.isFile) {
+            Log.w(TAG, "L1 隔离：找不到 $PROFILE_NAME 的清单，放弃")
+            return@withContext null
+        }
+        val json = try {
+            JSONObject(manifest.readText())
+        } catch (t: Throwable) {
+            // 清单本身已经坏了 —— 那是 L3（安全模式）的活，不是"某个插件致命"。
+            Log.w(TAG, "L1 隔离：$PROFILE_NAME 清单解析失败（${t.message}），交给安全模式")
+            return@withContext null
+        }
+        val core = ArrayList<String>()
+        val third = ArrayList<String>()
+        run {
+            val bundles = json.optJSONObject("dsh")?.optJSONObject("profile")
+                ?.optJSONArray("bundles") ?: return@run
+            for (i in 0 until bundles.length()) {
+                val name = bundles.optString(i, "")
+                if (name.isEmpty()) continue
+                if (name.startsWith("@deepseek-ai/")) core += name else third += name
+            }
+        }
+        if (third.isEmpty()) {
+            Log.w(TAG, "L1 隔离：清单里没有第三方 bundle，不是插件问题")
+            return@withContext IsolationResult(
+                emptyList(), "清单里没有第三方插件 —— 不是插件问题", 0, false,
+            )
+        }
+        Log.w(TAG, "L1 隔离开始：${third.size} 个第三方 bundle，核心 ${core.size} 个")
+
+        // ② 备份失败就什么都不做。备份**只做一次**（幂等，I3）：
+        //    判断依据是"已经存在同源备份"，避免每轮都产生一个新的 .bak-<ts>。
+        if (!ensureManifestBackup(manifest)) {
+            Log.w(TAG, "L1 隔离：备份清单失败，放弃（绝不覆盖用户唯一一份原始清单）")
+            return@withContext null
+        }
+
+        val overlays = activeOverlays
+        val deadline = System.currentTimeMillis() + ISOLATION_BUDGET_MS
+        var attempts = 0
+
+        /** 写清单（`core + keep`），然后试启动。true = 能起来。 */
+        fun tryWith(keep: List<String>, label: String): Boolean {
+            if (System.currentTimeMillis() > deadline) {
+                Log.w(TAG, "L1 隔离：预算耗尽（$label），放弃")
+                return false
+            }
+            // ⚠️ `keep` **只放第三方**，不要放 core：下面 [writeBundles] 自己会拼
+            //   `core + keep`。早先的写法把 core 也塞进 keep，于是核心 bundle 被
+            //   写了两遍 —— 而那种错误**不会报错**（引擎照样能解析一个含重复项的
+            //   数组），只会让配置文件里凭空多出一倍的 `@deepseek-ai/*` 条目。
+            if (!writeBundles(manifest, core, keep)) {
+                Log.w(TAG, "L1 隔离：写清单失败（$label）")
+                return false
+            }
+            attempts++
+            val r = probeBoot(PROFILE_NAME, overlays)
+            val ok = r?.ready == true
+            Log.w(
+                TAG,
+                "L1 隔离[$label] 保留 ${keep.size} 个第三方 → ${if (ok) "能起来" else "起不来"}" +
+                    (r?.requiredDidNotActivate?.let { "（required 未激活 $it）" } ?: ""),
+            )
+            recordAttempt(label, keep, ok, r, deadline)
+            return ok
+        }
+
+        // 基线：摘掉全部第三方。失败 ⇒ 不是（仅）插件问题。
+        if (!tryWith(emptyList(), "baseline-all-removed")) {
+            Log.w(TAG, "L1 隔离：全摘之后仍起不来 ⇒ 不是（仅）插件问题，交 L2")
+            // ⚠️ 把用户清单**还回去**：既然不是插件问题，就不该留下改动 ——
+            //   否则 L2 虽然能打开界面，用户的插件配置却被我们悄悄清空了。
+            if (!writeBundles(manifest, core, third)) {
+                Log.w(TAG, "L1 隔离：还原清单失败（用户配置可能停留在已摘状态，备份仍在）")
+            }
+            return@withContext IsolationResult(emptyList(), "全摘之后仍起不来 —— 不是插件问题", attempts, false)
+        }
+
+        // 二分：找**第一个**致命插件。
+        //
+        // 方向说明（**容易写反，且方案原稿的文字就是反的**）：每一轮都把候选集
+        // `C` 对半切成 C1/C2，然后**只摘掉 C1**（`keep = third − C1`，即 C 之外的
+        // 那些照旧保留）。于是：
+        //   - 摘掉 C1 之后**能起来** ⇒ 所有致命插件都在 C1 里 ⇒ `C = C1`
+        //   - 摘掉 C1 之后**起不来** ⇒ C1 不足以解决问题，致命的在 C2 ⇒ `C = C2`
+        // 两个分支都成立的前提是「keep 是 third − C1」—— 若误写成「keep = C2」，
+        // 那些已排除的插件会被一起摘掉，判据就失效了。
+        var candidates: List<String> = ArrayList(third)
+        while (candidates.size > 1) {
+            if (System.currentTimeMillis() > deadline) break
+            val half = candidates.size / 2
+            val c1 = candidates.subList(0, half).toList()
+            val c2 = candidates.subList(half, candidates.size).toList()
+            // 只摘 C1；C 之外的（已排除的）照旧保留
+            val drop = c1.toSet()
+            val keep = third.filter { it !in drop }
+            candidates = if (tryWith(keep, "bisect-${candidates.size}→${c1.size}")) c1 else c2
+        }
+
+        val culprit = candidates.firstOrNull()
+        if (culprit == null) {
+            Log.w(TAG, "L1 隔离：没收敛到具体插件，交 L2")
+            return@withContext IsolationResult(emptyList(), "二分未收敛", attempts, false)
+        }
+
+        // 收尾：只摘这一个，确认真的能起来。
+        // ⚠️ 同 [tryWith]：`finalKeep` **只放第三方**，core 由 [writeBundles] 拼。
+        val finalKeep = third.filter { it != culprit }
+        val verified = tryWith(finalKeep, "verify-single:$culprit")
+        if (verified) {
+            Log.w(TAG, "L1 隔离完成：摘掉 1 个（$culprit），其余 ${third.size - 1} 个保留")
+            IsolationResult(
+                listOf(culprit),
+                "二分定位到 $culprit，摘掉后能正常启动（其余 ${third.size - 1} 个插件保留）",
+                attempts,
+                true,
+            )
+        } else {
+            // 还有别的致命插件，但预算已尽。留着"摘掉它"的清单（至少排除了一个），
+            // 剩下的交给 L2 与救援会话 —— **不假装成功**。
+            Log.w(TAG, "L1 隔离：摘掉 $culprit 后仍起不来 ⇒ 还有别的致命插件，交 L2")
+            IsolationResult(
+                listOf(culprit),
+                "找到 $culprit 但摘掉后仍起不来（还有别的致命插件，或预算耗尽）",
+                attempts,
+                false,
+            )
+        }
+    }
+
+    /**
+     * 确保清单有一份**同源**备份（幂等）。
+     *
+     * ⚠️ **幂等判据是"有没有指向同一份原件的备份"**，不是"有没有 .bak"：
+     *   每轮二分都调一次 [quarantine] 的话，会在用户目录里堆出 6 个 `.bak-<ts>`，
+     *   而每个都只是**上一轮的中间状态**（不是用户的原始配置）—— 用户看到
+     *   6 个备份文件，根本分不清哪个才是"我原来的配置"。
+     *
+     *   所以这里用固定后缀 `.bak-l1`（区分于用户手动隔离产生的 `.bak-<ts>`），
+     *   存在即视为已备份。方案 §7.2 第 6 条验收的就是这条。
+     *
+     * @return 备份就位（含"本来就有"）返回 true。
+     */
+    private fun ensureManifestBackup(manifest: File): Boolean {
+        val backup = File(manifest.parentFile, "${manifest.name}.bak-l1")
+        if (backup.isFile) return true
+        return try {
+            backup.writeText(manifest.readText())
+            Log.w(TAG, "L1 隔离：已备份原始清单 → ${backup.name}")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "L1 隔离：备份清单失败: ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 把清单写成 `core + keep`（顺序：核心在前，保留的第三方在后）。
+     *
+     * ⚠️ 与 [stripThirdPartyBundles] 一样用 `JSONObject` 解析再回写，并且
+     *   把 `\/` 还原成 `/`（见那里的说明：org.json 的转义会让文件看起来像坏了）。
+     */
+    private fun writeBundles(manifest: File, core: List<String>, keep: List<String>): Boolean = try {
+        val json = JSONObject(manifest.readText())
+        val dsh = json.optJSONObject("dsh") ?: JSONObject()
+        val profile = dsh.optJSONObject("profile") ?: JSONObject()
+        profile.put("bundles", JSONArray(core + keep))
+        dsh.put("profile", profile)
+        json.put("dsh", dsh)
+        manifest.writeText(json.toString(2).replace("\\/", "/"))
+        true
+    } catch (t: Throwable) {
+        Log.w(TAG, "L1 隔离：写清单失败: ${t.message}")
+        false
+    }
+
+    /**
+     * 把一轮二分的结论落进 `$DSH_HOME/rescue/attempts/NNNN.json`（方案 §5.1）。
+     *
+     * ⚠️ 这是**给人/AI 复盘用的**，所以即使失败也不能影响流程。写不进去只记警告。
+     */
+    private fun recordAttempt(
+        label: String,
+        keep: List<String>,
+        ok: Boolean,
+        r: ProbeResult?,
+        deadline: Long,
+    ) {
+        try {
+            val dir = File(dshHome, "${RescueBoot.DIR_NAME}/attempts")
+            if (!dir.isDirectory && !dir.mkdirs()) return
+            // 序号 = 现有文件数 + 1（从 1 开始，4 位补零，与方案 §5.1 的 0001.json 一致）
+            val next = (dir.listFiles()?.size ?: 0) + 1
+            val f = File(dir, "%04d.json".format(next))
+            f.writeText(
+                JSONObject()
+                    .put("label", label)
+                    .put("keptCount", keep.size)
+                    .put("kept", JSONArray(keep))
+                    .put("bootOk", ok)
+                    .put("requiredDidNotActivate", r?.requiredDidNotActivate ?: JSONObject.NULL)
+                    .put("exitCode", r?.exitCode ?: JSONObject.NULL)
+                    .put("budgetLeftMs", (deadline - System.currentTimeMillis()).coerceAtLeast(0))
+                    .put("at", System.currentTimeMillis())
+                    .toString(2),
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "L1 隔离：写试探记录失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 拼出启动引擎的完整 argv（**纯函数**，便于离线验证与复用）。
+     *
+     * ## 为什么抽出来
+     *
+     * 它现在有三个调用方，而且**必须给出完全一致的参数**，否则验证结果没有意义：
+     *
+     * | 调用方 | 用途 |
+     * |---|---|
+     * | `start()` | 真正启动 |
+     * | 试启动（P3 的 `try-boot`） | 让 AI 验证"改完能不能起来" |
+     * | L1 二分法（P1） | 逐组验证哪些插件是坏的 |
+     *
+     * ⚠️ 后两者如果自己拼参数，就会出现「试启动能起来、真启动起不来」这类
+     *   无法解释的差异 —— 而那正是本项目缺陷族最爱长的地方（同一个东西
+     *   被两处各写一遍，然后慢慢漂开）。所以只留一份。
+     *
+     * ## ⚠️ `--port` 的位置是硬性的
+     *
+     * `--port` 属于 **web app 的内层 flag**，而 launcher
+     * （`@deepseek-ai/dsh/lib/bin.js`）只解析自己的 `--profile` / `--patch`，
+     * 规则是「第一个不认识的 token 就是内层参数的起点，其后原样转交」。
+     * 插到 `--patch` 前面会让它们全被当成内层参数，引擎直接
+     * `error: unknown option '--patch'` 起不来（真机实测踩过）。
+     * 所以 `--patch` 全部排在 `--port` 之前，最后才是 `--no-open`。
+     *
+     * @param port null = 不传 `--port`（用引擎内置的 3080）；非 null = 显式指定。
+     *   试启动**必须传 0**（让内核挑空闲端口）—— 否则会和正在运行的引擎撞端口，
+     *   得到 `EADDRINUSE` 引发的 `startup failed: 2 required plugins did not activate`，
+     *   把「插件坏」误报成「端口占用」。
+     */
+    private fun buildEngineArgs(
+        nodeBin: File,
+        binJs: File,
+        profile: String,
+        overlays: List<File>,
+        port: Int?,
+    ): List<String> = buildList {
+        add(nodeBin.absolutePath)
+        add(binJs.absolutePath)
+        add("--profile"); add(profile)
+        for (patch in overlays) {
+            add("--patch"); add(patch.absolutePath)
+        }
+        port?.let {
+            add("--port"); add(it.toString())
+        }
+        add("--no-open")
+    }
 
     /**
      * 跑一次 `--dump-config` 并收集输出。
@@ -4701,9 +5753,63 @@ class EngineManager private constructor(private val context: Context) {
             return@withContext
         }
 
+        // ⚠️ 救援 profile 必须在**体检之前**建好，且必须建在体检**之外**。
+        //
+        //   体检（[preflight]）只处理 `web` profile，它的结论不该影响救援 profile
+        //   的可用性 —— 恰恰相反：**web 坏掉时救援必须还能起来**，那正是它存在的理由。
+        //   所以这里独立建、独立判失败（见 [ensureRescueProfile] 的 @return）。
+        //
+        //   建不出来 ⇒ 救援这条路不可用。这时**不能**假装没事继续（那会让
+        //   L2 的失败变成"救援模式也起不来"这种更糟的表现），而是记下来，
+        //   让降级决策直接跳到 L3（安全模式）。见 [rescueAvailable]。
+        val rescueProfileDir = ensureRescueProfile()
+        rescueAvailable = rescueProfileDir != null
+        if (!rescueAvailable) {
+            Log.e(TAG, "救援 profile 不可用 —— 降级阶梯将跳过 L2 直接到 L3")
+            EventLog.record("rescue.profile.unavailable")
+        }
+
+        // 本次用哪个 profile 启动，由**上一次**留下的救援层级决定。
+        //
+        //   判据只看 RESCUE 一态。SAFE_MODE（L3）与 ISOLATED（L1）**都仍然用
+        //   `web` profile** 启动 —— 两者的语义都是「用用户自己的配置，只是少加载
+        //   几个 bundle」，与救援 profile（完全不用用户配置）是两套不同的机制
+        //   （见 `docs/RESCUE-BOOT-PLAN.md` §4.1 的表）。把它俩也切到 rescue 会
+        //   让它们失去原本的作用，那是行为变更，不是本方案要的。
+        //
+        //   `tier()` 读的是 `$DSH_HOME/rescue/state.json`，由降级决策写入。
+        //   ⚠️ 它**不会**因为"这次起来了"而自动复位 —— 复位只在用户点
+        //   「退出救援模式」时发生（I4：降级状态必须常驻可见 + 可一键退出）。
+        val targetProfile = if (RescueBoot.tier().tier == RescueBoot.Tier.RESCUE) {
+            RESCUE_PROFILE_NAME
+        } else {
+            PROFILE_NAME
+        }
+        if (targetProfile != PROFILE_NAME) {
+            Log.w(TAG, "以救援 profile 启动（--profile $targetProfile）：不加载任何第三方插件")
+            EventLog.record("engine.start.rescue", mapOf("profile" to targetProfile))
+        }
+
         // 启动前体检：profile 与 patch 层都是模型可写的，改坏会让引擎直接 exit 1，
         // 而 App 没有任何自救路径（用户只能卸载重装，那会清掉全部会话与凭据）。
-        if (preflight()) {
+        //
+        // ⚠️ 结论**只是静态的**：它跑 `--dump-config`，不执行插件 `apply()`。
+        //   真机上杀死引擎的异常正是在 `apply()` 期抛的，所以体检放行 ≠ 能起来。
+        //   三态如实写进日志与事件时间线（原来 `false` 把两件事混成了一件）。
+        //
+        // ⚠️ **救援态下跳过体检**（I1：救援启动必须比正常启动简单，不能成为
+        //   第二个失败源）。体检会跑 `--dump-config`、可能触发整棵 engine/
+        //   重解包（15 秒 + 抹掉已打好的补丁）—— 那些动作在救援场景下全是风险，
+        //   而救援 profile 本来就只有核心 bundle，没什么可体检的。
+        val pre = if (targetProfile == PROFILE_NAME) {
+            preflight()
+        } else {
+            Log.i(TAG, "救援启动：跳过启动前体检（I1：救援路径不引入新的失败点）")
+            PreflightResult.StaticOnly
+        }
+        Log.i(TAG, "启动前体检结论：${pre.label}")
+        EventLog.record("preflight.result", mapOf("result" to pre.label))
+        if (pre == PreflightResult.Repaired) {
             Log.i(TAG, "启动前体检已修复损坏的插件配置，继续启动")
         }
 
@@ -4800,6 +5906,25 @@ class EngineManager private constructor(private val context: Context) {
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
+
+        // ⚠️ **救援 profile 也必须拿到同一套用户层配置**，否则救援界面是残废的：
+        //   没有默认模型 ⇒ AI 一开口就路由失败；没有号池 ⇒ 用户得自己配 key；
+        //   没有出厂设置 ⇒ 主题/权限预设全空。而「救援模式里 AI 能帮我修」
+        //   正是整个方案的核心承诺（G3），AI 不能用就全盘失效。
+        //
+        //   这四处写入都是**幂等 + 只补缺**的（各自 KDoc 有论证），所以对 rescue
+        //   重复调用是安全的：救援 profile 刚被建出来时它们会播种，之后不再动。
+        //
+        //   ⚠️ 只对**已建出来**的救援 profile 播种（`rescueProfileDir != null`）：
+        //     目录不存在时这几个函数会 `mkdirs()` 把它造出来，而造出来的目录
+        //     只有 `cordis.patch.yml`、**没有 `package.json`** —— 那样的 profile
+        //     引擎读不了（`profile "rescue" does not exist`），比不建更糟。
+        if (rescueProfileDir != null) {
+            seedDefaultSettings(RESCUE_PROFILE_NAME)
+            ensurePresetDefault(RESCUE_PROFILE_NAME)
+            ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
+            ensureDefaultModel(RESCUE_PROFILE_NAME)
+        }
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
         val privRunner = ensurePrivilegedShell()
@@ -4847,6 +5972,15 @@ class EngineManager private constructor(private val context: Context) {
         // 这里轮询读走交给原生。**必须早于引擎启动** —— 否则模型第一次调工具时
         // 信箱还没人守，命令会一直等不到回执。
         SystemBarCommandBridge.start(dshHome)
+        // 救援命令信箱：AI 通过插件把 `rescue-cmd.json` 写进 `$DSH_HOME`，这里轮询读走。
+        // 三个动作：`status`（当前层级、摘了哪些插件、上次失败详情）、
+        // `probe`（拿改动后的配置**真跑一次**引擎验证，配额见 PROBE_QUOTA）、
+        // `switch-rescue` / `switch-back`（进出救援态）。
+        //
+        // ⚠️ **必须早于引擎启动**，理由与上面三条相同；而且对这条尤其要紧 ——
+        //   救援场景下引擎可能压根起不来，那时用户唯一的自救手段就是让 AI 走这条路，
+        //   所以信箱必须在**引擎启动之前**就已经有人守。
+        RescueCommandBridge.start(dshHome)
         // 让模型知道「有特权身份可选、什么时候该用、用了会失去什么」。
         // ⚠️ 判据用**挂载结果**（`privPatch != null`）而不是 `privRunner != null`：
         //   前者才是「`shell` 工具真的注册了」。见 ensurePrivilegedPrompt 的 @param。
@@ -4878,84 +6012,31 @@ class EngineManager private constructor(private val context: Context) {
             return@withContext
         }
 
-        val cmd = buildList {
-            add(nodeBin.absolutePath)
-            add(binJs.absolutePath)
-            add("--profile"); add("web")
-            // 移动端 UI 适配：作为 profile 层之上的 overlay 挂载
-            if (mobileUiPatch != null) {
-                add("--patch"); add(mobileUiPatch.absolutePath)
-            }
-            // Agnes 多模态插件（generate_image / generate_video）：同样是 overlay
-            if (agnesMmPatch != null) {
-                add("--patch"); add(agnesMmPatch.absolutePath)
-            }
-            // 内置预设 dsh-preset-razor：声明行 + registry 默认位，同样是 overlay
-            if (presetRazorPatch != null) {
-                add("--patch"); add(presetRazorPatch.absolutePath)
-            }
-            // 跨会话持久记忆插件：同样是 overlay
-            if (coreMemoryPatch != null) {
-                add("--patch"); add(coreMemoryPatch.absolutePath)
-            }
-            // 沙箱 runner：同样是 overlay（--patch 可重复，按顺序应用）
-            if (sandboxPatch != null) {
-                add("--patch"); add(sandboxPatch.absolutePath)
-            }
-            // 默认工作区目录：同上，补上引擎缺的 android 平台分支
-            if (workspacePatch != null) {
-                add("--patch"); add(workspacePatch.absolutePath)
-            }
-            // 插件安装源：同样是 overlay（--patch 可重复，按顺序应用）
-            if (pluginManagerPatch != null) {
-                add("--patch"); add(pluginManagerPatch.absolutePath)
-            }
-            // uid 2000 特权工具：也是 overlay，注册成独立的 `shell` 工具
-            if (privPatch != null) {
-                add("--patch"); add(privPatch.absolutePath)
-            }
-            // root 特权工具：同样是 overlay，注册成独立的 `root` 工具
-            if (rootPatch != null) {
-                add("--patch"); add(rootPatch.absolutePath)
-            }
-            // 悬浮球控制工具：同样是 overlay，注册成独立的 `bubble` 工具
-            if (bubblePatch != null) {
-                add("--patch"); add(bubblePatch.absolutePath)
-            }
-            // 系统栏配色工具：同样是 overlay，注册成独立的 `statusbar` 工具
-            if (statusBarPatch != null) {
-                add("--patch"); add(statusBarPatch.absolutePath)
-            }
-            // 桌面宠物状态桥：同样是 overlay（只订阅事件，不注册工具）
-            if (petPatch != null) {
-                add("--patch"); add(petPatch.absolutePath)
-            }
-            // UI 调试工具：同样是 overlay，注册成独立的 `ui` 工具。
-            // ⚠️ 必须留在 `--port` **之前** —— 见下面那段关于内层 flag 的说明。
-            if (uiToolPatch != null) {
-                add("--patch"); add(uiToolPatch.absolutePath)
-            }
-            // 日志工具：同样是 overlay，注册成独立的 `logs` 工具
-            if (logsToolPatch != null) {
-                add("--patch"); add(logsToolPatch.absolutePath)
-            }
-            // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
-            // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
-            // 端口：默认沿用引擎内置的 3080；被占用时改让内核分配空闲端口。
-            // 不这么做的话 webserver（required）会以 EADDRINUSE 激活失败 →
-            // `dsh: startup failed: 2 required plugins did not activate` → 引擎退出。
-            // 详见 [resolveWebPort]。
-            //
-            // ⚠️ 位置是硬性的：`--port` 属于 **web app 的内层 flag**，而 launcher
-            // （`@deepseek-ai/dsh/lib/bin.js`）只解析自己的 `--profile` / `--patch`，
-            // 「第一个不认识的 token 就是内层参数的起点，其后原样转交」。
-            // 插到 `--patch` 前面会让它们全被当成内层参数，引擎直接
-            // `error: unknown option '--patch'` 起不来（真机实测踩过）。
-            resolveWebPort()?.let { port ->
-                add("--port"); add(port.toString())
-            }
-            add("--no-open")
-        }
+        // ⚠️ overlay 的顺序是**语义**的一部分（`--patch` 可重复、按顺序应用，
+        //   后应用的覆盖先应用的）。这里的顺序与改造前逐项一致，别顺手调。
+        val overlays = listOfNotNull(
+            mobileUiPatch,
+            agnesMmPatch,
+            presetRazorPatch,
+            coreMemoryPatch,
+            sandboxPatch,
+            workspacePatch,
+            pluginManagerPatch,
+            privPatch,
+            rootPatch,
+            bubblePatch,
+            statusBarPatch,
+            petPatch,
+            uiToolPatch,
+            logsToolPatch,
+        )
+        // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
+        // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
+        //
+        // ⚠️ 存下来给试启动用（见 [activeOverlays]）：试启动必须与真实启动
+        //   用**同一份** overlay，否则「探测能过、真实过不了」无法排查。
+        activeOverlays = overlays
+        val cmd = buildEngineArgs(nodeBin, binJs, targetProfile, overlays, resolveWebPort())
 
         Log.i(TAG, "启动引擎: ${cmd.joinToString(" ")}")
 
@@ -5048,10 +6129,77 @@ class EngineManager private constructor(private val context: Context) {
             adbWireless?.let { put("DSH_ADB_HOME", it.absolutePath) }
         }
 
+        // ⚠️ 存下这一份给试启动用（见 [activeEnv]）：试启动必须与真实启动**逐项相同**，
+        //   否则「探测能过、真实过不了」无法排查。**必须在 pb.start() 之前存**，
+        //   否则第一次探测可能读到空表而被拒绝。
+        activeEnv = pb.environment().toMap()
+
+        // ── L1 自动隔离（P1）──────────────────────────────────────────────
+        //
+        // ⚠️ **位置是硬性的：必须在这里**，即 [activeOverlays] 与 [activeEnv] 都已
+        //   就绪之后、真正 `pb.start()` 之前。
+        //
+        //   这两个基线原先是在 `start()` 靠后位置才赋值的，而触发闸门要求它们非空 ——
+        //   也就是说，如果按"读起来更顺"的直觉把闸门放在选 profile 那里，闸门**每轮
+        //   都会被自己拦下**，L1 永远不触发。这与本方案开头证伪的
+        //   `consecutiveFailures` 是**同一个缺陷**：判据描述的时机与它存在的时机不重合。
+        //   所以这里不改闸门（改成"没有基线也硬跑"会让探测结论不可信），
+        //   而是把调用点挪到基线之后。
+        //
+        //   触发条件（**不是**「同一 bootId 内连续失败 ≥2 次」—— 那个条件永远不成立，
+        //    见 [RescueBoot.Failure.consecutiveFailures] 里的实测证伪）：
+        //      连续 ≥2 次真实启动失败，且失败原因**指向插件**，且当前是正常态。
+        //
+        //   ⚠️ 为什么在 `pb.start()` **之前**：隔离成功之后本次就要用正常 profile
+        //     起来（用户的绝大多数插件保住了），而引擎是在 `bin.js` 启动时才读
+        //     `package.json` 的 —— 所以在这里改清单，本次启动就生效。
+        //
+        //   ⚠️ 只在正常态跑：救援态走的是 rescue profile（压根没有第三方 bundle，
+        //     没有可隔离的对象）；隔离态已经是上次隔离后的结果了，再跑一遍没有意义
+        //     （幂等靠这个判断 + `.bak-l1`）。见 [maybeIsolateBadBundles]。
+        //
+        //   ⚠️ 隔离之后**不重跑 [preflight]**。L1 只动 `bundles` 里第三方的名字，
+        //     而体检判的是核心 bundle 完不完整，判据没变、结论不会变。反过来，
+        //     体检在发现核心损坏时会触发**整棵 engine/ 重解包**，那会把此刻已经
+        //     就绪的 native addon 与补丁抹掉 —— 白跑一趟还引入新失败点。
+        maybeIsolateBadBundles()
+
+        // ⚠️ L1 可能刚刚把层级降级成 RESCUE（二分没收敛时，见 [maybeIsolateBadBundles]
+        //   末尾）。但 `targetProfile` 与 `cmd` 是在这**之前**算好的，本次发车仍会用
+        //   用户那个已经证明起不来的 web profile —— 白等 20 秒拿到同样的失败。
+        //
+        //   所以这里重新读一次层级：变了就**不发车**，改走既有的重启路径。
+        //   复用 [requestRestart] 而不是自己再拼一遍启动流程，是因为它已经接好了
+        //   `MainActivity` 那条 `State.Dead` 分支（清 `webViewPainted`、置
+        //   `forceReloadOnReady`、重新 `start()`），多一条自建路径只会多一个失败点。
+        //
+        //   ⚠️ 条件**只能判 RESCUE**，不能写成 `tier != NORMAL`：ISOLATED 态意味着
+        //     L1 **成功**摘掉了致命插件，而那时用用户的 web profile 启动恰恰是
+        //     正确动作（绝大多数插件保住了）。写成 `!= NORMAL` 会把成功当成失败，
+        //     把用户直接丢进救援模式、白丢全部插件。
+        if (RescueBoot.tier().tier == RescueBoot.Tier.RESCUE &&
+            targetProfile != RESCUE_PROFILE_NAME
+        ) {
+            Log.w(TAG, "L1 已把层级改为救援模式，本次不发车，改用救援 profile 重启")
+            EventLog.record("engine.restart.for-rescue", mapOf("staleProfile" to targetProfile))
+            requestRestart("L1 降级到救援模式")
+            return@withContext
+        }
+
         // 无线调试端口由 Kotlin 侧发现（Node 侧发不出 UDP 组播，见 WirelessDebugging）。
         // 常驻监听：端口会随用户重开无线调试/重启/切网络而变，只在启动时发现一次的话
         // 一变就永久失效。监听本身由系统 mdnsd 承担，开销可忽略。
         resumePrivilegedChannel()
+
+        // ── P4：把「你现在处于降级态、可以这样修」写进 agent 指令 ──────────
+        //
+        // ⚠️ **必须在这里**，即 [maybeIsolateBadBundles] 之后。层级是在 L1 里才
+        //   定下来的（它可能刚把 tier 改成 ISOLATED 或 RESCUE），早于它写提示词
+        //   就会写进上一次的层级 —— 表现为「AI 被告知处于救援模式，实际不是」。
+        //
+        // ⚠️ 也**必须早于引擎启动**：`AGENTS.md` 是引擎启动时读的（agent-instructions
+        //   插件），启动之后再写，这一轮就注入不进系统提示词了。
+        ensureRescuePrompt()
 
         val proc = try {
             pb.start()
@@ -5064,7 +6212,10 @@ class EngineManager private constructor(private val context: Context) {
         // 只用一个后台线程从头到尾持续消费 stdout。
         // 不能用 use{} 读完 URL 就关流：引擎之后仍在写日志，64KB 管道缓冲写满后
         // 会阻塞在 write 上导致引擎彻底卡死；重复打开同一 inputStream 也会失败。
-        val urlPattern = Regex("""dsh web: (http://127\.0\.0\.1:\d+/\?token=[A-Za-z0-9_\-]+)""")
+        // ⚠️ 用共享常量 [URL_PATTERN] 而不是就地写一份：试启动（[probeBoot]）
+                        //   也用同一条正则判断"起来了没有"，两处各写一份迟早漂开，
+                        //   而症状会是「试启动说成功、真启动说失败」这种无法解释的差异。
+                        val urlPattern = URL_PATTERN
         val readyLatch = java.util.concurrent.CountDownLatch(1)
         var readyUrl: String? = null
 
@@ -5172,6 +6323,16 @@ class EngineManager private constructor(private val context: Context) {
         if (got && url != null) {
             _state.value = State.Ready(url)
             Log.i(TAG, "引擎就绪: $url")
+            // ⚠️ 引擎**真的起来了** ⇒ 清掉上次的失败记录。
+            //
+            //   见 RescueBoot 的类注释：这份记录是「上次为什么起不来」的唯一线索，
+            //   救援会话里的 AI 全靠它。但它在**成功之后必须清掉**，
+            //   否则下次再出问题时，AI 看到的是早就不成立的旧失败 ——
+            //   又一处「结论与它描述的时刻不是同一个」（同族已 28 例）。
+            //
+            //   位置要紧：必须放在「确实拿到 URL」这个分支里，不能放在别处。
+            //   `got && url != null` 就是「引擎打印过 URL」的严格判据。
+            RescueBoot.clearFailure()
             // 事件时间线里记一笔「从起进程到就绪花了多久」。
             // ⚠️ 这是「打开 App 慢」这类模糊反馈唯一能定量的地方：没有它，
             //   用户说「卡」，我们只能猜是引擎慢、解包慢还是网络慢。
@@ -5207,6 +6368,26 @@ class EngineManager private constructor(private val context: Context) {
                 "引擎进程在打印 URL 之前就结束了（等了 ${waited} ms）"
             }
             _state.value = State.Failed("引擎启动失败（$reason）。最后输出:\n$tail")
+            // ⚠️ **P0：把「真实启动失败」变成可读的状态**（见 RescueBoot 的类注释）。
+            //
+            // 这里传的是**真实启动**的 stdout 尾部 —— 这一点是整个修复的要害：
+            // 启动前体检（[preflight]）读的是 `--dump-config` 的**静态输出**，
+            // 而它看不见插件在 `apply()` 期抛的异常。真机反例（2026-10-14，
+            // Xiaomi 24122RKC7C / Android 16 / v18）：`dump-config` 退出码 0、
+            // 4 个 required 条目全在，体检因此**放行**，引擎照死 —— 连续 8 次。
+            //
+            // 所以判据必须换成「引擎自己说了 required plugin did not activate」，
+            // 而那行只在真实启动的输出里。
+            //
+            // ⚠️ 顺序：必须在 CrashRecorder 之前 —— 下面那步要写崩溃现场，
+            //   而现场文件里会读事件时间线；先把「为什么失败」的结构化事实落盘，
+            //   保证即使现场写入失败也留下了线索。
+            val tailList = synchronized(logLines) { logLines.toList() }
+            RescueBoot.recordFailure(
+                bootId = BootState.bootId,
+                exitCode = runCatching { proc.exitValue() }.getOrNull(),
+                tailLines = tailList,
+            )
             // ⚠️ 「引擎起不来」是本 App 最严重的一类故障（界面直接不可用），
             //   所以要写**崩溃现场文件**而不只是日志行：现场文件里带着
             //   最后 200 行日志与设备快照，用户点「导出日志」就能一次性带走。
@@ -5298,6 +6479,37 @@ class EngineManager private constructor(private val context: Context) {
         // 守护线程同理：引擎都停了，再去切 adbd 没有意义，还白耗电
         WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
+    }
+
+    /**
+     * 请求**界面**重启引擎（供救援信箱的 `switch-rescue` / `switch-back` 用）。
+     *
+     * ## 为什么要拐一道，而不是直接 `stop()` + `start()`
+     *
+     * 换 profile 之后界面必须**重新加载 Web GUI**：旧页面连的是旧引擎的端口，
+     * 而 `--profile rescue` 起来的是**另一个引擎实例**（另一个端口、另一个 token）。
+     * 光在后台重启引擎、不重载页面，用户看到的就是一个永远连不上的界面。
+     *
+     * 重载页面的能力在 `MainActivity`（`forceReloadOnReady` + `loadUrl`），
+     * 而 `EngineManager` 不该反向持有 Activity —— 所以这里只发一个**状态信号**，
+     * 让 `MainActivity.observeEngine` 走它已有的 `State.Dead` 重启路径
+     * （那条路径已经会把 `forceReloadOnReady` 置位并重新 `loadUrl`，
+     * 正是这里需要的行为，不必新写一套）。
+     *
+     * ## 为什么用 `State.Dead` 而不是 `State.Failed`
+     *
+     * 见 `State.Dead` 的 KDoc：`Failed` 的界面分支会引导用户去点「安全模式」，
+     * 而安全模式会**推开用户的插件配置** —— 切 profile 是正常操作，不该诱导
+     * 用户做破坏性动作。`Dead` 的语义「原样重启」正好匹配。
+     *
+     * ⚠️ 必须**先** `stop()`（把 `userStopped` 置位并杀死旧进程），否则
+     *   `start()` 会在开头命中「引擎已在运行」的早返回，profile 根本不会切换。
+     */
+    fun requestRestart(reason: String) {
+        Log.i(TAG, "请求界面重启引擎：$reason")
+        EventLog.record("engine.restart-requested", mapOf("reason" to reason))
+        stop()
+        _state.value = State.Dead(reason)
     }
 
     /**
@@ -5450,12 +6662,58 @@ class EngineManager private constructor(private val context: Context) {
         private const val MAX_LOG_LINES = 400
 
         /**
+         * 引擎「起来了」的唯一判据：它打印了带 token 的回环 URL。
+         *
+         * 真机原文：`dsh web: http://127.0.0.1:3080/?token=xxxxxxxx`。
+         *
+         * ⚠️ **`start()` 与 [probeBoot] 共用这一条**（原来 `start()` 里就地写了一份）。
+         *   两处各写一份的后果是「试启动说成功、真启动说失败」这类无法解释的差异 ——
+         *   而验证类工具一旦不可信，整个降级阶梯的判断都跟着不可信。
+         */
+        private val URL_PATTERN =
+            Regex("""dsh web: (http://127\.0\.0\.1:\d+/\?token=[A-Za-z0-9_\-]+)""")
+
+        /**
+         * 一次试启动（[probeBoot]）的上限。
+         *
+         * 真机实测失败路径 17~22 秒就返回了，所以 60 秒足够。
+         * ⚠️ **刻意比 [READY_TIMEOUT_MS]（120 秒）短**：二分法要跑很多轮，
+         *   每轮都按 120 秒算会让总时长失控（上限是 3 分钟，见 §4.3）。
+         */
+        private const val PROBE_TIMEOUT_MS = 60_000L
+
+        /**
+         * L1 自动隔离的**总时长上限**（方案 §4.3）。
+         *
+         * 3 分钟的依据：单次失败实测 17~22 秒，基线 1 次 + 二分 ⌈log2(40)⌉ = 6 轮
+         * + 收尾 1 次 ≈ 8 次 × 20 秒 ≈ 2.7 分钟。取 3 分钟刚好够走完，
+         * 又不会让用户对着"正在启动…"等太久。
+         *
+         * ⚠️ 超预算必须**优雅放弃**并保留已确认的结论，绝不能无限试下去 ——
+         *   那会把「App 打不开」变成「App 一直显示正在启动」，比原来更糟。
+         */
+        private const val ISOLATION_BUDGET_MS = 3 * 60 * 1000L
+
+        /**
          * 启动前体检（[preflight]）的超时。
          *
          * 真机实测正常态耗时 0.7~0.8 秒；给到 30 秒是为了容忍慢卡（体检只是
          * 保险，超时即跳过、不影响启动，所以宁可给宽一点）。
          */
         private const val PREFLIGHT_TIMEOUT_MS = 30_000L
+
+        /**
+         * 自动进安全模式所需的**连续真实启动失败**次数（方案 §4.5 的 P6）。
+         *
+         * 取 3 的依据：1~2 次失败可能是偶发（系统内存紧张导致引擎被 OOM、
+         * 端口被上一次残留进程占着），那时推开用户的插件配置是**过度反应** ——
+         * 用户会莫名其妙丢掉所有插件。而 3 次连续失败（每次都是完整的启动流程、
+         * 都走到「引擎没打印 URL」）已经排除了偶发。
+         *
+         * ⚠️ 这个数**只是三个条件之一**，见 [shouldAutoEnterSafeMode]：
+         *   单独满足它不会触发，还必须 `tier == RESCUE`（= L1/L2 都试过）。
+         */
+        private const val AUTO_SAFE_MODE_MIN_FAILURES = 3
 
         /**
          * `requiredStartupEntryIds` 的副本 —— 与 `dsh-app-boot/lib/index.js` 里的
@@ -6305,8 +7563,55 @@ class EngineManager private constructor(private val context: Context) {
         // 只在首次安装时播种进 profile 的**用户 patch 层**，之后永不覆盖。
         // 为什么不能用 `--patch` overlay、为什么不会被引擎覆盖，见 seedDefaultSettings()。
 
-        /** 引擎启动时用的 profile 名（`--profile web`）。 */
-        private const val PROFILE_NAME = "web"
+        /**
+         * 引擎启动时用的 profile 名（`--profile web`）。
+         *
+         * ⚠️ **`internal` 而不是 `private`**：`RescueCommandBridge` 的 `probe`
+         *   默认就探测这个 profile。让它自己写 `"web"` 字面量等于把这个名字
+         *   复制一份，将来改名必漏一处。
+         */
+        internal const val PROFILE_WEB = "web"
+
+        /** [PROFILE_WEB] 的私有别名，保持文件内既有引用不动。 */
+        private const val PROFILE_NAME = PROFILE_WEB
+
+        /**
+         * 救援 profile 名（`--profile rescue`）。
+         *
+         * ⚠️ **不能用引擎内置模板名**：`PROFILE_TEMPLATES` 只有
+         * `acp` / `web` / `headless` / `sdk` / `sdk-minimal` 五个，
+         * 传别的名字引擎直接抛
+         * `dsh: profile "rescue" does not exist; create it with 'dsh plugin --profile rescue add <package>'`
+         * （`dsh-app-boot/lib/index.js` L973-974）。
+         *
+         * 真机实测过（2026-10-14，CDY-TN90 / Android 10）：
+         * 手工写好 `profiles/rescue/package.json`（bundles =
+         * `["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]`）之后，
+         * `--profile rescue --dump-config` 打出完整条目表、
+         * `--profile rescue --no-open --port 0` 打出
+         * `dsh web: http://127.0.0.1:44057/?token=…` —— 完全可用。
+         *
+         * ⇒ 所以 App **自己写这个 profile 的 `package.json`**，不指望引擎初始化它。
+         * 见 [ensureRescueProfile]。
+         */
+        private const val RESCUE_PROFILE_NAME = "rescue"
+
+        /**
+         * 救援 profile 的 bundle 清单。
+         *
+         * 逐字取自引擎自己的 `PROFILE_TEMPLATES.web.bundles`
+         * （`dsh-app-boot/lib/index.js` L531），**不是**从用户的
+         * `profiles/web/package.json` 推导的 —— 那份文件正是可能已经坏掉的东西
+         * （用户装了 40 个插件、其中某个拖挂了核心插件）。用它当模板等于
+         * 把病灶复制进救援环境，救援就一起起不来了。
+         *
+         * ⚠️ 只放 `@deepseek-ai/…` 核心 bundle ⇒ 天然满足不变量 I1
+         * （救援启动必须比正常启动简单，不能成为第二个失败源）。
+         */
+        private val RESCUE_BUNDLES = listOf(
+            "@deepseek-ai/dsh-base",
+            "@deepseek-ai/dsh-web-app",
+        )
 
         /** profile 的用户 patch 层文件名（引擎的 `PROFILE_PATCH_FILENAME`）。 */
         private const val PROFILE_PATCH_FILENAME = "cordis.patch.yml"
@@ -6583,6 +7888,10 @@ class EngineManager private constructor(private val context: Context) {
         private const val ROOT_PROMPT_BEGIN = "<!-- dsh-android:root BEGIN（本段由客户端生成，勿手改）-->"
         private const val ROOT_PROMPT_END = "<!-- dsh-android:root END -->"
 
+        private const val RESCUE_PROMPT_BEGIN =
+            "<!-- dsh-android:rescue BEGIN（本段由客户端生成，勿手改）-->"
+        private const val RESCUE_PROMPT_END = "<!-- dsh-android:rescue END -->"
+
         /**
          * root 可用时写给模型的说明。
          *
@@ -6728,6 +8037,110 @@ class EngineManager private constructor(private val context: Context) {
             - **不要**尝试用任何方式绕过应用身份去执行特权命令，那只会回落成应用身份。
             - 截图、点击屏幕、卸载应用、改系统设置、读 `/dev/input` 这类操作
               **当前一律做不到**，如实告诉用户并说明需要上面那次引导，不要反复重试。
+        """.trimIndent()
+
+        /**
+         * 降级态下写给模型的说明（方案 §4.4 的 P4）。
+         *
+         * ## 为什么这段必须存在
+         *
+         * 整个方案的承诺是「App 一定打得开 + AI 帮你修」。前半段由 Kotlin 侧保证，
+         * 后半段**只靠这段文本** —— 模型不知道 `rescue-cmd.json` 存在、不知道怎么
+         * 验证改动，它就只会说「我建议你禁用那个插件」，然后用户还是打不开。
+         *
+         * ⚠️ 这段是**条件注入**的（只在降级态时写入），所以正文里可以放心说
+         *   「你现在处于 X」。正常态下这段整个不存在，不占一个 token。
+         *
+         * ⚠️ 三条给模型的硬约束必须写清，否则它会做出有害的动作：
+         *   ① 不许删插件（只能改名隔离）—— 用户可能还要它；
+         *   ② 必须用 `try-boot` 验证，不能靠 `--dump-config` 猜（那是本方案的地基）；
+         *   ③ **日志里的失败插件名不是元凶**（真机实测：引擎列 40 个，元凶不在里面）。
+         */
+        private val RESCUE_PROMPT = """
+            ## 你正处于降级启动模式（插件把 App 搞崩了）
+
+            上一轮启动时，用户装的第三方插件里有东西让引擎起不来。App 已经**自动
+            降级**，用一个最小配置把你启动起来了 —— 所以你现在能用，但用户的插件
+            配置处于降级状态。**用户很可能就是来找你修这个的。**
+
+            ### 先看现状，不要猜
+
+            用户在 App 顶部看到一条常驻横幅。你也可以自己查：
+
+            - 当前层级、原因、被摘掉的插件：读 `${'$'}DSH_HOME/rescue/state.json`
+            - 上次启动为什么失败：读 `${'$'}DSH_HOME/rescue/last-boot-failure.json`
+            - 自动隔离时每一轮试启动的结果：`${'$'}DSH_HOME/rescue/attempts/`
+            - 用户的原始插件清单备份：`profiles/web/package.json.bak-l1`
+
+            想知道当前状态又不想读文件，可以发一条命令（见下）。
+
+            ### ⚠️ 三条硬约束（违反会造成真实损害）
+
+            1. **不许删除用户的插件。** 要排除某个插件，只允许**改名**（例如
+               `package.json.bak-<时间>`），绝不允许 `rm`。用户可能还要它、可能
+               只是版本不兼容、也可能是别的东西拖累了它。
+            2. **任何「修好了」的结论都必须用 `try-boot` 真跑一次验证。**
+               `--dump-config`、看配置文件、看日志**都不算证据** —— 真机上杀死
+               引擎的异常是在插件 `apply()` 阶段抛的，而 `--dump-config` **不执行
+               `apply()`**（实测它退出码 0、条目齐全，引擎照样起不来）。
+            3. **日志里那份「失败插件」名单不是元凶名单。** 真机实测：引擎打印
+               `Failed plugins (40)` 而实际只列了 38 条，且**真正的元凶不在里面** ——
+               日志点名的是**受害者**（比如核心的 `typert-loader` 被某个第三方插件
+               重复注册端点拖死）。所以不要拿日志里的名字当结论去禁用它们。
+
+            ### 怎么验证你的修改（rescue 信箱）
+
+            你不能重启 App（那会把自己杀掉），但可以让原生侧帮你**真跑一次**：
+
+            1. 把命令写进 `${'$'}DSH_HOME/rescue-cmd.json`（`id` 必须是**整数**且递增）：
+
+               ```json
+               {"id": 1, "action": "try-boot"}
+               ```
+
+            2. 等 1~25 秒，读 `${'$'}DSH_HOME/rescue-result.json`：
+
+               ```json
+               {"id": 1, "ok": true, "message": "试启动成功：引擎打印了 URL（profile=web）",
+                "data": {"ready": true, "exitCode": null, "requiredDidNotActivate": null,
+                         "tail": ["...引擎输出尾部..."], "probesUsed": 1, "probeQuota": 20}}
+               ```
+
+               `data.ready == true` 是**唯一**可信的成功标志。
+
+            #### 不想动用户的配置就验证？用 `bundleFilter`
+
+            加一个 `bundleFilter` 数组，原生侧会**临时**只加载「核心 + 你列的那些」
+            试启动，跑完**把用户配置逐字节还原**（你什么都不用清）：
+
+            ```json
+            {"id": 2, "action": "try-boot", "bundleFilter": ["@some/pkg-a", "@some/pkg-b"]}
+            ```
+
+            ⚠️ 这就是定位坏插件的正道：**二分**。40 个插件最多 6 轮就能定位到 1 个
+            （`bundleFilter` 给一半，看能不能起来；能起来说明坏的在你**没**给的那半）。
+
+            #### 其它动作
+
+            | action | 作用 |
+            |---|---|
+            | `status` | 立刻返回当前层级、被隔离的插件、上次失败详情（不跑进程） |
+            | `switch-rescue` | 切到救援模式（最小配置），界面重启 |
+            | `switch-back` | **切回正常模式并重启界面** —— 你确信修好了就用它 |
+
+            ⚠️ `try-boot` 有配额（一次会话 20 次），每次十几秒。用尽会明确告诉你，
+            不要再试 —— 改用 `bundleFilter` 做更少的轮次，或者把结论交给用户。
+
+            ### 修好之后
+
+            1. 先 `try-boot`（不带 `bundleFilter`，用用户完整配置）确认 `ready: true`；
+            2. 再发 `{"id": N, "action": "switch-back"}` 让 App 切回正常模式重启；
+            3. 告诉用户你做了什么、动过哪个文件。
+
+            ⚠️ 如果你判断**根本不是插件问题**（全摘之后仍起不来、或引擎报的错与插件
+            无关），就**不要**乱动用户的配置 —— 直接如实告诉用户，并建议他点横幅上的
+            「退出并重试」，或考虑 App 里的「安全模式」（那会重新解包引擎，能救
+            「引擎目录被改坏」这类问题）。
         """.trimIndent()
 
         @Volatile

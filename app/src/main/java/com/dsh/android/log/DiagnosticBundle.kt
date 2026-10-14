@@ -921,7 +921,54 @@ object DiagnosticBundle {
             )
         }
 
-        // ⑦ 调用方给的检查（资产版本戳、补丁锚点、插件激活 —— EngineManager 知道这些）
+        // ⑦ 救援层级（P5）
+        //
+        // ## 🔴 为什么必须有这一项
+        //
+        // 救援机制（见 `docs/RESCUE-BOOT-PLAN.md`）让 App 在插件坏掉时**降级启动**：
+        // 「已隔离可疑插件」/「救援模式」/「安全模式」。降级本身是好事，
+        // 但它会引入一种**新的静默**：用户此刻看到的是**功能不全**的界面，
+        // 而诊断包里没有任何一项能说明这件事 —— 6 个检查全 ok、headline
+        // 写「未发现异常」，而用户其实少了一批插件。
+        //
+        // 这正是本项目已确认 28 例的缺陷族（「结论与它描述的对象不是同一个」）：
+        // 「未发现异常」描述的是**日志**，而它会被读成**App 状态正常**。
+        // 加了本项之后，降级状态第一次在报告里**可见**。
+        //
+        // ⚠️ 判据是「**当前**处于哪个层级」，不是「历史上降级过几次」：
+        //   `state.json` 是**当前状态**（成功启动会把它清回 normal），
+        //   所以它天然对齐「此刻」—— 与 ② 里那条「必须按 bootId 对齐、
+        //   不能拿历史现场当现状」是同一个道理。
+        runCatching {
+            // ⚠️ `RescueBoot.tier()` 返回的是 **State**（含 tier/since/reason/…），
+            //   不是 Tier 本身 —— 名字短，容易读错。这里取字段。
+            val st = RescueBoot.tier()
+            val since = RescueBoot.stateSinceText()
+            checks.add(
+                when (st.tier) {
+                    RescueBoot.Tier.NORMAL -> Check(
+                        "boot-tier", "ok",
+                        "正常启动（未降级）：插件全部按配置加载",
+                    )
+                    // 降级了但界面能用 ⇒ 不是故障，但**必须让人看见**
+                    RescueBoot.Tier.ISOLATED -> Check(
+                        "boot-tier", "warn",
+                        "以「已隔离可疑插件」启动${since?.let { "（自 $it）" } ?: ""}：" +
+                            "App 能打开，但被隔离的插件**没有加载**。" +
+                            "已摘除的 bundle 见 rescue/state.json 的 removedBundles",
+                    )
+                    // 救援/安全模式：第三方插件全部不加载 —— 用户面对的是"能打开但不完整"
+                    RescueBoot.Tier.RESCUE, RescueBoot.Tier.SAFE_MODE -> Check(
+                        "boot-tier", "fail",
+                        "以「${st.tier.label}」启动${since?.let { "（自 $it）" } ?: ""}：" +
+                            "**第三方插件全部未加载**（App 刻意只加载核心 bundle 以保住「打得开」）。" +
+                            "这不是日志问题而是当前功能状态 —— 详见 rescue/state.json",
+                    )
+                },
+            )
+        }
+
+        // ⑧ 调用方给的检查（资产版本戳、补丁锚点、插件激活 —— EngineManager 知道这些）
         checks.addAll(extra)
 
         val ok = checks.count { it.status == "ok" }

@@ -61,4 +61,13 @@
       代价必须让用户看得见才敢点。
     -->
     <string name="safe_mode_entry">进入安全模式（不改动会话与凭据）</string>
+
+    <!--
+      降级态常驻横幅上的两个按钮（方案 §4.4.5，不变量 I4）。
+
+      「退出」做的是把层级复位成 NORMAL 并重启（不是删数据）；「详情」把
+      state.json 里的原因摆出来给用户看。两个都刻意短 —— 横幅上横向放得下。
+    -->
+    <string name="rescue_banner_exit">退出并重试</string>
+    <string name="rescue_banner_detail">上次为什么失败</string>
 </resources>

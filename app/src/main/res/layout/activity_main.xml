@@ -158,4 +158,85 @@
                 android:textSize="12.5sp" />
         </LinearLayout>
     </FrameLayout>
+
+    <!-- ── 降级态常驻横幅（不变量 I4）──────────────────────────────────────
+      
+      ## 为什么必须是**独立于 overlay** 的顶层视图
+
+      overlay 在 Web 视图加载完成后会**淡出**（见 MainActivity.hideOverlay），
+      而救援/隔离态恰恰是"界面正常、但配置是被降级的" —— 那时 overlay 早就没了。
+      把提示挂在 overlay 里，等于"只在打不开的时候提示"，而用户最需要知道的是
+      打**开之后**：我的插件少了几个、怎么退回去。
+
+      ⚠️ 方案 §4.4.5 明确要求「不许做成一句一闪而过的 toast」。常驻 + 可操作。
+
+      ## 为什么做成一条横幅而不是一个对话框
+
+      它要在用户使用 AI 修复的全过程里一直在，不能挡住 composer 与消息区。
+      一条贴在顶部的横幅是唯一不侵入的选择。
+
+      ⚠️ 默认 `gone`：正常态下这条**一个像素都不该占**。
+    -->
+    <LinearLayout
+        android:id="@+id/rescueBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#F2B45318"
+        android:orientation="vertical"
+        android:paddingStart="14dp"
+        android:paddingTop="9dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="9dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/rescueBannerText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:lineSpacingExtra="2dp"
+            android:textColor="#FFE7C2"
+            android:textSize="12.5sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="7dp"
+            android:orientation="horizontal">
+
+            <!-- 一键退出降级态（I4）。用 TextView 而不是 Button：主题
+                 `Theme.Material3.*` 会给 Button 套实心紫底，顶掉 android:background
+                 （同 overlay 上那两个按钮的既有做法）。 -->
+            <TextView
+                android:id="@+id/rescueBannerExit"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@drawable/log_chip_bg"
+                android:clickable="true"
+                android:focusable="true"
+                android:paddingStart="14dp"
+                android:paddingTop="7dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="7dp"
+                android:text="@string/rescue_banner_exit"
+                android:textColor="#FFE7C2"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/rescueBannerDetail"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="9dp"
+                android:background="@drawable/log_chip_bg"
+                android:clickable="true"
+                android:focusable="true"
+                android:paddingStart="14dp"
+                android:paddingTop="7dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="7dp"
+                android:text="@string/rescue_banner_detail"
+                android:textColor="#8FA3C0"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
 </FrameLayout>

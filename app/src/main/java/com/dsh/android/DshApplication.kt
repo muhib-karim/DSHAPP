@@ -10,6 +10,7 @@ import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogContext
 import com.dsh.android.log.LogStore
 import com.dsh.android.log.LogUploader
+import com.dsh.android.log.RescueBoot
 import com.dsh.android.termux.TermuxBootstrap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,6 +70,12 @@ class DshApplication : Application() {
             EventLog.init(logDir)
             BootState.begin(logDir)
             CrashRecorder.install(logDir)
+            // ⚠️ 救援启动的目录装在 `$DSH_HOME/rescue/`，而不是 logs/ ——
+            //   它是**关于启动本身**的状态（哪个层级、上次为什么起不来），
+            //   与 logs/ 下那堆日志文件的生命周期不同：清日志不该清掉它
+            //   （清了就等于忘记"上次是救援模式起来的"）。
+            //   位置必须在 BootState.begin 之后：它要读 BootState.bootId 对齐。
+            RescueBoot.installUnder(File(ctx.filesDir, DSH_HOME_REL))
 
             LogUploader.configure(LOG_UPLOAD_ENDPOINT, LOG_UPLOAD_TOKEN, logDir)
 
@@ -214,6 +221,20 @@ class DshApplication : Application() {
 
         /** 日志目录名（`filesDir/logs`）。 */
         const val LOG_DIR = "logs"
+
+        /**
+         * `$DSH_HOME` 相对 `filesDir` 的路径（即 `filesDir/home/.dsh`）。
+         *
+         * ⚠️ **单一真相源**：`attachBaseContext()` 里要装救援启动的记录目录
+         * （[com.dsh.android.log.RescueBoot]），而那时 `EngineManager` 实例还不存在
+         * （它的 `dshHome` 是实例属性），所以这个路径必须有一份**不依赖实例**的定义。
+         *
+         * 定义放在这里、并由 `EngineManager.dshHome` 引用同一常量 —— 两边各拼一次
+         * `File(filesDir, "home/.dsh")` 的话，改了一处漏一处就是「两个进程看不同目录」，
+         * 而症状只是「工具超时」/「状态读不到」，没有任何线索指向路径。
+         * 本项目已经吃过这个形态的亏（见 `EngineManager.dshHomeDir` 的 KDoc）。
+         */
+        const val DSH_HOME_REL = "home/.dsh"
 
         /**
          * 日志上传服务器端点。

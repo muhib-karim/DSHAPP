@@ -39,6 +39,8 @@ import com.dsh.android.log.CrashRecorder
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
 import com.dsh.android.log.LogUploader
+import com.dsh.android.log.RescueBoot
+import com.dsh.android.log.SafeDateFormat
 import com.dsh.android.web.DownloadRequest
 import com.dsh.android.web.DownloadStream
 import com.dsh.android.web.PageBridge
@@ -53,6 +55,8 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Date
+import java.util.Locale
 
 /**
  * 主界面：启动内置引擎，然后把 DSH 自带的 Web GUI 加载进 Web 视图。
@@ -276,6 +280,19 @@ class MainActivity : AppCompatActivity() {
 
     /** 上一次引擎意外退出的时刻（见 [engineRestarts] 的归零规则）。 */
     private var lastEngineDeadAt = 0L
+
+    /**
+     * 自动进安全模式是否正在进行（P6 的重入锁）。
+     *
+     * ⚠️ 必须有：`State.Failed` 分支**每次失败都会进**，而重解包要 15 秒 ——
+     *   这期间再来一次 Failed 会叠起第二次重解包，两次 `stop()`/`start()`
+     *   交错，最终可能两个都没起来。
+     *
+     * ⚠️ 与判据里的幂等（`tier` 被记成 SAFE_MODE 后 `== RESCUE` 不再成立）**不是
+     *   一回事**：那个防的是「下一轮启动」，这个防的是「同一轮里的并发」。
+     *   两者都要有。
+     */
+    private var autoSafeModeInFlight = false
 
     /**
      * 承载页面的内核进程死了 —— 重载界面把它带回来。
@@ -541,6 +558,12 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 同样要拦冒泡：不拦的话点它会先触发 overlay 自己的「点一下收起浮层」，
         //   于是启动层被收掉、白屏露出来，而日志界面还没打开。
         binding.overlayLogs.setOnClickListener { openLogViewer("overlay") }
+
+        // 降级态常驻横幅（不变量 I4）。**入口必须在 onCreate 就装好**，不能等到
+        // 引擎就绪 —— 救援态恰恰可能在引擎起来之前用户就想退出（比如他确信
+        // 自己刚卸载了那个坏插件，想直接回正常模式试一次）。
+        binding.rescueBannerExit.setOnClickListener { exitDegradedMode() }
+        binding.rescueBannerDetail.setOnClickListener { showDegradedDetail() }
 
         setupWebView()
         detectWebViewVersion()
@@ -1997,6 +2020,22 @@ class MainActivity : AppCompatActivity() {
                             hint = state.message,
                             isError = true,
                         )
+                        // ── P6：连续失败够多次、且 L1/L2 都已试过 ⇒ 自动进安全模式 ──
+                        //
+                        // ⚠️ 判据全在 [EngineManager.shouldAutoEnterSafeMode] 里
+                        //   （见它的 KDoc：三个条件、为什么门槛这么高）。这里只负责
+                        //   「判据成立就执行」，不重复判断条件 —— 两处各写一份判据
+                        //   迟早漂开，而症状会是「自动触发了但理由是错的」。
+                        //
+                        // ⚠️ 这个分支会被**重复进入**（每次失败都发一次 Failed），
+                        //   所以必须有幂等保护：进安全模式会把 `tier` 记成 SAFE_MODE，
+                        //   而判据要求 `tier == RESCUE` ⇒ 第二次进来就自动关上了。
+                        //   再加一个本地的 in-flight 标记防重入（重解包要 15 秒，
+                        //   这期间再来一次 Failed 会叠起两次重解包）。
+                        if (!autoSafeModeInFlight && engine.shouldAutoEnterSafeMode()) {
+                            autoSafeModeInFlight = true
+                            autoEnterSafeMode()
+                        }
                     }
                     is EngineManager.State.Dead -> {
                         // ⚠️ 与 Failed **刻意不同的动作**：引擎本来跑得好好的、
@@ -2050,6 +2089,9 @@ class MainActivity : AppCompatActivity() {
                         lifecycleScope.launch {
                             try {
                                 engine.start()
+                                // 同 bootEngine()：`start()` 内部可能刚降级，
+                                // 重启完要重新刷横幅，否则显示的层级是旧的。
+                                refreshRescueBanner()
                             } catch (c: CancellationException) {
                                 // 同 bootEngine()：Activity 被销毁时 lifecycleScope 取消，
                                 // 这不是启动失败，别记成错误、也别弹遮罩。
@@ -2094,7 +2136,14 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             try {
                 engine.ensureExtracted(assetStamp)
+                // ⚠️ **启动前先刷一次**：救援/隔离态是**上次**留下的，界面一起来就该
+                //   让用户看到（不能等到引擎就绪 —— 救援态恰恰可能起得很慢）。
+                refreshRescueBanner()
                 engine.start()
+                // ⚠️ **启动后再刷一次**：`start()` 内部可能刚刚发生降级（L1 二分没
+                //   收敛时会把层级改成 RESCUE，见 EngineManager.maybeIsolateBadBundles），
+                //   只刷一次的话横幅会停在旧层级上。
+                refreshRescueBanner()
             } catch (c: CancellationException) {
                 // ⚠️ **协程取消不是异常，必须原样抛出去。**
                 //
@@ -2208,6 +2257,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * P6：**自动**进入安全模式（方案 §4.5）。
+     *
+     * 与用户点击的 [enterSafeMode] 做**同一件事**（同样的推开配置 + 重解包 +
+     * 重启），差别只在文案与「谁触发的」这个事实 —— 那件事由
+     * [EngineManager.shouldAutoEnterSafeMode] 打 `[rescue-auto]` 标记记进日志。
+     *
+     * ## 为什么文案必须和用户点的那条不一样
+     *
+     * 用户点的时候他知道自己在做什么；自动触发时他**什么都没点**，界面却突然
+     * 说「正在进入安全模式…」，如果不解释原因，他会以为 App 坏了。
+     * 所以文案里必须写清「连续 N 次没能起来，所以自动推开了插件配置」。
+     *
+     * ⚠️ 必须把「用户的插件配置被推开了」讲出来，而不是含糊地说「正在修复」——
+     *   这是**破坏性**动作（虽然不删东西，但插件全部失效），用户有权当场知道。
+     */
+    private fun autoEnterSafeMode() {
+        binding.overlaySafeMode.isEnabled = false
+        overlayDismissed = false
+        showOverlay(
+            "连续多次没能启动，正在自动进入安全模式…",
+            hint = "已自动推开可能损坏的插件配置并重新解包引擎（约 15 秒）。" +
+                "你的会话、凭据、工作区都不会丢；被推开的配置都改名保留着。",
+        )
+        lifecycleScope.launch {
+            try {
+                val changed = engine.enterSafeMode()
+                Log.i(DshApplication.TAG, "[rescue-auto] 安全模式：改动=$changed，重启引擎")
+                // 同 [enterSafeMode]：必须补一次重解包，否则这次 start() 之前的
+                // ensureExtracted 已经跑过去了，引擎还是用旧的坏目录起来。
+                engine.ensureExtracted(assetStamp)
+                engine.start()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.e(DshApplication.TAG, "[rescue-auto] 安全模式启动失败", t)
+                binding.overlaySafeMode.isEnabled = true
+                showOverlay("安全模式启动失败", hint = t.message, isError = true)
+            } finally {
+                // 放开重入锁：`enterSafeMode` 已把层级记成 SAFE_MODE，判据此后
+                // 不会再成立，所以这里放开是安全的（不会导致反复触发）。
+                autoSafeModeInFlight = false
+            }
+        }
+    }
+
+    /**
      * 用户点了失败浮层上的「安全模式」：推开模型改坏的配置，然后重启引擎。
      *
      * 这是**唯一**不靠卸载重装的出路 —— 见 [EngineManager.enterSafeMode] 的 KDoc。
@@ -2240,6 +2335,121 @@ class MainActivity : AppCompatActivity() {
                 binding.overlaySafeMode.isEnabled = true
                 showOverlay("安全模式启动失败", hint = t.message, isError = true)
             }
+        }
+    }
+
+    /**
+     * 刷新降级态常驻横幅（方案 §4.4.5，不变量 I4）。
+     *
+     * ## 为什么单独抽一个函数、而不是写进 `showOverlay`
+     *
+     * 两者的生命周期**不同**：overlay 是启动期的，会淡出；横幅要在用户整个使用
+     * 过程里一直在（救援态下用户还要让 AI 慢慢修，可能十分钟）。挂在 overlay
+     * 上等于「只在打不开时提示」，而用户最需要知道的恰恰是打开之后的事。
+     *
+     * ## 三个层级的文案
+     *
+     * 文案必须说清**两件事**：发生了什么、以及**现在能做什么**。只说
+     * "已进入救援模式"而不说"让 AI 帮你修"，用户就只看到一个坏消息。
+     *
+     * ⚠️ 正常态一律 `gone`（不占一个像素）。
+     */
+    private fun refreshRescueBanner() {
+        val st = RescueBoot.tier()
+        val banner = binding.rescueBanner
+        if (st.tier == RescueBoot.Tier.NORMAL) {
+            banner.visibility = View.GONE
+            return
+        }
+        val when_ = RescueBoot.stateSinceText()?.let { "（$it 起）" }.orEmpty()
+        val text = when (st.tier) {
+            RescueBoot.Tier.RESCUE ->
+                "⚠️ 救援模式$when_\n" +
+                    "上次启动因为插件问题没能起来，已用最小配置启动（你的插件配置没被删）。\n" +
+                    "AI 可以帮你找出并修好那个插件 —— 直接问它就行。"
+            RescueBoot.Tier.ISOLATED ->
+                "⚠️ 已隔离可疑插件$when_\n" +
+                    "启动时发现 ${st.removedBundles.size} 个插件会让引擎起不来，已把它们改名隔离" +
+                    "（没有删除），其余插件照常工作。\n" +
+                    "想让 AI 复查或恢复，直接问它就行。"
+            RescueBoot.Tier.SAFE_MODE ->
+                "⚠️ 安全模式$when_\n" +
+                    "已推开全部第三方插件配置并重新解包引擎。"
+            RescueBoot.Tier.NORMAL -> return
+        }
+        binding.rescueBannerText.text = text
+        banner.visibility = View.VISIBLE
+    }
+
+    /**
+     * 用户点了横幅上的「退出并重试」：把层级复位成 NORMAL 然后重启引擎。
+     *
+     * ⚠️ **不删任何东西**（I5）。它只改 `rescue/state.json` 里的层级，于是下次
+     *   启动走正常 profile。用户原来的插件配置如果被 L1 摘过，恢复它走的是
+     *   `.bak-l1`（见 [showDegradedDetail] 的说明），那是**另一个显式动作** ——
+     *   不能顺手做掉，否则用户点一次"退出"就同时丢掉了隔离结论，AI 再也查不到
+     *   是哪个插件坏。
+     */
+    private fun exitDegradedMode() {
+        val st = RescueBoot.tier()
+        if (st.tier == RescueBoot.Tier.NORMAL) {
+            refreshRescueBanner()
+            return
+        }
+        Log.i(DshApplication.TAG, "用户请求退出降级态（当前 ${st.tier.id}）")
+        RescueBoot.setTier(RescueBoot.Tier.NORMAL, "用户点了横幅上的「退出并重试」")
+        engine.requestRestart("用户请求退出降级态")
+    }
+
+    /**
+     * 用户点了横幅上的「上次为什么失败」：把失败详情摆出来。
+     *
+     * 用 `AlertDialog` 而不是浮层：这时界面是**正常可用**的，弹一个全屏浮层会把
+     * 整个 GUI 盖掉（用户在救援态里正要用 AI 修，最不需要的就是界面被抢）。
+     */
+    private fun showDegradedDetail() {
+        val st = RescueBoot.tier()
+        val f = RescueBoot.lastFailure()
+        val sb = StringBuilder()
+        sb.append("当前层级：").append(st.tier.label).append('\n')
+        RescueBoot.stateSinceText()?.let { sb.append("自 ").append(it).append('\n') }
+        if (st.reason.isNotBlank()) sb.append("原因：").append(st.reason).append('\n')
+        if (st.removedBundles.isNotEmpty()) {
+            sb.append("\n已隔离的插件（").append(st.removedBundles.size).append(" 个）：\n")
+            st.removedBundles.forEach { sb.append("  · ").append(it).append('\n') }
+        }
+        st.restorePoint?.let {
+            sb.append("\n原始配置备份：").append(it)
+            sb.append("（想让 AI 恢复就告诉它这个路径）").append('\n')
+        }
+        if (f == null) {
+            sb.append("\n（没有记录到启动失败详情）")
+        } else {
+            sb.append("\n上次启动失败：\n")
+            sb.append("  时间：").append(
+                SafeDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(f.at)),
+            ).append('\n')
+            sb.append("  bootId：").append(f.bootId).append('\n')
+            sb.append("  连续失败：").append(f.consecutiveFailures).append(" 次\n")
+            f.requiredDidNotActivate?.let {
+                sb.append("  引擎报「未激活的必需插件」：").append(it).append(" 个\n")
+            }
+            f.failedCountMismatch?.let {
+                sb.append("  ⚠️ 引擎报的失败数与实际列出条数不一致：").append(it).append('\n')
+            }
+            if (f.failedPlugins.isNotEmpty()) {
+                sb.append("  引擎列出的失败插件（").append(f.failedPlugins.size).append(" 个，").append(
+                    "⚠️ 这是引擎列出的，**不一定是元凶** —— 元凶常常不在这个名单里）\n",
+                )
+            }
+        }
+        sb.append("\n想修的话，直接问 AI：把上面这些告诉它就行。")
+        runOnUiThread {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("启动失败详情")
+                .setMessage(sb.toString())
+                .setPositiveButton("知道了", null)
+                .show()
         }
     }
 
