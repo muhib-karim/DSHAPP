@@ -140,8 +140,43 @@ class MainActivity : AppCompatActivity() {
 
     /** 启动层超时的 handler 与 runnable（见 [armOverlayTimeout]）。 */
     private val overlayHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 「等界面就绪」的轮次编号 —— 用来作废**上一轮**遗留的超时计时器。
+     *
+     * ⚠️ 计时器只该对**排定它的那一轮**负责，而这一点原先没有任何判据：
+     *   [armOverlayTimeout] 排的 12 秒计时器，全工程唯一的 `removeCallbacks`
+     *   在 [onDestroy]，**中途从不撤销**。于是只要某一轮在 12 秒内没走完，
+     *   它的计时器就会留在队列里，等在**下一轮**的某个时刻开火 —— 而
+     *   [overlayDismissed] 这道唯一的守卫又会被引擎重启显式放开
+     *   （见 [EngineManager.State.Dead] 分支），守卫便形同不存在。
+     *
+     *   真机证据（服务器诊断包，OPPO PKJ110 / Android 16，v21）：
+     *   ```
+     *   16:58:06.423 加载 Web GUI: http://127.0.0.1:3080/?token=…   ← 排定计时器(→18.423)
+     *   16:58:07.839 插件已激活（onUiReady）                          ← 本轮已就绪
+     *   16:58:07.874 Web 内核已提交首帧，收起启动动画                 ← 守卫关上
+     *   16:58:16.176 用户请求退出降级态（当前 rescue）                ← 引擎要重启
+     *   16:58:16.479 引擎已退出: …，准备自动重启（第 2 次）           ← 守卫被放开
+     *   16:58:17.195 启动引擎: …                                      ← 新一轮，还没起好
+     *   16:58:18.443 界面就绪回调超时（WebView 内核 138，页面错误: 无） ← 旧计时器开火
+     *   ```
+     *   此刻距新引擎的 `loadUrl` 还有一秒多，页面根本没开始解析 —— 「超时」
+     *   是一句假话，而用户看到的是红层盖住一个**本来正常的启动过程**。
+     *
+     *   判据是编号而不是「有没有计时器在队列里」：只有 [armOverlayTimeout]
+     *   记录它，作废点（引擎重启）自增它，两者不相等即说明到点的是旧轮次。
+     */
+    private var overlayWaitGeneration = 0
+
+    /** [overlayTimeoutRunnable] 被排定时所属的 [overlayWaitGeneration]。 */
+    private var overlayTimeoutArmedAt = 0
+
     private val overlayTimeoutRunnable = Runnable {
         if (overlayDismissed) return@Runnable
+        // ⚠️ 旧轮次的计时器必须**静默作废**：它描述的是上一轮那次等待，
+        //   对当前这一轮没有任何意义（见 [overlayWaitGeneration]）。
+        if (overlayTimeoutArmedAt != overlayWaitGeneration) return@Runnable
         // ⚠️ 这里**不再静默收起**。原做法是「到点无条件收起」，理由是
         //   「启动层永久盖住界面是最糟的失败方式」—— 但在旧 WebView 内核上，
         //   收起之后露出来的是**一片白屏**（前端 bundle 解析失败、React 没挂载），
@@ -415,6 +450,9 @@ class MainActivity : AppCompatActivity() {
             // 把出路摆给用户：不再自动重载，但说清发生了什么、以及该做什么。
             // ⚠️ 这里显式放开 `overlayDismissed`（见 showOverlay 的第一行守卫），
             //   否则界面早就收起过启动层，这条提示永远贴不上去。
+            // ⚠️ 并作废旧计时器：这是**终态**（不再恢复），若留着它，到点会
+            //   再贴一条「界面就绪回调超时」把这条更准确的提示顶掉。
+            invalidateOverlayTimeout()
             overlayDismissed = false
             showOverlay(
                 "界面反复出错",
@@ -530,6 +568,8 @@ class MainActivity : AppCompatActivity() {
                 //   白屏。这与上界分支的处置保持同一语义：既然两条重载都拿不到
                 //   首帧，继续自动重载没有意义。
                 rendererGaveUp = true
+                // ⚠️ 同上：终态，留着的旧计时器会把这条提示顶掉。
+                invalidateOverlayTimeout()
                 overlayDismissed = false
                 showOverlay(
                     "界面没能恢复",
@@ -2196,6 +2236,7 @@ class MainActivity : AppCompatActivity() {
                         //   `engineRestarts` 的说明）。此时「安全模式」才是正确出口。
                         if (engineRestarts > MAX_ENGINE_RESTARTS) {
                             Log.e(DshApplication.TAG, "引擎反复退出，停止自动重启")
+                            invalidateOverlayTimeout()
                             overlayDismissed = false
                             showOverlay(
                                 "引擎反复停止",
@@ -2207,6 +2248,13 @@ class MainActivity : AppCompatActivity() {
                         }
                         // ⚠️ 先放开「已收起」守卫，否则提示贴不上（界面早就收起过
                         //   启动层了）。
+                        //
+                        // ⚠️ **同时作废上一轮遗留的「界面就绪」计时器。** 放开守卫
+                        //   等于让上一轮的计时器重新变得能开火 —— 而它描述的是
+                        //   **上一次**加载（往往早就成功了），到点会对着刚启动的
+                        //   新页面报「界面就绪回调超时」。真机上就是这样盖住了一次
+                        //   正常的启动过程（完整证据见 [overlayWaitGeneration] 的 KDoc）。
+                        invalidateOverlayTimeout()
                         overlayDismissed = false
                         showOverlay("引擎已停止，正在重新启动…", hint = state.message)
                         // ⚠️ 页面此刻是**活的**，但它连的是已经没人监听的端口 ——
@@ -2423,6 +2471,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun autoEnterSafeMode() {
         binding.overlaySafeMode.isEnabled = false
+        invalidateOverlayTimeout()
         overlayDismissed = false
         showOverlay(
             "连续多次没能启动，正在自动进入安全模式…",
@@ -2459,8 +2508,10 @@ class MainActivity : AppCompatActivity() {
      */
     private fun enterSafeMode() {
         binding.overlaySafeMode.isEnabled = false
-        // ⚠️ 顺序：先清掉"已收起"标记再 showOverlay —— 后者在 overlayDismissed
-        //   为真时会直接返回（那是防动画闪回的守卫），提示文案就贴不上去了。
+        // ⚠️ 顺序：先作废旧计时器、清掉"已收起"标记，再 showOverlay —— 后者在
+        //   overlayDismissed 为真时会直接返回（那是防动画闪回的守卫），提示文案
+        //   就贴不上去了。作废计时器是同一件事的另一半：这次也要重新加载界面。
+        invalidateOverlayTimeout()
         overlayDismissed = false
         showOverlay(
             "正在进入安全模式…",
@@ -2700,7 +2751,31 @@ class MainActivity : AppCompatActivity() {
      * 只有真出问题时才会走到这里。
      */
     private fun armOverlayTimeout() {
+        // ⚠️ 先撤销队列里可能还躺着的旧计时器：`postDelayed` 不会覆盖同一个
+        //   Runnable 的既有排期（只会再加一条），不撤销就会攒出多个计时器，
+        //   到点各报一次（见 [overlayWaitGeneration]）。
+        overlayHandler.removeCallbacks(overlayTimeoutRunnable)
+        overlayTimeoutArmedAt = overlayWaitGeneration
         overlayHandler.postDelayed(overlayTimeoutRunnable, UI_READY_TIMEOUT_MS)
+    }
+
+    /**
+     * 作废**上一轮**遗留的「界面就绪」计时器（见 [overlayWaitGeneration]）。
+     *
+     * ⚠️ 必须与「放开 [overlayDismissed] 守卫」成对调用：那条守卫是计时器
+     *   唯一的自我约束，一旦被放开，上一轮的计时器就重新变得能开火 ——
+     *   而它描述的是**上一次**加载（多半已经成功过），到点会对着刚开始的
+     *   新一轮报「界面就绪回调超时」。
+     *
+     * 四类调用点都是「界面马上要重新加载」或「已经放弃恢复」的时刻：
+     * [EngineManager.State.Dead] 分支（引擎自己死了，即将重启）、
+     * [enterSafeMode] 与 [autoEnterSafeMode]（推开配置后重启）、
+     * 以及 [onRendererGone] / [reloadWithRetry] 的两条**终态**分支
+     * （不再恢复，此时留着旧计时器只会把更准确的提示顶掉）。
+     */
+    private fun invalidateOverlayTimeout() {
+        overlayWaitGeneration++
+        overlayHandler.removeCallbacks(overlayTimeoutRunnable)
     }
 
     // ══ 悬浮气泡：注入通道 ══════════════════════════════════════════════
