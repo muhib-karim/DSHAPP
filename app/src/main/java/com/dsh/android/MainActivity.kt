@@ -1736,17 +1736,37 @@ class MainActivity : AppCompatActivity() {
      *
      * ⚠️ 用 `evaluateJavascript` 注入，**不保证一定被调用**（页面未就绪时不会回），
      *   所以这是"尽力而为"的推值；页面侧自己也有兜底（取不到时默认为 0px）。
+     *
+     * ## ⚠️ 必须换算成 CSS 像素再推（这里踩过一次，症状是"汉堡整行下移"）
+     *
+     * 页面是 **CSS 像素**的世界（真机实测视口 360×800 CSS px），而
+     * `statusBarHeightPx()` 给的是**物理像素**（同一台机 108px）。两者差一个
+     * `density`（该机 3）。直接把物理值当 CSS 值推下去，让位量就**放大 3 倍**：
+     *
+     * | 变量值 | 汉堡 rect.top | 标题 header top |
+     * |---|---|---|
+     * | 108（错误，物理值直推） | 124.3 | 108 |
+     * | 36（正确，108 ÷ 3） | 52.3 | 36 |
+     *
+     * 状态栏在 CSS 坐标里只占 36px 高，页面却按 108px 让位 ⇒ 汉堡与整个
+     * header 被推到屏幕下方一大截，用户看到的就是"开启沉浸式后顶部那行明显下移"。
+     * 因为 `--dsh-android-system-top` 同时被三处消费（汉堡 `top`、内容列
+     * `padding-top`、抽屉 `padding-top`），一处错就三处一起错。
+     *
+     * 换算成 CSS px 后变量语义统一为"CSS 像素"，与页面里写死的 6px 呼吸位同量纲。
      */
     private fun pushSystemBarInset(fullscreen: Boolean) {
-        val px = if (fullscreen) statusBarHeightPx() else 0
+        // 物理像素 → CSS 像素（÷ density）。density 为 0 时按 1 处理，避免除零。
+        val density = resources.displayMetrics.density.let { if (it > 0f) it else 1f }
+        val cssPx = if (fullscreen) Math.round(statusBarHeightPx() / density) else 0
         val js = "(function(){try{document.documentElement.style.setProperty(" +
-            "'--dsh-android-system-top','${px}px');}catch(e){}})()"
+            "'--dsh-android-system-top','${cssPx}px');}catch(e){}})()"
         web.evaluateJavascript(js, null)
-        Log.i(DshApplication.TAG, "页面让位变量 --dsh-android-system-top = ${px}px")
+        Log.i(DshApplication.TAG, "页面让位变量 --dsh-android-system-top = ${cssPx}px（CSS 像素）")
     }
 
     /**
-     * 状态栏高度（px）。
+     * 状态栏高度（**物理像素**，不是 CSS 像素 —— 推给页面时必须 ÷ density）。
      *
      * ⚠️ 读系统资源 `status_bar_height` 而不是从 insets 里取：`LAYOUT_NO_LIMITS`
      *   生效后 insets 里的 systemBars 会变成空（内容已经"在栏下面"了），
@@ -2362,10 +2382,22 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val when_ = RescueBoot.stateSinceText()?.let { "（$it 起）" }.orEmpty()
+        // ⚠️ 把「gateway 下线」这一种单独说出来。它和「起不来」是**两回事**：
+        //   引擎起来了、界面也加载了（用户看得见），但会话/模型列表/目录选择全废。
+        //   若横幅仍说「上次启动没能起来」，用户会对着一堆打不开的功能想：
+        //   「不是起来了吗？」—— 正是本项目缺陷族「结论与它描述的对象不符」。
+        val gw = RescueBoot.lastFailure()?.gatewayCulprit
+        val gatewayLine = if (gw != null) {
+            "\n启动时 typert gateway 整体下线（插件 " + (gw.ifEmpty { "（包名未解析到）" }) +
+                " 注册不上），会话、模型列表与目录选择都不可用。"
+        } else {
+            ""
+        }
         val text = when (st.tier) {
             RescueBoot.Tier.RESCUE ->
                 "⚠️ 救援模式$when_\n" +
-                    "上次启动因为插件问题没能起来，已用最小配置启动（你的插件配置没被删）。\n" +
+                    "引擎没能正常启动，或启动后 typert gateway 整体下线，" +
+                    "已用最小配置启动（你的插件配置没被删）。$gatewayLine\n" +
                     "AI 可以帮你找出并修好那个插件 —— 直接问它就行。"
             RescueBoot.Tier.ISOLATED ->
                 "⚠️ 已隔离可疑插件$when_\n" +
@@ -2425,12 +2457,24 @@ class MainActivity : AppCompatActivity() {
         if (f == null) {
             sb.append("\n（没有记录到启动失败详情）")
         } else {
-            sb.append("\n上次启动失败：\n")
+            // ⚠️ 标题按事实分岔，不写死「启动失败」：`gatewayCulprit` 非空表示
+            //   这一次引擎**起来了**（只是 gateway 废了），说「启动失败」是错的。
+            val gatewayOnly = f.gatewayCulprit != null && (f.requiredDidNotActivate ?: 0) <= 0
+            sb.append(if (gatewayOnly) "\n上次启动（引擎已就绪，但 gateway 下线）：\n" else "\n上次启动失败：\n")
             sb.append("  时间：").append(
                 SafeDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(f.at)),
             ).append('\n')
             sb.append("  bootId：").append(f.bootId).append('\n')
             sb.append("  连续失败：").append(f.consecutiveFailures).append(" 次\n")
+            f.gatewayCulprit?.let {
+                // ⚠️ 措辞必须带「如果为空 = 没解析到」，不能只说「注册不上的插件：」
+                //   后面跟一片空白 —— 那会被读成「插件名就是空的」。
+                sb.append("  ⚠️ typert gateway 整体下线，注册不上的插件：")
+                    .append(it.ifEmpty { "（引擎报了这句话，但包名没解析出来）" })
+                    .append('\n')
+                sb.append("     （会话、模型列表、目录选择都会报 " +
+                    "「its strict definition was withdrawn」）\n")
+            }
             f.requiredDidNotActivate?.let {
                 sb.append("  引擎报「未激活的必需插件」：").append(it).append(" 个\n")
             }

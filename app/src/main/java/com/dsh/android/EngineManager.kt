@@ -5182,8 +5182,12 @@ class EngineManager private constructor(private val context: Context) {
      *   非破坏性的（换一个最小 profile 启动，原配置原地不动、有常驻横幅、
      *   可一键退出），所以这条路径可以放心走。
      */
-    private fun escalateToRescue(reason: String) {
-        EventLog.record("rescue.degrade.l2", mapOf("from" to "l1", "reason" to reason))
+    private fun escalateToRescue(reason: String, from: String = "l1") {
+        // ⚠️ `from` 不能写死 "l1"：本函数还有第二个调用方 —— [start] 的
+        //   「引擎起来了但 gateway 废了」那条路（**没经过 L1 二分**）。
+        //   写死会让事件时间线把一次 NORMAL→RESCUE 的直接降级记成 L1 的产物，
+        //   排查时按 `from=l1` 找证据会落空（同族缺陷：「结论与它描述的对象不符」）。
+        EventLog.record("rescue.degrade.l2", mapOf("from" to from, "reason" to reason))
         RescueBoot.setTier(tier = RescueBoot.Tier.RESCUE, reason = "自动降级：$reason")
     }
 
@@ -6321,6 +6325,86 @@ class EngineManager private constructor(private val context: Context) {
         val url = readyUrl
 
         if (got && url != null) {
+            // ── 引擎**起来了**，但 gateway 可能已经废了（本 App 的第三种故障形态）──
+            //
+            // ⚠️ **这一段的判据与处置都必须早于 `clearFailure()`**，见下面两条注释。
+            //
+            // 真机现场（OPPO PKJ110 / v18）：引擎打印了 URL、界面正常加载，但
+            // `typert-loader` 的 contributor 注册失败 ⇒ gateway 的严格定义被撤下
+            // ⇒ `session/control` / `session/modelCatalog` / `directoryPicker/list`
+            // 全部报 `its strict definition was withdrawn and SRC fallback is forbidden`。
+            // 用户「选不了工作区、发不出消息、插件面板打不开」，而**界面上没有任何
+            // 按钮**——救援阶梯的每一道门都要求「启动失败」，这次启动是成功的。
+            //
+            // 时序是可靠的：真机 `engine.log` 里 typert 那段报错在 `dsh web:`
+            // **之前 21ms**（13:29:30.709 vs .730），而 stdout 循环是先
+            // `logLines.addLast(line)` 再 `readyLatch.countDown()`（见上面那段），
+            // 所以等到这里时证据必然已经在缓冲里。
+            val gatewayTail = synchronized(logLines) { logLines.toList() }
+            val gatewayCulprit = RescueBoot.parseGatewayFailure(gatewayTail)
+            if (gatewayCulprit != null) {
+                Log.e(
+                    TAG,
+                    "引擎打印了 URL 但 typert gateway 整体下线（涉事=${gatewayCulprit.ifEmpty { "未解析到包名" }}）" +
+                        " —— 界面会正常加载，但会话/模型列表/目录选择全部不可用",
+                )
+                EventLog.record(
+                    "engine.gateway-degraded",
+                    mapOf("culprit" to gatewayCulprit.ifEmpty { "unknown" }),
+                )
+                // ⚠️ **先记失败**，再决定降级。这份记录让「连续失败几次」「涉事是谁」
+                //   在重启后仍然可查 —— `start()` 成功分支本来会 `clearFailure()`，
+                //   而这次的「成功」是假的（见 [RescueBoot.recordGatewayFailure] 的说明）。
+                RescueBoot.recordGatewayFailure(
+                    bootId = BootState.bootId,
+                    tailLines = gatewayTail,
+                    culprit = gatewayCulprit,
+                )
+                // 正常态 ⇒ 降级到 L2 救援模式并**立刻重启**，用户零操作。
+                // L2 是**非破坏性**的（不动用户配置、有常驻横幅、可一键退出），
+                // 所以这条路径可以放心走（同 [escalateToRescue] 的 KDoc）。
+                //
+                // ⚠️ 只在 NORMAL 态推。已是 RESCUE 时再推没有意义，而且会把横幅的
+                //   `since` 刷成每次启动的时刻（「自 XX 起」就永远显示刚刚）。
+                // ⚠️ `rescueAvailable == false` 时**不能**推：那个 profile 建不出来，
+                //   推过去下次启动会直接失败（见上面 `ensureRescueProfile` 那段）。
+                val tierNow = RescueBoot.tier().tier
+                if (tierNow == RescueBoot.Tier.NORMAL && rescueAvailable) {
+                    escalateToRescue(
+                        "引擎起来了但 typert gateway 整体下线（contributor 注册失败：" +
+                            "${gatewayCulprit.ifEmpty { "包名未解析到" }}）",
+                        // 这条降级**没有经过 L1 二分**（引擎是「成功」启动的，L1 的闸门
+                        // 一个都没开），所以事件里必须如实标成 gateway 检测，不能冒 L1 的名。
+                        from = "gateway",
+                    )
+                    Log.w(TAG, "已降级到救援模式，立刻重启引擎（下次启动不加载任何第三方插件）")
+                    // ⚠️ **不设 Ready**：直接走既有重启路径，避免界面先加载再重启闪一下。
+                    //   状态打成 [State.Dead] 而不是 [State.Failed] —— 引擎没崩、页面能
+                    //   加载，而 Failed 会把用户引向**破坏性**的「安全模式」按钮；
+                    //   Dead 的「原样重启」正是这里要的（同 [requestRestart] 的 KDoc）。
+                    requestRestart("typert gateway 整体下线，切救援模式")
+                    return@withContext
+                }
+                // 走到这里 = 已经是救援态仍失效，或救援 profile 不可用。
+                // 两者都**不是**第三方插件的问题（rescue 不含任何第三方 bundle），
+                // 所以不再自动推层级 —— 只保持界面可用，让常驻横幅把事实说出来
+                // （不变量 I4：降级状态必须常驻可见 + 可一键退出）。
+                Log.w(
+                    TAG,
+                    "gateway 仍失效（层级=${tierNow.id}，救援可用=$rescueAvailable），不再自动降级",
+                )
+                EventLog.record(
+                    "engine.ready",
+                    mapOf(
+                        "ms" to (System.currentTimeMillis() - startMs).toString(),
+                        "port" to portOf(url),
+                        "degraded" to "gateway",
+                    ),
+                )
+                _state.value = State.Ready(url)
+                Log.i(TAG, "引擎就绪: $url")
+                return@withContext
+            }
             _state.value = State.Ready(url)
             Log.i(TAG, "引擎就绪: $url")
             // ⚠️ 引擎**真的起来了** ⇒ 清掉上次的失败记录。
@@ -6332,6 +6416,9 @@ class EngineManager private constructor(private val context: Context) {
             //
             //   位置要紧：必须放在「确实拿到 URL」这个分支里，不能放在别处。
             //   `got && url != null` 就是「引擎打印过 URL」的严格判据。
+            //
+            //   ⚠️ 上面那段 gateway 检测已经 `return@withContext` 走了，
+            //   所以走到这里就是**真·成功**，可以放心清。
             RescueBoot.clearFailure()
             // 事件时间线里记一笔「从起进程到就绪花了多久」。
             // ⚠️ 这是「打开 App 慢」这类模糊反馈唯一能定量的地方：没有它，
@@ -7554,8 +7641,19 @@ class EngineManager private constructor(private val context: Context) {
          *      引擎自己的加载路径，不经过那个编译。
          *      ⚠️ 但仍然必须 bump 本常量：否则 `.mobile_ui_version` 标记不变，
          *      `ensureMobileUi()` 直接跳过解包，**老设备永远拿不到这个分节**。
+         * 1.0.0-62：**沉浸式下汉堡整行下移的根因不在插件，而在原生推错了单位。**
+         *      真正的修复在 `MainActivity.pushSystemBarInset()`（把状态栏物理像素
+         *      ÷ density 换算成 CSS 像素再推）。本版只改了两处**注释**：
+         *      `mpSyncFloatNavGap()` 与 CSS 那条规则原先写着「该变量在本 App 里
+         *      从未被任何代码写入（恒 0）」—— 那句话在修复 58 之后就过时了，
+         *      留着会误导下一个来改的人按"变量恒 0"的旧前提动手。
+         *      ⚠️ 严格说这一版**没有改任何 JS 行为**，本可以不 bump；但
+         *      `mobileui/lib/client.js` 是降级编译的输入之一，注释变了产物字节就变，
+         *      而 `.mobile_ui_version` 与 `-CompatVersion` 两戳只要都对得上，
+         *      设备上那棵树就会被跳过、继续用旧产物覆盖。为免"源码与设备不一致"
+         *      这种最难查的中间态，两个戳一起 bump（见 ⑯ 的 v4~v17 全部先例）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-61"
+        private const val MOBILE_UI_VERSION = "1.0.0-62"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

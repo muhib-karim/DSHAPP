@@ -162,6 +162,28 @@ object RescueBoot {
         val tail: List<String>,
         /** 失败判定时刻。 */
         val at: Long,
+        /**
+         * 「引擎**起来了**、但 typert gateway 整体下线」时的涉事包名；没有该故障时为 null。
+         *
+         * ## 为什么必须单开一个字段，而不能塞进 [failedPlugins]
+         *
+         * 语义来源完全不同，混用就是本项目缺陷族的形态（结论与它描述的对象不符）：
+         *
+         * | 字段 | 来源 | 引擎原话 |
+         * |---|---|---|
+         * | [failedPlugins] | `Failed plugins (N):` 段落 | 「这些插件**没起来**」 |
+         * | 本字段 | `N typert contributor(s) failed to register` | 「这个插件**注册不上**，gateway 因此整体下线」 |
+         *
+         * 真机两句话**都出现过、且不在同一次启动里**：v16 那次是前者（引擎起不来），
+         * 本次是后者（引擎起来了、功能全废）。塞进同一个列表会让读者以为
+         * 「引擎列了这份失败插件清单」，而它列的是**另一件事**。
+         *
+         * ⚠️ 真机上这个名字是**受害者而非元凶**的近邻：报错行形如
+         * `- typert-loader: @winterchenhuan/dsh-shadow-mind …`，冒号**前**的是
+         * 报错的那个核心包（`typert-loader`），冒号**后**的才是注册不上的那个。
+         * 本字段存的是**后者**（见 [CONTRIBUTOR_LINE_RE]）。
+         */
+        val gatewayCulprit: String?,
     ) {
         /** 是不是「插件问题导致起不来」。
          *
@@ -378,7 +400,140 @@ object RescueBoot {
             consecutiveFailures = consecutiveFailures,
             tail = tailLines.takeLast(TAIL_MAX_LINES),
             at = at,
+            // 本方法只从「启动失败」的 stdout 解析，那条路上没有 gateway 判据
+            // （引擎压根没起来，谈不上 contributor 注册）。由
+            // [recordGatewayFailure] 在自己的 copy 里补上。
+            gatewayCulprit = null,
         )
+    }
+
+    /**
+     * 引擎**起来了**、但 typert gateway 整体下线的判据（纯函数，可被测试直接调用）。
+     *
+     * ## 为什么需要它：这是一种此前判据完全覆盖不到的故障
+     *
+     * 真机现场（OPPO PKJ110 / Android 16 / v18，`20261014-133139-dae3d8a3.zip`）：
+     *
+     * ```
+     * 13:29:30.709  dsh: warning: 1 entry did not activate
+     * 13:29:30.709  typert-loader: AggregateError: 1 typert contributor(s) failed to register:
+     * 13:29:30.709    - @winterchenhuan/dsh-shadow-mind … result codec has no create() factory
+     * 13:29:30.730  dsh web: http://127.0.0.1:3080/?token=…      ← 引擎「就绪」
+     * ```
+     *
+     * 引擎**打印了 URL**（`engine.ready`、界面正常加载），所以：
+     *
+     * - `start()` 走的是**成功**分支 ⇒ `RescueBoot.clearFailure()`、tier 停在 NORMAL；
+     * - `shouldAutoEnterSafeMode()` 要求 `tier == RESCUE` ⇒ 永不成立；
+     * - L1 隔离要求 `lastFailure()` 非空 ⇒ 永不成立；
+     * - `refreshRescueBanner()` 要求 `tier != NORMAL` ⇒ 横幅不显示。
+     *
+     * 于是救援阶梯**一条都进不去**。而用户实际面对的是：`session/control`、
+     * `session/modelCatalog`、`dynamicCordisRunner/inventory`、`directoryPicker/list`
+     * **全部**报 `its strict definition was withdrawn and SRC fallback is forbidden`
+     * —— 会话发不出、模型列表读不到、插件面板打不开、**连工作区目录都选不了**，
+     * 界面上却没有任何按钮可点。这是「App 打不开」的**变体**：功能上等价不可用，
+     * 只是没崩溃。
+     *
+     * ## 判据 = 引擎自己说的那句话
+     *
+     * 与 [Failure.looksLikePluginProblem] 同一原则：**用引擎自己的措辞**，不猜。
+     * `typert contributor(s) failed to register` 只在 contributor 注册失败时出现，
+     * 而注册失败 ⇔ gateway 的严格定义被撤下（`requireStrictCodec` 抛在这里）。
+     *
+     * ⚠️ **输入必须是真实启动的 stdout**（同 [recordFailure]）：`--dump-config`
+     *   的静态输出里没有这一句。
+     *
+     * ⚠️ 判据**只看有没有那句话**，不解析它后面列了哪个包名。真机上那段是
+     *   `AggregateError` 的多行堆栈，格式随 cordis 版本变；而我们需要回答的问题
+     *   只是「gateway 是不是废了」，不是「谁弄废的」—— 后者由 L1 二分去找
+     *   （见 `EngineManager.isolateBadBundles` 的论证：日志里点名的是受害者）。
+     *
+     * @return 判据成立时返回涉事包名（能解析到就给，给不到返回空串）；否则 null。
+     */
+    fun parseGatewayFailure(tailLines: List<String>): String? {
+        val cleaned = tailLines.map { stripLogPrefix(it) }
+        // ⚠️ 先定位那句话，**只在它之后**找涉事行。
+        //   从缓冲区第 0 行开始找是错的：这是最多 400 行的历史输出，前面任何一个
+        //   `- <词>: <包名>` 式的行（报错列表、帮助文本、别的插件的清单…）都会被
+        //   [CONTRIBUTOR_LINE_RE] 命中，于是报出一个**与 gateway 无关的包名**。
+        //   那正是本项目缺陷族的形态（结论与它描述的对象不符）——
+        //   而且它比「解析不出来」更糟：错答案看着像答案。
+        val at = cleaned.indexOfFirst { TYPERT_CONTRIBUTOR_RE.containsMatchIn(it) }
+        if (at < 0) return null
+        for (i in at until cleaned.size) {
+            val m = CONTRIBUTOR_LINE_RE.find(cleaned[i]) ?: continue
+            return m.groupValues[1]
+        }
+        // 有那句话但没解析出包名 ⇒ 空串（"确实有该故障，但包名没解析到"）。
+        // ⚠️ 空串与 null 语义不同，调用方/界面必须区分（见 [Failure.gatewayCulprit]）。
+        return ""
+    }
+
+    /**
+     * 把「引擎起来了、但 typert gateway 整体下线」记进失败记录文件。
+     *
+     * ⚠️ **这是本判据唯一的落盘入口。** `start()` 在成功分支里本来会
+     *   `clearFailure()`，所以必须**先记再清**（调用点的顺序见
+     *   `EngineManager.start()`）—— 否则刚写下的证据会被下一行删掉。
+     *
+     * ## ⚠️ 为什么**不**复用 [Failure.requiredDidNotActivate] / [Failure.failedPlugins]
+     *
+     * 那两个字段的语义是「引擎**自己说的**」：
+     * `requiredDidNotActivate` ⟵ `dsh: startup failed: N required plugin did not activate`，
+     * `failedPlugins` ⟵ `Failed plugins (N):` 段落。
+     *
+     * 而真机这次的引擎**两句话都没说过** —— 它起来了，只打了
+     * `1 entry did not activate`（通用告警，与 required 不是同一个总体）
+     * 和 `1 typert contributor(s) failed to register`。
+     *
+     * 一度把它们**编**成 `requiredDidNotActivate = 1` + `failedPlugins = [culprit]`，
+     * 好让 [Failure.looksLikePluginProblem] 成立。那是错的，且错得有后果：
+     * `MainActivity.refreshRescueBanner` 会照着这两个字段对用户说
+     * 「引擎报 1 个 required 插件未激活」「引擎列出的失败插件（1 个）」——
+     * 而引擎**从没说过**这些。用户与诊断包的读者会去找一份不存在的清单。
+     * 这正是本项目已确认的缺陷族「结论与它描述的对象不是同一个」。
+     *
+     * 所以：**新增一个如实命名的字段** [Failure.gatewayCulprit]，既有字段一律不碰
+     * （解析出什么就是什么，没解析到就是 null）。
+     *
+     * ## ⚠️ 别写「这样 L1 就能接手做二分」——那条推论是错的
+     *
+     * L1（`maybeIsolateBadBundles`）的第一道门就是 `tier == NORMAL`，而调用本函数的
+     * `EngineManager.start()` 紧接着就会 `escalateToRescue()` 把 tier 推成 RESCUE
+     * ⇒ L1 **永远不会**在这条路径上跑。本路径是**直接到 L2** 的
+     * （救援 profile，不含任何第三方 bundle）。
+     *
+     * 这是有意的取舍：L1 的价值是「只摘坏插件、保住用户其余插件」，但它要先跑
+     * 一轮最多 2.5 分钟的试启动才能收敛；而此刻用户手上是一个「界面能开、功能
+     * 全废」的 App，**L2 能让 App 立刻可用**（零操作、有常驻横幅、可一键退出，
+     * 且不碰用户任何配置）。代价是第三方插件在这次救援里全都不加载 ——
+     * 如实记在此处，不假装 L1 还能兜底。
+     *
+     * @return 落盘成功与否；false 不是异常。
+     */
+    fun recordGatewayFailure(
+        bootId: String,
+        tailLines: List<String>,
+        culprit: String,
+        at: Long = System.currentTimeMillis(),
+    ): Boolean {
+        val f = fileOf(FILE_LAST_FAILURE) ?: return false
+        val streak = (lastFailure()?.consecutiveFailures ?: 0) + 1
+        val parsed = parseFailure(bootId, null, tailLines, at, streak)
+        val marked = parsed.copy(gatewayCulprit = culprit.ifEmpty { null })
+        return try {
+            f.writeText(toJson(marked).toString(2))
+            Log.w(
+                TAG,
+                "救援：已记录 gateway 失效（第 $streak 次，涉事=${culprit.ifEmpty { "未解析到包名" }}）" +
+                    " —— 引擎起来了但 typert gateway 整体下线",
+            )
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "救援：gateway 失效记录写入失败: ${t.message}")
+            false
+        }
     }
 
     /** 读回最近一次失败记录；没有或读不出时返回 null。 */
@@ -411,6 +566,13 @@ object RescueBoot {
                     (0 until a.length()).map { a.optString(it, "") }
                 } ?: emptyList(),
                 at = o.optLong("at", 0L),
+                // 老版本写的记录没有这个字段 ⇒ null（「不是 gateway 故障」）。
+                // ⚠️ 取不出时**不能**编一个空串：空串的语义是「有该故障但包名没解析到」，
+                //   与「没有该故障」是两回事，混起来界面就会对一次普通启动失败
+                //   说「typert gateway 下线」。
+                gatewayCulprit = o.optString("gatewayCulprit")
+                    .ifEmpty { null }
+                    ?.takeIf { it != "null" },
             )
         } catch (t: Throwable) {
             Log.w(TAG, "救援：启动失败记录读取失败: ${t.message}")
@@ -521,7 +683,16 @@ object RescueBoot {
         return when (s.tier) {
             Tier.NORMAL -> "正常启动"
             Tier.ISOLATED -> "已隔离 ${s.removedBundles.size} 个可疑插件后启动（其余插件照常）"
-            Tier.RESCUE -> "救援模式启动（未加载任何第三方插件）—— 上次启动因插件问题失败"
+            // ⚠️ 措辞**不能**只说「上次启动失败」：进入本层级有**两条**互斥的路
+            //   （见 `EngineManager` 的两处 `escalateToRescue` 调用点）：
+            //   ① L1 二分没收敛（引擎**确实起不来**）；
+            //   ② 引擎**起来了**但 typert gateway 整体下线（界面能开、功能全废）。
+            //   只写①，第②种情况在诊断包里就成了「结论与它描述的对象不符」
+            //   —— 读的人会去找一场根本不存在的启动失败。
+            //   所以两条都点明，并指出「第三方插件未加载」这个**本层级的实际后果**
+            //   （它才是用户能直接感知到的那件事）。
+            Tier.RESCUE -> "救援模式启动（未加载任何第三方插件）——" +
+                "上次因插件问题未能正常启动，或启动后 typert gateway 整体下线"
             Tier.SAFE_MODE -> "安全模式启动（已推开配置并重解包引擎）"
         }
     }
@@ -595,6 +766,8 @@ object RescueBoot {
         put("consecutiveFailures", f.consecutiveFailures)
         put("tail", JSONArray(f.tail))
         put("at", f.at)
+        // 「引擎起来了但 gateway 下线」的涉事包名（见 [Failure.gatewayCulprit]）。
+        put("gatewayCulprit", f.gatewayCulprit ?: JSONObject.NULL)
         put("atText", SafeDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
             .format(java.util.Date(f.at)))
     }
@@ -624,4 +797,35 @@ object RescueBoot {
 
     /** 是否是合法包名（`foo`、`@scope/name`）。 */
     private val PACKAGE_RE = Regex("""^(@[a-z0-9][\w.-]*/)?[a-z0-9][\w.-]*$""")
+
+    /**
+     * `typert-loader: 1 typert contributor(s) failed to register:`
+     *
+     * 真机原文（`20261014-133139-dae3d8a3.zip` 的 `engine.log`）：
+     *
+     * ```
+     * typert-loader (@deepseek-ai/dsh-typert-loader): AggregateError: typert-loader: 1 typert contributor(s) failed to register:
+     * ```
+     *
+     * ⚠️ **只认这一句，不认 `N entry did not activate`。** 后者是通用告警，sandbox
+     *   注册失败时也会打（见 `EngineManager` 里那段 `4 entries did not activate`
+     *   的注释），拿它当判据会大面积误报。而这一句是 `typert-loader` **自己**
+     *   说的「有 contributor 没注册上」，与 gateway 是否下线是同一件事。
+     */
+    private val TYPERT_CONTRIBUTOR_RE = Regex("""typert contributor\(s\) failed to register""")
+
+    /**
+     * contributor 失败列表里的一行，取组 1 = 涉事包名。
+     *
+     * 真机原文（`20261014-133139-dae3d8a3.zip`）：
+     *
+     * ```
+     *   - typert-loader: @winterchenhuan/dsh-shadow-mind invocation "…" result codec has no create() factory
+     * ```
+     *
+     * ⚠️ 包名在**冒号之后**（冒号前那个 `typert-loader` 是**受害者**，不是元凶）。
+     *   按 `- ` 后第一个词取会取到受害者 —— 那正是 L1 的 KDoc 里论证过的
+     *   「日志里点名的是受害者不是元凶」。所以必须跳过 `xxx:` 前缀。
+     */
+    private val CONTRIBUTOR_LINE_RE = Regex("""^\s*-\s+[\w-]+:\s+(@?[\w./-]+)\s""")
 }

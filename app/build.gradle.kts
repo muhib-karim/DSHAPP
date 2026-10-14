@@ -32,10 +32,24 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 19
+        versionCode = 21
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
+        // ⚠️ versionCode 20 与 19 都是 versionName `0.2.9-rescue`（同一个包名的两版），
+        //    靠 versionCode 区分。19 的缺陷是「开全面屏后顶栏整行下移」——
+        //    原生把状态栏高度按物理像素直推给页面（108 而非 36），让位量放大 3 倍。
+        //
+        // ⚠️ 21（本次）修的是一条**此前完全没有判据**的故障：引擎**起来了**
+        //    （打印了 URL、界面正常加载），但 typert gateway 因其某个 contributor
+        //    注册失败而整体下线 —— `session/control` / `session/modelCatalog` /
+        //    `directoryPicker/list` 全部报 `its strict definition was withdrawn
+        //    and SRC fallback is forbidden`。用户看到的是「选不了工作区、发不出
+        //    消息、插件面板打不开」，而界面上**没有任何按钮**：救援阶梯的四道门
+        //    全都要求「启动失败」，这一次启动是成功的。
+        //    现在由 `RescueBoot.parseGatewayFailure` 认引擎自己那句话，命中即
+        //    自动降级到救援模式并重启（零操作）。versionName 不变，靠 versionCode
+        //    区分（20 已作为 `0.2.9-immersive` 发出，**不能**倒退或重发同号）。
         versionName = "0.2.9-rescue"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构

@@ -104,8 +104,55 @@ const ACTION_BUDGET_BASE64 = 12 * 1024 * 1024;
  *
  * ⚠️ 多一个、少一个都不会报错，只会**静默不生效**（原生 `actionMapOf` 会把
  *   未知状态整条丢掉）—— 那种"配了但宠物不按它动"最难查。
+ *
+ * ⚠️ **顺序就是这个数组的顺序，不是字母序**：`workStatusTexts` / `statusImages`
+ *   都是**按档位下标**索引的（第 0 档 = idle，第 1 档 = thinking …）。
+ *   原生侧的新状态是**追加在末尾**的（`result` / `success`），正是为了不改动
+ *   前 5 档的下标 —— 老配置的文案不会错位。往中间插一个状态会让所有老配置的
+ *   文案整体串档，而且**不报任何错**。
  */
-const RUN_STATES = ['idle', 'thinking', 'working', 'waiting', 'error'];
+const RUN_STATES = ['idle', 'thinking', 'working', 'waiting', 'error', 'result', 'success'];
+
+/**
+ * 池名/动作名的合法字符集。与原生侧 `BubbleAppearance.normalizePoolName` 必须一致。
+ */
+const POOL_NAME_RE = /^[a-z0-9_-]{1,24}$/;
+
+/** 动作池数量上限。与原生侧 `BubbleAppearance.MAX_POOLS` 必须一致。 */
+const MAX_POOLS = 24;
+
+/** 单个池里的动作数上限。与原生侧 `BubbleAppearance.MAX_POOL_ACTIONS` 必须一致。 */
+const MAX_POOL_ACTIONS = 64;
+
+/** 每档状态文案的句数上限。与原生侧 `MAX_STATUS_TEXTS_PER_TIER` 必须一致。 */
+const MAX_STATUS_TEXTS_PER_TIER = 8;
+
+/** 单句状态文案的长度上限。与原生侧 `MAX_STATUS_TEXT_CHARS` 必须一致。 */
+const MAX_STATUS_TEXT_CHARS = 60;
+
+/** 状态配图的档数上限。与原生侧 `BubbleAppearance.MAX_STATUS_IMAGES` 必须一致。 */
+const MAX_STATUS_IMAGES = 7;
+
+/** 每档状态配图的数量上限。 */
+const MAX_STATUS_IMAGES_PER_TIER = 8;
+
+/** 状态配图的边长上限（dp）。与原生侧 `MAX_STATUS_IMAGE_DP` 必须一致。 */
+const MAX_STATUS_IMAGE_DP = 240;
+
+/** 单张状态图的 base64 长度上限。与原生侧 `BubbleStatusImages.MAX_IMAGE_BASE64` 必须一致。 */
+const MAX_STATUS_IMAGE_BASE64 = 4 * 1024 * 1024;
+
+/**
+ * **一次调用里全部状态图**的 base64 总预算。
+ *
+ * ⚠️ 与 `ACTION_BUDGET_BASE64` 同理：只查单张的话，7 档 × 每档 3 张 × 3 MB
+ *   合计 60 MB 会照样过闸，而原生侧那一次 `readText()` 就足以被 LMK 杀掉。
+ *   状态图是**头顶小图**，正常一张只有几十 KB，8 MB 已经很宽松。
+ */
+const STATUS_IMAGE_BUDGET_BASE64 = 8 * 1024 * 1024;
+
+/** 单张状态图的数量上限（磁盘上保留的总数）。与原生侧 `BubbleStatusImages.MAX_FILES` 同口径。 */
+const MAX_STATUS_IMAGE_FILES = 64;
 
 /**
  * 模型可见的工具描述 —— **这是本插件最要紧的一段文本**。
@@ -159,6 +206,8 @@ Content layer:
 - \`frameIntervalMs\`: uniform frame duration in ms, 20–60000 (default 400).
 - \`frameLoop\`: how many full cycles to play; -1 (default) = forever, 0 = forever too, N>0 = stop on the last frame after N cycles.
 - \`spriteRows\` / \`spriteCols\`: **sprite sheet mode**. Pass ONE file in \`frameFiles\` that is a grid of \`rows × cols\` equally-sized cells; the plugin treats each cell as a frame, in row-major order. This is how you animate a character with a single image. Setting these with no new \`frameFiles\` re-slices the sheet that is already stored.
+- \`video\`: absolute path to a **transparent WebM** — the highest-quality content layer. This is how you reproduce a dsh-pet style pet: each action is a real animation (idle breathing, a throw, a landing squash) instead of a few still frames. Videos take priority over \`frameFiles\`, so you can ship both (the frames act as a fallback). Up to ~6 MB per file; VP9 with alpha is what dsh-pet uses and it plays correctly here. Pass \`""\` to delete this action's video. ⚠️ Prefer passing a PATH over inlining base64 — a single webm is 200 KB–1.3 MB, and base64 inflates it by another 33%.
+- \`throwEnabled\`: boolean (default true) — whether flinging the ball makes it fly, bounce off the screen edges, squash on landing and roll to a stop.
 
 Motion layer:
 - \`spin\`: degrees per second, -720–720 (negative = counter-clockwise), 0 = no rotation. Applied to the content layer, so the outline stays put.
@@ -168,7 +217,13 @@ Panel and status:
 - \`panelWidth\` (dp) and \`panelHeight\` (dp, 0 = fit content)
 - \`panelBg\` / \`panelText\` / \`panelAccent\`: "#RRGGBB" for the expanded panel
 - \`statusAutoHideMs\`: how long the status strip stays after its content stops changing; 0 disables auto-hide
-- \`edgeSnap\`: boolean — whether dragging the ball off-screen collapses it into an edge sliver
+- \`edgeSnap\`: boolean, default **false**. When false the ball **stays exactly where the
+  user drops it** — screen centre, anywhere. When true it is pulled to the nearest left/right
+  edge after every drag. Dragging the ball *off* the screen always collapses it into an edge
+  sliver regardless of this flag, because that is an explicit gesture.
+- \`throwEnabled\`: boolean, default true. Flick the ball and it **flies, bounces off all four
+  walls and the floor, and comes to rest where it lands** (no snap-back). This is the desktop
+  pet feel; set false for the old "drop and stick to the edge" behaviour.
 
 ## Desktop pet: one animation per state
 
@@ -176,19 +231,108 @@ A single frame set can only say "this ball animates". To make the ball a **pet t
 reacts to what you are doing**, register several *named* actions and map run states
 to them:
 
-1. \`actions: {"idle": {...}, "work": {...}, "wait": {...}}\` — each spec is a frame
-   set (same fields as \`frameFiles\` + \`spriteRows\`/\`spriteCols\`/\`frameIntervalMs\`/
-   \`frameDurations\`/\`frameLoop\`, but named). Names: a–z 0–9 \`-\` \`_\`, max 24 chars.
-   An empty \`frames\` array deletes that action. \`action:"get"\` returns the \`actions\`
-   list that actually exists on disk.
+1. \`actions: {"idle": {...}, "work": {...}, "wait": {...}}\` — each spec is a
+   frame set (same fields as \`frameFiles\` + \`spriteRows\`/\`spriteCols\`/\`frameIntervalMs\`/
+   \`frameDurations\`/\`frameLoop\`, but named), **or** a \`video\` for real animation.
+   Names: a–z 0–9 \`-\` \`_\`, max 24 chars. An empty \`frames\` array deletes that
+   action. \`action:"get"\` returns the \`actions\` list that actually exists on disk,
+   plus \`videoActions\` for the ones that have a video.
 2. \`actionMap: {"thinking":"think","working":"work","waiting":"wait","error":"sad"}\` —
    the pet then switches animation **by itself** as your run state changes. States:
    \`idle\` (not running), \`thinking\` (you are generating), \`working\` (a tool/command is
    executing), \`waiting\` (waiting for the user — approval or input), \`error\` (last turn
-   failed). Unmapped states fall back to the default action.
+   failed). **An unmapped state falls back to your \`idle\` action**, so mapping only
+   \`idle\` already keeps the pet visible in every state — without that fallback the pet
+   would flip to the built-in static avatar as soon as you start working, which looks
+   broken. (Only if \`idle\` is unmapped too does the state fall back to the avatar.)
 3. \`action:"state"\` with \`runState\` (and optionally \`playAction\`) reports the state
    right now **without saving anything** — this is how a state-bridge plugin drives the
    pet from engine events. \`action:"notify"\` still works for one-off lines.
+
+### Make it *alive*: pools, weights, status lines, walking
+
+Steps 1–3 give you a pet that changes animation when *you* tell it to. These four
+fields give you one that behaves like a pet on its own:
+
+4. **\`pools\`** — group your actions into named pools and let the app drive them.
+   Four names are special:
+   - \`idle\` — the **random idle chain**: whenever nothing is running, the pet picks
+     one of these at random and plays it (one-shot actions chain on their own; a
+     looping one is re-rolled every 8 s). This is what makes it stop looking frozen.
+   - \`click\` — **tap response**. ⚠️ Configuring this pool *changes the interaction*:
+     a single tap now pets the pet instead of opening the panel, and **the panel
+     moves to a long-press**. Don't configure it if the user mainly taps the ball to
+     open the panel.
+   - \`drag\` — the pose shown while the user drags the pet (e.g. a "being picked up"
+     animation). Without it, dragging just moves the ball.
+   - \`move\` — the pose used while the pet walks on its own (needs \`moveEnabled\`).
+   - \`turn\` — the pose played when the pet changes facing. **The action itself does
+     not flip anything**: the flip happens when it finishes playing, and only if
+     \`flipOnTurn\` is on (default). Give \`turn\` a weight in \`poolWeights\` (e.g.
+     \`{"idle":10,"turn":2}\`) or it will never be picked.
+   - \`work-<state>\` (or \`state-<state>\`) — a **per-state pool**, e.g.
+     \`work-thinking\`: \`{"work-thinking":["think-a","think-b"]}\`. This is the upgrade
+     of \`actionMap\`: instead of one fixed action per state, the pet re-rolls a
+     different one **every time it enters that state**. If both are configured the
+     pool wins.
+   - Any other pool name (\`celebrate\`, \`sleep\`, …) is yours: map it with \`actionMap\`
+     or play it by name. It costs nothing to declare.
+5. **\`poolWeights\`** — \`{"idle":10}\`. The \`idle\` weight drives the random chain:
+   **0 turns it off** (the pet then just stays on whatever \`actionMap\` says — that is
+   the "I want a calm ball" setting), and omitting it defaults to 10. \`turn\` is the
+   second weight that does something: see \`turn\` above. Other pool names are accepted
+   and ignored, so you can send a full weight table without error.
+6. **\`workStatusTexts\`** — what the status bubble says, per state, in run-state order
+   \`[idle, thinking, working, waiting, error, result, success]\`. Give several lines per
+   state and one is picked at random each time the state changes:
+   \`[["在发呆"],["正在想…"],["正在干活…"],["等你确认"],["出错了"]]\`.
+   This is how you give the pet a *voice* without any LLM call — the lines are static
+   text you write once. You may configure only the states you care about.
+   ⚠️ The order is positional and the last two states were appended, so a 5-entry array
+   still means exactly what it always meant.
+7. **\`statusImages\`** — **a picture above the ball's head** (the desktop pet's meme
+   panel), same positional structure as \`workStatusTexts\`:
+   \`[["/abs/idle.png"],["/abs/think.png"],["/abs/work.png"]]\`. One is picked at random
+   each time the state changes. Absolute paths (read by this process) or
+   \`data:image/...;base64,...\` both work; the bytes are copied into the app's own
+   storage so the picture survives even if the original file moves. A tier with no
+   text but a picture is fine — the bubble then shows the picture alone, which is the
+   usual look. \`statusImageSizeDp\` sets the size (32–240 dp, default 96).
+   Use this for reactions the pet should *show* rather than *say*.
+8. **\`flipOnTurn\`** (default true) — mirror the pet horizontally when it turns
+   around. Assets are usually drawn facing one way, so turning is done with a mirror;
+   turn it off if your art already has both directions (mirroring would flip any text
+   in the artwork).
+9. **\`moveParams\`** — per-action walk distance, overriding \`moveMinDp\`/\`moveMaxDp\`:
+   \`{"shuffle":{"minDp":10,"maxDp":20},"dash":{"minDp":120,"maxDp":200}}\`. Use it when
+   different \`move\` animations have different strides (a small shuffle should not
+   travel as far as a run). \`{minDp:0,maxDp:0}\` means "play the walk animation in
+   place without moving".
+10. **\`moveEnabled\`** (+ \`moveIntervalSec\` / \`moveMinDp\` / \`moveMaxDp\`) — let the pet
+    walk a short distance on its own every so often. **Off by default**: it is
+    charming for a pet and annoying for a button, so only turn it on if the user
+    actually wants a pet.
+
+### You are NOT limited to sprite sheets
+
+The content layer can be **either** still frames (carousel / sprite sheet) **or a
+transparent WebM video**. If you are asked to build something like the \`dsh-pet\`
+desktop pet, use \`video\` — that is what its animations are (VP9 webm with an alpha
+channel), and transparent video plays correctly here. Do not conclude that "the
+bubble can only do sprite sheets"; that was true before \`video\` existed.
+
+A dsh-pet style pet is therefore:
+
+1. Get the webm files (download them, or generate frames and encode them). They live
+   in your workspace, so you have their absolute paths.
+2. \`{action:"set", actions:{"idle":{"video":"/abs/idle.webm"}, "thinking":{"video":"/abs/think.webm"}, ...}}\`
+3. \`{action:"set", actionMap:{"idle":"idle","thinking":"thinking","working":"work"}}\`
+4. Make sure the ball is actually visible: with the default \`state:"auto"\` it only
+   shows while the app is in the background.
+
+One video per action; \`idle\` (and any action mapped from \`idle\`) is looped, the
+others play once and then fall back to \`idle\`. \`get\` reports \`videoActions\` so you
+can confirm each one landed.
 
 \`pinAction\` pins one action by name (the pet ignores \`actionMap\`); \`pinAction:""\` goes
 back to automatic switching. Prefer \`action:"state"\` over \`pinAction\` for live control:
@@ -206,8 +350,27 @@ back to automatic switching. Prefer \`action:"state"\` over \`pinAction\` for li
 - "tell me when you're done" → \`{action: "notify", text: "搞定", durationMs: 4000}\`
 - "make it a desktop pet" → register \`actions\` for idle/think/work + an \`actionMap\`, then
   drive it with \`{action:"state", runState:"working"}\` while you work
+- "make it look like dsh-pet" → \`{action:"set", actions:{"idle":{"video":"/abs/idle.webm"}},
+  actionMap:{"idle":"idle"}}\` — transparent webm per action, not sprite sheets
+- "make it feel alive / stop it looking frozen" → \`{pools:{"idle":["idle","stretch","look"]}}\`
+  (the random chain). Add \`{workStatusTexts:[["在发呆"],["正在想…"],["正在干活…"]]}\` for a voice
+- "let me pet it / it should react when I tap" → \`{pools:{"click":["happy","surprised"]}}\`
+  ⚠️ this moves panel-opening to a long-press — tell the user
+- "let me pick it up" → \`{pools:{"drag":["being-lifted"]}}\`
+- "make it wander around" → \`{moveEnabled:true, pools:{"move":["walk"]}}\`
+- "it should turn around / face the way it walks" →
+  \`{pools:{"turn":["turn"]}, poolWeights:{"idle":10,"turn":2}}\` (default \`flipOnTurn\` mirrors it)
+- "show a picture above its head" →
+  \`{statusImages:[["/abs/idle.png"],["/abs/think.png"],["/abs/work.png"]]}\`
+- "different animation each time it starts thinking" →
+  \`{pools:{"work-thinking":["think-a","think-b"]}}\` (beats \`actionMap\` for that state)
+- "walk animations with different strides" →
+  \`{pools:{"move":["shuffle","dash"]}, moveParams:{"shuffle":{"minDp":10,"maxDp":20},"dash":{"minDp":120,"maxDp":200}}}\`
+- "make it calm again / stop the random actions" → \`{poolWeights:{"idle":0}}\`
 - "have the pet react while you work" → \`{action:"state", runState:"thinking"}\` before you
   start, \`runState:"working"\` around each tool call, \`runState:"idle"\` when done
+  (also \`runState:"success"\` when it finishes well and \`runState:"error"\` when it fails)
+- "let me throw it around" → \`{throwEnabled: true}\` (already the default)
 - "stop making it a pet" → \`{actionMap: {}, pinAction: ""}\`
 
 Invalid values fall back to the current value instead of failing, and unknown fields are ignored, so a typo does not make the ball disappear. The result tells you the appearance as it is *after* the change; check it if you need to be sure.
@@ -229,7 +392,14 @@ function pickFields(args) {
 		//   所以它不放进这个通用循环，由 execute 单独处理（见那里的 pinAction）。
 		'spin', 'pulse',
 		'panelWidth', 'panelHeight', 'panelBg', 'panelText', 'panelAccent',
-		'statusAutoHideMs', 'edgeSnap',
+		'statusAutoHideMs', 'edgeSnap', 'throwEnabled',
+		'moveEnabled', 'moveIntervalSec', 'moveMinDp', 'moveMaxDp',
+		'statusImageSizeDp', 'flipOnTurn',
+		// ⚠️ 这几个允许空对象/空数组（那是"清空"这个语义本身），所以能走通用循环；
+		//   但**池名与动作名的合法性在 execute 里单独校验** —— 原生侧虽然也会
+		//   逐条丢掉非法的，但它只记日志、不回执，AI 看不到自己写错了哪个。
+		//   `statusImages` / `moveParams` 同理：它们含路径/动作名，也要单独校验。
+		'pools', 'poolWeights', 'workStatusTexts',
 	];
 	for (const key of keys) {
 		const value = args[key];
@@ -307,6 +477,247 @@ function readFrameFiles(files) {
 }
 
 /**
+ * 校验并透传 `pools`：池名 → 动作名数组。
+ *
+ * ⚠️ **非法项在这里就报错，不丢给原生**。原生侧对非法池名/动作名的策略是
+ *   "逐条丢掉 + 记日志"，它不回执 —— AI 于是看不到自己写错了哪一个，只会
+ *   觉得"配了但宠物不动"。这类静默失效是最难查的一类。
+ *
+ * ⚠️ 但**池里引用了磁盘上不存在的动作名不算错**：先配池、后传素材是很正常的
+ *   顺序（素材可能很大，AI 会分几次传）。原生侧抽签时会跳过不存在的，
+ *   所以最坏结果只是"那个动作永远抽不到"，不会卡住宠物。
+ *
+ * @param {object} pools - `{池名: [动作名…]}`。
+ * @returns {{ok: true, pools: object} | {ok: false, error: string}} 结果。
+ */
+function checkPools(pools) {
+	if (pools === null || typeof pools !== 'object' || Array.isArray(pools)) {
+		return { ok: false, error: 'pools 必须是对象（池名 → 动作名数组）' };
+	}
+	const names = Object.keys(pools);
+	if (names.length > MAX_POOLS) {
+		return { ok: false, error: `动作池过多（${names.length} > 上限 ${MAX_POOLS}）` };
+	}
+	const out = {};
+	for (const rawPool of names) {
+		const pool = String(rawPool).trim().toLowerCase();
+		if (!POOL_NAME_RE.test(pool)) {
+			return { ok: false, error: `池名不合法: ${rawPool}（只允许 a-z 0-9 - _，最多 24 字符）` };
+		}
+		const list = pools[rawPool];
+		if (!Array.isArray(list)) {
+			return { ok: false, error: `动作池 ${rawPool} 必须是数组` };
+		}
+		if (list.length > MAX_POOL_ACTIONS) {
+			return { ok: false, error: `动作池 ${rawPool} 里动作过多（${list.length} > 上限 ${MAX_POOL_ACTIONS}）` };
+		}
+		const acts = [];
+		for (const rawAct of list) {
+			const act = String(rawAct).trim().toLowerCase();
+			if (!POOL_NAME_RE.test(act) || act === 'default') {
+				return { ok: false, error: `动作池 ${rawPool} 里的动作名不合法: ${rawAct}` };
+			}
+			if (!acts.includes(act)) acts.push(act);
+		}
+		out[pool] = acts;
+	}
+	return { ok: true, pools: out };
+}
+
+/**
+ * 校验并透传 `poolWeights`：池名 → 相对权重。
+ *
+ * ⚠️ 只有 `idle` 的权重被原生使用，但**其余池名不报错**：AI 写一份完整的权重表
+ *   （对应它配的全部池）是很自然的，为此报错会逼它维护"哪些池有特殊含义"这份
+ *   隐含知识。写多了无害，写错了池名才是错。
+ *
+ * @param {object} weights - `{池名: 数字}`。
+ * @returns {{ok: true, weights: object} | {ok: false, error: string}} 结果。
+ */
+function checkPoolWeights(weights) {
+	if (weights === null || typeof weights !== 'object' || Array.isArray(weights)) {
+		return { ok: false, error: 'poolWeights 必须是对象（池名 → 数字）' };
+	}
+	const out = {};
+	for (const rawPool of Object.keys(weights)) {
+		const pool = String(rawPool).trim().toLowerCase();
+		if (!POOL_NAME_RE.test(pool)) {
+			return { ok: false, error: `权重里的池名不合法: ${rawPool}` };
+		}
+		const v = weights[rawPool];
+		if (typeof v !== 'number' || !Number.isFinite(v)) {
+			return { ok: false, error: `池 ${rawPool} 的权重必须是数字` };
+		}
+		out[pool] = Math.max(0, Math.min(1000, Math.trunc(v)));
+	}
+	return { ok: true, weights: out };
+}
+
+/**
+ * 校验并透传 `workStatusTexts`：二维数组，外层是档位。
+ *
+ * ⚠️ 档位顺序 = `RUN_STATES`（idle/thinking/working/waiting/error/result/success），
+ *   **不是**按名字索引。写超 7 档就是写错了，直接报错而不是丢掉 —— 多出来的档永远
+ *   不会显示，静默丢掉等于骗 AI。
+ *
+ * @param {Array} tiers - `[[文案…], …]`。
+ * @returns {{ok: true, tiers: Array} | {ok: false, error: string}} 结果。
+ */
+function checkStatusTexts(tiers) {
+	if (!Array.isArray(tiers)) {
+		return { ok: false, error: 'workStatusTexts 必须是数组（按状态顺序，每项是一个字符串数组）' };
+	}
+	if (tiers.length > RUN_STATES.length) {
+		return {
+			ok: false,
+			error: `workStatusTexts 最多 ${RUN_STATES.length} 档（顺序 = ${RUN_STATES.join(' / ')}），收到 ${tiers.length} 档`,
+		};
+	}
+	const out = [];
+	for (let i = 0; i < tiers.length; i++) {
+		const tier = tiers[i];
+		if (!Array.isArray(tier)) {
+			return { ok: false, error: `第 ${i} 档（${RUN_STATES[i]}）必须是字符串数组` };
+		}
+		if (tier.length > MAX_STATUS_TEXTS_PER_TIER) {
+			return { ok: false, error: `第 ${i} 档（${RUN_STATES[i]}）文案过多（${tier.length} > 上限 ${MAX_STATUS_TEXTS_PER_TIER}）` };
+		}
+		const texts = [];
+		for (const raw of tier) {
+			if (typeof raw !== 'string') {
+				return { ok: false, error: `第 ${i} 档（${RUN_STATES[i]}）里的文案必须是字符串` };
+			}
+			const s = raw.trim();
+			if (s !== '') texts.push(s.slice(0, MAX_STATUS_TEXT_CHARS));
+		}
+		out.push(texts);
+	}
+	return { ok: true, tiers: out };
+}
+
+/**
+ * 把 `statusImages` 读成 data URI 的二维数组（外层是档位）。
+ *
+ * ⚠️ **与 `frameFiles` 相反，这里允许 data URI 直传**：状态图常常是模型自己
+ *   生成/拼出来的小图，走 base64 反而省一步落盘。两种形态都收。
+ *
+ * ⚠️ 与 [checkStatusTexts] 一样按**档位下标**对齐 `RUN_STATES`，所以档数上限
+ *   就是状态数；写超了直接报错（多出来的档永远不会显示，静默丢掉等于骗模型）。
+ *
+ * ⚠️ 这里只做**格式与预算**校验，不校验图片能不能解码 —— 那要真去解一张图，
+ *   而原生侧 `BubbleStatusImages.write` 已经有一道 `BitmapFactory` 闸（解不出来
+ *   就丢掉并记日志）。在这里重复一遍只是多花时间。
+ *
+ * @param {Array} tiers - `[[路径或 dataURI…], …]`。
+ * @returns {{ok: true, tiers: Array, note: string} | {ok: false, error: string}} 结果。
+ */
+function checkStatusImages(tiers) {
+	if (!Array.isArray(tiers)) {
+		return { ok: false, error: 'statusImages 必须是数组（按状态顺序，每项是一个字符串数组）' };
+	}
+	if (tiers.length > MAX_STATUS_IMAGES) {
+		return {
+			ok: false,
+			error: `statusImages 最多 ${MAX_STATUS_IMAGES} 档（顺序 = ${RUN_STATES.join(' / ')}），收到 ${tiers.length} 档`,
+		};
+	}
+	const out = [];
+	let budget = 0;
+	let total = 0;
+	for (let i = 0; i < tiers.length; i++) {
+		const tier = tiers[i];
+		if (!Array.isArray(tier)) {
+			return { ok: false, error: `第 ${i} 档（${RUN_STATES[i]}）必须是字符串数组` };
+		}
+		if (tier.length > MAX_STATUS_IMAGES_PER_TIER) {
+			return {
+				ok: false,
+				error: `第 ${i} 档（${RUN_STATES[i]}）图片过多（${tier.length} > 上限 ${MAX_STATUS_IMAGES_PER_TIER}）`,
+			};
+		}
+		const uris = [];
+		for (const raw of tier) {
+			if (typeof raw !== 'string' || raw.trim() === '') {
+				return { ok: false, error: `第 ${i} 档（${RUN_STATES[i]}）里的图片必须是路径或 data URI 字符串` };
+			}
+			const s = raw.trim();
+			// 已经是 data URI：直接收（但要算进预算）。
+			if (s.startsWith('data:image/')) {
+				budget += s.length;
+				uris.push(s);
+				continue;
+			}
+			const read = readImageFile(s);
+			if (!read.ok) {
+				return {
+					ok: false,
+					error: `第 ${i} 档（${RUN_STATES[i]}）第 ${uris.length + 1} 张图不可用（${read.error}）`,
+				};
+			}
+			budget += read.uri.length;
+			uris.push(read.uri);
+		}
+		total += uris.length;
+		out.push(uris);
+		if (budget > STATUS_IMAGE_BUDGET_BASE64) {
+			return {
+				ok: false,
+				error: `本次要下发的状态图总量过大（已超 ${Math.round(STATUS_IMAGE_BUDGET_BASE64 / 1024 / 1024)} MB）。`
+					+ '状态图是头顶的小图，请把图片压小（例如 240×240 的 PNG），或一次少配几张。',
+			};
+		}
+	}
+	const note = total > MAX_STATUS_IMAGE_FILES
+		? `（共 ${total} 张，磁盘上只保留最近 ${MAX_STATUS_IMAGE_FILES} 张，旧的会被清理）`
+		: '';
+	return { ok: true, tiers: out, note };
+}
+
+/**
+ * 校验并透传 `moveParams`：动作名 → `{minDp, maxDp}`。
+ *
+ * ⚠️ 键是**动作名**（不是池名），所以用与 `actions` 同一套字符规则校验 ——
+ *   它必须能和 `pools.move` 里的元素对上，规则不一致就永远对不上。
+ *
+ * ⚠️ `minDp`/`maxDp` **允许只写一个**：缺的那个跟随全局 \`moveMinDp\`/\`moveMaxDp\`。
+ *   这与"写成 0"是两回事（0 = 原地踏步），所以缺省必须传 `null` 而不是 0 ——
+ *   原生侧的 `MoveParams` 就是这么区分的。
+ *
+ * @param {object} params - `{动作名: {minDp?, maxDp?}}`。
+ * @returns {{ok: true, params: object} | {ok: false, error: string}} 结果。
+ */
+function checkMoveParams(params) {
+	if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+		return { ok: false, error: 'moveParams 必须是对象（动作名 → {minDp, maxDp}）' };
+	}
+	const out = {};
+	for (const rawAction of Object.keys(params)) {
+		const action = String(rawAction).trim().toLowerCase();
+		if (!POOL_NAME_RE.test(action) || action === 'default') {
+			return { ok: false, error: `moveParams 里的动作名不合法: ${rawAction}` };
+		}
+		const spec = params[rawAction];
+		if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+			return { ok: false, error: `moveParams.${rawAction} 必须是对象（{minDp, maxDp}）` };
+		}
+		const entry = {};
+		for (const key of ['minDp', 'maxDp']) {
+			if (spec[key] === undefined || spec[key] === null) continue;
+			const v = spec[key];
+			if (typeof v !== 'number' || !Number.isFinite(v)) {
+				return { ok: false, error: `moveParams.${rawAction}.${key} 必须是数字` };
+			}
+			entry[key] = Math.max(0, Math.min(400, Math.trunc(v)));
+		}
+		if (Object.keys(entry).length === 0) {
+			return { ok: false, error: `moveParams.${rawAction} 至少要给 minDp 或 maxDp（都是 0 表示原地踏步）` };
+		}
+		out[action] = entry;
+	}
+	return { ok: true, params: out };
+}
+
+/**
  * 把 `actions` 参数（动作名 → 规格）翻成原生认的那份 `actions` 对象。
  *
  * 规格里允许 `frameFiles`（本进程读文件）或 `frames`（已是 data URI），其余字段
@@ -344,6 +755,15 @@ function buildActions(actions) {
 		for (const key of ['spriteRows', 'spriteCols', 'frameIntervalMs', 'frameDurations', 'frameLoop']) {
 			if (spec[key] !== undefined && spec[key] !== null) entry[key] = spec[key];
 		}
+		// 视频素材：**直接透传路径**（原生自己读文件，见顶层 `video` 处的说明）。
+		// ⚠️ 与 `frames` 二选一**不成立** —— 一个动作可以同时带两者（视频是主素材、
+		//   帧集是兜底），所以这里不参与下面的 else-if 链。
+		if (spec.video !== undefined && spec.video !== null) {
+			if (typeof spec.video !== 'string') {
+				return { ok: false, error: `动作 ${rawName} 的 video 必须是字符串（绝对路径）` };
+			}
+			entry.video = spec.video.trim();
+		}
 		// 两种来源二选一：`frames` 已是 data URI（模型自己拼的），`frameFiles` 要读盘。
 		if (spec.frames !== undefined) {
 			if (!Array.isArray(spec.frames)) {
@@ -356,9 +776,14 @@ function buildActions(actions) {
 			if (!read.ok) return { ok: false, error: `动作 ${rawName}: ${read.error}` };
 			budget += read.frames.reduce((n, s) => n + s.length, 0);
 			entry.frames = read.frames;
-		} else {
-			return { ok: false, error: `动作 ${rawName} 缺少 frames 或 frameFiles` };
+		} else if (entry.video === undefined) {
+			// 既没有帧、也没有视频 —— 这个动作是空的。**报错而不是静默跳过**：
+			//   静默会让模型以为配好了，而宠物纹丝不动。
+			return { ok: false, error: `动作 ${rawName} 缺少 frames、frameFiles 或 video` };
 		}
+		// ⚠️ 有视频、没帧时**补一个空数组**：原生侧把"frames 缺席"当成"这是老式
+		//   的帧集配置"，补上空数组能把语义明确成"这个动作不要帧集"。
+		if (entry.frames === undefined) entry.frames = [];
 		if (budget > ACTION_BUDGET_BASE64) {
 			return {
 				ok: false,
@@ -474,7 +899,7 @@ function bubbleTool(home) {
 				},
 				actionMap: {
 					type: 'object',
-					description: 'State → action name map, e.g. {"thinking":"think","working":"work","waiting":"wait","error":"sad"}. With an empty `action` the pet then switches animation by itself as the run state changes. Pass {} to clear the map.',
+					description: 'State → action name map, e.g. {"thinking":"think","working":"work","waiting":"wait","error":"sad","success":"happy"}. States are idle / thinking / working / waiting / error / result / success. With an empty `action` the pet then switches animation by itself as the run state changes. A state you do NOT map falls back to your `idle` action, so mapping just `idle` already keeps the pet alive in every state — without this fallback the pet would snap back to the built-in static avatar the moment you start working. Only if `idle` is unmapped too does that state fall back to the avatar. A per-state pool (work-thinking / state-working) beats this map for that state. Pass {} to clear the map.',
 					additionalProperties: { type: 'string' },
 				},
 				pinAction: {
@@ -510,6 +935,45 @@ function bubbleTool(home) {
 				frameLoop: { type: 'number', description: '-1 (default) plays forever; N>0 stops on the last frame after N cycles.' },
 				spriteRows: { type: 'number', description: 'Sprite-sheet rows, 0–32. Use with spriteCols and a single frameFiles entry.' },
 				spriteCols: { type: 'number', description: 'Sprite-sheet columns, 0–32.' },
+				video: {
+					type: 'string',
+					description: 'Absolute path to a transparent WebM video to use as the animation for this action — the highest-quality content layer, and how you build a pet like dsh-pet. Prefer a path (the bytes are read by this process); a data:video/webm;base64,... URI also works for small files. Pass "" to delete this action\'s video. Up to ~6 MB per file. Videos take priority over frameFiles, which then act as a fallback.',
+				},
+				pools: {
+					type: 'object',
+					description: 'Named action pools: {"idle":["a","b"],"click":["c"],"drag":["d"],"move":["e"],"turn":["t"],"work-thinking":["x","y"],"celebrate":["f"]}. Names the app drives itself: "idle" = the random idle chain (the pet picks one when nothing is running), "click" = tap response (configuring it turns a single tap into petting, and expanding the panel moves to a long-press), "drag" = the pose shown while the user drags the pet, "move" = the pose used while the pet walks on its own, "turn" = the pose played when the pet changes facing (give it a weight in poolWeights or it is never picked; the flip itself happens when the animation finishes, see flipOnTurn), "work-<state>" or "state-<state>" = a per-state pool that re-rolls a different action every time the pet enters that state and beats actionMap for it. Any other pool name is yours — map it with actionMap or play it by name. Pool names use a-z 0-9 - _ (max 24 chars). Action names that have no asset on disk are skipped, so a typo can never freeze the pet. Pass {} to clear all pools.',
+				},
+				poolWeights: {
+					type: 'object',
+					description: 'Relative weights for the random chain, e.g. {"idle":10,"turn":2}. "idle" drives the chain: 0 disables it entirely (the pet then just stays on whatever actionMap says), and omitting it defaults to 10. "turn" is the chance of picking from the "turn" pool (0/unset means the pet never turns on its own). Other names are accepted and ignored. Negative values are clamped to 0.',
+				},
+				workStatusTexts: {
+					type: 'array',
+					description: 'Per-state lines for the status bubble, in run-state order [idle, thinking, working, waiting, error, result, success]: [["daydreaming"],["thinking…"],["working…"]]. One line is picked at random each time the state changes (write a single line to keep it fixed). Shorter arrays are fine — you can configure only the states you care about. Empty strings are dropped; lines are capped at 60 chars.',
+				},
+				statusImages: {
+					type: 'array',
+					description: 'A picture shown above the ball (the desktop pet\'s head-top panel / meme), in the SAME positional order as workStatusTexts: [["/abs/idle.png"],["/abs/think.png"],["/abs/work.png"]]. One is picked at random each time the state changes. Entries are absolute image paths (read by this process, png/jpg/webp/gif) or data:image/...;base64,... URIs. The bytes are copied into the app\'s own storage, so the picture keeps working even if the original file is moved or deleted. A tier with a picture but no text shows the picture alone — that is the normal look. Pass [[]] or [] to clear. Use statusImageSizeDp to size it.',
+				},
+				statusImageSizeDp: {
+					type: 'number',
+					description: 'Side of the status picture in dp, 32–240 (default 96). The longer edge fits this value; the aspect ratio is preserved.',
+				},
+				flipOnTurn: {
+					type: 'boolean',
+					description: 'Default true. Mirror the pet horizontally when it turns around (from the "turn" pool, or when it walks the other way). Assets are normally drawn facing one direction, so the mirror IS the turn. Set false if your artwork already contains both directions — mirroring would reverse any text drawn in it.',
+				},
+				moveParams: {
+					type: 'object',
+					description: 'Per-action walk distance, overriding moveMinDp/moveMaxDp: {"shuffle":{"minDp":10,"maxDp":20},"dash":{"minDp":120,"maxDp":200}}. Keys are action names (the ones in the "move" pool). Either bound may be omitted, in which case the global moveMinDp/moveMaxDp is used for it. {minDp:0,maxDp:0} means "play the walk animation without moving". Values 0–400 dp.',
+				},
+				moveEnabled: {
+					type: 'boolean',
+					description: 'Let the pet walk around on its own while idle (default false). Off by default because most people use the ball as a button and would find it intrusive.',
+				},
+				moveIntervalSec: { type: 'number', description: 'Seconds between walks, 10–3600 (default 20). The actual delay is randomized to 0.5–1.5× this.' },
+				moveMinDp: { type: 'number', description: 'Shortest walk distance in dp, 8–400 (default 24).' },
+				moveMaxDp: { type: 'number', description: 'Longest walk distance in dp, 8–400 (default 80).' },
 				spin: { type: 'number', description: 'Degrees per second of rotation, -720–720; negative is counter-clockwise, 0 stops it.' },
 				pulse: { type: 'boolean', description: 'Breathing scale animation on the image.' },
 				panelWidth: { type: 'number', description: 'Expanded panel width in dp.' },
@@ -518,7 +982,8 @@ function bubbleTool(home) {
 				panelText: { type: 'string', description: 'Panel body text colour "#RRGGBB".' },
 				panelAccent: { type: 'string', description: 'Panel accent colour "#RRGGBB" (send button, user bubble).' },
 				statusAutoHideMs: { type: 'number', description: 'Milliseconds before the status strip hides once its content stops changing; 0 disables it.' },
-				edgeSnap: { type: 'boolean', description: 'Whether dragging the ball off-screen collapses it into an edge sliver.' },
+				edgeSnap: { type: 'boolean', description: 'Default false. False = the ball stays where the user drops it (anywhere on screen). True = it is pulled back to the nearest left/right edge after each drag. Dragging the ball off-screen always collapses it into an edge sliver either way.' },
+				throwEnabled: { type: 'boolean', description: 'Default true. True = flick the ball and it flies, bounces off all four walls and the floor, then rests where it lands (desktop-pet feel). False = the old drop-and-stick-to-edge behaviour.' },
 				text: { type: 'string', description: 'For action:"notify" — the message to show in the status strip above the ball.' },
 				durationMs: { type: 'number', description: 'For action:"notify" — how long the message stays, in ms. Omit to use statusAutoHideMs.' },
 				sticky: { type: 'boolean', description: 'For action:"notify" — true keeps the message up until the next notify.' },
@@ -612,6 +1077,18 @@ function bubbleTool(home) {
 			// 而 pickFields 会把空串当"没传"丢掉。
 			if (typeof args?.pinAction === 'string') fields.action = args.pinAction.trim();
 
+			// `video` 也单独处理，理由与 `pinAction` 同：**空串是合法取值**
+			// （= 删掉这个动作的视频），pickFields 会把它当"没传"丢掉。
+			//
+			// ⚠️ 与 `avatarFile` 相反，这里**传路径而不是读成 data URI**：
+			//   webm 单个 200KB~1.3MB，base64 后还要再涨 33%，而原生侧完全有能力
+			//   自己读文件（它就在同一台设备上、同一个 App 里）。图片走 base64 是
+			//   因为原生拿不到**工作区**路径 —— 但 `video` 传的是**设备上的绝对
+			//   路径**（AI 把素材下载到 /sdcard 或 filesDir 下），原生读得到。
+			if (typeof args?.video === 'string') {
+				fields.video = args.video.trim();
+			}
+
 			// `actionMap`：状态 → 动作名。逐条校验，非法的那条直接报错而不是静默丢 ——
 			// 「配了但宠物不按它动」是最难查的一类问题（原生侧也会丢未知状态）。
 			if (args?.actionMap !== undefined) {
@@ -636,6 +1113,44 @@ function bubbleTool(home) {
 				if (!built.ok) return { ok: false, appearance: '', message: `动作集不可用（${built.error}）` };
 				fields.actions = built.actions;
 				if (built.count > 0) notes.push(` · 已配 ${built.count} 个动作`);
+			}
+
+			// `pools` / `poolWeights` / `workStatusTexts`：**在这里校验而不是交给原生**。
+			// 原生侧对非法项的策略是"逐条丢掉并记日志"，它不回执 —— AI 于是看不到
+			// 自己写错了哪一个，只会觉得"配了但没生效"。这类静默失效最难查，
+			// 所以在能报错的地方就报错。
+			if (args?.pools !== undefined) {
+				const chk = checkPools(args.pools);
+				if (!chk.ok) return { ok: false, appearance: '', message: chk.error };
+				// 写回**规范化后**的版本（小写化 + 去重），别让原生再猜一遍。
+				fields.pools = chk.pools;
+				const total = Object.keys(chk.pools).length;
+				if (total > 0) notes.push(` · 已配 ${total} 个动作池`);
+			}
+			if (args?.poolWeights !== undefined) {
+				const chk = checkPoolWeights(args.poolWeights);
+				if (!chk.ok) return { ok: false, appearance: '', message: chk.error };
+				fields.poolWeights = chk.weights;
+			}
+			if (args?.workStatusTexts !== undefined) {
+				const chk = checkStatusTexts(args.workStatusTexts);
+				if (!chk.ok) return { ok: false, appearance: '', message: chk.error };
+				fields.workStatusTexts = chk.tiers;
+			}
+			// `statusImages`：头顶配图。**在这里读成 data URI**，与 `frameFiles` 同理
+			// —— 原生侧拿不到工作区路径。但状态图允许 data URI 直传（见函数注释）。
+			if (args?.statusImages !== undefined) {
+				const chk = checkStatusImages(args.statusImages);
+				if (!chk.ok) return { ok: false, appearance: '', message: chk.error };
+				fields.statusImages = chk.tiers;
+				const n = chk.tiers.reduce((acc, t) => acc + t.length, 0);
+				if (n > 0) notes.push(` · 已配 ${n} 张状态图`);
+				if (chk.note !== '') notes.push(chk.note);
+			}
+			if (args?.moveParams !== undefined) {
+				const chk = checkMoveParams(args.moveParams);
+				if (!chk.ok) return { ok: false, appearance: '', message: chk.error };
+				fields.moveParams = chk.params;
 			}
 
 			// `avatarFile` → data URI。先做，因为它可能失败，失败时要**明确报错**

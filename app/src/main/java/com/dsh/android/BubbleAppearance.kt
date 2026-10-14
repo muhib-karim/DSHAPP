@@ -79,6 +79,7 @@ import java.io.File
  * | `panelAccent` | `#RRGGBB` | 面板强调色（发送按钮、用户气泡） |
  * | `statusAutoHideMs` | int | 状态横条**内容无变化**多久后自动消失，0 = 不自动消失 |
  * | `edgeSnap` | bool | 是否启用「拖出屏幕即贴边折叠」 |
+ * | `throwEnabled` | bool | 是否启用「甩出去会飞、会弹、落地会挤压」的抛掷物理 |
  *
  * ## 三条设计约束
  *
@@ -135,8 +136,136 @@ data class BubbleAppearance(
     val panelText: String = "",
     val panelAccent: String = "",
     val statusAutoHideMs: Int = 2000,
-    val edgeSnap: Boolean = true,
+    /**
+     * 是否启用**边缘吸附**。
+     *
+     * 打开时球会被拉回最近的左右边缘、拖出屏幕会折叠成一条缝；
+     * 关掉时球**松手在哪就待在哪**，屏幕正中间也行 —— 这是电脑版桌面宠物的行为。
+     *
+     * ⚠️ 默认 **false（不吸附）**，这是改过的。原来是 true，真机反馈是
+     *   「它不像电脑一样可以放在手机屏幕上的任何一个位置，而是会自动回落到
+     *   屏幕的两边」—— 吸附把"悬浮球想放哪就放哪"这件事直接抹掉了。
+     *   要贴边省屏幕的人（把球当按钮用）显式设 true 即可。
+     */
+    val edgeSnap: Boolean = false,
+    /**
+     * 是否启用**抛掷物理**：快速甩动后松手，球会飞出去、撞边反弹、落地挤压、滚停。
+     *
+     * 关掉时松手只有"吸附到最近边缘"与"拖出屏幕贴边"两种结局 —— 也就是加物理层
+     * 之前的行为。默认**开**：那是"宠物"手感的核心，也是 dsh-pet 的默认。
+     */
+    val throwEnabled: Boolean = true,
+    /**
+     * **具名动作池**：一次配一组动作，让宠物自己抽着播。
+     *
+     * key 是池名（`[a-z0-9_-]`，≤[MAX_POOL_NAME_CHARS] 字符），value 是动作名列表。
+     * 三个池名有**约定语义**，原生会主动用它们：
+     *
+     * - `idle`   —— 待机池。宠物闲下来时从这里随机抽一个播（随机链的主体）。
+     * - `click`  —— 点击回应池。**配了它就等于把「单击」改成「逗宠物」**：
+     *               单击播这里的动作而**不再展开面板**，展开改走**长按**。
+     *               不配时单击照旧展开面板 —— 老用户零影响。
+     * - `drag`   —— 拖拽姿势池。手指按住球拖动时切到这里的动作（如"被拎起来"）。
+     * - `move`   —— 走动池。宠物自己挪位置时播这里的动作（需 [moveEnabled]）。
+     *
+     * 其余池名（`celebrate`、`sleep`…）不会被原生自动触发，但**对 AI 有意义**：
+     * 它可以 `actionMap` 指过来、或用 `bubble` 工具的 `action` 直接点名播。
+     *
+     * ⚠️ 池里**不存在于磁盘的动作名会被跳过**（素材没传/传失败），所以配错了
+     *   不会让宠物卡住，只是那个动作永远抽不到。
+     */
+    val pools: Map<String, List<String>> = emptyMap(),
+    /**
+     * 随机链里各池的**相对权重**（整数，0 = 该池不参与随机链）。
+     *
+     * 只对 `idle` 这一个池有实际作用：宠物播完一个动作后，按这里的权重决定
+     * 是再抽一个 idle 动作、还是回到最朴素的待机。没配 `idle` 权重时按
+     * [DEFAULT_IDLE_WEIGHT] 处理。
+     *
+     * ⚠️ 与 dsh-pet 的 `animationWeights` 是同一个思路，但**刻意做得更小**：
+     *   那边有 5 个大类（小动作/玩耍/吃什么/时节/文字）各带权重，因为它的素材
+     *   有 106 个。我们把它压成"池 + 权重"两层，AI 用 `pools` 自己分类即可，
+     *   不必学一套固定的分类学。
+     */
+    val poolWeights: Map<String, Int> = emptyMap(),
+    /**
+     * **运行状态气泡文案**：按 [RUN_STATES] 的顺序分档，每档可给多句备选。
+     *
+     * 第 0 项对 idle、第 1 项对 thinking、第 2 项 working、第 3 项 waiting、
+     * 第 4 项 error。每档内**随机抽一句**显示（想固定就只写一句）。
+     *
+     * 例：`[["在发呆"],["正在想"],["正在干活"]]`
+     *
+     * ⚠️ 显示位置与既有的状态横条是**同一个**（球上方那条）—— 这是刻意的：
+     *   状态文字本来就该显示在那里，另开一个位置会让球上叠两个气泡。
+     *   没配这一项时照旧显示引擎报来的状态文本（零影响）。
+     */
+    val workStatusTexts: List<List<String>> = emptyList(),
+    /**
+     * 是否让宠物**自己走动**（闲下来时每隔一段时间横向挪一段）。
+     *
+     * 默认**关**：球会自己跑位对"当个按钮用"的用户是打扰，而那是当前绝大多数
+     * 用法。要宠物感就打开它。
+     */
+    val moveEnabled: Boolean = false,
+    /** 自己走动的间隔（秒），10~3600。实际会在 [moveIntervalSec] 的 0.5~1.5 倍间随机。 */
+    val moveIntervalSec: Int = 20,
+    /** 单次走动的**最短**距离（dp），8~400。 */
+    val moveMinDp: Int = 24,
+    /** 单次走动的**最长**距离（dp），8~400。 */
+    val moveMaxDp: Int = 80,
+    /**
+     * **状态配图**：按 [RUN_STATES] 的顺序分档，每档可给多张图（随机抽一张）。
+     *
+     * 这就是电脑端"头顶冒出表情包"的那个能力 —— dsh-pet 的 `memes`。每项是一个
+     * 图片路径（设备上的绝对路径，**推荐**）或 `data:image/…;base64,…`。
+     *
+     * ⚠️ 用**路径**而不是 base64：一张表情包 100~300 KB，base64 要涨 33%，
+     *   而十几张图一起进 SharedPreferences 会把它撑爆。原生侧读路径，图片字节
+     *   落在 `filesDir/bubble-status-images/`，配置里只留文件名。
+     *
+     * 例：`[["/sdcard/可爱.png"],["/sdcard/思考.png"],["/sdcard/忙碌.png"]]`
+     */
+    val statusImages: List<List<String>> = emptyList(),
+    /**
+     * 状态配图的显示边长（dp），32~[MAX_STATUS_IMAGE_DP]。
+     *
+     * ⚠️ 配图与状态横条**同时显示**：横条在上、图在横条上方。两者是叠加关系
+     *   而不是替换关系（电脑端也是这样：那句话与那张图一起出现）。
+     */
+    val statusImageSizeDp: Int = DEFAULT_STATUS_IMAGE_DP,
+    /**
+     * 转向时是否翻转宠物的水平朝向。
+     *
+     * 宠物横向走动改变方向（往左走 ↔ 往右走）时，`turn` 池的动作播完会把
+     * 内容层水平镜像一次 —— 否则宠物会一直朝着同一个方向"倒着走"。
+     *
+     * 默认**开**，因为素材本身是朝一个方向的，不翻就是倒着走。
+     * 若素材自己带双向动画（不该翻），设 false。
+     */
+    val flipOnTurn: Boolean = true,
+    /**
+     * **逐动作的走动参数**：动作名 → 该动作自己的位移/停顿参数。
+     *
+     * 电脑端的 `moves.actions[].params` 就是干这个的：不同走动动画步幅不一样
+     * （"螃蟹走路"横着挪得远、"原地漂浮踏步"几乎不挪），共用一个全局距离会很怪。
+     * 这里每一项都可以覆盖 [moveMinDp] / [moveMaxDp]。
+     *
+     * 键是**动作名**（与 [pools] 里的元素同一套命名），不是池名。
+     *
+     * 例：`{"float_step":{"minDp":12,"maxDp":40},"crab_walk":{"minDp":60,"maxDp":160}}`
+     */
+    val moveParams: Map<String, MoveParams> = emptyMap(),
 ) {
+
+    /**
+     * 单个走动动作的距离覆盖值。
+     *
+     * ⚠️ 两个字段都可空：`null` = 用全局的 [moveMinDp] / [moveMaxDp]。
+     *   "没配"与"配成 0"必须能区分 —— 0 dp 的位移是"原地踏步"（合法用法），
+     *   而没配是要跟随全局默认，两者语义不同。
+     */
+    data class MoveParams(val minDp: Int? = null, val maxDp: Int? = null)
 
     companion object {
         private const val TAG = DshApplication.TAG
@@ -175,8 +304,114 @@ data class BubbleAppearance(
         /** 出错：上一轮失败了。 */
         const val RUN_ERROR = "error"
 
-        /** 全部运行状态。用于校验 [actionMap] 的 key。 */
-        val RUN_STATES = listOf(RUN_IDLE, RUN_THINKING, RUN_WORKING, RUN_WAITING, RUN_ERROR)
+        /**
+         * 整理：工具刚跑完、模型在消化结果（dsh-pet 的 `result` 档）。
+         *
+         * ⚠️ 与 [RUN_WORKING] 的区别是"手上有没有活在跑"：干活是工具执行**中**，
+         *   整理是工具**已返回**。把它单列出来是因为这两个状态在体感上明显不同
+         *   （"忙"与"刚忙完"），而宠物能表达出这个差别。
+         */
+        const val RUN_RESULT = "result"
+
+        /**
+         * 成功：上一轮顺利收工（dsh-pet 的 `success` 档）。
+         *
+         * ⚠️ 这是一个**瞬时**状态：它由 `turn/end` 带 `completed` 触发，随即回到
+         *   idle。宠物在这段时间里播"庆祝"类动作 —— 这正是电脑端"干完活了会雀跃"
+         *   那个手感。
+         */
+        const val RUN_SUCCESS = "success"
+
+        /**
+         * 全部运行状态。用于校验 [actionMap] / [statePools] 的 key。
+         *
+         * ⚠️ **顺序即 `workStatusTexts` 的档位下标，且新状态一律追加在末尾。**
+         *   中途插入会让所有既有配置的档位整体错位（AI 配的第 3 档会突然变成
+         *   另一个状态的文案），而那种错位**不会报错**，只会显示错的话。
+         *   所以 [RUN_RESULT] / [RUN_SUCCESS] 挂在最后两位，代价是顺序不是
+         *   语义上的自然序 —— 用文档说清，比静默错位强。
+         */
+        val RUN_STATES = listOf(
+            RUN_IDLE, RUN_THINKING, RUN_WORKING, RUN_WAITING, RUN_ERROR,
+            RUN_RESULT, RUN_SUCCESS,
+        )
+
+        // ── 具名动作池（桌面宠物）─────────────────────────────────────
+        //
+        // ⚠️ 池名与**运行状态名共用一套字符规则**（`[a-z0-9_-]`），因为它们会
+        //   一起出现在 `pools` / `poolWeights` / `actionMap` 三处配置里，规则
+        //   不一致的话 AI 要记两套。上限也一致（24），理由相同。
+
+        /** 待机池：闲下来时从这里随机抽一个播。 */
+        const val POOL_IDLE = "idle"
+
+        /** 点击回应池：配了它单击就是逗宠物（展开改走长按）。 */
+        const val POOL_CLICK = "click"
+
+        /** 拖拽姿势池：按住拖动时切到这里的动作。 */
+        const val POOL_DRAG = "drag"
+
+        /** 走动池：自己挪位置时播的动作。 */
+        const val POOL_MOVE = "move"
+
+        /**
+         * 转向池：宠物换朝向时播的动作（dsh-pet 的 `turn`）。
+         *
+         * ⚠️ 与其余池不同，这里的动作有个**约定**：它播完会把宠物朝向翻转
+         *   （dsh-pet 的注释写着"每一项都必须是『播完会翻转朝向』的动画"）。
+         *   我们不移素材，所以由 [flipOnTurn] 决定要不要在播完后翻转 `scaleX`。
+         */
+        const val POOL_TURN = "turn"
+
+        /**
+         * 工作状态专属池：池名 = `work-<运行状态>`，如 `work-thinking`。
+         *
+         * ⚠️ 这是 `actionMap` 的**升级版**：`actionMap` 是"一个状态一个固定动作"，
+         *   而这里是"一个状态一个**池**，每次进这个状态随机抽一个"。电脑端正是
+         *   这么做的（`workStatus` 那六档各自都能配多个）。
+         */
+        const val POOL_WORK_PREFIX = "work-"
+
+        /** 状态池的前缀：`state-<运行状态>`，与 [POOL_WORK_PREFIX] 等价，二选一即可。 */
+        const val POOL_STATE_PREFIX = "state-"
+
+        /** 池名/动作名的长度上限（与 `BubbleFrames` 的动作名一致）。 */
+        const val MAX_POOL_NAME_CHARS = 24
+
+        /** 一个池最多几个动作 —— 再多也抽不过来，还占配置体积。 */
+        const val MAX_POOL_ACTIONS = 64
+
+        /** 最多几个池 —— 与 `BubbleFrames.MAX_ACTIONS` 同量级。 */
+        const val MAX_POOLS = 24
+
+        /** `workStatusTexts` 最多几档（= [RUN_STATES] 的档数）。 */
+        const val MAX_STATUS_TIERS = 7
+
+        /** `statusImages` 最多几档（通常只配前几档）。 */
+        const val MAX_STATUS_IMAGES = 7
+
+        /**
+         * 每档最多几张备选配图。
+         *
+         * ⚠️ 与 [MAX_STATUS_TEXTS_PER_TIER] **数值相同但语义无关**，所以分开命名：
+         *   配图每张几十 KB、文案每句几十字节，将来一方要调大时不该被另一方绑住。
+         */
+        const val MAX_STATUS_IMAGES_PER_TIER = 8
+
+        /** 状态配图的边长上限（dp）—— 再大就把球整个盖住了。 */
+        const val MAX_STATUS_IMAGE_DP = 240
+
+        /** 状态配图的默认边长（dp）。 */
+        const val DEFAULT_STATUS_IMAGE_DP = 96
+
+        /** 每档最多几句备选文案。 */
+        const val MAX_STATUS_TEXTS_PER_TIER = 8
+
+        /** 单句文案的长度上限（状态横条只有一行，长了被截断）。 */
+        const val MAX_STATUS_TEXT_CHARS = 60
+
+        /** 没配 `idle` 权重时用的默认值 —— 让它默认就有随机小动作。 */
+        const val DEFAULT_IDLE_WEIGHT = 10
 
         const val SHAPE_CIRCLE = "circle"
         const val SHAPE_SQUARE = "square"
@@ -273,6 +508,20 @@ data class BubbleAppearance(
                 panelAccent = colorOf(o, "panelAccent", base.panelAccent),
                 statusAutoHideMs = clampInt(o, "statusAutoHideMs", base.statusAutoHideMs, 0, 60_000),
                 edgeSnap = if (o.has("edgeSnap")) o.optBoolean("edgeSnap", base.edgeSnap) else base.edgeSnap,
+                throwEnabled = if (o.has("throwEnabled")) o.optBoolean("throwEnabled", base.throwEnabled) else base.throwEnabled,
+                // ⚠️ 池与文案都**允许传空对象/空数组来清空**（与 `actionMap` 同规矩）：
+                //   一刀切地"空即保持原值"会让 AI 没法撤掉配错的池。
+                pools = if (o.has("pools")) poolsOf(o) else base.pools,
+                poolWeights = if (o.has("poolWeights")) poolWeightsOf(o) else base.poolWeights,
+                workStatusTexts = if (o.has("workStatusTexts")) statusTextsOf(o) else base.workStatusTexts,
+                moveEnabled = if (o.has("moveEnabled")) o.optBoolean("moveEnabled", base.moveEnabled) else base.moveEnabled,
+                moveIntervalSec = clampInt(o, "moveIntervalSec", base.moveIntervalSec, 10, 3600),
+                moveMinDp = clampInt(o, "moveMinDp", base.moveMinDp, 8, 400),
+                moveMaxDp = clampInt(o, "moveMaxDp", base.moveMaxDp, 8, 400),
+                statusImageSizeDp = clampInt(o, "statusImageSizeDp", base.statusImageSizeDp, 32, MAX_STATUS_IMAGE_DP),
+                flipOnTurn = if (o.has("flipOnTurn")) o.optBoolean("flipOnTurn", base.flipOnTurn) else base.flipOnTurn,
+                statusImages = if (o.has("statusImages")) statusImagesOf(o) else base.statusImages,
+                moveParams = if (o.has("moveParams")) moveParamsOf(o) else base.moveParams,
             )
 
             // ── 轮播帧 / 动作帧集 ──
@@ -334,6 +583,31 @@ data class BubbleAppearance(
                     if (n == null && writeAction == BubbleFrames.DEFAULT_ACTION && merged.frameCount > 0) {
                         Log.w(TAG, "精灵图网格重切失败（帧字节已丢），退回整图模式")
                         merged = merged.copy(spriteRows = 0, spriteCols = 0)
+                    }
+                }
+            }
+
+            // ── 视频素材（桌面宠物的高质量动效）──
+            //
+            // ⚠️ 与 `frames` **并列而不是替代**：视频是"高质量"，帧集是"能跑就行"
+            //   的兜底。两者可以同时存在于同一个动作名下（不同目录），内容层的
+            //   优先级是 视频 > 帧集 > 头像（见 FloatingBubble.applyContentLayer）。
+            //   所以这里既不删帧集，也不因为帧集存在就跳过视频。
+            //
+            // ⚠️ 传空串 = **删掉这个动作的视频**，与 `frames: []` 的语义对齐。
+            //   不这么设计的话，"换成静态图"就永远删不掉旧视频（视频优先级更高，
+            //   会一直盖着）。
+            if (context != null && o.has("video")) {
+                val v = o.optString("video", "")
+                if (v.isEmpty()) {
+                    BubbleVideos.clear(context, writeAction)
+                    Log.i(TAG, "已清除悬浮球视频素材: $writeAction")
+                } else {
+                    val n = BubbleVideos.write(context, v, writeAction)
+                    if (n != null) {
+                        merged = merged.copy(action = writeAction)
+                    } else {
+                        Log.w(TAG, "视频素材写入失败，保持原素材")
                     }
                 }
             }
@@ -459,15 +733,278 @@ data class BubbleAppearance(
          *
          * 这是「哪个动作该播」的唯一判定入口 —— 原生自动切换与插件主动点名
          * 都从这里取，免得两处各写一份 if 链。
+         *
+         * ⚠️ **缺档时先回退到 `idle` 档，最后才用 [fallback]。** 这条回退链是必须的：
+         *   宠物素材通常只配一两个动作（配 `idle` 是绝对常态），而 [fallback] 指向的是
+         *   **内置静态头像**。缺档直接回退 fallback 的后果是 —— AI 一干活（状态切到
+         *   `thinking`）宠物就"啪"地变成一张不动的头像，看起来像坏掉了。
+         *   真机踩过：用户只配了 `idle`/`working`，一发消息球就变回静态默认图。
          */
         fun actionFor(a: BubbleAppearance, runState: String, fallback: String): String {
             val mapped = a.actionMap[runState]
             if (!mapped.isNullOrEmpty()) return mapped
+            // 缺档：优先用 idle 的动作顶上（"宠物还在，只是没配这个状态"），
+            // 而不是换成一个静态头像（"宠物不见了"）。
+            if (runState != RUN_IDLE) {
+                val idle = a.actionMap[RUN_IDLE]
+                if (!idle.isNullOrEmpty()) return idle
+            }
             return fallback
         }
 
         /**
-         * 写入一个动作的帧集（`actions` 对象里的一项）。
+         * 一个池名/动作名是否合法（`[a-z0-9_-]`，1~[MAX_POOL_NAME_CHARS] 字符）。
+         *
+         * ⚠️ **不复用 [BubbleFrames.normalizeAction]**：那个函数把 `default`
+         *   单独挑出来当"默认动作"，而池名里 `idle`/`click` 这些要原样保留 ——
+         *   借它来过一道会把池名判成 null。
+         */
+        fun normalizePoolName(raw: String): String? {
+            val s = raw.trim().lowercase()
+            if (s.isEmpty() || s.length > MAX_POOL_NAME_CHARS) return null
+            return if (s.all { it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '_' }) s else null
+        }
+
+        /**
+         * 解析 `pools`：池名 → 动作名列表。
+         *
+         * ⚠️ 非法池名/非法动作名**只丢那一条**，不影响同一个池里的其余动作，
+         *   更不影响其它池 —— 配 5 个池错一个字不该让整份配置作废。
+         * ⚠️ 传空对象 = 清空全部池（与"没传"不同）。
+         */
+        private fun poolsOf(o: JSONObject): Map<String, List<String>> {
+            val src = o.optJSONObject("pools") ?: return emptyMap()
+            val out = LinkedHashMap<String, List<String>>()
+            for (rawPool in src.keys()) {
+                val pool = normalizePoolName(rawPool)
+                if (pool == null) {
+                    Log.w(TAG, "动作池名非法，已忽略: $rawPool")
+                    continue
+                }
+                if (out.size >= MAX_POOLS) {
+                    Log.w(TAG, "动作池数量超过 $MAX_POOLS，其余已忽略")
+                    break
+                }
+                val arr = src.optJSONArray(rawPool)
+                if (arr == null) {
+                    Log.w(TAG, "动作池 $pool 不是数组，已忽略")
+                    continue
+                }
+                val acts = ArrayList<String>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val raw = arr.optString(i, "").trim()
+                    if (raw.isEmpty()) continue
+                    val nm = BubbleFrames.normalizeAction(raw)
+                    if (nm == null || nm == BubbleFrames.DEFAULT_ACTION) {
+                        Log.w(TAG, "动作池 $pool 里的动作名非法，已忽略: $raw")
+                        continue
+                    }
+                    if (acts.size >= MAX_POOL_ACTIONS) break
+                    if (nm !in acts) acts += nm
+                }
+                if (acts.isNotEmpty()) out[pool] = acts
+            }
+            return out
+        }
+
+        /**
+         * 解析 `poolWeights`：池名 → 相对权重。
+         *
+         * ⚠️ 负数**归零而不是丢弃**：0 与"没配"的语义不同（0 = 明确不参与
+         *   随机链），把负数当没配会让 AI 没法表达"这个池先别用"。
+         */
+        private fun poolWeightsOf(o: JSONObject): Map<String, Int> {
+            val src = o.optJSONObject("poolWeights") ?: return emptyMap()
+            val out = LinkedHashMap<String, Int>()
+            for (rawPool in src.keys()) {
+                val pool = normalizePoolName(rawPool)
+                if (pool == null) {
+                    Log.w(TAG, "权重里的动作池名非法，已忽略: $rawPool")
+                    continue
+                }
+                out[pool] = src.optInt(rawPool, 0).coerceIn(0, 1000)
+            }
+            return out
+        }
+
+        /**
+         * 解析 `workStatusTexts`：二维数组，外层是档位（顺序同 [RUN_STATES]）。
+         *
+         * ⚠️ 允许**只写前几档**（数组短了后面的档就没有文案）—— 让 AI 可以只配
+         *   它在意的思考/干活两档，不必凑满 5 档。
+         * ⚠️ 每档内空字符串直接丢掉：显示一个空横条比不显示更奇怪。
+         */
+        private fun statusTextsOf(o: JSONObject): List<List<String>> {
+            val arr = o.optJSONArray("workStatusTexts") ?: return emptyList()
+            val out = ArrayList<List<String>>()
+            for (i in 0 until minOf(arr.length(), MAX_STATUS_TIERS)) {
+                val tier = arr.optJSONArray(i) ?: continue
+                val texts = ArrayList<String>(tier.length())
+                for (j in 0 until tier.length()) {
+                    val s = tier.optString(j, "").trim()
+                    if (s.isEmpty()) continue
+                    if (texts.size >= MAX_STATUS_TEXTS_PER_TIER) break
+                    texts += s.take(MAX_STATUS_TEXT_CHARS)
+                }
+                out += texts
+            }
+            return out
+        }
+
+        /**
+         * 取某个运行状态该显示的文案（没配返回 null）。
+         *
+         * ⚠️ 随机抽而不是取第一句：同一个状态反复出现时总显示同一句会像卡住。
+         *   调用方**每次状态变化才调一次**（不是每帧），所以随机是安全的。
+         */
+        fun statusTextFor(a: BubbleAppearance, runState: String): String? {
+            val idx = RUN_STATES.indexOf(runState)
+            if (idx < 0 || idx >= a.workStatusTexts.size) return null
+            val tier = a.workStatusTexts[idx]
+            return if (tier.isEmpty()) null else tier.random()
+        }
+
+        /**
+         * 状态专属池的**抽取入口**（抽一次，返回动作名或 null）。
+         *
+         * 与 [actionForState] 的区别：那个每次调用都抽（会变），这个专门给
+         * "状态变化时抽一次并缓存"的调用方用。两处分开命名是为了让调用点一眼
+         * 看出自己用的是哪一种 —— 混用就是"宠物动作乱跳"那个 bug。
+         */
+        fun statePoolPick(context: Context, a: BubbleAppearance, runState: String): String? {
+            val pool = statePoolName(a, runState) ?: return null
+            return pickFromPool(context, a, pool)
+        }
+
+        /**
+         * 取某个运行状态该显示的**配图**（没配返回 null）。
+         *
+         * ⚠️ 与 [statusTextFor] 同理：随机抽一张，且调用方**每次状态变化才调一次**。
+         *   "每次进这个状态换张图"正是电脑端的观感；每次渲染都抽会变成幻灯片乱闪。
+         */
+        fun statusImageFor(a: BubbleAppearance, runState: String): String? {
+            val idx = RUN_STATES.indexOf(runState)
+            if (idx < 0 || idx >= a.statusImages.size) return null
+            val tier = a.statusImages[idx]
+            return if (tier.isEmpty()) null else tier.random()
+        }
+
+        /**
+         * 解析 `statusImages`：二维数组，外层是档位（顺序同 [RUN_STATES]）。
+         *
+         * 结构与 `workStatusTexts` 完全同构，理由也一样：允许只写前几档。
+         * ⚠️ 每档内的字符串**原样保留**（可能是绝对路径，也可能是 data URI），
+         *   到落盘那一步才决定怎么存 —— 见 `BubbleStatusImages`。
+         */
+        private fun statusImagesOf(o: JSONObject): List<List<String>> {
+            val arr = o.optJSONArray("statusImages") ?: return emptyList()
+            val out = ArrayList<List<String>>()
+            for (i in 0 until minOf(arr.length(), MAX_STATUS_IMAGES)) {
+                val tier = arr.optJSONArray(i) ?: continue
+                val imgs = ArrayList<String>()
+                for (j in 0 until tier.length()) {
+                    val s = tier.optString(j, "").trim()
+                    if (s.isEmpty()) continue
+                    if (imgs.size >= MAX_STATUS_IMAGES_PER_TIER) break
+                    imgs += s
+                }
+                out += imgs
+            }
+            return out
+        }
+
+        /**
+         * 解析 `moveParams`：动作名 → 距离覆盖值。
+         *
+         * ⚠️ 动作名走 [BubbleFrames.normalizeAction] 校验（与池里的元素同一套
+         *   规则），因为它的键**就是**池里的动作名，规则不一致会对不上。
+         * ⚠️ `minDp`/`maxDp` **缺省必须是 null 而不是 0**：0 是"原地踏步"这个
+         *   合法用法，缺省是"跟随全局默认"。混成一个就没法表达了。
+         */
+        private fun moveParamsOf(o: JSONObject): Map<String, MoveParams> {
+            val src = o.optJSONObject("moveParams") ?: return emptyMap()
+            val out = LinkedHashMap<String, MoveParams>()
+            for (rawAction in src.keys()) {
+                val name = BubbleFrames.normalizeAction(rawAction)
+                if (name == null || name == BubbleFrames.DEFAULT_ACTION) {
+                    Log.w(TAG, "moveParams 里的动作名非法，已忽略: $rawAction")
+                    continue
+                }
+                val spec = src.optJSONObject(rawAction)
+                if (spec == null) {
+                    Log.w(TAG, "moveParams.$name 不是对象，已忽略")
+                    continue
+                }
+                out[name] = MoveParams(
+                    minDp = if (spec.has("minDp")) spec.optInt("minDp", 0).coerceIn(0, 400) else null,
+                    maxDp = if (spec.has("maxDp")) spec.optInt("maxDp", 0).coerceIn(0, 400) else null,
+                )
+            }
+            return out
+        }
+
+        /**
+         * 某动作该用的走动距离区间（dp）。
+         *
+         * ⚠️ 覆盖值**允许倒置**（min > max）时自动交换：AI 写反了不该让走动
+         *   直接失效（`random()` 在倒置区间上会抛异常或返回奇怪值）。
+         */
+        fun moveRangeFor(a: BubbleAppearance, action: String): Pair<Int, Int> {
+            val p = a.moveParams[action]
+            var lo = p?.minDp ?: a.moveMinDp
+            var hi = p?.maxDp ?: a.moveMaxDp
+            if (lo > hi) lo = hi.also { hi = lo }
+            return lo to hi
+        }
+
+        /**
+         * 某个运行状态该抽哪个池（没配返回 null）。
+         *
+         * 支持两个前缀，因为 AI 可能用任一种写法来描述"这个状态专用池"：
+         * `work-thinking` 与 `state-thinking` 等价。两个都认，省得它猜。
+         */
+        fun statePoolName(a: BubbleAppearance, runState: String): String? {
+            for (prefix in listOf(POOL_WORK_PREFIX, POOL_STATE_PREFIX)) {
+                val name = prefix + runState
+                if (!a.pools[name].isNullOrEmpty()) return name
+            }
+            return null
+        }
+
+        /**
+         * 从池里随机抽一个**磁盘上真的存在**的动作名（没得抽返回 null）。
+         *
+         * ⚠️ 过滤掉不存在的动作是必须的：AI 可能先配池再传素材，中间任何一步
+         *   失败都会留下"池里有名、磁盘上没素材"的状态，不过滤就会抽到一个
+         *   播不出来的动作（症状是宠物突然不动了）。
+         *
+         * @param exclude 尽量避开的名字（通常是当前正在播的），池里还有别的就避开。
+         */
+        fun pickFromPool(
+            context: Context,
+            a: BubbleAppearance,
+            pool: String,
+            exclude: String = "",
+        ): String? {
+            val list = a.pools[pool] ?: return null
+            val playable = list.filter {
+                BubbleVideos.available(context, it) || BubbleFrames.available(context, it)
+            }
+            if (playable.isEmpty()) return null
+            val rest = playable.filter { it != exclude }
+            // 池里只有一个动作、且正是当前这个 —— 那就还抽它（重复播总好过不动）。
+            return (if (rest.isNotEmpty()) rest else playable).random()
+        }
+
+        /**
+         * 写入一个动作的素材（`actions` 对象里的一项）。
+         *
+         * 一个动作可以带**两种素材**，各自独立：
+         * - `video`：一段带 alpha 的 webm（高质量动效，dsh-pet 那一套）；
+         * - `frames`/`frameFiles`：一组静态图或一张精灵图（不需要解码器支持的兜底）。
+         *
+         * 内容层优先级是 视频 > 帧集 > 头像，所以**两者都给时视频会盖住帧集** ——
+         * 这是刻意的：帧集留作"视频放不出来时的兜底"。
          *
          * ⚠️ 每个动作**各自解析自己的网格与轮数**，不共用全局那份：宠物不同动作
          *   常常来自不同的素材包（待机是 4 帧精灵图、思考是 6 帧独立图），
@@ -476,11 +1013,36 @@ data class BubbleAppearance(
          * ⚠️ 失败**不抛**：批量配动作时一个坏图不该让另外几个换不上。
          */
         private fun applyActionSpec(context: Context, name: String, spec: JSONObject) {
+            // ── 视频素材 ──
+            // ⚠️ 先于 frames 处理，且**不因 frames 缺席而跳过** —— 只传 video 是
+            //   最自然的用法（"这个动作是一段动画"），旧逻辑会把"没有 frames"
+            //   当成"删掉这个动作"，正好把刚写的视频删掉。
+            val hasVideo = spec.has("video")
+            if (hasVideo) {
+                val v = spec.optString("video", "")
+                if (v.isEmpty()) {
+                    BubbleVideos.clear(context, name)
+                    Log.i(TAG, "已清除悬浮球动作视频: $name")
+                } else {
+                    val n = BubbleVideos.write(context, v, name)
+                    if (n == null) Log.w(TAG, "悬浮球动作 $name 的视频写入失败，保持原素材")
+                    else Log.i(TAG, "悬浮球动作 $name 视频已就位: $n 字节")
+                }
+            }
+
             val arr = spec.optJSONArray("frames")
             if (arr == null || arr.length() == 0) {
-                // 显式空数组 = 删掉这个动作。
-                BubbleFrames.clear(context, name)
-                Log.i(TAG, "已删除悬浮球动作: $name")
+                // 显式空数组 = 删掉这个动作的帧集。
+                // ⚠️ 但如果这一项**带了视频**，那只删帧集、不删视频 ——
+                //   否则 `{"idle":{"video":"/a.webm","frames":[]}}` 这种写法会
+                //   把刚写进去的视频一起清掉（本意只是"这个动作不要帧集"）。
+                if (!hasVideo) {
+                    BubbleFrames.clear(context, name)
+                    BubbleVideos.clear(context, name)
+                    Log.i(TAG, "已删除悬浮球动作: $name")
+                } else {
+                    BubbleFrames.clear(context, name)
+                }
                 return
             }
             val frames = ArrayList<String>(arr.length())
@@ -742,6 +1304,59 @@ data class BubbleAppearance(
                 put("panelAccent", appearance.panelAccent)
                 put("statusAutoHideMs", appearance.statusAutoHideMs)
                 put("edgeSnap", appearance.edgeSnap)
+                put("throwEnabled", appearance.throwEnabled)
+                // ⚠️ 池、权重、状态文案都必须落盘，否则重启后宠物只剩默认动作 ——
+                //   而磁盘上那几十段素材还在，表现为"重开 App 宠物就不动了"。
+                //   空对象/空数组也要写：它们正是"清空"这个状态本身。
+                put(
+                    "pools",
+                    JSONObject().apply {
+                        for ((k, v) in appearance.pools) put(k, org.json.JSONArray(v))
+                    },
+                )
+                put(
+                    "poolWeights",
+                    JSONObject().apply {
+                        for ((k, v) in appearance.poolWeights) put(k, v)
+                    },
+                )
+                put(
+                    "workStatusTexts",
+                    org.json.JSONArray().apply {
+                        for (tier in appearance.workStatusTexts) put(org.json.JSONArray(tier))
+                    },
+                )
+                put("moveEnabled", appearance.moveEnabled)
+                put("moveIntervalSec", appearance.moveIntervalSec)
+                put("moveMinDp", appearance.moveMinDp)
+                put("moveMaxDp", appearance.moveMaxDp)
+                // ⚠️ 状态配图存的是**落盘后的文件名**（见 [BubbleStatusImages]），
+                //   不是原始路径 —— 插件可能传一个 /sdcard 上的临时路径，
+                //   那个文件随时会被清掉，而配图必须跨重启活着。
+                put(
+                    "statusImages",
+                    org.json.JSONArray().apply {
+                        for (tier in appearance.statusImages) put(org.json.JSONArray(tier))
+                    },
+                )
+                put("statusImageSizeDp", appearance.statusImageSizeDp)
+                put("flipOnTurn", appearance.flipOnTurn)
+                put(
+                    "moveParams",
+                    JSONObject().apply {
+                        for ((action, p) in appearance.moveParams) {
+                            put(
+                                action,
+                                JSONObject().apply {
+                                    // ⚠️ null 不写键（而不是写 0）：0 是"原地踏步"
+                                    //   这个合法值，写 0 会把"跟随全局"改掉。
+                                    p.minDp?.let { put("minDp", it) }
+                                    p.maxDp?.let { put("maxDp", it) }
+                                },
+                            )
+                        }
+                    },
+                )
             }.toString()
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putString(KEY_APPEARANCE, json).apply()

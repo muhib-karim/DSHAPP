@@ -260,6 +260,12 @@ object RescueCommandBridge {
                                 .put("failedPlugins", JSONArray(f.failedPlugins))
                                 .put("claimedFailedPlugins", f.claimedFailedPlugins ?: JSONObject.NULL)
                                 .put("failedCountMismatch", f.failedCountMismatch ?: JSONObject.NULL)
+                                // ⚠️ **救援 AI 修这个故障唯一拿得到的线索，不能漏。**
+                                //   真机那次引擎是「成功启动」的（`requiredDidNotActivate`
+                                //   为 null、`failedPlugins` 为空），AI 若只看上面那几个
+                                //   字段，会以为「没有失败记录」而无从下手。
+                                //   非空即表示「引擎起来了但 typert gateway 下线」。
+                                .put("gatewayCulprit", f.gatewayCulprit ?: JSONObject.NULL)
                                 .put("atText", com.dsh.android.log.SafeDateFormat(
                                     "yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US,
                                 ).format(java.util.Date(f.at)))

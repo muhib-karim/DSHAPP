@@ -179,6 +179,35 @@ class FloatingBubble(private val context: Context) {
         private const val KEY_TRANSCRIPT_H = "transcript_h"
 
         /**
+         * 随机链的兜底换动作间隔（ms）。
+         *
+         * ⚠️ 只对**循环播放**的动作起作用：一次性动作播完会自己触发 `ended`，
+         *   这个定时器是给"待机动画永远循环、永远不结束"那种情况兜底的。
+         *   8 秒是刻意的中值 —— 太短会让宠物像抽搐，太长就失去"活着"的感觉。
+         */
+        private const val CHAIN_INTERVAL_MS = 8000L
+
+        /**
+         * 单击判定为"点宠物"还是"点开面板"的**长按阈值**（ms）。
+         *
+         * ⚠️ 只有配了 `click` 池时才启用长按展开。没配池时单击照旧展开面板 ——
+         *   否则老用户会发现"球点不开了"，那是破坏性的行为变更。
+         */
+        private const val LONG_PRESS_MS = 500L
+
+        /** 自己走动的动画时长（ms）。走太快会像瞬移。 */
+        private const val MOVE_MS = 900L
+
+        /**
+         * 点击回应姿势的保持时长（ms）。
+         *
+         * ⚠️ 必须有存活期：`click` 池的动作多是**循环**短片（`开心跃动` 那种），
+         *   没有 `ended` 回调来结束它。不设期限的话宠物会永远停在"点击回应"上，
+         *   AI 干完活也不回到 `actionMap` 的动作。
+         */
+        private const val CLICK_POSE_MS = 2500L
+
+        /**
          * 气泡是否应当显示。
          *
          * 由 `MainActivity` 在 `onStart`/`onStop` 里设置 —— 只有**退到后台**才显示，
@@ -332,6 +361,17 @@ class FloatingBubble(private val context: Context) {
                     next.copy(avatar = BubbleAppearance.load(ctx).avatar)
                 }
             }
+            // 状态配图同理，只是它是一张二维表：逐档逐张过一遍 [BubbleStatusImages.ensure]。
+            //
+            // ⚠️ **`ensure` 而不是 `write`**：表里可能混着两种东西 —— 这次新传的
+            //   路径/data URI，以及**上一次下发后回读出来的存储名**（插件做
+            //   "读-改-写"时表里就是存储名）。用 `write` 会把存储名当路径去解析，
+            //   失败后那一张就被剔掉，表现为「AI 只改了个尺寸，配图全没了」。
+            merged = merged.copy(
+                statusImages = merged.statusImages.map { tier ->
+                    tier.mapNotNull { BubbleStatusImages.ensure(ctx, it) }
+                },
+            )
             BubbleAppearance.save(ctx, merged)
             Log.i(TAG, "插件下发悬浮球外观: state=${merged.state} shape=${merged.shape} size=${merged.size}")
             main.post {
@@ -434,9 +474,84 @@ class FloatingBubble(private val context: Context) {
                 )
                 // 磁盘上真实存在的动作名 —— AI 据此知道"现在能用哪些动作"，
                 // 不用自己维护一份清单。
+                //
+                // ⚠️ **帧集与视频要分开报**：一个动作名可能在两边都存在（视频是
+                //   主素材、帧集是兜底），也可能只有一边。合成一个列表会让 AI
+                //   分不清"这个动作到底有没有视频"，从而反复重传素材。
                 put("actions", JSONArray().apply {
                     for (n in BubbleFrames.actionNames(ctx)) put(n)
                 })
+                put("videoActions", JSONArray().apply {
+                    for (n in BubbleVideos.actionNames(ctx)) put(n)
+                })
+                put("throwEnabled", a.throwEnabled)
+                // 池、权重、状态文案、走动 —— 与 `actions` 同理：AI 据此知道
+                // "现在配了哪些池"，不用自己维护一份清单。
+                put(
+                    "pools",
+                    JSONObject().apply {
+                        for ((k, v) in a.pools) put(k, JSONArray(v))
+                    },
+                )
+                put(
+                    "poolWeights",
+                    JSONObject().apply {
+                        for ((k, v) in a.poolWeights) put(k, v)
+                    },
+                )
+                put(
+                    "workStatusTexts",
+                    JSONArray().apply {
+                        for (tier in a.workStatusTexts) put(JSONArray(tier))
+                    },
+                )
+                put("moveEnabled", a.moveEnabled)
+                put("moveIntervalSec", a.moveIntervalSec)
+                put("moveMinDp", a.moveMinDp)
+                put("moveMaxDp", a.moveMaxDp)
+                // 状态配图读回时给的是**绝对路径**，不是内部存储名。
+                //
+                // ⚠️ 这一步是"读-改-写"能不能成立的关键：插件拿到的东西会原样
+                //   回传，而它只能读工作区里的路径（存储名 `ab12….png` 对它是个
+                //   不存在的相对路径，会报"图片不可用"）。给绝对路径它就能读成
+                //   data URI 再传回来，原生侧 [BubbleStatusImages.ensure] 按内容
+                //   摘要算出同一个存储名 ⇒ 幂等，不会复制出一堆重复文件。
+                put(
+                    "statusImages",
+                    JSONArray().apply {
+                        for (tier in a.statusImages) {
+                            put(
+                                JSONArray().apply {
+                                    for (name in tier) {
+                                        BubbleStatusImages.file(ctx, name)?.let { put(it.absolutePath) }
+                                    }
+                                },
+                            )
+                        }
+                    },
+                )
+                put("statusImageSizeDp", a.statusImageSizeDp)
+                put("flipOnTurn", a.flipOnTurn)
+                put(
+                    "moveParams",
+                    JSONObject().apply {
+                        for ((action, p) in a.moveParams) {
+                            put(
+                                action,
+                                JSONObject().apply {
+                                    // ⚠️ null 的键**不写**：写 0 会让"跟随全局"变成
+                                    //   "原地踏步"，那是两种完全不同的行为。
+                                    p.minDp?.let { put("minDp", it) }
+                                    p.maxDp?.let { put("maxDp", it) }
+                                },
+                            )
+                        }
+                    },
+                )
+                // ⚠️ 这两个只有"球正在显示"时才有意义：当前随机链抽中的动作，
+                //   以及当前抽中的状态文案（没配则为空串）。
+                put("chainAction", instance?.chainAction ?: "")
+                put("statusText", instance?.workStatusText ?: "")
                 // ⚠️ 这两个只有"球正在显示"时才有意义（取自实例，不是配置）：
                 //   `runState` 是当前运行状态，`playingAction` 是**实际**在播的动作
                 //   （可能与配置里的 `action` 不同 —— 指向的动作没帧时会回退）。
@@ -533,6 +648,16 @@ class FloatingBubble(private val context: Context) {
     private var root: View? = null
     private var circleView: View? = null
     private var avatarView: ImageView? = null
+
+    /**
+     * 视频层宿主。默认 GONE，只有在**磁盘上真有视频素材**时才会创建 WebView 并显示。
+     *
+     * 见 [BubbleVideoLayer] 与 [applyContentLayer] 的优先级说明。
+     */
+    private var videoHost: View? = null
+
+    /** 视频渲染后端。惰性创建 —— 没有视频素材的用户不会有这个 WebView。 */
+    private var videoLayer: BubbleVideoLayer? = null
     private var panelView: View? = null
     private var dotView: View? = null
     private var panelDot: View? = null
@@ -575,6 +700,103 @@ class FloatingBubble(private val context: Context) {
 
     /** 当前运行状态（[BubbleAppearance.RUN_IDLE] 等），由引擎状态推导。 */
     private var runState = BubbleAppearance.RUN_IDLE
+
+    /**
+     * **随机动作链**当前抽中的动作（空串 = 没抽中，走 `actionMap`）。
+     *
+     * ⚠️ 它**不进配置、不落盘**：这是"这一次播什么"的临时状态，与
+     *   `actionMap`（AI 配好的映射）是两回事。落盘会让宠物每次重启都从
+     *   同一个动作开始。
+     *
+     * ⚠️ 只在 [runState] 为 idle 时被 [wantedAction] 采信 —— 干活时必须演
+     *   "正在干活"，详见那里的注释。
+     */
+    private var chainAction = ""
+
+    /** 随机链里"连抽同一个动作"的次数，用来避免连着播两遍同一段动画。 */
+    private var chainRepeats = 0
+
+    /**
+     * [chainAction] 是从 `turn` 池抽出来的吗（播完要翻转朝向）。
+     *
+     * ⚠️ **必须记下来，不能事后从池里反查**：同一个动作名可能既在 `idle` 池又在
+     *   `turn` 池里（AI 图省事直接复用素材）。反查会把它一律判成"要转身"，
+     *   于是待机时宠物会莫名其妙地自己翻面。
+     */
+    private var chainIsTurn = false
+
+    /**
+     * 宠物当前是否**面朝右**（false = 面朝左，与 dsh-pet 的默认值一致）。
+     *
+     * 素材只画了一个方向，所以"转身"只能靠水平镜像（`scaleX = -1`）表达 ——
+     * 这与 dsh-pet 的做法逐字相同（见其 `pet.ts` 的 `el.style.transform =
+     * facingRef.current === 'right' ? 'scaleX(-1)' : ''`）。
+     */
+    private var facingRight = false
+
+    /** 下一次抽随机动作的 runnable（球隐藏 / 干活时必须取消，否则白转）。 */
+    private var chainRunnable: Runnable? = null
+
+    /** 自己走动：下一次挪位置的 runnable。 */
+    private var moveRunnable: Runnable? = null
+
+    /**
+     * 当前运行状态对应的**配置文案**（`workStatusTexts` 抽中的那一句，空串 = 没配）。
+     *
+     * ⚠️ **在状态切换时抽一次并缓存**，不能在每次渲染时抽：`applyStatus` 每秒都推，
+     *   每次渲染都重抽会让那句话**每秒闪一次**，看起来像坏了。
+     */
+    private var workStatusText = ""
+
+    /**
+     * 当前运行状态**专属池**抽中的动作（空串 = 没配这个状态的池）。
+     *
+     * ⚠️ 与 [workStatusText] 同一套规矩：**状态变化时抽一次并缓存**。
+     *   在 [wantedAction] 里现抽会让每次调用拿到不同动作（那里被调用多次），
+     *   表现为宠物动作乱跳。
+     */
+    private var statePoolAction = ""
+
+    /**
+     * 当前运行状态的**配图路径**（空串 = 没配）。
+     *
+     * ⚠️ 同样只在状态变化时抽一次。图片字节由 `BubbleStatusImages` 落在
+     *   `filesDir/bubble-status-images/` 下，这里存的是落盘后的文件名。
+     */
+    private var statusImagePath = ""
+
+    /** 按下时刻（`eventTime`），用于区分"单击"与"长按"。 */
+    private var downAt = 0L
+
+    /** 长按定时器（配了 `click` 池时才用）。 */
+    private var longPressRunnable: Runnable? = null
+
+    /** 当前是否正演着拖拽姿势（松手时要还原）。 */
+    private var draggingPose = false
+
+    /**
+     * **用户直接操作**（点/拖/走）引起的临时姿势（空串 = 没有）。
+     *
+     * ⚠️ 它必须与 [chainAction] **分开**，而且**不受 [runState] 限制**。
+     *   这两条都是真机踩出来的：
+     *   - `chainAction`（随机链）只在 idle 时生效是对的 —— 干活时宠物该演"正在干活"，
+     *     随机玩耍动作会演反。
+     *   - 但**用户的手**不是"AI 在忙就该忽略"的东西。AI 每时每刻都在 thinking/working
+     *     （那正是用户发消息的时候），若把点/拖/走也挂在 `runState == idle` 上，
+     *     用户**永远**点不出回应、拖不出姿势、看不到走动 —— 实测就是"2、4、5 全都没有"。
+     *
+     * 所以：手动操作压过运行状态，且有自己的存活期（见 [manualUntil]）。
+     */
+    private var manualAction = ""
+
+    /** [manualAction] 的失效时刻（`uptimeMillis`，0 = 一直有效直到显式清除）。 */
+    private var manualUntil = 0L
+
+    /** [manualAction] 的到期定时器。 */
+    private var manualRunnable: Runnable? = null
+
+    /** 正在跑的"自己走动"动画（用户一按就要停掉，否则和拖拽抢坐标）。 */
+    private var walkAnim: android.animation.ValueAnimator? = null
 
     /**
      * 脚本/AI **临时**钦定的动作（不走持久配置）。
@@ -661,6 +883,26 @@ class FloatingBubble(private val context: Context) {
     private var downWidth = 0
     private var downHeight = 0
 
+    // ── 抛掷物理 ──────────────────────────────────────────────────────
+
+    /** 抛掷物理（按设备密度构造，保证不同 DPI 手感一致）。 */
+    private val physics by lazy { BubblePhysics(density) }
+
+    /** 手指轨迹采样（用来估抛掷速度）。 */
+    private val trail = BubblePhysics.Trail()
+
+    /** 当前飞行状态；null = 没在飞。 */
+    private var throwState: BubblePhysics.State? = null
+
+    /** 飞行循环的 Runnable（用来取消）。 */
+    private var throwRunnable: Runnable? = null
+
+    /** 上一帧的时间戳（ns），用来算 dt。 */
+    private var throwLastFrameNs = 0L
+
+    /** 落地挤压动画（X / Y 各一个，必须同步）。 */
+    private var squashAnim: android.animation.ValueAnimator? = null
+
     private val density = context.resources.displayMetrics.density
     private fun dp(v: Int) = (v * density).roundToInt()
     private fun dp(v: Float) = (v * density).roundToInt()
@@ -697,6 +939,12 @@ class FloatingBubble(private val context: Context) {
     private var statusRoot: View? = null
     private var statusDot: View? = null
     private var statusText: TextView? = null
+
+    /** 状态配图（球头顶那张表情包）。没配 `statusImages` 时一直是 GONE。 */
+    private var statusImage: ImageView? = null
+
+    /** 「点 + 文字」那一行。只有配图没文案时整行收起（否则留一条空白）。 */
+    private var statusTextRow: View? = null
 
     /** 状态横条自动消失的计时器。 */
     private val statusHandler = Handler(Looper.getMainLooper())
@@ -786,6 +1034,7 @@ class FloatingBubble(private val context: Context) {
         root = view
         circleView = view.findViewById(R.id.bubbleCircle)
         avatarView = view.findViewById(R.id.bubbleAvatar)
+        videoHost = view.findViewById(R.id.bubbleVideoHost)
         panelView = view.findViewById(R.id.bubblePanel)
         dotView = view.findViewById(R.id.bubbleDot)
         panelDot = view.findViewById(R.id.panelDot)
@@ -836,6 +1085,12 @@ class FloatingBubble(private val context: Context) {
                 BubbleAppearance.STATE_COLLAPSED -> Unit
                 else -> Unit
             }
+            // 随机链与自己走动：**显示之后**才起（hide 里已经把它们取消了）。
+            workStatusText = BubbleAppearance.statusTextFor(appearance, runState) ?: ""
+            statePoolAction = BubbleAppearance.statePoolPick(context, appearance, runState) ?: ""
+            statusImagePath = BubbleAppearance.statusImageFor(appearance, runState) ?: ""
+            scheduleChain(CHAIN_INTERVAL_MS)
+            scheduleMove()
         } catch (t: Throwable) {
             // 最常见的是没权限（BadTokenException）。不致命，只是没气泡。
             Log.w(TAG, "添加气泡失败: ${t.message}")
@@ -851,6 +1106,14 @@ class FloatingBubble(private val context: Context) {
         // 停掉轮播与动效：视图都要移除了，继续 postDelayed 只是空转耗电，
         // 而且回调里会碰到已经 detach 的 ImageView。
         stopFramePlayer()
+        // 视频层要彻底释放：WebView 持有解码器与渲染线程，只把 View 摘掉不 destroy
+        // 会让它继续占内存，反复显示/隐藏几次就是几十 MB 的泄漏。
+        videoLayer?.release()
+        videoLayer = null
+        // 飞行中的球也要停下：视图都要移除了，继续 postOnAnimation 会碰到 null root。
+        stopThrow()
+        squashAnim?.cancel()
+        squashAnim = null
         spinning = false
         pulsing = false
         spinAnimator?.cancel()
@@ -868,10 +1131,22 @@ class FloatingBubble(private val context: Context) {
         pushedStatus = ""
         pushedSticky = false
         pushedDurationMs = 0L
+        // 随机链与走动的定时器同理：View 都要摘掉了，继续 postDelayed 只会空转，
+        // 回调里还会碰到已 detach 的 root。
+        cancelChain()
+        cancelMove()
+        stopWalk()
+        cancelLongPress()
+        clearManualAction()
+        chainAction = ""
+        workStatusText = ""
+        statePoolAction = ""
+        statusImagePath = ""
         runCatching { wm.removeViewImmediate(v) }
         root = null
         circleView = null
         avatarView = null
+        videoHost = null
         panelView = null
         panelInput = null
         edgeView = null
@@ -907,6 +1182,18 @@ class FloatingBubble(private val context: Context) {
                 val (nx, ny) = clampInto(curX, curY)
                 moveTo(nx, ny)
             }
+            // 配置变了 → 随机链与走动的定时器都要按**新配置**重排：AI 可能刚把
+            // `moveEnabled` 打开、或刚配上一批池。不重排的话这次改动要等下一次
+            // 状态切换才生效，表现为"配了但宠物不动"。
+            //
+            // ⚠️ 先清 `chainAction`：它指向的是**旧配置**里的池成员，新配置可能
+            //   根本没这个池，留着会让宠物卡在一个不该播的动作上。
+            chainAction = ""
+            workStatusText = BubbleAppearance.statusTextFor(appearance, runState) ?: ""
+            statePoolAction = BubbleAppearance.statePoolPick(context, appearance, runState) ?: ""
+            statusImagePath = BubbleAppearance.statusImageFor(appearance, runState) ?: ""
+            scheduleChain(CHAIN_INTERVAL_MS)
+            scheduleMove()
         } catch (t: Throwable) {
             Log.w(TAG, "应用悬浮球外观失败: ${t.message}")
         }
@@ -1007,16 +1294,75 @@ class FloatingBubble(private val context: Context) {
     /**
      * 当前**想要**播的动作名（还没核对磁盘上有没有）。
      *
-     * 选择优先级（桌面宠物的"该做哪个动作"就这三条）：
+     * 选择优先级（桌面宠物的"该做哪个动作"就这四条）：
      * ① 配置里的 `action` 非空 → 就播它（AI 明确点名，压过一切）；
      * ② 脚本临时钦定的 [stateOverrideAction] → 播它；
-     * ③ `actionMap[runState]` → 按当前运行状态自动映射；
-     * ④ 都没有 → [BubbleFrames.DEFAULT_ACTION]。
+     * ③ 随机链抽中的 [chainAction]（**只在 idle 时生效**）→ 播它；
+     * ④ `actionMap[runState]` → 按当前运行状态自动映射；
+     * ⑤ 都没有 → [BubbleFrames.DEFAULT_ACTION]。
+     *
+     * ⚠️ ③ 排在 ④ 前面但**只在 idle 时**生效，这是关键：干活时宠物必须演
+     *   "正在干活"，而随机链抽中的多半是个玩耍小动作 —— 不限制的话 AI 一忙
+     *   起来宠物反而在玩，正好演反。
      */
     private fun wantedAction(): String = when {
         appearance.action.isNotEmpty() -> appearance.action
         stateOverrideAction.isNotEmpty() -> stateOverrideAction
+        // ②.5 用户手动操作（点/拖/走）的姿势 —— **压在运行状态前面**：
+        //   用户的手比 AI 的忙闲重要，且这类姿势有存活期，过期自动让位。
+        isManualAlive() -> manualAction
+        runState == BubbleAppearance.RUN_IDLE && chainAction.isNotEmpty() -> chainAction
+        // ③ 状态专属池（`work-thinking` / `state-working` …）优先于 `actionMap`：
+        //   池能"每次进这个状态换个花样"，而 `actionMap` 只能固定一个动作。
+        //   两者都配时池赢 —— 配池是更明确、更花力气的表达。
+        //
+        // ⚠️ 读的是**已经抽好的** [statePoolAction]，不在这里现抽。
+        //   本函数被调用多次（`applyRunState` 判一次、`applyActionLayer` 再判一次），
+        //   在这里现抽会让两次拿到不同动作 —— 表现为宠物动作不停乱跳。
+        //   抽取时机与 `workStatusText` 完全一致：**状态变化时抽一次**。
+        statePoolAction.isNotEmpty() -> statePoolAction
         else -> BubbleAppearance.actionFor(appearance, runState, BubbleFrames.DEFAULT_ACTION)
+    }
+
+    /** [manualAction] 现在是否还有效（顺带把过期的清掉）。 */
+    private fun isManualAlive(): Boolean {
+        if (manualAction.isEmpty()) return false
+        if (manualUntil == 0L) return true
+        if (android.os.SystemClock.uptimeMillis() < manualUntil) return true
+        clearManualAction()
+        return false
+    }
+
+    /**
+     * 演一个**用户操作**引起的临时姿势。
+     *
+     * @param action 动作名（空串 = 清掉）。
+     * @param holdMs 保持多久（0 = 一直保持，直到调用方显式清掉，拖拽用这个）。
+     */
+    private fun playManualAction(action: String, holdMs: Long) {
+        manualRunnable?.let { root?.removeCallbacks(it) }
+        manualRunnable = null
+        manualAction = action
+        manualUntil = if (holdMs > 0) android.os.SystemClock.uptimeMillis() + holdMs else 0L
+        if (holdMs > 0) {
+            val r = Runnable {
+                manualRunnable = null
+                clearManualAction()
+                // 姿势到期 → 交回给状态映射/随机链。
+                applyActionLayer(dp(appearance.size))
+            }
+            manualRunnable = r
+            root?.postDelayed(r, holdMs)
+        }
+        applyActionLayer(dp(appearance.size))
+    }
+
+    /** 清掉手动姿势（不重刷视图，调用方自己决定要不要刷）。 */
+    private fun clearManualAction() {
+        manualRunnable?.let { root?.removeCallbacks(it) }
+        manualRunnable = null
+        manualAction = ""
+        manualUntil = 0L
     }
 
     /**
@@ -1070,6 +1416,28 @@ class FloatingBubble(private val context: Context) {
     private fun applyRunState(next: String) {
         if (next == runState) return
         runState = next
+        // 状态变了 → 重抽一次状态文案。**必须在这里抽而不是渲染时抽**：
+        // applyStatus 每秒推一次，渲染时抽会让那句话每秒闪一次。
+        workStatusText = BubbleAppearance.statusTextFor(appearance, next) ?: ""
+        // 同理：状态专属池的动作也只在这里抽一次（见 [statePoolAction]）。
+        statePoolAction = BubbleAppearance.statePoolPick(context, appearance, next) ?: ""
+        // 同理：状态配图也只在这里抽一次。
+        statusImagePath = BubbleAppearance.statusImageFor(appearance, next) ?: ""
+        // 干活时随机链要让位（wantedAction 里也有这道闸，这里顺手清掉，
+        // 免得回到 idle 时先播一个"上一轮残留"的动作）。
+        if (next != BubbleAppearance.RUN_IDLE) {
+            chainAction = ""
+            cancelChain()
+        } else {
+            scheduleChain(CHAIN_INTERVAL_MS)
+        }
+        // 状态一变，头顶那句话/那张图**立刻**要跟着换。
+        //
+        // ⚠️ 不能只等引擎状态推送来刷新：那条路是"页面里发生了什么"的采样，空闲时
+        //   几秒才推一次、而且**内容没变就不推**。状态图（表情包）恰恰是在"状态变了
+        //   但页面没动静"时最该出现 —— 漏了这一步，AI 配好的图会一直不显示，
+        //   看起来像接口没生效。用上一次的引擎状态重刷即可（只有图/文案取自配置）。
+        lastStatus?.let { refreshStatusBubble(it) }
         // 钦定动作（配置或脚本）不受运行状态影响，不用白刷一遍。
         if (appearance.action.isNotEmpty() || stateOverrideAction.isNotEmpty()) return
         if (resolvePlayableAction(wantedAction()) == frameAction) return
@@ -1108,12 +1476,17 @@ class FloatingBubble(private val context: Context) {
     /**
      * 把一个"想播的动作名"落到磁盘上真实存在的动作。
      *
+     * ⚠️ **"存在"包含视频素材**：只传了 `video` 的动作（那是 dsh-pet 那种宠物的
+     *   常态 —— 一个动作就是一段动画，没有帧集）如果不认，会被判成"动作不在
+     *   磁盘上"而回退到默认动作，症状是「视频明明写进去了，球却纹丝不动」。
+     *   所以判据是 [BubbleFrames.available] **或** [BubbleVideos.available]。
+     *
      * ⚠️ 名字不合法（含路径字符等）时 [BubbleFrames.normalizeAction] 返回 null ——
      *   这种情况**只警告一次**，否则每帧（轮播 400ms 一帧）都会刷一行日志。
      */
     private fun resolvePlayableAction(wanted: String): String {
         val name = BubbleFrames.normalizeAction(wanted)
-        if (name != null && BubbleFrames.available(context, name)) {
+        if (name != null && (BubbleFrames.available(context, name) || BubbleVideos.available(context, name))) {
             warnedMissingAction = ""
             return name
         }
@@ -1124,21 +1497,26 @@ class FloatingBubble(private val context: Context) {
             }
             return BubbleFrames.DEFAULT_ACTION
         }
-        // ⚠️ **默认动作没有帧不是异常**，而是绝大多数用户的常态（他们只用内置头像）。
+        // ⚠️ **默认动作没有素材不是异常**，而是绝大多数用户的常态（他们只用内置头像）。
         //   这里若也打日志，每次启动都会留一条"帧集不在磁盘上"的警告，把真正的
         //   问题（配了 actionMap 却忘了传那套帧）淹掉。
         if (name != BubbleFrames.DEFAULT_ACTION && warnedMissingAction != name) {
-            Log.i(TAG, "悬浮球动作 $name 的帧集不在磁盘上，改用默认动作")
+            Log.i(TAG, "悬浮球动作 $name 的素材不在磁盘上，改用默认动作")
             warnedMissingAction = name
         }
         return BubbleFrames.DEFAULT_ACTION
     }
 
     /**
-     * 内容层（头像 / 轮播帧 / 精灵图）。
+     * 内容层（视频 / 轮播帧 / 精灵图 / 头像）。
      *
-     * 优先级：**轮播帧 > 自定义头像 > 内置头像**。轮播在跑时不去碰单张头像的
-     * 逻辑，否则两套代码会互相覆盖 `setImageBitmap` 的结果。
+     * 优先级：**视频 > 轮播帧 > 自定义头像 > 内置头像**。
+     *
+     * ⚠️ 视频排最前是因为它才是「像 dsh-pet 那样的宠物动效」—— 帧集只能表达
+     *   "N 张静态图轮播"，做不出带 alpha 的连续动画。但**两者不是替代关系**：
+     *   没有视频素材时行为与加视频层之前**逐字相同**，所以老用户零影响。
+     *
+     * ⚠️ 轮播在跑时不去碰单张头像的逻辑，否则两套代码会互相覆盖 `setImageBitmap`。
      */
     private fun applyContentLayer(side: Int) {
         val iv = avatarView ?: return
@@ -1146,12 +1524,28 @@ class FloatingBubble(private val context: Context) {
         // 内容层的透明度单独作用在 ImageView 上（与整体 opacity 相乘）。
         iv.alpha = appearance.avatarOpacity.coerceIn(0f, 1f)
         // 内容缩放：0.2~2.0，>1 会溢出球，由球的裁剪兜住（这正是"图片比球大"想要的效果）。
-        iv.scaleX = appearance.avatarScale
+        // ⚠️ 用 [facingScaleX] 而不是直接读 `avatarScale`：转身（`flipOnTurn`）就是
+        //   靠这里的水平镜像表达的，直接赋值会把朝向抹掉 —— 表现为"转身只生效一瞬"。
         iv.scaleY = appearance.avatarScale
+        // 水平镜像（转身）交给 [applyFacing] 统一刷。
+        //
+        // ⚠️ 不能只在"朝向变化的那一刻"刷一次：内容层会因换动作/换状态被反复重建，
+        //   视频视图是新的（或刚被复用）。不在每次装配时补一次的话，视频素材的
+        //   宠物**永远不会转身** —— 而用视频素材恰恰是宠物最常见的用法。
+        applyFacing()
 
         // 轮播帧：先停掉旧的播放器，再按新配置决定要不要重启。
         stopFramePlayer()
 
+        // ── ① 视频层：磁盘上有这个动作的 webm 就用它 ────────────────────
+        if (BubbleVideos.available(context, frameAction)) {
+            showVideo(frameAction, side)
+            iv.visibility = View.GONE
+            return
+        }
+        hideVideo()
+
+        // ── ② 轮播帧 / 精灵图 ─────────────────────────────────────────
         // ⚠️ 帧数**按当前动作问磁盘**，不信 `appearance.frameCount` ——
         //   那个值描述的是配置里那个动作，换到别的动作后会对不上。
         val count = BubbleFrames.frameCount(context, frameAction)
@@ -1182,6 +1576,434 @@ class FloatingBubble(private val context: Context) {
             iv.setImageResource(R.drawable.bubble_avatar)
             iv.visibility = View.VISIBLE
         }
+    }
+
+    /**
+     * 显示视频层的某个动作。
+     *
+     * ⚠️ **只有在真的有素材时才创建 WebView**（几十 MB 内存）。这一步是惰性的，
+     *   所以没有视频的用户不会有任何额外开销。
+     *
+     * ⚠️ 视频层可见时**必须打开 [BubbleTouchFrame.interceptAll]**：WebView 会在
+     *   native 层吃掉 ACTION_DOWN，不抢回来的话球拖不动、点不开。详见那个类的注释。
+     */
+    private fun showVideo(action: String, side: Int) {
+        val host = videoHost as? FrameLayout ?: return
+        val url = BubbleVideos.urlOf(context, action) ?: return
+
+        val layer = videoLayer ?: BubbleVideoLayer(context) { ended ->
+            // 一次性动作播完 → 交回给「挑下一个动作」的逻辑。
+            // ⚠️ 走 post 是因为回调来自 JS 线程的桥，直接动 View 树不安全。
+            root?.post { onVideoActionEnded(ended) }
+        }.also { videoLayer = it }
+
+        layer.attach(host)
+        host.visibility = View.VISIBLE
+        (circleView as? BubbleTouchFrame)?.interceptAll = true
+
+        // 循环与否：待机类动作是"背景动作"，播完就该无限循环；其余播一次就换。
+        // ⚠️ **循环与否看"这是不是个姿势"，不是看动作名。**
+        //   原判据 `action == RUN_IDLE`（拿动作名跟状态名比）有两处错：
+        //   ① `idle` 池里通常还有别的待机动作（`happy` 之类），它们同样该循环，
+        //      却被判成一次性 —— 播完就触发 `ended` 去换动作，待机反而变得很跳；
+        //   ② 手动姿势（点/拖/走）是**循环短片**（`开心跃动` 那种没有 `ended`），
+        //      判成一次性会让"点击回应"只播一遍就没了。
+        //   正确的语义：姿势类（手动操作 + 待机）循环，其余（一次性表演）播完就换。
+        //   ⚠️ 这里直接读 [manualAction] 而不调 [isManualAlive]：后者会**清掉过期的**
+        //   手动姿势，而本函数在 `applyActionLayer` → `applyContentLayer` 的深处被调，
+        //   此时 [wantedAction] 已经跑过一轮、过期项早已清掉。这里只读不写，避免在
+        //   渲染路径上产生副作用。
+        //
+        //   ⚠️ **转向动作必须一次性播**（`!chainIsTurn`）：翻转朝向挂在"播完"这个
+        //   事件上（见 [consumeTurnFlip]），循环播放的话那个事件永远不来 ——
+        //   宠物会一直演转身动画却从不真的转身。dsh-pet 那边 turn 也走 `once`。
+        val isPose = (manualAction.isNotEmpty() || runState == BubbleAppearance.RUN_IDLE) && !chainIsTurn
+        layer.play(action, url, loop = isPose)
+    }
+
+    /** 收起视频层（切回帧集/头像，或球被隐藏）。 */
+    private fun hideVideo() {
+        (videoHost as? FrameLayout)?.visibility = View.GONE
+        (circleView as? BubbleTouchFrame)?.interceptAll = false
+        videoLayer?.pause()
+    }
+
+    /**
+     * 一次性视频动作播完之后做什么。
+     *
+     * 策略：回到 idle，并在空闲时从 `idle` 池**随机抽下一个动作**（随机链）。
+     * 与 [BubbleFrames] 里 `loop >= 0` 的处理同构：播完停在最后一帧会让人以为卡住了。
+     *
+     * ⚠️ 「不随机挑下一个动作」是**加池之前**的行为：那时没有权重表，而权重属于
+     *   素材语义（哪些是待机、哪些是玩耍），只有配素材的 AI 才知道。现在那份语义
+     *   由 `pools` + `poolWeights` 表达了，所以这里可以真的抽。
+     *
+     * ⚠️ 抽之前先判 [runState]：正在干活时必须让 `actionMap` 说了算，否则宠物会
+     *   在 AI 忙的时候播玩耍动作，正好演反。
+     */
+    private fun onVideoActionEnded(ended: String) {
+        if (ended != frameAction) return
+        if (runState != BubbleAppearance.RUN_IDLE) return
+        // ⚠️ 拖拽/走动期间不换姿势：`drag`/`move` 池的动作多是**一次性**短片，
+        //   播完就触发这里。不挡的话用户还拎着宠物，姿势已经被换成待机 ——
+        //   实测一次 3 秒的慢拖拽里，`被吓一跳` 播完就把姿势抢回了 idle。
+        if (dragging || draggingPose || walkAnim != null) return
+        // ⚠️ 转向动作播完 → 先翻朝向，再抽下一个。顺序反了的话"下一个动作"会
+        //   按**旧朝向**渲染一帧，用户看到的是转身之后又弹回原方向。
+        consumeTurnFlip()
+        rollNextChainAction()
+        applyActionLayer(dp(appearance.size))
+    }
+
+    /**
+     * 若刚播完的是 `turn` 池的动作，翻转朝向（并把标记清掉）。
+     *
+     * ⚠️ 与 dsh-pet 的时机**逐字一致**：翻转发生在转向动画**播完**时
+     *   （`pet.ts` 的 `if (animations.turn.includes(animRef.current)) setFacing(next)`），
+     *   而不是开播时 —— 开播就翻的话，那段"转身"动画本身会被镜像成反的，
+     *   看起来像在原地抖。
+     *
+     * ⚠️ `flipOnTurn` 关掉时**只清标记、不翻朝向**：那是"我的素材本来就两个方向
+     *   各有一套，别镜像我"的用法，镜像会把人脸变成镜像文字。
+     */
+    private fun consumeTurnFlip() {
+        if (!chainIsTurn) return
+        chainIsTurn = false
+        if (appearance.flipOnTurn) facingRight = !facingRight
+    }
+
+    /** 走动方向决定朝向（走右朝右、走左朝左）。 */
+    private fun setFacing(right: Boolean) {
+        if (!appearance.flipOnTurn || facingRight == right) return
+        facingRight = right
+        applyFacing()
+    }
+
+    /**
+     * 把当前朝向刷到内容层上。
+     *
+     * ⚠️ **两个内容视图都要刷**（`avatarView` 与 `videoHost`）：它们是互斥的内容层
+     *   （视频优先，否则帧集/头像）。只刷头像的话，用视频素材的宠物**永远不会转身**，
+     *   而转身恰恰是视频素材最常见的用法。
+     *
+     * ⚠️ 不镜像父容器（`circleView`）：那会连带把右下角的状态点也镜像到左下角。
+     *   dsh-pet 镜像的也只是精灵元素本身，不是整个宠物容器。
+     */
+    private fun applyFacing() {
+        val s = facingScaleX()
+        avatarView?.scaleX = s
+        (videoHost as? View)?.scaleX = s
+    }
+
+    /**
+     * 内容层该用的 `scaleX`（含水平镜像）。
+     *
+     * ⚠️ **镜像就是"转身"的全部实现**：素材只画了一个方向，所以 dsh-pet 用
+     *   `scaleX(-1)` 表达朝向（`pet.ts` 的 `facingRef.current === 'right' ? 'scaleX(-1)' : ''`）。
+     *   我们逐字照搬。
+     */
+    private fun facingScaleX(): Float {
+        val s = appearance.avatarScale
+        return if (appearance.flipOnTurn && facingRight) -s else s
+    }
+
+    /**
+     * 抽下一个随机动作，写进 [chainAction]（抽不到就清空，退回 `actionMap`）。
+     *
+     * ⚠️ **权重只对 idle 池生效**：`poolWeights["idle"]` 为 0 时不再抽，宠物就停在
+     *   `actionMap` 指的那个待机动作上 —— 那是"我只想要一个安静的球"的用法，必须支持。
+     *
+     * ⚠️ 连抽同一个动作时**重抽一次**（不是无限重抽）：池里只有 2 个动作时无限重抽
+     *   会退化成死循环，而重抽一次就够把"连续播两遍"的概率压下去。
+     *
+     * ⚠️ **配了 `turn` 池就优先掷一次"要不要转身"**：电脑端的随机链是三档
+     *   （`idle` / `turn` / `move`），转身是**独立的一档**，而不是待机池里的
+     *   一个普通成员 —— 因为转身有个副作用（翻朝向），不能和普通动作混在一起抽。
+     *   没配 `turn` 池时这一档直接跳过，行为与加它之前逐字相同。
+     */
+    private fun rollNextChainAction() {
+        if (runState != BubbleAppearance.RUN_IDLE) return
+        val weight = appearance.poolWeights[BubbleAppearance.POOL_IDLE]
+            ?: BubbleAppearance.DEFAULT_IDLE_WEIGHT
+        if (weight <= 0) {
+            chainAction = ""
+            chainIsTurn = false
+            return
+        }
+
+        // ── ① 转向那一档（只有配了 `turn` 池才参与掷骰）──────────────────
+        // 概率取 `poolWeights["turn"]`，与 idle 的相对关系同 dsh-pet 的
+        // `rollKind`（turn 的份额排在 idle 之后）。没配权重就按 0 算 ——
+        // 配了池却不配权重时不该让宠物频繁自顾自转身。
+        val turnWeight = appearance.poolWeights[BubbleAppearance.POOL_TURN] ?: 0
+        if (turnWeight > 0 && appearance.pools[BubbleAppearance.POOL_TURN].orEmpty().isNotEmpty()) {
+            val roll = Math.random() * (weight + turnWeight)
+            if (roll >= weight) {
+                val t = BubbleAppearance.pickFromPool(
+                    context, appearance, BubbleAppearance.POOL_TURN, chainAction,
+                )
+                if (!t.isNullOrEmpty()) {
+                    chainAction = t
+                    chainIsTurn = true
+                    return
+                }
+                // 池里全是磁盘上没有的动作 → 落到下面的普通抽取（不空转）。
+            }
+        }
+        chainIsTurn = false
+
+        val picked = BubbleAppearance.pickFromPool(
+            context, appearance, BubbleAppearance.POOL_IDLE, chainAction,
+        ) ?: run {
+            chainAction = ""
+            return
+        }
+        if (picked == chainAction) {
+            if (++chainRepeats < 2) {
+                chainAction = BubbleAppearance.pickFromPool(
+                    context, appearance, BubbleAppearance.POOL_IDLE, chainAction,
+                ) ?: picked
+                return
+            }
+        } else {
+            chainRepeats = 0
+        }
+        chainAction = picked
+    }
+
+    /**
+     * 排下一次随机动作（兜底定时器）。
+     *
+     * ⚠️ 循环播放的动作（待机）永远不会触发 `ended`，所以只靠事件驱动会让宠物
+     *   永远卡在第一段动画上。这里排一个定时器保证它**一定会换**。
+     *
+     * ⚠️ 没配任何池时**不排** —— 不配就是"不要宠物感"，不该留一个空转的定时器。
+     */
+    private fun scheduleChain(delayMs: Long) {
+        cancelChain()
+        if (appearance.pools.isEmpty()) return
+        val r = object : Runnable {
+            override fun run() {
+                chainRunnable = null
+                if (!attached || runState != BubbleAppearance.RUN_IDLE) return
+                // ⚠️ **拖拽期间不许抢姿势**：用户正拎着宠物（`drag` 池的动作在演），
+                //   随机链到点会把 `chainAction` 换成 idle 池里的动作 —— 宠物在手里
+                //   突然"放下手站着"，动作与手的动作对不上。
+                //   （实测：3 秒的慢拖拽里正好撞上一次 8 秒定时器，姿势被抢回 idle。）
+                if (dragging || draggingPose) {
+                    scheduleChain(delayMs)
+                    return
+                }
+                val before = chainAction
+                rollNextChainAction()
+                if (chainAction != before) applyActionLayer(dp(appearance.size))
+                scheduleChain(delayMs)
+            }
+        }
+        chainRunnable = r
+        root?.postDelayed(r, delayMs)
+    }
+
+    /** 取消随机链的定时器。 */
+    private fun cancelChain() {
+        chainRunnable?.let { root?.removeCallbacks(it) }
+        chainRunnable = null
+    }
+
+    /**
+     * 排一个长按定时器（到点展开面板）。
+     *
+     * ⚠️ **只有配了 `click` 池才排**：没配池时单击就展开，再排一个长按会让
+     *   "按住不放"也展开 —— 那本来应该是拖拽的起手式，会互相打架。
+     */
+    private fun scheduleLongPress() {
+        cancelLongPress()
+        if (appearance.pools[BubbleAppearance.POOL_CLICK].isNullOrEmpty()) return
+        val r = Runnable {
+            longPressRunnable = null
+            // 到点时还按着、且没拖动 → 判成长按。
+            if (dragging && !moved) {
+                dragging = false
+                moved = false
+                expand()
+            }
+        }
+        longPressRunnable = r
+        root?.postDelayed(r, LONG_PRESS_MS)
+    }
+
+    /** 取消长按定时器。 */
+    private fun cancelLongPress() {
+        longPressRunnable?.let { root?.removeCallbacks(it) }
+        longPressRunnable = null
+    }
+
+    /**
+     * 播一个"点击回应"动作（从 `click` 池随机抽）。
+     *
+     * ⚠️ 走 [playManualAction]（手动通道）而**不是** [chainAction]：随机链那条路
+     *   在非 idle 时会被 `wantedAction` 挡掉，而用户点宠物恰恰多半发生在 AI 忙的时候
+     *   （用户刚发完消息）。走错通道的症状就是"点了没反应"。
+     *
+     * ⚠️ 有存活期（[CLICK_POSE_MS]）：这是一次性回应，到点就该回到状态映射，
+     *   不能永久占着 —— 否则 AI 干完活宠物还停在"开心跃动"上。
+     */
+    private fun playClickPose() {
+        // ⚠️ **先切动作，再压扁**，顺序不能反。切动作会走 `applyActionLayer` →
+        //   `applyContentLayer`，那里会把 `scaleY` 重置回 `avatarScale` 基准值 ——
+        //   先压扁的话，刚起动的挤压动画会被这一下重置打断（表现为"点了只闪一下"）。
+        //
+        // ⚠️ 挤压**无条件**发生：抽不到 `click` 池的动作时也该压一下，那是点击的
+        //   即时反馈（电脑上点宠物也是这个），否则"点了没反应"的手感又回来了。
+        val picked = BubbleAppearance.pickFromPool(
+            context, appearance, BubbleAppearance.POOL_CLICK, manualAction,
+        )
+        if (picked != null) playManualAction(picked, CLICK_POSE_MS)
+        playSquash(BubblePhysics.SQ_CLICK_DEPTH)
+    }
+
+    /**
+     * 切到"被拎起来"的拖拽姿势（从 `drag` 池随机抽）。
+     *
+     * ⚠️ 存活期 = 0（一直保持）：拖拽的结束时刻由手指决定，不由定时器决定。
+     *   松手时 [playManualAction]`("", 0)` 清掉。
+     *
+     * ⚠️ 抽不到就**什么都不做**（保留当前动作）—— 拖拽时画面已经在动，
+     *   强行切回默认动作反而会让宠物"变脸"。
+     */
+    private fun showDragPose() {
+        val picked = BubbleAppearance.pickFromPool(
+            context, appearance, BubbleAppearance.POOL_DRAG, manualAction,
+        ) ?: return
+        playManualAction(picked, 0)
+    }
+
+    /**
+     * 让宠物自己走一段（`moveEnabled` 打开时）。
+     *
+     * ⚠️ 走动**不改配置、不落盘**位置：那是"宠物自己溜达"，用户拖到哪就还回哪，
+     *   下次启动仍从用户放的位置开始。落盘会让用户下次找不到球。
+     *
+     * ⚠️ 走动时**先切 `move` 池的动作**（配了的话），走完再切回来 —— 不切的话
+     *   宠物是"平移"而不是"走过去"，很假。
+     */
+    private fun scheduleMove() {
+        cancelMove()
+        if (!appearance.moveEnabled) return
+        val base = appearance.moveIntervalSec * 1000L
+        // 0.5~1.5 倍随机：固定周期会像钟摆，随机才有"活着"的感觉。
+        val delay = (base * (0.5 + Math.random())).toLong()
+        val r = object : Runnable {
+            override fun run() {
+                moveRunnable = null
+                if (!attached) {
+                    scheduleMove()
+                    return
+                }
+                // ⚠️ **走动不看 `runState`**：那是"宠物自己溜达"，与 AI 忙不忙无关。
+                //   挂在 idle 上会让走动只在 AI 完全不干活时才发生 —— 而用户盯着
+                //   宠物看的时候，往往正是 AI 在忙的时候。真机症状就是"走动永远看不到"。
+                //   （与点/拖同理，见 [manualAction] 的说明。）
+                if (expanded || edgeCollapsed || dragging || draggingPose) {
+                    scheduleMove()
+                    return
+                }
+                doWalk()
+                scheduleMove()
+            }
+        }
+        moveRunnable = r
+        root?.postDelayed(r, delay)
+    }
+
+    /**
+     * 取消**下一次**走动的定时器。
+     *
+     * ⚠️ **不能顺手把 [walkAnim] 也停掉。** 这条踩过：`scheduleMove()` 的第一句就是
+     *   `cancelMove()`，而 [doWalk] 刚 `start()` 的动画正是在 `scheduleMove()` 之后
+     *   才排下一轮的 —— 于是动画被自己取消，位置永远不动。日志特征很明确：
+     *   `走动: curX=792 targetX=623 nx=623` 算得没错，但下一次打印 `curX` 仍是 792。
+     *
+     * 要停掉正在走的动画用 [stopWalk]（球隐藏、手指按下时才需要）。
+     */
+    private fun cancelMove() {
+        moveRunnable?.let { root?.removeCallbacks(it) }
+        moveRunnable = null
+    }
+
+    /** 停掉正在跑的走动动画（球隐藏、用户按下时用）。 */
+    private fun stopWalk() {
+        walkAnim?.cancel()
+        walkAnim = null
+    }
+
+    /**
+     * 真的走一段：水平挪一段距离（方向随机），撞到屏幕边就反向。
+     *
+     * ⚠️ 用 [moveTo]（改 window 的 `x`）而不是 `translationX`：后者会和
+     *   WindowManager 的坐标打架，拖拽时就会打架（见 `startThrow` 的注释）。
+     *
+     * ⚠️ **距离按"这次抽中的走路动作"取**（`moveParams[动作]`），不是全局一个值。
+     *   电脑端每个移动动作自带 `minDist`/`maxDist`：小碎步的动作就该挪得少，
+     *   大步跑的动作就该挪得多。所以**必须先抽动作、再算距离**，顺序反了就只能
+     *   用全局值 —— 那样 `moveParams` 这个接口等于不存在。
+     */
+    private fun doWalk() {
+        val side = dp(appearance.size)
+        // ① 先抽姿势（抽不到就没配 `move` 池，此时用全局距离）。
+        val pose = BubbleAppearance.pickFromPool(
+            context, appearance, BubbleAppearance.POOL_MOVE, manualAction,
+        )
+        // ② 按这个动作取距离区间（没覆盖值就回落全局）。
+        val (loDp, hiDp) = BubbleAppearance.moveRangeFor(appearance, pose ?: "")
+        val minD = dp(loDp).toFloat()
+        val maxD = dp(hiDp).toFloat()
+        if (maxD < minD) return
+        val dist = minD + (maxD - minD) * Math.random().toFloat()
+        // ③ 距离为 0 = **原地踏步**（`moveParams` 里把 min/max 都写成 0）。
+        //   这是合法用法（"别到处跑，就演一下走路的动作"），所以要在这里就把
+        //   姿势演出来再返回 —— 否则下面的 `nx == curX` 会直接 return，
+        //   连动作都不播，用户看到的是"配了走路却什么都不发生"。
+        if (dist < 1f) {
+            if (pose != null) playManualAction(pose, MOVE_MS + 600)
+            return
+        }
+        val dir = if (Math.random() < 0.5) -1 else 1
+        var targetX = curX + (dist * dir).roundToInt()
+        // 撞边就朝反方向走，而不是卡在边上（卡住会让"走动"变成"贴边抖动"）。
+        val (clamped, _) = clampInto(targetX, curY, side, side)
+        if (clamped == curX && abs(targetX - curX) > 2) {
+            targetX = curX - (dist * dir).roundToInt()
+        }
+        val (nx, ny) = clampInto(targetX, curY, side, side)
+        if (nx == curX) return
+        // 朝向：走动方向变了就转身（`flipOnTurn` 关掉时是空操作）。
+        setFacing(nx > curX)
+        // 走动姿势：配了 `move` 池就切过去，走完清掉、交回状态映射/随机链。
+        // ⚠️ 走**手动通道**：走动不看 `runState`（见 scheduleMove），姿势也就不能
+        //   挂在只看 idle 的 `chainAction` 上，否则 AI 一忙姿势立刻被顶掉。
+        // ⚠️ 带一个**兜底期限**（比动画略长）：动画正常结束会 `clearManualAction`，
+        //   但若动画是被 `stopWalk()` 取消的（用户按下的那一瞬间），`onAnimationEnd`
+        //   会因 `dragging` 提前返回而不清 —— 那样宠物就永久卡在"走路"姿势上。
+        if (pose != null) playManualAction(pose, MOVE_MS + 600)
+        val startX = curX
+        val anim = android.animation.ValueAnimator.ofInt(startX, nx)
+        anim.duration = MOVE_MS
+        anim.interpolator = android.view.animation.DecelerateInterpolator()
+        anim.addUpdateListener { curX = it.animatedValue as Int; moveTo(curX, curY) }
+        // ⚠️ 播完把姿势还回去：留着 `move` 池的动作会让宠物停在"走路"姿势上
+        //   （腿抬着不动），看起来像卡死。
+        anim.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: android.animation.Animator) {
+                if (walkAnim === animation) walkAnim = null
+                if (dragging || draggingPose) return
+                clearManualAction()
+                if (runState == BubbleAppearance.RUN_IDLE) rollNextChainAction()
+                applyActionLayer(side)
+            }
+        })
+        walkAnim = anim
+        anim.start()
     }
 
     /**
@@ -1337,10 +2159,14 @@ class FloatingBubble(private val context: Context) {
         // ── 呼吸 ──────────────────────────────────────────────────────
         if (appearance.pulse) {
             val base = appearance.avatarScale
-            val changed = pulseAnimator == null || pulseBase != base
+            // ⚠️ **呼吸的 X 缩放要带上朝向符号**：这个动画器独占 `SCALE_X`，
+            //   直接给正值会把转身（`scaleX = -s`）覆盖掉 —— 表现为"呼吸一开，
+            //   宠物立刻转回正面，而且再也不转身"。
+            val sx = if (appearance.flipOnTurn && facingRight) -base else base
+            val changed = pulseAnimator == null || pulseBase != sx
             if (changed) {
                 pulseAnimator?.cancel()
-                pulseAnimator = ObjectAnimator.ofFloat(iv, View.SCALE_X, base, base * 1.12f).apply {
+                pulseAnimator = ObjectAnimator.ofFloat(iv, View.SCALE_X, sx, sx * 1.12f).apply {
                     this.duration = 700
                     repeatCount = ObjectAnimator.INFINITE
                     repeatMode = ObjectAnimator.REVERSE
@@ -1357,7 +2183,7 @@ class FloatingBubble(private val context: Context) {
                     interpolator = AccelerateDecelerateInterpolator()
                     start()
                 }
-                pulseBase = base
+                pulseBase = sx
                 pulsing = true
             }
         } else if (pulsing) {
@@ -1367,7 +2193,10 @@ class FloatingBubble(private val context: Context) {
             pulseAnimatorY = null
             pulseBase = 0f
             pulsing = false
-            iv.scaleX = appearance.avatarScale
+            // ⚠️ 用 [facingScaleX] 而不是 `avatarScale`：这里在"关掉呼吸"时把缩放
+            //   复位，直接写 avatarScale 会把朝向一起抹掉 —— 表现为"关掉呼吸后
+            //   宠物突然转回正面"。
+            iv.scaleX = facingScaleX()
             iv.scaleY = appearance.avatarScale
         }
     }
@@ -1491,8 +2320,18 @@ class FloatingBubble(private val context: Context) {
      * @param autoHideMs 覆盖外观配置里的停留时长；null = 用外观配置。
      *   0 = 常驻（AI 主动推送用得上：「这条别消失」）。
      */
-    private fun showStatusBubble(text: String, running: Boolean, autoHideMs: Int? = null) {
-        if (text.isEmpty() || expanded || edgeCollapsed) {
+    private fun showStatusBubble(
+        text: String,
+        running: Boolean,
+        autoHideMs: Int? = null,
+        showImage: Boolean = true,
+    ) {
+        // ⚠️ 有图时**允许文字为空**：电脑端桌面宠物头顶经常只有一张表情包、
+        //   没有台词。若仍按"文字为空就不显示"处理，配了图却没配文案的用法
+        //   会整个气泡都不出现 —— 那正好是最常见的用法（只想要表情包）。
+        val imgName = if (showImage) statusImagePath else ""
+        val hasImage = imgName.isNotEmpty() && BubbleStatusImages.available(context, imgName)
+        if ((text.isEmpty() && !hasImage) || expanded || edgeCollapsed) {
             hideStatusBubble()
             return
         }
@@ -1502,6 +2341,7 @@ class FloatingBubble(private val context: Context) {
             statusRoot = v
             statusDot = v.findViewById(R.id.statusDot)
             statusText = v.findViewById(R.id.statusText)
+            statusImage = v.findViewById(R.id.statusImage)
             // 宽度上限靠 maxWidth 约束 TextView，而不是给 window 定死宽度 ——
             // 短文案要能收紧，长文案才截断。
             statusText?.maxWidth = statusMaxWidthPx
@@ -1540,15 +2380,48 @@ class FloatingBubble(private val context: Context) {
         //
         // key 里带上时长：AI 推一条"常驻"的消息时内容可能与引擎状态一致，
         // 不带时长的话会被判成"没变"而沿用旧的自动消失计时器。
-        val key = "$text\u0000$running\u0000$autoHideMs"
+        // key 里也带上图名：换状态换了张图但文案恰好相同时，图必须跟着换。
+        val key = "$text\u0000$running\u0000$autoHideMs\u0000$imgName"
         val changed = key != statusKey
         if (changed) {
             statusKey = key
+            applyStatusImage(if (hasImage) imgName else "")
+            // ⚠️ 只有图、没有文字时把文字行收起来：否则气泡底部会留一行空的高度
+            //   （TextView 空串仍占一行），看起来像图下面贴了块白条。
+            statusTextRow?.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
             statusText?.text = text
             paintDot(statusDot, running, small = true)
             scheduleStatusAutoHide(autoHideMs)
         }
         positionStatusBubble()
+    }
+
+    /**
+     * 把状态配图贴到气泡顶部（传空串即收起）。
+     *
+     * ⚠️ **尺寸在代码里设而不是写死布局**：`statusImageSizeDp` 是配置项，
+     *   而且它同时约束宽和高 —— 素材宽高比不一，用 `maxWidth/maxHeight` +
+     *   `adjustViewBounds` 让长边贴合，短边自适应，不会把图拉变形。
+     */
+    private fun applyStatusImage(name: String) {
+        val iv = statusImage ?: return
+        if (name.isEmpty()) {
+            iv.setImageDrawable(null)
+            iv.visibility = View.GONE
+            return
+        }
+        val side = dp(appearance.statusImageSizeDp.coerceIn(32, BubbleAppearance.MAX_STATUS_IMAGE_DP))
+        val bmp = BubbleStatusImages.read(context, name, side)
+        if (bmp == null) {
+            // 文件被清了（用户清数据 / 超出上限被 prune 掉）—— 收起而不是留白。
+            iv.setImageDrawable(null)
+            iv.visibility = View.GONE
+            return
+        }
+        iv.maxWidth = side
+        iv.maxHeight = side
+        iv.setImageBitmap(bmp)
+        iv.visibility = View.VISIBLE
     }
 
     /**
@@ -1592,6 +2465,11 @@ class FloatingBubble(private val context: Context) {
         statusRoot = null
         statusDot = null
         statusText = null
+        statusTextRow = null
+        // ⚠️ 位图要显式断开：气泡是**反复创建/销毁**的（每次状态变化后自动消失），
+        //   留着引用会让每张状态图都钉在堆里，几十张之后就是 OOM。
+        statusImage?.setImageDrawable(null)
+        statusImage = null
         statusKey = ""
         runCatching { wm.removeViewImmediate(v) }
     }
@@ -1747,6 +2625,18 @@ class FloatingBubble(private val context: Context) {
                     rawY = curY
                     dragging = true
                     moved = false
+                    downAt = ev.eventTime
+                    // 抓住飞行的球：立刻停下并清掉轨迹，否则松手时会用"上一段飞行"
+                    // 的残留速度把它又甩出去。
+                    stopThrow()
+                    // 自己走动的动画也要停：它每一帧都在写 `curX`，不停下来会和
+                    // 手指的位移互相覆盖，表现为"球跟手一跳一跳的"。
+                    stopWalk()
+                    trail.clear()
+                    trail.add(ev.rawX, ev.rawY, ev.eventTime)
+                    // 长按计时：只有配了 `click` 池时才有意义（那时单击被改成
+                    // "逗宠物"，展开改走长按）。没配池时下面不排这个 runnable。
+                    scheduleLongPress()
                     true
                 }
 
@@ -1756,9 +2646,19 @@ class FloatingBubble(private val context: Context) {
                     val dy = ev.rawY - downRawY
                     if (!moved && (abs(dx) > tapSlop || abs(dy) > tapSlop)) moved = true
                     if (!moved) return@setOnTouchListener true
+                    cancelLongPress()
                     // ⚠️ 位移量累加到**按下时的 window 坐标**上，不能直接用 rawX/rawY
                     rawX = downWinX + dx.roundToInt()
                     rawY = downWinY + dy.roundToInt()
+                    // 轨迹采样用**手指位置**（rawX/rawY 是手指的屏幕坐标），不是
+                    // 窗口坐标 —— 估速要的是"手甩多快"，与窗口偏移无关。
+                    trail.add(ev.rawX, ev.rawY, ev.eventTime)
+                    // 拖拽姿势：**只在真的拖起来之后**切，否则轻点一下也会闪一下
+                    // "被拎起来"的动作。
+                    if (!draggingPose) {
+                        draggingPose = true
+                        showDragPose()
+                    }
                     val (nx, ny) = clampInto(rawX, rawY)
                     moveTo(nx, ny)
                     true
@@ -1766,9 +2666,29 @@ class FloatingBubble(private val context: Context) {
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     val wasDrag = moved
+                    val heldMs = ev.eventTime - downAt
                     dragging = false
+                    cancelLongPress()
+                    if (draggingPose) {
+                        draggingPose = false
+                        // ⚠️ **先清掉拖拽姿势再重抽**：此刻演的是 `drag` 池那个
+                        //   "被拎起来"的动作，不清掉会继续演它 —— 宠物已经被放下了
+                        //   却还在挣扎。清空后交回状态映射（或 idle 时重抽随机链）。
+                        clearManualAction()
+                        if (runState == BubbleAppearance.RUN_IDLE) rollNextChainAction()
+                        applyActionLayer(dp(appearance.size))
+                    }
                     if (!wasDrag) {
-                        if (ev.actionMasked == MotionEvent.ACTION_UP) onTap()
+                        if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                            // ⚠️ 配了 `click` 池 → 单击是"逗宠物"；长按才展开。
+                            //   没配 → 单击照旧展开（老行为，零影响）。
+                            val hasClickPool = !appearance.pools[BubbleAppearance.POOL_CLICK].isNullOrEmpty()
+                            if (hasClickPool && heldMs < LONG_PRESS_MS) {
+                                playClickPose()
+                            } else if (!hasClickPool) {
+                                onTap()
+                            }
+                        }
                     } else {
                         onTouchUp(allowEdgeCollapse)
                     }
@@ -1783,9 +2703,25 @@ class FloatingBubble(private val context: Context) {
     /**
      * 拖动松手后的落位。
      *
-     * 两种结局：
-     * 1. **拖出了屏幕**（越界量超过 [EDGE_OVERSHOOT_DP]）→ 贴边折叠（[enterEdge]）。
-     * 2. 否则吸附到最近的左右边缘（原有行为）。
+     * 三种结局，**按这个顺序**判：
+     * 1. **甩出去了**（松手速度超过死区）→ 抛掷飞行（[startThrow]），四壁反弹、
+     *    落地弹跳，最后**停在哪就留在哪**。这是"宠物"的手感。
+     * 2. **拖出了屏幕**（越界量超过 [EDGE_OVERSHOOT_DP]）→ 贴边折叠（[enterEdge]）。
+     * 3. 否则**留在松手的位置**，不吸附。
+     *
+     * ⚠️ **③ 原来是 `snapToEdge()`（强制吸到左右边缘），这是错的。**
+     *   电脑版压根没有"吸附边缘"这个概念：宠物扔到哪就待在哪，屏幕正中间也行。
+     *   强制吸附的后果是"球永远只能贴两边"，用户**没法把它放在屏幕中间** ——
+     *   而悬浮球本来就是"我想放哪就放哪"的东西。
+     *   真机反馈原话：「它不像电脑一样可以放在手机屏幕上的任何一个位置，
+     *   而是会自动回落到屏幕的两边」。
+     *
+     * ⚠️ 但**吸附仍然保留一个入口**：`edgeSnap` 是 AI 可配的字段，把它设为 true
+     *   就恢复老行为（贴边更省屏幕，是不少人的偏好）。默认 false = 学电脑。
+     *
+     * ⚠️ **抛掷必须排在贴边之前**：一次"往外甩"同时满足"速度大"和"越界多"，
+     *   而用户甩出去时想要的是看它飞、弹、停，不是立刻变成一条缝。反过来的话
+     *   甩的动作永远触发贴边，抛掷形同虚设。
      *
      * ⚠️ 判定必须用 [rawX]（未夹取）而不是 [curX]（已夹取）。夹取会把越界量抹掉，
      *   用 curX 判的结果永远是"没越界"，贴边永远不触发。
@@ -1797,11 +2733,167 @@ class FloatingBubble(private val context: Context) {
         val overshootRight = rawX + w - dm.widthPixels
         val overshoot = maxOf(overshootLeft, overshootRight)
 
-        if (allowEdgeCollapse && appearance.edgeSnap && overshoot >= dp(EDGE_OVERSHOOT_DP)) {
+        // ── ① 抛掷：手甩得够快就飞出去 ──────────────────────────────────
+        if (appearance.throwEnabled) {
+            // ⚠️ **时间基准必须是 `uptimeMillis()`，不能是 `currentTimeMillis()`。**
+            //   轨迹点的时刻来自 `ev.eventTime`，那是 `SystemClock.uptimeMillis()`
+            //   基准（开机以来毫秒数，通常几千万）；而 `currentTimeMillis()` 是
+            //   墙钟（约 1.7e12）。两者相减永远是个天文数字，
+            //   `now - point.t <= RELEASE_WINDOW_MS` 恒为假 ⇒ 过滤后一个点都不剩
+            //   ⇒ 恒返回 null ⇒ **抛掷永远不触发**。
+            //   症状是"怎么甩都只是慢速落位"，而代码看起来完全正确。
+            val v = physics.estimateThrow(trail.snapshot(), android.os.SystemClock.uptimeMillis())
+            if (v != null) {
+                startThrow(v.first, v.second)
+                return
+            }
+        }
+        trail.clear()
+
+        // ── ② 拖出屏幕 → 贴边折叠 ──────────────────────────────────────
+        // ⚠️ **这一条不再受 `edgeSnap` 管**：把球拖出屏幕是个**明确的手势意图**
+        //   （"我要它变成一条缝"），与"松手后被自动吸到边上"是两回事。
+        //   原来两者共用一个开关，关掉吸附就会连带废掉贴边能力 —— 那是回归。
+        if (allowEdgeCollapse && overshoot >= dp(EDGE_OVERSHOOT_DP)) {
             enterEdge(if (overshootLeft > overshootRight) -1 else 1)
             return
         }
-        snapToEdge()
+        // ── ③ 就留在松手处（`edgeSnap` 打开时才吸附）────────────────────
+        if (appearance.edgeSnap) {
+            snapToEdge()
+            return
+        }
+        // 位置落盘：下次启动回到用户放的地方（`snapToEdge` 里也做这件事）。
+        persistPosition()
+    }
+
+    /** 把当前位置写进配置（用户拖到哪，下次启动就回到哪）。 */
+    private fun persistPosition() {
+        prefs.edit().putInt(KEY_X, curX).putInt(KEY_Y, curY).apply()
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 抛掷物理：飞、弹、滚、停、挤压
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 开始一段抛掷飞行。
+     *
+     * 用 `postOnAnimation` 逐帧推进而不是 `ViewPropertyAnimator`：后者只能走预设
+     * 曲线，而这里的轨迹依赖**每次撞墙/落地的实时反弹**，是算出来的不是插出来的。
+     *
+     * ⚠️ 与 [snapToEdge] 同理，动画的是 `layoutParams.x/y`（`moveTo`），
+     *   不是 View 的 `translationX/Y` —— 悬浮窗的位置由 WindowManager 决定，
+     *   两者会打架（表现为"飞一下又闪回原位"）。
+     */
+    private fun startThrow(vx: Float, vy: Float) {
+        val v = root ?: return
+        stopThrow()
+
+        throwState = BubblePhysics.State(curX.toFloat(), curY.toFloat(), vx, vy)
+        throwLastFrameNs = System.nanoTime()
+        Log.i(TAG, "悬浮球抛掷: v=(${vx.roundToInt()}, ${vy.roundToInt()}) px/s")
+
+        val tick = object : Runnable {
+            override fun run() {
+                val st = throwState ?: return
+                val now = System.nanoTime()
+                val dt = ((now - throwLastFrameNs) / 1_000_000_000f).coerceIn(0f, 0.05f)
+                throwLastFrameNs = now
+
+                val w = v.width.takeIf { it > 0 } ?: dp(appearance.size)
+                val h = v.height.takeIf { it > 0 } ?: dp(appearance.size)
+                val dm = context.resources.displayMetrics
+                val minY = dp(TOP_MARGIN_DP).toFloat()
+                val maxY = (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx)
+                    .coerceAtLeast(minY.toInt()).toFloat()
+
+                val step = physics.step(
+                    st, dt,
+                    minX = 0f,
+                    minY = minY,
+                    maxX = (dm.widthPixels - w).coerceAtLeast(0).toFloat(),
+                    maxY = maxY,
+                )
+
+                moveTo(st.x.roundToInt(), st.y.roundToInt())
+
+                if (step.landed) {
+                    // 落地挤压：只压 `avatarView`（内容层），不压窗口 ——
+                    // 压窗口会改变 layoutParams 尺寸，把"球的位置"也一起改了。
+                    playSquash(physics.squashScale(step.impactSpeed))
+                }
+
+                if (step.resting) {
+                    throwState = null
+                    throwRunnable = null
+                    // ⚠️ **停稳后留在落点，不吸附边缘。** 电脑版扔完宠物就停在
+                    //   落地处，哪怕屏幕正中间。这里原来无条件 `snapToEdge()`，
+                    //   后果是"扔出去的球弹几下之后又被吸回左右两边" —— 与用户
+                    //   要的"扔出去在屏幕里反弹"完全相悖（真机反馈原话：
+                    //   「它不像电脑一样可以放在手机屏幕上的任何一个位置」）。
+                    //   `edgeSnap` 打开时才回到老行为。
+                    if (appearance.edgeSnap) snapToEdge() else persistPosition()
+                    return
+                }
+                v.postOnAnimation(this)
+            }
+        }
+        throwRunnable = tick
+        v.postOnAnimation(tick)
+    }
+
+    /** 停掉抛掷（幂等）。 */
+    private fun stopThrow() {
+        throwRunnable?.let { root?.removeCallbacks(it) }
+        throwRunnable = null
+        throwState = null
+    }
+
+    /**
+     * Q 弹挤压：竖直压扁再回弹（含过冲）。
+     *
+     * ⚠️ **与 dsh-pet 逐字一致：只压 `scaleY`，不撑宽 `scaleX`，且锚点在底部。**
+     *   电脑版的实现是 `el.style.transform = 'scaleY(s)'` 配 `transformOrigin: 'bottom'`
+     *   （见 `src/client/pet.ts` 的 `startSquash`）—— 脚不动、头往下压，观感就是
+     *   "被捏扁了"。若额外把 X 撑宽，会变成"横向鼓起来"，那与电脑版**不是**同一个效果。
+     *
+     * ⚠️ **必须作用在"当前可见的内容层"上，不能只压 [avatarView]。** 内容层优先是
+     *   视频（WebView），此时 avatarView 是 `GONE` —— 只压它等于什么都没发生，
+     *   症状正是"点了没有压扁感"。所以两个视图都压：可见的那个生效，隐藏的无害。
+     *
+     * ⚠️ 锚点要设成**底部**（`pivotY = height`）：默认锚点在中心，压下去会变成
+     *   "上下一起缩"，宠物像悬在半空；锚在底部才是"踩在地上被压"。
+     */
+    private fun playSquash(depth: Float) {
+        val targets = listOfNotNull(avatarView, videoHost as? View).filter { it.visibility == View.VISIBLE }
+        if (targets.isEmpty()) return
+        val base = appearance.avatarScale
+        val d = depth.coerceIn(0f, 1f)
+        squashAnim?.cancel()
+        val anim = android.animation.ValueAnimator.ofFloat(0f, 1f)
+        anim.duration = BubblePhysics.SQUASH_MS
+        // ⚠️ 不给插值器：曲线自己带 ease-in 下压 + easeOutBack 回弹过冲，
+        //   再叠一层系统插值器会把过冲抹平（那正是"Q 弹"的来源）。
+        anim.interpolator = null
+        anim.addUpdateListener { a ->
+            val s = physics.squashCurve(a.animatedFraction, d)
+            for (v in targets) {
+                if (v.pivotY != v.height.toFloat()) v.pivotY = v.height.toFloat()
+                v.scaleY = base * s
+            }
+        }
+        anim.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: android.animation.Animator) {
+                if (squashAnim !== animation) return
+                squashAnim = null
+                // 收尾必须回到基准值：过冲段的 1.12 若留在视图上，
+                // 宠物会一直比正常高一点。
+                for (v in targets) v.scaleY = base
+            }
+        })
+        squashAnim = anim
+        anim.start()
     }
 
     private fun moveTo(x: Int, y: Int) {
@@ -2387,7 +3479,18 @@ class FloatingBubble(private val context: Context) {
         // 推送会在下一帧就被冲掉 —— 那这个能力等于不存在。
         val pushed = pushedStatus
         if (pushed.isNotEmpty()) {
-            showStatusBubble(pushed, status.running, pushedAutoHideMs())
+            showStatusBubble(pushed, status.running, pushedAutoHideMs(), showImage = false)
+            return
+        }
+        // AI 配的状态文案排第二：它是**AI 特意为这个状态写的台词**，
+        // 比引擎报来的原始动作串更贴宠物的人设。
+        //
+        // ⚠️ 判据是「文案**或**配图有一个配了」，不是只看文案：配了状态图就等于
+        //   AI 声明"这个状态我自己表达"。此时若还往下走引擎那一路，气泡里会变成
+        //   「表情包 + 正在运行命令 · sleep 10」，两种语气混在一起。
+        //   只配图不配文案正是最常见的用法（只想要头顶的表情包），必须走得通。
+        if (workStatusText.isNotEmpty() || statusImagePath.isNotEmpty()) {
+            showStatusBubble(workStatusText, status.running)
             return
         }
         val text = when {
@@ -2436,9 +3539,13 @@ class FloatingBubble(private val context: Context) {
             }
         }
         // 用当前状态刷新一次：这样即使引擎状态没变（key 相同），推送也能立刻上屏。
+        // ⚠️ 推送是"AI 主动说的话"，所以**不带状态配图**（showImage=false）：
+        //   配图描述的是运行状态（想事情 / 干活 / 出错），而一条自由文案与当前
+        //   状态没有关系 —— 挂上当前状态的图会表达错意思。要图就在配置里配
+        //   `statusImages`，让状态自己带图。
         lastStatus?.let { refreshStatusBubble(it) } ?: run {
             statusKey = ""
-            showStatusBubble(pushedStatus, false, pushedAutoHideMs())
+            showStatusBubble(pushedStatus, false, pushedAutoHideMs(), showImage = false)
         }
     }
 

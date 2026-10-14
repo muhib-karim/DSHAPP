@@ -2673,9 +2673,10 @@ window.__ModuleLoader__.load({
 			   → 面板标题撞进汉堡。
 
 			   ⚠️ **量汉堡的真实 rect，不写死像素**：
-			     汉堡 top = calc(var(--dsh-android-system-top, 0px) + 6px)，而该变量
-			     在本 App 里从未被任何代码写入（恒 0）；真正把汉堡推下去的是 WebView
-			     自身对系统栏的避让。写死 46px 在别的机型/系统栏高度上就会偏，
+			     汉堡 top = calc(var(--dsh-android-system-top, 0px) + 6px)；该变量由
+			     原生在**全面屏打开时**写入（关闭时显式写回 0px），单位是 **CSS 像素**
+			     （原生已把物理像素 ÷ density，见 MainActivity.pushSystemBarInset）。
+			     写死 46px 在别的机型/系统栏高度上就会偏，
 			     所以直接读 getBoundingClientRect().bottom —— 它是 fixed 元素，
 			     页面滚动不影响，读数恒定，也不需要知道系统栏多高。
 

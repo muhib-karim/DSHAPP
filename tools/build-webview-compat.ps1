@@ -129,7 +129,14 @@ param(
     # v17：日志分节补读一次（`mobileui/lib/client.js` 的 `refreshRef`）——
     #      改的是 mobile-ui 源码，降级产物随之变化，不 bump 会命中
     #      「戳一致 → 跳过」，插件继续是旧的（静默）。
-    [string]$CompatVersion = "17",
+    # v18：**沉浸式下汉堡整行下移**的真修复在原生
+    #      （`MainActivity.pushSystemBarInset` 把物理像素 ÷ density 换算成 CSS 像素，
+    #      原先直推 108 而页面只该让位 36，让位量被放大 3 倍）。
+    #      本版 `mobileui/lib/client.js` 只改了两处**注释**（把"该变量恒 0"这句
+    #      在修复 58 之后就已过时的话更正）—— 严格说没有行为变化，本可不 bump。
+    #      但注释变了、降级产物字节就变，两个戳只要都对得上设备就会整棵树跳过，
+    #      于是源码与设备长期不一致。宁可多 bump 一次，也不留这种中间态。
+    [string]$CompatVersion = "18",
 
     [string]$EngineBin,
     [string]$OutZip
