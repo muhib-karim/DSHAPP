@@ -4699,10 +4699,16 @@ class EngineManager private constructor(private val context: Context) {
      * （[preflight] 自动修 / [enterSafeMode] 用户显式触发），日志里必须能分清
      * 是哪一条动的 —— 否则排查时会把用户主动进安全模式误读成"体检又修了一次"。
      *
-     * @return true = 确实隔离了；false = 文件本来就不存在或改名失败。
+     * @return true = 确实隔离了；false = 路径本来就不存在或改名失败。
      */
     private fun quarantine(file: File, reason: String): Boolean {
-        if (!file.isFile) return false
+        // ⚠️ 判据是 `exists()` 而**不是** `isFile`：L1 隔离要摘的是
+        //   `profiles/web/node_modules/@deepseek-ai/<名>` —— 那是**目录**。
+        //   用 `isFile` 的话它直接返回 false，而调用方看到的是
+        //   「一个都没能隔离」⇒ 修复静默失效（真机踩过：日志里明明
+        //   「发现 1 个遮蔽副本」，下一行却是「遮蔽副本一个都没能隔离」）。
+        //   改名对目录与文件是同一个系统调用，语义完全一致。
+        if (!file.exists()) return false
         val base = "${file.name}.bak-${System.currentTimeMillis()}"
         var target = File(file.parentFile, base)
         var ordinal = 0
@@ -5298,13 +5304,23 @@ class EngineManager private constructor(private val context: Context) {
                 if (name.startsWith("@deepseek-ai/")) core += name else third += name
             }
         }
-        if (third.isEmpty()) {
-            Log.w(TAG, "L1 隔离：清单里没有第三方 bundle，不是插件问题")
+        // ⚠️ **遮蔽副本的检查必须在这里、而不是在 `third.isEmpty()` 之后**：
+        //   「profile 的 node_modules 里躺着引擎自带官方包的旧副本」与
+        //   「清单里有没有第三方 bundle」是**互相独立**的两类故障。先判 third
+        //   会让「没装第三方 bundle、却有遮蔽副本」这种形态直接走「不是插件
+        //   问题」分支，永远救不回来 —— 又一个「判据与对象不是同一个」。
+        val shadowed = shadowingOfficialCopies()
+        if (third.isEmpty() && shadowed.isEmpty()) {
+            Log.w(TAG, "L1 隔离：清单里没有第三方 bundle，也没有遮蔽副本，不是插件问题")
             return@withContext IsolationResult(
                 emptyList(), "清单里没有第三方插件 —— 不是插件问题", 0, false,
             )
         }
-        Log.w(TAG, "L1 隔离开始：${third.size} 个第三方 bundle，核心 ${core.size} 个")
+        Log.w(
+            TAG,
+            "L1 隔离开始：${third.size} 个第三方 bundle，核心 ${core.size} 个" +
+                (if (shadowed.isNotEmpty()) "，${shadowed.size} 个遮蔽引擎自带包的本地副本" else ""),
+        )
 
         // ② 备份失败就什么都不做。备份**只做一次**（幂等，I3）：
         //    判断依据是"已经存在同源备份"，避免每轮都产生一个新的 .bak-<ts>。
@@ -5343,8 +5359,61 @@ class EngineManager private constructor(private val context: Context) {
             return ok
         }
 
-        // 基线：摘掉全部第三方。失败 ⇒ 不是（仅）插件问题。
+        // 基线：摘掉全部第三方。失败 ⇒ 再试一次「摘遮蔽副本」。
         if (!tryWith(emptyList(), "baseline-all-removed")) {
+            // ⚠️ **这一步是本方法存在的第二个理由**（第一个是二分）。
+            //
+            //   真机形态（vivo V2232A / 20261014-211229-de7d4b8f，23 个真实用户包）：
+            //   用户装了第三方插件（`dsh-better-sidebar`、`@dsh-trading/*`），
+            //   pnpm 把它们**依赖的官方包旧版**一并装进了 profile：
+            //
+            //     profiles/web/node_modules/@deepseek-ai/dsh-llm@0.1.0-rc.6
+            //     profiles/web/node_modules/@deepseek-ai/dsh-tools@0.1.0-rc.8
+            //
+            //   Node 的解析顺序是**从近到远**，于是 profile 里那份旧副本**遮蔽**了
+            //   引擎自带的 0.2.0-rc.2。引擎一看版本对不上就把它禁掉：
+            //
+            //     disabling profile plugin row "llm": Plugin @deepseek-ai/dsh-llm@0.1.0-rc.6
+            //       is incompatible with dsh 0.2.0-rc.2: peerDependencies {...}
+            //
+            //   而 `llm` 是**服务提供者**：它一被禁，`agent-loop (required)` 就永远
+            //   拿不到 `llm` ⇒ `1 required plugin did not activate` ⇒ 引擎起不来。
+            //
+            //   ⚠️ **二分救不了它**：`llm` / `tools` 都是 `@deepseek-ai/` 开头，
+            //     [isolateBadBundles] 开头的分类把它们放进 `core`，而 `core`
+            //     是**恒定保留**的（`writeBundles` 自己拼 `core + keep`）。
+            //     于是「全摘第三方」这一步摘的是**宿主插件**，遮蔽副本原封不动，
+            //     试启动照样失败 ⇒ 旧代码在这里判「不是（仅）插件问题」→ 交 L2。
+            //     而 L2 换的是**另一个 profile**，用户的 web profile 一个字没动，
+            //     下次启动又走同一条路 —— **永远打不开**。
+            //
+            //   真机 A/B（同一台机器、同一份清单，只差这一个目录）：
+            //     有 profiles/web/node_modules/@deepseek-ai/dsh-llm  ⇒ 引擎起不来
+            //     删掉它                                              ⇒ 引擎立刻就绪
+            //   所以这一处不是推测，是实测出来的因果。
+            if (shadowed.isNotEmpty()) {
+                Log.w(
+                    TAG,
+                    "L1 隔离：全摘第三方仍起不来，但发现 ${shadowed.size} 个遮蔽副本" +
+                        "（${shadowed.joinToString()}）⇒ 摘掉它们再试",
+                )
+                val moved = shadowed.filter { quarantine(it, "L1 隔离") }
+                if (moved.isNotEmpty()) {
+                    val ok = tryWith(emptyList(), "shadowed-official-copies")
+                    if (ok) {
+                        Log.w(TAG, "L1 隔离完成：摘掉 ${moved.size} 个遮蔽副本后能正常启动")
+                        return@withContext IsolationResult(
+                            moved.map { it.name },
+                            "profile 里遮蔽引擎自带包的 ${moved.size} 个旧副本（" +
+                                "${moved.joinToString { it.name }}）已隔离，摘掉后能正常启动",
+                            attempts,
+                            true,
+                        )
+                    }
+                } else {
+                    Log.w(TAG, "L1 隔离：遮蔽副本一个都没能隔离，继续按原判据走")
+                }
+            }
             Log.w(TAG, "L1 隔离：全摘之后仍起不来 ⇒ 不是（仅）插件问题，交 L2")
             // ⚠️ 把用户清单**还回去**：既然不是插件问题，就不该留下改动 ——
             //   否则 L2 虽然能打开界面，用户的插件配置却被我们悄悄清空了。
@@ -5430,6 +5499,72 @@ class EngineManager private constructor(private val context: Context) {
             Log.w(TAG, "L1 隔离：备份清单失败: ${t.message}")
             false
         }
+    }
+
+    /**
+     * 找出 profile 的 `node_modules` 里**遮蔽引擎自带官方包**的本地副本。
+     *
+     * ## 为什么这是一个独立的故障类
+     *
+     * Node 的模块解析是**从近到远**：`profiles/web/node_modules/@deepseek-ai/dsh-llm`
+     * 会先于 `engine/node_modules/@deepseek-ai/dsh-llm` 被找到。用户装第三方插件时，
+     * pnpm 会把那些插件**声明的官方依赖**一并装进 profile —— 版本往往是插件发布时
+     * 锁定的旧版。于是引擎自带的 `0.2.0-rc.2` 被 profile 里那份 `0.1.0-rc.6` 顶掉，
+     * 引擎按 `peerDependencies` 判它不兼容并**禁用该 row**：
+     *
+     * ```
+     * disabling profile plugin row "llm": Plugin @deepseek-ai/dsh-llm@0.1.0-rc.6
+     *   is incompatible with dsh 0.2.0-rc.2: peerDependencies {"@deepseek-ai/dsh":"^0.1.0-rc.6"}
+     * dsh: startup failed: 1 required plugin did not activate
+     * ```
+     *
+     * 被禁的是 `llm` 这种**服务提供者**，于是 `agent-loop (required)` 永远等不到
+     * `llm` ⇒ 引擎起不来 ⇒ 界面永远打不开。
+     *
+     * ## 判据：只认「引擎里也有同名包，且版本不同」
+     *
+     * ⚠️ **不能只看「profile 的 node_modules 里有没有 @deepseek-ai/ 目录」** ——
+     *   那会把用户正常安装的、引擎里**没有**的官方扩展插件也当成遮蔽副本摘掉。
+     *   真正的遮蔽需要两个条件同时成立：
+     *     ① 引擎 `node_modules/@deepseek-ai/<名>` 存在（同名，才谈得上遮蔽）；
+     *     ② 两者的 `version` 不相等（相等时引擎不会报不兼容，摘了纯属误伤）。
+     *
+     * ⚠️ **也不能只比对版本、不看引擎有没有**：引擎里没有的同名包，摘掉就是
+     *   把用户装的插件删了 —— 那是破坏而不是修复。
+     *
+     * @return 需要隔离的目录列表（可能为空）。**不修改任何东西**，只报告。
+     */
+    private fun shadowingOfficialCopies(): List<File> {
+        val profileModules = File(dshHome, "profiles/$PROFILE_NAME/node_modules/@deepseek-ai")
+        if (!profileModules.isDirectory) return emptyList()
+        val engineModules = File(engineDir, "node_modules/@deepseek-ai")
+        val found = ArrayList<File>()
+        profileModules.listFiles()?.forEach { local ->
+            if (!local.isDirectory) return@forEach
+            val inEngine = File(engineModules, local.name)
+            if (!inEngine.isDirectory) return@forEach
+            val localVersion = packageVersion(local)
+            val engineVersion = packageVersion(inEngine)
+            // 版本读不出来时不摘：判据不成立就不动手（宁可少救，不可误伤）。
+            if (localVersion == null || engineVersion == null) return@forEach
+            if (localVersion != engineVersion) {
+                Log.w(
+                    TAG,
+                    "L1 隔离：发现遮蔽副本 ${local.name}@$localVersion" +
+                        "（引擎自带 $engineVersion）",
+                )
+                found += local
+            }
+        }
+        return found
+    }
+
+    /** 读一个包目录的 `package.json` 里的 `version`；读不出来返回 null。 */
+    private fun packageVersion(dir: File): String? = try {
+        val f = File(dir, "package.json")
+        if (!f.isFile) null else JSONObject(f.readText()).optString("version", "").ifEmpty { null }
+    } catch (_: Throwable) {
+        null
     }
 
     /**
