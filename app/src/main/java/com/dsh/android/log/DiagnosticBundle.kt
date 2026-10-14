@@ -798,6 +798,48 @@ object DiagnosticBundle {
     private fun runChecks(logDir: File, extra: List<Check>): JSONObject {
         val checks = mutableListOf<Check>()
 
+        // ⚠️ **跨 check 共用的事实只算一遍**：「最近一次启动的引擎起没起来」。
+        //
+        //   两处需要它，而它们的**判据来源不同**，这正是问题所在：
+        //     · ② `crash-scenes` —— 判据就是它，决定 fail 还是 warn；
+        //     · ⑦ `boot-tier`   —— 判据是**层级**，却顺手在文案里断言了**插件加载情况**。
+        //
+        //   原先只有 ② 算这件事（且算在 `runCatching` 块内、作用域出不来），
+        //   于是 ⑦ 只能凭 `tier == NORMAL` 写出「插件全部按配置加载」——
+        //   那是**推断，不是它检查过的事实**。引擎自己因版本不兼容禁用插件行时
+        //   （`dsh: disabling profile plugin row "…"`），tier 仍是 normal，
+        //   插件却实实在在少了一批。
+        //
+        //   真机现场（`20261014-210912-87475efa`，vivo V2232A / Android 15 /
+        //   v21 system / `debuggable:false`）**同一份** `diagnosis.json` 里两条
+        //   check 直接打架：
+        //     · `crash-scenes`: fail「最近一次启动的引擎**没能起来**（界面打不开）」
+        //     · `boot-tier`  : ok  「正常启动（未降级）：插件全部按配置加载」
+        //   而包里的 `engine.log` 是引擎自己写的：
+        //     `disabling profile plugin row "llm": …incompatible with dsh 0.2.0-rc.2`
+        //     `disabling profile plugin row "settings": …`
+        //     `agent-loop (required)      llm`
+        //     `dsh: startup failed: 1 required plugin did not activate`
+        //   插件**没有**全部加载，引擎**没有**起来。
+        //
+        //   实测 564 个包里 **24 个**（全部 `debuggable:false` 的真实用户）
+        //   同时出现上面那两句。
+        //
+        //   这是本项目缺陷族「结论与它描述的对象不是同一个」的又一例：
+        //   文案描述的是**插件加载情况**，而判据查的是**层级**。
+        //   修法是把两者对齐 —— 层级照旧由 tier 判（那确实是它的职责），
+        //   但文案不许替一个没查过的事实作保。
+        //
+        //   ⚠️ 现场里的 bootId **永远不会**等于 `BootState.bootId`（本次启动）：
+        //     失败发生在**上一次**启动里，而诊断包是用户重开 App 之后才导出的。
+        //     真机核对过 40 个包，无一例外，所以只能跟 `previous()` 比。
+        val latestStartFailedCount = runCatching {
+            val prevBoot = BootState.previous().bootId
+            CrashRecorder.listScenes().count {
+                CrashRecorder.kindOf(it) == "engine-start-failed" && sceneBootId(it) == prevBoot
+            }
+        }.getOrDefault(0)
+
         // ① 上次退出类型
         runCatching {
             val prev = BootState.previous()
@@ -850,18 +892,20 @@ object DiagnosticBundle {
         // ⚠️ 现场里的 bootId **永远不会**等于 `BootState.bootId`（本次启动）：
         //   失败发生在**上一次**启动里，而诊断包是在用户重开 App 之后才导出的。
         //   真机核对过 40 个包，无一例外。所以只能跟 `previous()` 比。
+        //
+        // ⚠️ 这件事**已经在上面算过了**（`latestStartFailedCount`），因为 ⑦
+        //   `boot-tier` 也要用同一份事实。这里直接取，**不要再算一遍** ——
+        //   同一个事实量两遍，两处就可能因为时序不同而给出不同答案。
         runCatching {
             val scenes = CrashRecorder.listScenes()
             val hard = scenes.count { CrashRecorder.isHardCrash(it) }
             val startFailed = scenes.filter { CrashRecorder.kindOf(it) == "engine-start-failed" }
-            val prevBoot = runCatching { BootState.previous().bootId }.getOrNull()
-            val latestFailed = startFailed.filter { sceneBootId(it) == prevBoot }
             checks.add(
                 when {
                     // 「最近一次启动的引擎起不来」= 界面直接不可用 ⇒ 必须 fail。
-                    latestFailed.isNotEmpty() -> Check(
+                    latestStartFailedCount > 0 -> Check(
                         "crash-scenes", "fail",
-                        "最近一次启动的引擎**没能起来**（界面打不开）：${latestFailed.size} 份 " +
+                        "最近一次启动的引擎**没能起来**（界面打不开）：$latestStartFailedCount 份 " +
                             "engine-start-failed 现场属于该次启动，详见 crashes/",
                     )
                     scenes.isEmpty() -> Check("crash-scenes", "ok", "没有崩溃现场文件")
@@ -1044,6 +1088,36 @@ object DiagnosticBundle {
         //   `state.json` 是**当前状态**（成功启动会把它清回 normal），
         //   所以它天然对齐「此刻」—— 与 ② 里那条「必须按 bootId 对齐、
         //   不能拿历史现场当现状」是同一个道理。
+        //
+        // 🔴 **但「层级是 normal」不等于「插件全部加载了」。**（2026-10-15 修，同族第 29 例）
+        //
+        //   层级只说明**救援阶梯没介入**（`RescueBoot` 没降级、没隔离、没摘 bundle）。
+        //   插件**仍然可以因为别的原因没加载** —— 最常见的是引擎自己判版本不兼容而
+        //   整行禁用：
+        //
+        //   ```
+        //   dsh: disabling profile plugin row "llm": Plugin @deepseek-ai/dsh-llm@0.1.0-rc.6
+        //        is incompatible with dsh 0.2.0-rc.2 …
+        //   dsh: disabling profile plugin row "settings": …
+        //   agent-loop (required)      llm
+        //   dsh: startup failed: 1 required plugin did not activate
+        //   ```
+        //
+        //   此时 tier 是 normal、`state.json` 里 `removedBundles: []`、
+        //   `RescueBoot` 一次都没记过失败 —— 而用户面对的是**界面打不开**。
+        //   原文案「正常启动（未降级）：插件全部按配置加载」把「阶梯没介入」
+        //   说成了「插件都加载了」，是**替一个本项没查过的事实作保**。
+        //
+        //   真机现场（`20261014-210912-87475efa`，vivo V2232A / Android 15 /
+        //   v21 system / `debuggable:false`）**同一份** `diagnosis.json` 里：
+        //     · `crash-scenes`: fail「最近一次启动的引擎**没能起来**（界面打不开）」
+        //     · `boot-tier`  : ok  「正常启动（未降级）：插件全部按配置加载」
+        //   两条直接打架。实测 564 个包里 **24 个**（全部 `debuggable:false`
+        //   的真实用户）同时出现这两句。
+        //
+        //   修法：层级照旧由 tier 判（那确实是本项的职责），但文案**只陈述
+        //   它真正查过的东西**；「引擎这次有没有起来」另有 `crash-scenes` 负责，
+        //   这里不再替它说话。
         runCatching {
             // ⚠️ `RescueBoot.tier()` 返回的是 **State**（含 tier/since/reason/…），
             //   不是 Tier 本身 —— 名字短，容易读错。这里取字段。
@@ -1053,7 +1127,10 @@ object DiagnosticBundle {
                 when (st.tier) {
                     RescueBoot.Tier.NORMAL -> Check(
                         "boot-tier", "ok",
-                        "正常启动（未降级）：插件全部按配置加载",
+                        "未进入救援阶梯（层级 normal）：没有摘除任何插件、" +
+                            "没有切换到 rescue profile。⚠️ 这只说明**阶梯没介入**，" +
+                            "不等于插件全部加载 —— 引擎自己判版本不兼容而禁用插件行时" +
+                            "层级仍是 normal。本次引擎是否真的起来了看 crash-scenes 那一项。",
                     )
                     // 降级了但界面能用 ⇒ 不是故障，但**必须让人看见**
                     RescueBoot.Tier.ISOLATED -> Check(
