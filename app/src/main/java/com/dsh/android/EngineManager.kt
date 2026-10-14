@@ -2117,6 +2117,28 @@ class EngineManager private constructor(private val context: Context) {
      * 会让老设备永远停在旧版。
      */
     private fun ensureAgnesMultimodal() {
+        // ⚠️ **必须早于下面的版本戳提前返回**：本故障只出现在老设备上（版本戳已经
+        // 是最新），放末尾就等于「永远不会执行」，修了个寂寞。
+        //
+        // 清理 profile 里的同名副本。老版本或插件管理器可能把本包装进
+        // `profiles/<p>/node_modules/`，而 App 的 overlay 又按 `file://` 挂了同一份，
+        // `dsh-client-modules` 的 `reconcilePackage()` 会判成「同一包来自两个
+        // Loader 源」并抛错 ⇒ `modules (required)` 不激活 ⇒ **引擎起不来、界面打不开**：
+        //
+        //   client-modules: package dsh-agnes-multimodal resolves from multiple active
+        //   Loader sources: "dsh-agnes-multimodal" from .../profiles/web/,
+        //   "file://.../agnes-multimodal/dsh-agnes-multimodal/lib/index.js" from .../profiles/web/
+        //
+        // 与 [ensureMobileUi] 末尾那行**同构、同一套理由**（它清的是自己那份）。
+        // 判据是「包解析得到 client bundle」而不是「目录在不在」：删掉后裸包名那条
+        // entry 的 `locatePkgJson()` 返回 undefined，源数就回到 1。
+        File(dshHome, "profiles").listFiles()?.forEach { profile ->
+            val duplicate = File(profile, "node_modules/$AGNES_MM_PACKAGE")
+            if (duplicate.exists() && duplicate.deleteRecursively()) {
+                Log.i(TAG, "已清理 profile 里重复的 $AGNES_MM_PACKAGE 副本: ${profile.name}")
+            }
+        }
+
         val target = File(dshHome, "$AGNES_MM_DIR/$AGNES_MM_PACKAGE")
         val clientJs = File(target, "lib/client.js")
         val stamp = File(target, AGNES_MM_STAMP)

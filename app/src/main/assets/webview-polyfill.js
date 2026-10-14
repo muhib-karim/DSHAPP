@@ -1062,7 +1062,127 @@
         return options && options.name ? String(options.name) : '(未命名)';
       }
 
+      // ── 上传 Worker 改走主线程 ────────────────────────────────────────
+      //
+      // 症状（服务器诊断包实证：nubia NX809J / Android 16 / WebView 143）：
+      //   composer 左下角「+」→「文件」→ 选**任意格式**都只回一句「上传失败」。
+      //   整包日志只有一行 `Worker 上报传输失败 [dsh-file-upload]:
+      //   background upload transport failed`，且**选完文件 130ms 就失败** ——
+      //   是 XHR 立刻 `onerror`，不是超时，所以既不是网络慢、也不是服务端拒绝。
+      //
+      // 为什么「发图片没事、发文件全挂」：两者走的是**两条不同的路**。图片经
+      //   `ctx.remote.fileUploads.upload`（主线程 fetch + base64 JSON），
+      //   **根本不建 Worker**；只有非图片才交给下面这个 Worker。
+      //   真机复刻（CDY-TN90 / WebView 114）跑同一份 `workerTransport()`：
+      //   同一个 Blob、同一个 URL、同样 `withCredentials` → **200**。
+      //   即失败与上传逻辑无关，是**该内核上 blob Worker 内的 XHR 不可用**。
+      //
+      // 修法：把「上传」这一个 Worker 换成主线程实现。接口面照 Worker 协议
+      //   原样提供（postMessage / onmessage / onerror / terminate /
+      //   addEventListener），`workerTransport()` 完全无感；进度用
+      //   `xhr.upload.onprogress` 照旧上报，**进度条不丢**。
+      //
+      // ⚠️ 只接管 Blob body。`upload()` 的 body 也可能是 ReadableStream，那条路
+      //   要 `duplex: 'half'` 的 fetch 语义，主线程 XHR 表达不了 —— 原样退回真
+      //   Worker，宁可维持现状也不引入新的失败面。
+      // ⚠️ 只接管 `name === 'dsh-file-upload'` 的构造，其余 Worker 一字不动。
+      var UPLOAD_WORKER_NAME = 'dsh-file-upload';
+
+      function uploadWorkerOnMainThread() {
+        // 事件中枢：`workerTransport()` 用**属性**（`onmessage`/`onerror`），
+        // 而上面的观测代码用 `addEventListener` —— 两种写法都要能收到，所以
+        // 属性存取器直接映射到同一个中枢上。
+        var bus = new EventTarget();
+        var activeXhr = null;
+
+        function emit(detail) {
+          try {
+            bus.dispatchEvent(new MessageEvent('message', { data: detail }));
+          } catch (e) {
+            /* 上报失败不能影响上传本身 */
+          }
+        }
+
+        function fail(message) {
+          console.error('[dsh-webview] 上传改走主线程后仍失败: ' + message);
+          emit({ kind: 'error', message: message });
+        }
+
+        var worker = {
+          terminate: function () {
+            if (activeXhr) {
+              try {
+                activeXhr.abort();
+              } catch (e) {
+                /* 请求已结束 */
+              }
+              activeXhr = null;
+            }
+          },
+          postMessage: function (message) {
+            var data = message || {};
+            if (!(data.body instanceof Blob)) {
+              fail('background upload worker received an invalid body');
+              return;
+            }
+            var xhr = new XMLHttpRequest();
+            activeXhr = xhr;
+            try {
+              xhr.open('POST', data.url);
+              xhr.withCredentials = true;
+              var headers = data.headers || {};
+              for (var name in headers) {
+                if (Object.prototype.hasOwnProperty.call(headers, name)) {
+                  xhr.setRequestHeader(name, headers[name]);
+                }
+              }
+              xhr.upload.onprogress = function (progress) {
+                var out = { kind: 'progress', loaded: progress.loaded };
+                if (progress.lengthComputable) out.total = progress.total;
+                emit(out);
+              };
+              xhr.onload = function () {
+                emit({ kind: 'complete', status: xhr.status, body: xhr.responseText });
+              };
+              xhr.onerror = function () {
+                fail('background upload transport failed');
+              };
+              xhr.send(data.body);
+            } catch (e) {
+              fail((e && e.message) || String(e));
+            }
+          },
+        };
+
+        worker.addEventListener = function (type, listener, options) {
+          bus.addEventListener(type, listener, options);
+        };
+        worker.removeEventListener = function (type, listener, options) {
+          bus.removeEventListener(type, listener, options);
+        };
+        ['message', 'error'].forEach(function (type) {
+          Object.defineProperty(worker, 'on' + type, {
+            get: function () {
+              return worker['__on' + type];
+            },
+            set: function (fn) {
+              var previous = worker['__on' + type];
+              if (previous) bus.removeEventListener(type, previous);
+              worker['__on' + type] = fn;
+              if (typeof fn === 'function') bus.addEventListener(type, fn);
+            },
+          });
+        });
+
+        return worker;
+      }
+
       function observed(url, options) {
+        if (options && options.name === UPLOAD_WORKER_NAME) {
+          // 打一行是**有意的**：修复是否生效只能靠它确认（真机日志里看得见）。
+          console.log('[dsh-webview] 上传 Worker 改走主线程: ' + UPLOAD_WORKER_NAME);
+          return uploadWorkerOnMainThread();
+        }
         var worker;
         try {
           worker = new NativeWorker(url, options);
