@@ -26,14 +26,14 @@
  *
  * | hook | 做什么 |
  * |---|---|
- * | `SSL_set_alpn_protos` | 把 ALPN 列表**扣住**，等知道域名之后再设 |
- * | `SSL_ctrl`（SET_SNI） | 拿到域名 → 只对目标域名降级 `http/1.1` |
- * | `SSL_write` | **随机抽一把钥匙**换上；国内站的钥匙**顺带改写 Host 头**（两处都等长） |
+ * | `SSL_set_alpn_protos` | 原样放行；仅当 SNI 已先到且已判定为目标域名时才降级 |
+ * | `SSL_ctrl`（SET_SNI） | 拿到域名 → 是目标域名就记进 SSL 的 ex_data，并**覆盖** ALPN 只留 `http/1.1` |
+ * | `SSL_write` | 报文头部同时含占位符与目标域名时，**随机抽一把钥匙**换上；国内站的钥匙**顺带改写 Host 头**（两处都等长），写完立刻还原 |
  *
  * ─────────────────────────────────────────────────────────────────────
  * ## combo：把两个站点合成「一个供应商」
  *
- * 引擎里只配**一个** provider（baseURL 用国际站域名），但 14 把钥匙分属两个
+ * 引擎里只配**一个** provider（baseURL 用国际站域名），但钥匙分属两个
  * 站点，而两站钥匙**不通用**（实测互打 401）。要让一个 provider 同时用上两站
  * 的钥匙，靠的是三个实测事实：
  *
@@ -80,7 +80,7 @@
  * ─────────────────────────────────────────────────────────────────────
  * ## 为什么是「等长替换」
  *
- * 14 个密钥实测**全部恰好 51 字符**，所以占位符也做成 51 字符：替换后
+ * 池中密钥实测**全部恰好 51 字符**，所以占位符也做成 51 字符：替换后
  * `Content-Length` 不变、缓冲区布局不变，直接原地 `memcpy` 即可。
  * 换密钥池时**长度必须一致** —— `build-keyinject.ps1` 会强校验并在不等长时
  * 直接构建失败，不允许静默放过。
@@ -94,16 +94,17 @@
  * `SSL_write` 返回后立刻抹回。代价是栈上几十字节，换来「不污染调用方缓冲区」。
  *
  * ─────────────────────────────────────────────────────────────────────
- * ## 号池：14 把钥匙，每个请求随机抽一把
+ * ## 号池：每个请求随机抽一把
  *
- * 池子按「国际站、国内站」**交错**排列：
+ * 池子按「国际站、国内站」**交错**排列（数量由生成的头文件给出，
+ * 见 `KI_CN_COUNT` / `KI_INTL_COUNT`，别把某个具体数字当常量）：
  *
- *     intl.1, cn.1, intl.2, cn.2, … intl.7, cn.7
+ *     intl.1, cn.1, intl.2, cn.2, …
  *
  * 每个带占位符的请求**独立随机**抽一个槽位（`arc4random_uniform`），所以：
  *
  *   · 两站的钥匙会被**均匀用上**，不会出现「一头配额耗尽、另一头闲着」；
- *   · 单个钥匙的速率被摊薄到 1/14，**撞 429 的概率显著下降**；
+ *   · 单个钥匙的速率被摊薄到 1/池子大小，**撞 429 的概率显著下降**；
  *   · 不再需要「失败才换」那套退避逻辑 —— 下一个请求本来就会换一把。
  *
  * ⚠️ **抽到哪把是每个请求独立的**，不维护「当前是哪把」的概念。
@@ -158,6 +159,7 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,12 +189,9 @@ typedef struct ssl_st SSL;
 _Static_assert(sizeof KI_PLACEHOLDER - 1 == KI_KEY_LEN,
                "占位符长度必须等于密钥长度：等长替换是「不用重算 Content-Length」的前提");
 
-/** 槽位上限。node 的 TLS 连接池远小于这个数；耗尽时退回「不干预」。 */
-#define MAX_SSL_SLOTS 32
-
 /* ── combo：一个域名，两个站点 ─────────────────────────────────────────── */
 
-/** 目标域名判据：两个站点域名都含它。换 baseURL 域名时必须同步改这里。 */
+/** 目标域名判据：两个站点域名都以它结尾。换 baseURL 域名时必须同步改这里。 */
 #define KI_HOST_MARKER "agnes-ai.cn"
 
 /** 国际站域名 —— 也是引擎 baseURL 用的那个（两者中较长的，18 字符）。 */
@@ -228,20 +227,107 @@ static void keyref_at(int slot, int *site, int *idx) {
     }
 }
 
-/** 每个 SSL 对象是否属于目标域名（0 = 不干预）。 */
-static SSL *slot_ssl[MAX_SSL_SLOTS];
-static int slot_target[MAX_SSL_SLOTS];
-/** 被扣住的 ALPN 列表，等 SNI 到达再设。 */
-static unsigned char slot_alpn[MAX_SSL_SLOTS][128];
-static unsigned int slot_len[MAX_SSL_SLOTS];
+/**
+ * ⚠️ **本库不再持有任何「自己管理的、每个 SSL 对象」的状态。**
+ *
+ * 早先的实现用一张**固定大小**的槽位表 `slot_ssl[MAX_SSL_SLOTS]`（32 个）
+ * 记录「这个 SSL* 是不是目标域名、它被扣住的 ALPN 列表是什么」，
+ * 而**从不释放槽位**。那是一个真实的线上故障：
+ *
+ *   · 槽位在 `SSL_set_alpn_protos` 里登记，而那个 hook 对**所有域名**都跑，
+ *     不只是 agnes —— 任何 HTTPS 连接都在消耗它；
+ *   · 32 个占满之后 `slot_of()` 返回 -1，`SSL_write` 里 `if (i >= 0 && …)`
+ *     **静默跳过注入** ⇒ 占位符原样发到上游 ⇒ 上游回 `401 Invalid token`
+ *     ⇒ 用户看到「API 密钥无效」；
+ *   · 重启 App = 进程重启 = 静态数组清零 ⇒ **自动恢复**。
+ *
+ * 现在的做法是**把这份状态交给 OpenSSL 自己管**，而不是把表调大
+ * （调大只是推迟耗尽 —— 引擎会长期保活连接，子进程还各自持有连接）：
+ *
+ *   · 「是不是目标域名」用 SSL **ex_data** 挂载：容量由 OpenSSL 分配，
+ *     随 `SSL_free` 自动失效，**没有上限、不会泄漏**；
+ *   · 降级 ALPN 改由 `SSL_ctrl(SET_SNI)` 拿到域名后**覆盖**设置 ——
+ *     OpenSSL 把 ALPN 列表暂存在 SSL 对象里、到构造 ClientHello 时才读，
+ *     所以握手前后一次设置会覆盖前一次；
+ *   · 「要不要注入」的**最终判据是报文本身**（头部区域同时含占位符和目标域名），
+ *     这比「记住某个 SSL* 是不是目标域名」更准 —— 占位符只会由内置号池的
+ *     provider 写进请求，且不会因 SSL 对象地址被回收复用而误判。
+ *
+ * 结果：不存在会耗尽的资源，天然线程安全（`SSL_write` 会被 node 的连接池
+ * 跨线程调用）。
+ */
 
 static int (*real_SSL_write)(SSL *, const void *, int);
 static int (*real_SSL_set_alpn_protos)(SSL *, const unsigned char *, unsigned int);
 static int (*real_SSL_ctrl)(SSL *, int, long, void *);
+static int (*real_SSL_set_ex_data)(SSL *, int, void *);
+static void *(*real_SSL_get_ex_data)(const SSL *, int);
+typedef void (*ki_ex_cb_t)(void);
+static int (*real_SSL_get_ex_new_index)(long, void *, ki_ex_cb_t, ki_ex_cb_t, ki_ex_cb_t);
 
 static int inject_enabled = 1;
 static int debug_on;
-static int inited;
+/** 初始化只做一次。用 `pthread_once` 而不是裸标志位：本库会被多线程并发调用。 */
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+
+/** ALPN 列表：只留 `http/1.1`（1 字节长度 + 8 字节串 = 9 字节）。 */
+static const unsigned char ALPN_ONLY_HTTP11[] = "\x08http/1.1";
+
+/**
+ * per-SSL 的「已判定为目标域名」标记 —— 用 OpenSSL 的 **ex_data** 挂载。
+ *
+ * ⚠️ 这正是本次修复的要害：旧实现用一张固定大小的全局静态表
+ * （`SSL *slot_ssl[32]`）记这件事，**且从不释放**。ex_data 的容量由 OpenSSL
+ * 自己管理、随 `SSL_free` 自动失效，**没有上限、不会泄漏、天然随对象回收**。
+ *
+ * 标记值固定为 `(void *)1`（非 NULL 即表示「是」），所以**不分配任何内存**，
+ * 注册时的 free 回调传 NULL。
+ */
+static int g_target_ex_idx = -1;
+
+/** 初始化。`pthread_once` 保证只跑一次，并发调用安全。 */
+static void init_impl(void) {
+    real_SSL_write = (int (*)(SSL *, const void *, int))dlsym(RTLD_NEXT, "SSL_write");
+    real_SSL_set_alpn_protos =
+        (int (*)(SSL *, const unsigned char *, unsigned int))dlsym(RTLD_NEXT, "SSL_set_alpn_protos");
+    real_SSL_ctrl = (int (*)(SSL *, int, long, void *))dlsym(RTLD_NEXT, "SSL_ctrl");
+    real_SSL_set_ex_data = (int (*)(SSL *, int, void *))dlsym(RTLD_NEXT, "SSL_set_ex_data");
+    real_SSL_get_ex_data = (void *(*)(const SSL *, int))dlsym(RTLD_NEXT, "SSL_get_ex_data");
+    real_SSL_get_ex_new_index = (int (*)(long, void *, ki_ex_cb_t, ki_ex_cb_t, ki_ex_cb_t))
+        dlsym(RTLD_NEXT, "SSL_get_ex_new_index");
+    if (real_SSL_get_ex_new_index != NULL) {
+        g_target_ex_idx = real_SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    }
+    /* 逃生开关：用来区分「是本库引起的」还是「本来就这样」。它不参与保密 ——
+     * 关掉之后请求会带着占位符发出去并被判 401，是个可观测的失败。 */
+    const char *off = getenv("DSH_KEYINJECT_OFF");
+    if (off != NULL && off[0] == '1') inject_enabled = 0;
+    const char *dbgv = getenv("DSH_KEYINJECT_DEBUG");
+    if (dbgv != NULL && dbgv[0] == '1') debug_on = 1;
+}
+
+static void init_once(void) {
+    (void)pthread_once(&g_init_once, init_impl);
+}
+
+/**
+ * 把这个 SSL 标记为「目标域名」。
+ *
+ * ex_data 不可用时（极端情况下 dlsym 失败）退化为**什么都不记** ——
+ * 此时 ALPN 降级仍由 `SSL_ctrl` 里的直接覆盖完成，常见调用顺序
+ * （ALPN 在前、SNI 在后）依然正确工作，只是少了「顺序反过来」那层兜底。
+ */
+static void mark_target(SSL *ssl) {
+    if (g_target_ex_idx >= 0 && real_SSL_set_ex_data != NULL) {
+        (void)real_SSL_set_ex_data(ssl, g_target_ex_idx, (void *)1);
+    }
+}
+
+/** 这个 SSL 之前是否已被判定为目标域名。 */
+static int is_target_marked(const SSL *ssl) {
+    if (g_target_ex_idx < 0 || real_SSL_get_ex_data == NULL) return 0;
+    return real_SSL_get_ex_data(ssl, g_target_ex_idx) != NULL;
+}
 
 /* ── 小工具 ───────────────────────────────────────────────────────────── */
 
@@ -280,58 +366,28 @@ static void derive_key(int site, int idx, char *out) {
     out[KI_KEY_LEN] = '\0';
 }
 
-static void init_once(void) {
-    if (inited) return;
-    inited = 1;
-    real_SSL_write = (int (*)(SSL *, const void *, int))dlsym(RTLD_NEXT, "SSL_write");
-    real_SSL_set_alpn_protos =
-        (int (*)(SSL *, const unsigned char *, unsigned int))dlsym(RTLD_NEXT, "SSL_set_alpn_protos");
-    real_SSL_ctrl = (int (*)(SSL *, int, long, void *))dlsym(RTLD_NEXT, "SSL_ctrl");
-    /* 逃生开关：用来区分「是本库引起的」还是「本来就这样」。它不参与保密 ——
-     * 关掉之后请求会带着占位符发出去并被判 401，是个可观测的失败。 */
-    const char *off = getenv("DSH_KEYINJECT_OFF");
-    if (off != NULL && off[0] == '1') inject_enabled = 0;
-    const char *dbgv = getenv("DSH_KEYINJECT_DEBUG");
-    if (dbgv != NULL && dbgv[0] == '1') debug_on = 1;
-}
-
-/** 找出 ssl 的槽位，没有就分配一个。返回 -1 表示槽位耗尽。 */
-static int slot_of(SSL *ssl) {
-    for (int i = 0; i < MAX_SSL_SLOTS; i++) {
-        if (slot_ssl[i] == ssl) return i;
-    }
-    for (int i = 0; i < MAX_SSL_SLOTS; i++) {
-        if (slot_ssl[i] == NULL) {
-            slot_ssl[i] = ssl;
-            slot_target[i] = 0;
-            return i;
-        }
-    }
-    return -1;
-}
-
 /** 域名是不是目标站点（两个 agnes 域名都算）。 */
 static int is_target_host(const char *host) {
     return find_sub(host, strlen(host), KI_HOST_MARKER, sizeof KI_HOST_MARKER - 1) != NULL;
 }
 
-/* ── hook 1：扣住 ALPN，等 SNI 到达再决定 ─────────────────────────────── */
+/* ── hook 1：ALPN 列表 ────────────────────────────────────────────────── */
 
 int SSL_set_alpn_protos(SSL *ssl, const unsigned char *protos, unsigned int len) {
     init_once();
-    if (!inject_enabled || real_SSL_set_alpn_protos == NULL || len > sizeof slot_alpn[0]) {
-        return real_SSL_set_alpn_protos(ssl, protos, len);
+    if (real_SSL_set_alpn_protos == NULL) return 0;
+    if (!inject_enabled) return real_SSL_set_alpn_protos(ssl, protos, len);
+
+    /* SNI 比 ALPN 先到的情况：那时已经知道是不是目标域名了，这里直接降级。
+     * 常见顺序是反过来的（ALPN 在前），那就原样放行，等 hook 2 覆盖。 */
+    if (is_target_marked(ssl)) {
+        dbg("alpn", "force http/1.1 (target known)");
+        return real_SSL_set_alpn_protos(ssl, ALPN_ONLY_HTTP11, sizeof ALPN_ONLY_HTTP11 - 1);
     }
-    int i = slot_of(ssl);
-    if (i < 0) return real_SSL_set_alpn_protos(ssl, protos, len);
-    memcpy(slot_alpn[i], protos, len);
-    slot_len[i] = len;
-    /* 返回 0 = 成功（OpenSSL 约定），真实调用推迟到 SSL_ctrl 里。
-     * 中间这段时间 ALPN 是「还没设」，而握手要等 SNI 之后才开始，安全。 */
-    return 0;
+    return real_SSL_set_alpn_protos(ssl, protos, len);
 }
 
-/* ── hook 2：SNI 到达 → 判断是否目标域名 + 决定 ALPN ──────────────────── */
+/* ── hook 2：SNI 到达 → 判断是否目标域名 + 降级 ALPN ──────────────────── */
 
 int SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg) {
     init_once();
@@ -340,23 +396,18 @@ int SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg) {
     if (inject_enabled && cmd == SSL_CTRL_SET_TLSEXT_HOSTNAME &&
         larg == TLSEXT_NAMETYPE_host_name && parg != NULL) {
         const char *host = (const char *)parg;
-        int i = slot_of(ssl);
-        if (i >= 0 && slot_len[i] > 0) {
-            int target = is_target_host(host);
-            slot_target[i] = target;
-            if (target) {
-                /* 只留 http/1.1：让 Authorization 与 Host 头以明文出现在
-                 * SSL_write 里。去掉 h2 是有意为之，见文件头。 */
-                unsigned char only11[16];
-                only11[0] = 8;
-                memcpy(only11 + 1, "http/1.1", 8);
-                real_SSL_set_alpn_protos(ssl, only11, 9);
-                dbg("target", host);
-            } else {
-                /* 非目标域名：原样放行，HTTP/2 保持可用。 */
-                real_SSL_set_alpn_protos(ssl, slot_alpn[i], slot_len[i]);
+        if (is_target_host(host)) {
+            /* 记在 SSL 对象自己的 ex_data 上（不是全局表，见文件里那段说明），
+             * 让「SNI 在前」的调用顺序也能在 hook 1 里降级。 */
+            mark_target(ssl);
+            /* 覆盖之前设过的 ALPN 列表，只留 http/1.1：让 Authorization 与
+             * Host 头以明文出现在 SSL_write 里。OpenSSL 把列表暂存在 SSL 对象
+             * 内、构造 ClientHello 时才读取，所以握手前重复设置是覆盖语义。
+             * 去掉 h2 是有意为之，见文件头。 */
+            if (real_SSL_set_alpn_protos != NULL) {
+                (void)real_SSL_set_alpn_protos(ssl, ALPN_ONLY_HTTP11, sizeof ALPN_ONLY_HTTP11 - 1);
             }
-            slot_len[i] = 0; /* 同一个 SSL 对象只处理一次 */
+            dbg("target", host);
         }
     }
     return real_SSL_ctrl(ssl, cmd, larg, parg);
@@ -390,9 +441,14 @@ int SSL_write(SSL *ssl, const void *buf, int num) {
         /* 必须放得下整个 key 才替换 —— 放不下就原样发出。那会被判 401，
          * 是个可观测的失败，而不是静默发出半截密钥。 */
         if (found != NULL && (size_t)(found - base) + KI_KEY_LEN <= (size_t)num) {
-            int i = slot_of(ssl);
-            if (i >= 0 && slot_target[i]) {
-                /* 每个请求独立随机抽一把 —— 两站均匀消耗，单把速率摊薄到 1/14。
+            /* ⚠️ 这里**不再查任何「这个 SSL 是不是目标域名」的状态** ——
+             * 判据就是报文本身：头部区域同时含占位符**和**目标域名。
+             * 占位符只会由内置号池的 provider 写进请求，所以这比
+             * 「记住某个 SSL*」更准，也不会因 SSL 对象地址被回收复用而误判。
+             * （旧实现在这里查全局槽位表，槽位耗尽时静默跳过 ⇒ 线上 401。） */
+            const char *host_in_hdr = find_sub(base, hdr_end, KI_HOST_MARKER, sizeof KI_HOST_MARKER - 1);
+            if (host_in_hdr != NULL) {
+                /* 每个请求独立随机抽一把 —— 两站均匀消耗，单把速率摊薄到 1/132。
                  * 抽到哪把与「上一个请求用了哪把」无关，所以没有退避状态。 */
                 int slot = (int)arc4random_uniform(POOL_COUNT);
                 int site, idx;
