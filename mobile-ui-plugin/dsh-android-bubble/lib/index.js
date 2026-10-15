@@ -189,7 +189,9 @@ Shape layer:
 - \`shape\`: "circle" | "square" | "rounded" | "path"
 - \`shapePath\`: an SVG path \`d\` string — used when \`shape\` is "path", and this is how you give the ball ANY outline (star, heart, hexagon, speech bubble, logo). Coordinates are in \`shapeViewBox\` units, not dp, so the same path scales to any \`size\`. Example five-pointed star, viewBox "0 0 100 100": \`M50 3 L61 38 L98 38 L68 60 L79 95 L50 73 L21 95 L32 60 L2 38 L39 38 Z\`. Max 4000 characters. Invalid paths fall back to a circle.
 - \`shapeViewBox\`: "minX minY width height", default "0 0 100 100".
-- \`size\`: ball diameter in dp, 24–160
+- \`size\`: ball diameter in dp, 24–160. This is the **canvas**: the background shape AND the collision box (what you can drag / tap).
+- \`contentSize\`: the **subject** (the character image) in dp, 0–400. 0 (default) = follow \`size\`, which is the old behaviour. Set it to something BIGGER than \`size\` to make the pet bigger than its background without the picture being cropped: the canvas stays small (so it still reads as a small floating ball and the collision box stays small) while the character spills over its edges freely. The window grows to fit the subject, so nothing is cut off. Use it together with \`avatar:none\` or \`bgOpacity:0\` for the classic "a big pet on a tiny invisible ball" look.
+- \`showDot\`: whether to show the little status dot at the bottom-right of the ball (green = running, hollow grey = idle). Default **false** — it sits on top of the character, so it is off unless you deliberately want a status badge.
 - \`cornerRadius\`: dp, 0–80 (only meaningful for "rounded")
 - \`bg\` / \`bg2\`: "#RRGGBB". Together they make a vertical gradient; \`bg\` alone is a solid colour. Also accepts "#AARRGGBB" if you want per-colour alpha.
 - \`border\` ("#RRGGBB") and \`borderWidth\` (dp, 0–8)
@@ -383,7 +385,7 @@ Invalid values fall back to the current value instead of failing, and unknown fi
 function pickFields(args) {
 	const fields = {};
 	const keys = [
-		'state', 'shape', 'shapePath', 'shapeViewBox', 'size', 'cornerRadius', 'opacity',
+		'state', 'shape', 'shapePath', 'shapeViewBox', 'size', 'contentSize', 'showDot', 'cornerRadius', 'opacity',
 		'bgOpacity', 'avatarOpacity', 'avatarScale',
 		'bg', 'bg2', 'border', 'borderWidth', 'avatar',
 		'frameIntervalMs', 'frameDurations', 'frameLoop', 'spriteRows', 'spriteCols',
@@ -909,7 +911,9 @@ function bubbleTool(home) {
 				shape: { type: 'string', enum: ['circle', 'square', 'rounded', 'path'] },
 				shapePath: { type: 'string', description: 'SVG path "d" for shape:"path" — any outline you like, in shapeViewBox units. Max 4000 chars.' },
 				shapeViewBox: { type: 'string', description: '"minX minY width height" for shapePath, default "0 0 100 100".' },
-				size: { type: 'number', description: 'Ball diameter in dp, 24–160.' },
+				size: { type: 'number', description: 'Ball diameter in dp, 24–160. The canvas: background shape AND collision box.' },
+				contentSize: { type: 'number', description: 'Subject (character) size in dp, 0–400. 0 = follow size. Set bigger than size to enlarge the pet WITHOUT cropping it — the window grows to fit, the canvas stays small so the collision box stays small.' },
+				showDot: { type: 'boolean', description: 'Show the bottom-right status dot (green = running, hollow grey = idle). Default false.' },
 				cornerRadius: { type: 'number', description: 'dp, 0–80.' },
 				opacity: { type: 'number', description: 'Global opacity multiplier, 0.05–1.' },
 				bgOpacity: { type: 'number', description: '0–1, affects the background shape ONLY. 0 = fully transparent background.' },
@@ -1264,6 +1268,8 @@ function describeCall(args) {
 		bits.push(args.pinAction === '' ? '动作恢复自动' : `钦定动作 ${args.pinAction}`);
 	}
 	if (args?.size !== undefined) bits.push(`${args.size}dp`);
+	if (args?.contentSize !== undefined) bits.push(`主体 ${args.contentSize}dp`);
+	if (args?.showDot !== undefined) bits.push(args.showDot ? '显示状态点' : '隐藏状态点');
 	if (args?.shape !== undefined) bits.push(String(args.shape));
 	if (args?.shapePath !== undefined) bits.push('自定义形状');
 	if (args?.bg !== undefined) bits.push(String(args.bg));

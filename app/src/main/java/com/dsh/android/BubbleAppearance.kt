@@ -54,7 +54,9 @@ import java.io.File
  * | `shape` | string | `circle` / `square` / `rounded` / **`path`**（用 `shapePath`） |
  * | `shapePath` | string | SVG path 的 `d`，如 `M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z` |
  * | `shapeViewBox` | string | `shapePath` 的坐标系，默认 `0 0 100 100` |
- * | `size` | int(dp) | 球的直径，24~160 |
+ * | `size` | int(dp) | **画布**直径，24~160。既是底色形状的尺寸，也是碰撞箱 |
+ * | `contentSize` | int(dp) | **主体**尺寸，0 = 跟随 `size`，1~400。> 0 时主体不被画布裁切 |
+ * | `showDot` | bool | 是否显示右下角状态点。默认 **false**（不显示） |
  * | `cornerRadius` | int(dp) | `rounded` 形状的圆角 |
  * | `opacity` | float | **整体**不透明度 0.05~1.0 |
  * | `bgOpacity` | float | **只压背景层** 0~1（0 = 背景全透明，露出下层应用） |
@@ -96,6 +98,48 @@ data class BubbleAppearance(
     val shapePath: String = "",
     val shapeViewBox: String = BubbleShapeDrawable.DEFAULT_VIEW_BOX,
     val size: Int = 44,
+    /**
+     * **主体（宠物形象）的尺寸**，dp。0 = 跟随 [size]（老行为）。
+     *
+     * ## 为什么要有它
+     *
+     * 在这之前 [size] **一个数同时管三件事**：球（画布）的直径、内容层的尺寸、
+     * 碰撞范围。于是"画布小、主体大"这个桌面宠物最常见的形态**根本表达不出来** ——
+     * 把 [avatarScale] 调到 1 以上确实能放大主体，但溢出画布的部分会被画布的
+     * `clipChildren` 裁掉，看起来就是"图被切了"。
+     *
+     * 现在拆成两个数：
+     *
+     * ```
+     *   ┌──────────────────────────┐  ← 窗口包围盒 boxPx（透明）
+     *   │        ┌────────┐        │
+     *   │        │  画布  │        │  size        = 底色形状 + **碰撞箱**
+     *   │        │ ┌────┐ │        │
+     *   │        │ │主体│ │        │  contentSize = 宠物形象，**不被画布裁切**
+     *   │        │ └────┘ │        │
+     *   │        └────────┘        │
+     *   └──────────────────────────┘
+     * ```
+     *
+     * ⚠️ **设了本字段（> 0）就进入"主体独立"模式**，两个行为会跟着变：
+     *   ① 主体不再被画布（含 [shapePath] 的星形/心形轮廓）裁切；
+     *   ② 窗口放大到能容纳主体的包围盒，空白处**不吃触摸**（只有画布那块接收），
+     *      所以透明区域不会挡住下层应用。
+     *
+     * ⚠️ 留 0 时**逐字保持改动前的行为**，老配置零回归。
+     */
+    val contentSize: Int = 0,
+    /**
+     * 是否显示球右下角那个**状态点**（在跑=实心绿，空闲=空心灰）。
+     *
+     * ⚠️ 默认 **false（不显示）**，这是改过的。原来那个点是常显的，但它压在
+     *   宠物形象上，跟桌面宠物的观感冲突 —— 用户点名要删。留 [showDot] 只是为了
+     *   让"我就想要个运行状态指示"的人能开回来。
+     *
+     * ⚠️ 展开面板顶栏那个 `panelDot` **不受本字段影响**：那里是面板自己的图例，
+     *   与球上的角标不是一回事。
+     */
+    val showDot: Boolean = false,
     val cornerRadius: Int = 16,
     val opacity: Float = 1f,
     val bgOpacity: Float = 1f,
@@ -475,6 +519,10 @@ data class BubbleAppearance(
                 shapePath = textOf(o, "shapePath", base.shapePath, MAX_SHAPE_PATH_CHARS),
                 shapeViewBox = textOf(o, "shapeViewBox", base.shapeViewBox, 64),
                 size = clampInt(o, "size", base.size, 24, 160),
+                // ⚠️ 下界是 0 而不是 1：0 是**合法取值**（= 主体跟随画布，老行为），
+                //   写成 1 会让没法退回"主体跟着画布走"。
+                contentSize = clampInt(o, "contentSize", base.contentSize, 0, 400),
+                showDot = if (o.has("showDot")) o.optBoolean("showDot", base.showDot) else base.showDot,
                 cornerRadius = clampInt(o, "cornerRadius", base.cornerRadius, 0, 80),
                 opacity = clampFloat(o, "opacity", base.opacity, 0.05f, 1f),
                 bgOpacity = clampFloat(o, "bgOpacity", base.bgOpacity, 0f, 1f),
@@ -1263,6 +1311,10 @@ data class BubbleAppearance(
                 put("shapePath", appearance.shapePath)
                 put("shapeViewBox", appearance.shapeViewBox)
                 put("size", appearance.size)
+                // ⚠️ 与 `size` 一样必须落盘：漏了的话"主体独立"只在本次运行有效，
+                //   重开 App 主体就缩回画布大小 —— 表现为"宠物重启就变小了"。
+                put("contentSize", appearance.contentSize)
+                put("showDot", appearance.showDot)
                 put("cornerRadius", appearance.cornerRadius)
                 put("opacity", appearance.opacity.toDouble())
                 put("bgOpacity", appearance.bgOpacity.toDouble())

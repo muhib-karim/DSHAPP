@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 21
+        versionCode = 22
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -50,6 +50,16 @@ android {
         //    现在由 `RescueBoot.parseGatewayFailure` 认引擎自己那句话，命中即
         //    自动降级到救援模式并重启（零操作）。versionName 不变，靠 versionCode
         //    区分（20 已作为 `0.2.9-immersive` 发出，**不能**倒退或重发同号）。
+        //
+        // ⚠️ 22（本次）是 21 之后的一整夜修复。21 已于 10-14 23:45 作为
+        //    `DSH0.2.9-bubble.apk` 发出（提交 `555bc39`，23:36 设的 vc21），
+        //    而其后 6 次提交（`e671f58` 跨进程补传互斥、`fa8b6a5` ELF 用运行时
+        //    真实包名、`097211f` 救援日志落盘 + rescue/ 进诊断包、`05ec03e`
+        //    L1 隔离过期快照、`3cea637` boot-tier 文案）**全部落在 vc21 上**。
+        //    不 bump 就会有两个内容不同的 APK 都自称 `0.2.9-rescue (21)` ——
+        //    正是本项目缺陷族「结论与它描述的对象不是同一个」在发布版上的翻版：
+        //    诊断包里的 `0.2.9-rescue (21)` 再也无法指向唯一一份代码。
+        //    versionName 仍不变，靠 versionCode 区分（既有惯例，见上）。
         versionName = "0.2.9-rescue"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
