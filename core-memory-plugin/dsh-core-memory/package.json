@@ -1,6 +1,6 @@
 {
   "name": "dsh-core-memory",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Cross-session persistent memory for DeepSeek Harness: OpenClaw-style core memory always injected into every session, plus archival notes with seven model tools and a user-configurable AI reply-style (persona) settings page.",
   "type": "module",
   "main": "lib/index.js",
@@ -25,7 +25,9 @@
     "cross-session",
     "long-term-memory",
     "persona",
-    "markdown"
+    "markdown",
+    "dshapp-plugin",
+    "dshapp-plugin-featured"
   ],
   "license": "MIT",
   "dsh": {
