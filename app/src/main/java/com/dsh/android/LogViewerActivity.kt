@@ -316,9 +316,137 @@ class LogViewerActivity : AppCompatActivity() {
             toast("已刷新")
         }
         findViewById<TextView>(R.id.logCopy).setOnClickListener { copyAll() }
+        findViewById<TextView>(R.id.logPlugins).setOnClickListener { showPluginSheet() }
         findViewById<TextView>(R.id.logExport).setOnClickListener { exportBundle() }
         findViewById<TextView>(R.id.logUpload).setOnClickListener { upload() }
         findViewById<TextView>(R.id.logClear).setOnClickListener { confirmClear() }
+    }
+
+    // ── 插件开关（App 打不开时唯一的自救动作）──────────────────────────────
+
+    /**
+     * 弹出插件清单，让用户摘掉/装回某个 bundle。
+     *
+     * ## 为什么这个功能必须长在这个界面上
+     *
+     * 真机现场（OPPO PHY110）：用户在手机上写插件写到一半退出 App，留下的
+     * `client.js` 里多一个 `)`；而前端把所有插件的 client 半**合并成一批**
+     * 下发，一个坏段让整批解析失败 ⇒ 界面变成 `Failed to load plugins`
+     * 整页错误。引擎健康、数据完好，界面却进不去。
+     *
+     * 当时唯一的救法是：在电脑上用 adb 改 `profiles/web/package.json`
+     * 再重启。普通用户没有 adb，只能卸载重装 —— 而那会清掉全部会话与凭据。
+     *
+     * 本界面是**唯一在界面打不开时仍然可达的原生界面**（入口是启动层上那个
+     * 任何状态都显示的「查看日志」，见 activity_main.xml 的 overlayLogs），
+     * 所以自救动作只能放这里。放设置页没用 —— 那个页面正是打不开的那一环。
+     *
+     * ## 为什么是「摘掉」而不是「修好」
+     *
+     * 修好一个语法错误需要看代码、改文件、验证，那是 AI 干的活 ——
+     * 而 AI 要进对话才能干活。所以这里的职责只有一件：
+     * **把挡路的东西挪开，让用户进得去对话**，剩下的交给 AI。
+     */
+    private fun showPluginSheet() {
+        val profileDir = File(filesDir, "home/.dsh/profiles/web")
+        val read = PluginManifest.read(profileDir)
+        if (read == null) {
+            // ⚠️ 读失败与「没有插件」必须分开说。前者用户要去找 AI 修
+            //   package.json，后者只是清单里没第三方插件。
+            AlertDialog.Builder(this)
+                .setTitle(R.string.logs_plugins)
+                .setMessage(R.string.logs_plugins_unreadable)
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        val (_, entries) = read
+        val third = entries.filter { !it.isProtected }
+        if (third.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.logs_plugins)
+                .setMessage(getString(R.string.logs_plugins_none))
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+
+        // 每一项显示包名 + 当前状态；点一下切换。官方 bundle 不列（不可摘，
+        // 列出来只会让用户点到一个必然失败的项）。
+        val labels = third.map { it.name }.toTypedArray()
+        val checked = BooleanArray(third.size) { true } // 在清单里 = 已启用
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.logs_plugins_title, third.size))
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                checked[which] = isChecked
+            }
+            .setNegativeButton("取消", null)
+            .setPositiveButton(R.string.logs_plugins_apply) { _, _ ->
+                applyPluginToggles(profileDir, third, checked)
+            }
+            .show()
+    }
+
+    /**
+     * 应用勾选结果：与磁盘上的清单求差集，逐项摘掉/装回，然后重启引擎。
+     *
+     * ⚠️ **只在真的有变化时才重启**：重启要十几秒，用户点开看一眼再取消
+     *   不该触发它。
+     * ⚠️ **重启走 [EngineManager.requestRestart]**：它内部先 `stop()` 再置
+     *   `State.Dead`，而 `MainActivity` 的 `Dead` 分支会重新 `start()` 并重载
+     *   界面 —— 与我在电脑上用 adb 改完文件后手动重启是**同一条路径**。
+     */
+    private fun applyPluginToggles(
+        profileDir: File,
+        entries: List<PluginManifest.Entry>,
+        checked: BooleanArray,
+    ) {
+        var changed = 0
+        val failures = mutableListOf<String>()
+        entries.forEachIndexed { i, e ->
+            val wantEnabled = checked[i]
+            // 当前在清单里 = 启用。wantEnabled 与它不同才动手。
+            val ok = PluginManifest.setBundle(profileDir, e.name, remove = !wantEnabled)
+            if (ok.first) {
+                changed++
+            } else {
+                failures += "${e.name}: ${ok.second}"
+            }
+        }
+        if (failures.isNotEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.logs_plugins_failed)
+                .setMessage(failures.joinToString("\n\n"))
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        if (changed == 0) {
+            toast(getString(R.string.logs_plugins_unchanged))
+            return
+        }
+        // ⚠️ 二次确认：重启会中断用户当前正在看的东西（虽然数据不丢）。
+        AlertDialog.Builder(this)
+            .setTitle(R.string.logs_plugins_restart_title)
+            .setMessage(getString(R.string.logs_plugins_restart_msg, changed))
+            .setNegativeButton("稍后", null)
+            .setPositiveButton(R.string.logs_plugins_restart_now) { _, _ ->
+                restartEngine()
+            }
+            .show()
+    }
+
+    /** 重启引擎（界面会随之重载）。失败要如实说，不能静默。 */
+    private fun restartEngine() {
+        runCatching {
+            EngineManager.get(applicationContext).requestRestart("用户在日志界面切换插件")
+        }.onSuccess {
+            toast(getString(R.string.logs_plugins_restarting))
+            finish()
+        }.onFailure {
+            DshLog.e(DshApplication.TAG, "重启引擎失败: ${it.message}", it)
+            toast(getString(R.string.logs_plugins_restart_failed, it.message ?: "未知错误"))
+        }
     }
 
     // ── 动作 ─────────────────────────────────────────────────────────────────

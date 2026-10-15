@@ -387,6 +387,18 @@ class MainActivity : AppCompatActivity() {
     private var autoSafeModeInFlight = false
 
     /**
+     * 「浏览器侧插件加载失败 ⇒ 降级救援」是否正在进行（[maybeRescueFromWebFailure] 的重入锁）。
+     *
+     * ⚠️ 必须有：前端加载失败后会**重复**打印 `Failed to load plugins`（它自己会重试
+     *   拉那批合并 bundle），而每次降级都是一次 `requestRestart` —— 不判重会叠起
+     *   多次重启，两次 `stop()`/`start()` 交错，最终可能两个都没起来。
+     *
+     * ⚠️ 用 `AtomicBoolean` 而不是普通 `var`：`onConsole` 由内核在自己的线程上回调，
+     *   与主线程上的降级流程不是同一个线程。
+     */
+    private val webRescueInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
      * 承载页面的内核进程死了 —— 重载界面把它带回来。
      *
      * ## 为什么这件事必须由宿主做
@@ -1107,6 +1119,23 @@ class MainActivity : AppCompatActivity() {
                     //   真机 72/74 个包的 `app.log` 里混着这类重复行。
                     //   落盘已由 `LogStore.web` 负责，这里只要 logcat，所以用全限定名。
                     android.util.Log.i(DshApplication.TAG, "[web] $line")
+                    // ⚠️ **第四种故障形态：引擎健康，但浏览器侧有一个插件的
+                    //   client 半加载不了。** 真机现场（OPPO PHY110）：用户在写
+                    //   插件的过程中退出 App，留下的半成品 client.js 里有一个多余
+                    //   的 `)`，于是**整批合并 bundle 解析失败** —— 一个坏段让
+                    //   `Failed to load plugins` 整页顶掉 GUI，用户进不去对话。
+                    //
+                    // ⚠️ 引擎那条路径（[RescueBoot.parseGatewayFailure]）**盖不到
+                    //   这一种**：它的判据是引擎 stdout 里的
+                    //   `typert contributor(s) failed to register`，而这次的引擎
+                    //   一切正常（`dsh-gateway-ui: 已激活`、供应商也注册上了），
+                    //   坏的是发给浏览器的 JS。所以判据必须落在浏览器 console 上。
+                    //
+                    // ⚠️ 判据用**前端自己打印的那句话**，与其它三处同一原则：
+                    //   `Failed to load plugins` 只在 client 半加载失败时出现。
+                    //   `import failed` / `did not activate` 单独都不够 ——
+                    //   `did not activate` 在正常告警里也会出现。
+                    maybeRescueFromWebFailure(line)
                 },
                 onExternalUrl = { url ->
                     runCatching {
@@ -2605,6 +2634,98 @@ class MainActivity : AppCompatActivity() {
                 // 放开重入锁：`enterSafeMode` 已把层级记成 SAFE_MODE，判据此后
                 // 不会再成立，所以这里放开是安全的（不会导致反复触发）。
                 autoSafeModeInFlight = false
+            }
+        }
+    }
+
+    /**
+     * 浏览器侧插件加载失败 ⇒ 自动降级到救援模式（不加载任何第三方插件）。
+     *
+     * ## 这是第四种故障形态，前三处判据都盖不到
+     *
+     * | 形态 | 判据落点 | 引擎 |
+     * |---|---|---|
+     * | 启动即崩 | stdout `startup failed` | 没起来 |
+     * | 起来了但 typert gateway 下线 | stdout `typert contributor(s) failed to register` | 起来了、功能废 |
+     * | 已降级仍失败 | 同上 | 起来了 |
+     * | **本次：client 半加载失败** | **浏览器 console `Failed to load plugins`** | **完全健康** |
+     *
+     * 真机现场（OPPO PHY110，用户「做插件做到一半退出 App」）：引擎日志一切正常
+     * （`dsh-gateway-ui: 已激活`、`已注册供应商 wb-gateway`），但前端整页变成
+     * `Failed to load plugins` —— 一个插件的 `client.js` 里多了一个 `)`，
+     * 而前端把所有插件的 client 半**合并成一批**下发，一个坏段让整批解析失败。
+     *
+     * ## 为什么救援模式能解决它
+     *
+     * 救援 profile **不含任何第三方 bundle**（见 [EngineManager.ensureRescueProfile]），
+     * 所以那批合并 bundle 里根本不会有坏段 ⇒ 界面正常渲染 ⇒ 用户进得去对话，
+     * 而对话里正好可以让 AI 把插件修好（这正是用户要的）。
+     *
+     * ## ⚠️ 三条守卫，缺一不可
+     *
+     * ① **只推一次**（[webRescueInFlight]）：前端会**重复**打印这句话（重试加载），
+     *    不判重会叠起多次重启。
+     * ② **只在 NORMAL 态推**：已是 RESCUE 还推没有意义，且会把横幅的 `since`
+     *    刷成每次启动的时刻。同 `EngineManager` 里那处的论证。
+     * ③ **`rescueAvailable == false` 时不推**：那个 profile 建不出来，推过去
+     *    下次启动直接失败。
+     *
+     * ⚠️ 推完**不设 Ready**、状态打 [EngineManager.State.Dead] 而不是 `Failed` ——
+     *   `Failed` 会把用户引向**破坏性**的「安全模式」按钮（推开配置 + 重解包 15 秒），
+     *   而这里引擎是好的，只需要换个 profile 重启。与 `EngineManager` 里
+     *   gateway 那条降级路径的取舍完全一致。
+     */
+    private fun maybeRescueFromWebFailure(line: String) {
+        // 判据：前端自己打印的那句话。⚠️ 大小写与措辞都照抄前端原文。
+        if (!line.contains("Failed to load plugins")) return
+        // ① 判重（这条 console 会重复出现）
+        if (!webRescueInFlight.compareAndSet(false, true)) return
+        // ② 只在 NORMAL 态推
+        val tierNow = RescueBoot.tier().tier
+        if (tierNow != RescueBoot.Tier.NORMAL) {
+            Log.w(
+                DshApplication.TAG,
+                "[web-rescue] 浏览器侧插件加载失败，但层级已是 ${tierNow.id}，不再降级",
+            )
+            return
+        }
+        // ③ 救援 profile 必须可用
+        val engine = EngineManager.get(this)
+        if (!engine.rescueAvailable) {
+            Log.w(DshApplication.TAG, "[web-rescue] 浏览器侧插件加载失败，但救援 profile 不可用，无法降级")
+            webRescueInFlight.set(false)
+            return
+        }
+
+        Log.e(
+            DshApplication.TAG,
+            "[web-rescue] 浏览器侧插件加载失败（引擎健康，坏的是 client 半）—— 降级到救援模式并重启界面",
+        )
+        EventLog.record("web.plugin-load-failed", mapOf("line" to line.take(200)))
+
+        lifecycleScope.launch {
+            try {
+                showOverlay(
+                    "有插件加载不了，正在进入救援模式…",
+                    hint = "本次启动不加载任何第三方插件，界面马上就能用。" +
+                        "你的会话、凭据、工作区都不会丢。",
+                )
+                // ⚠️ 先武装首帧等待 + 清「已收起」标记：这一轮之后要重新加载界面，
+                //   同 [autoEnterSafeMode] 的两条论证。
+                resetFirstFrameAwait()
+                overlayDismissed = false
+                RescueBoot.setTier(
+                    RescueBoot.Tier.RESCUE,
+                    "浏览器侧插件加载失败（Failed to load plugins）",
+                )
+                refreshRescueBanner()
+                engine.requestRestart("浏览器侧插件加载失败，切救援模式")
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.e(DshApplication.TAG, "[web-rescue] 降级失败", t)
+                webRescueInFlight.set(false)
+                showOverlay("进入救援模式失败", hint = t.message, isError = true)
             }
         }
     }

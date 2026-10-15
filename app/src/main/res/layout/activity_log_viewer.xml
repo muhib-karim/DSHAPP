@@ -226,6 +226,41 @@
             android:paddingEnd="12dp"
             android:paddingBottom="10dp">
 
+            <!--
+              插件开关 —— **本界面上唯一能改变 App 状态的动作**。
+
+              ## 为什么必须在这里
+
+              真机现场（OPPO PHY110）：用户写插件写到一半退出 App，留下的
+              `client.js` 里多了一个 `)`，而前端把**所有插件的 client 半合并成
+              一批**下发 —— 一个坏段让整批解析失败，界面变成
+              「Failed to load plugins」整页错误。引擎完全健康、数据完好，
+              用户却进不去对话。
+
+              当时唯一的救法是在电脑上用 adb 改 `profiles/web/package.json`
+              （把坏 bundle 从 `dsh.profile.bundles` 里摘掉）再重启。
+              而普通用户手上没有 adb、没有电脑、也进不去设置页 ——
+              只能卸载重装，那会清掉全部会话与凭据。
+
+              ## 为什么放在这个界面
+
+              因为它是**唯一在界面打不开时仍然可达的原生界面**
+              （入口是启动层上那个任何状态都显示的「查看日志」按钮，
+              见 activity_main.xml 的 overlayLogs）。放在 Web GUI 的设置页里
+              没用 —— 那个页面恰恰就是打不开的那一环。
+
+              ## 动作边界
+
+              只做两件事：把某个 bundle 从清单里摘掉 / 装回去，然后重启引擎。
+              **官方 bundle（`@deepseek-ai/*`）不可摘**（摘了引擎就废），
+              所以它们压根不出现在列表里 —— 用「不显示」代替「禁用了但看得见」，
+              少一层状态。
+            -->
+            <TextView
+                android:id="@+id/logPlugins"
+                style="@style/LogAction"
+                android:text="@string/logs_plugins" />
+
             <TextView
                 android:id="@+id/logExport"
                 style="@style/LogAction"

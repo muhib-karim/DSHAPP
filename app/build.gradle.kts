@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 22
+        versionCode = 23
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -59,6 +59,25 @@ android {
         //    不 bump 就会有两个内容不同的 APK 都自称 `0.2.9-rescue (21)` ——
         //    正是本项目缺陷族「结论与它描述的对象不是同一个」在发布版上的翻版：
         //    诊断包里的 `0.2.9-rescue (21)` 再也无法指向唯一一份代码。
+        //    versionName 仍不变，靠 versionCode 区分（既有惯例，见上）。
+        //
+        // ⚠️ 23（本次）补的是**第五种故障形态**，也是此前唯一「用户完全没救」
+        //    的一种：引擎**完全健康**（`dsh-gateway-ui: 已激活`、供应商注册成功），
+        //    但某个插件的 **client 半**有语法错误 —— 而前端把所有插件的 client 半
+        //    **合并成一批**下发（`/plugins/??a/client.js,b/client.js,…`），
+        //    一个段坏就让**整批**解析失败 ⇒ 界面变成 `Failed to load plugins`
+        //    整页错误。真机现场（OPPO PHY110）：用户写插件写到一半退出 App。
+        //
+        //    此前四道门（L1 隔离 / L2 救援 / L3 安全模式 / 21 的 gateway 判据）
+        //    **一道都进不去**：它们的判据全部读引擎 stdout，而引擎这次没说错话；
+        //    唯一能自救的信箱 `rescue-cmd.json` 又只有 AI 能写，而 AI 要进对话
+        //    才能写 —— 死锁。当时只能靠电脑上的 adb 改 `profiles/web/package.json`
+        //    再重启，普通用户只能卸载重装（清掉全部会话与凭据）。
+        //
+        //    现在把那个动作做成了 App 内的按钮：日志界面（**唯一在界面打不开时
+        //    仍然可达的原生界面**，入口是启动层上任何状态都显示的「查看日志」）
+        //    新增「插件」动作 —— 列出第三方 bundle，可摘掉/装回，然后重启。
+        //    官方 bundle（「@deepseek-ai/」开头）不列出、也拒绝摘除。
         //    versionName 仍不变，靠 versionCode 区分（既有惯例，见上）。
         versionName = "0.2.9-rescue"
 

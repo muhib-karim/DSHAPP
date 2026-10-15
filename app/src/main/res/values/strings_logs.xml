@@ -17,6 +17,27 @@
     <string name="logs_copy">复制全部</string>
     <string name="logs_refresh">刷新</string>
     <string name="logs_clear">清空</string>
+    <string name="logs_plugins">插件</string>
+
+    <!--
+      ══ 插件开关（App 打不开时的自救）══════════════════════════════════════
+
+      ⚠️ 这一组文案的读者是「界面已经打不开、正着急的用户」，所以必须：
+      ① 说清**摘掉插件不会丢数据**（他最怕的是这个）；
+      ② 说清**为什么值得摘**（进去之后才能让 AI 修）；
+      ③ 不用「bundle」这类内部词，除非同时给出人话解释。
+    -->
+    <string name="logs_plugins_title">插件（%1$d 个）</string>
+    <string name="logs_plugins_apply">应用</string>
+    <string name="logs_plugins_none">当前没有第三方插件。\n\n界面若仍然打不开，问题不在插件上 —— 请把诊断包发给开发者。</string>
+    <string name="logs_plugins_unreadable">读不到插件清单（profiles/web/package.json 不是合法 JSON 或被删了）。\n\n这正是界面打不开的常见原因。请进对话后让 AI 修它；若进不去，请把诊断包发给开发者。</string>
+    <string name="logs_plugins_failed">改动没能生效</string>
+    <string name="logs_plugins_unchanged">没有改动</string>
+    <string name="logs_plugins_restart_title">需要重启才能生效</string>
+    <string name="logs_plugins_restart_msg">已改动 %1$d 项插件。\n\n重启后生效（约十几秒）。你的会话、凭据、工作区都不会丢。</string>
+    <string name="logs_plugins_restart_now">立即重启</string>
+    <string name="logs_plugins_restarting">正在重启…</string>
+    <string name="logs_plugins_restart_failed">重启失败：%1$s</string>
 
     <!--
       空态文案。
