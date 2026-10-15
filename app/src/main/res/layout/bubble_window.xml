@@ -21,33 +21,6 @@
 
     <!-- ══ 收起态：头像气泡 ══ -->
     <!--
-      ## 为什么画布外面要包一层 `bubbleBox`
-
-      为了让**主体（宠物形象）可以比画布大，且不被裁**。
-
-      窗口的尺寸就是本层算出来的尺寸，而**窗口的 Surface 是硬边界** —— 画到窗口
-      之外的像素会被 WindowManager 直接丢掉，`clipChildren=false` 也救不回来。
-      所以"画布 44dp、主体 120dp"这件事在一层里表达不出来：要么窗口 44dp
-      （主体被丢），要么窗口 120dp 但那是画布跟着一起放大。
-
-      拆成两层之后：
-
-      ```
-        bubbleBox    边长 = max(画布, 主体) —— 窗口真正的大小，**装得下主体**
-          └ bubbleCircle  边长 = 画布（size），clipChildren=false —— 不裁主体
-               └ 主体（头像/视频/帧集）边长 = contentSize，居中 → 从画布四周溢出
-      ```
-
-      ⚠️ 本层尺寸由代码设（`applyAppearanceToViews`），XML 里的 `wrap_content` 只是
-         兜底：主体没配（`contentSize` 为 0）时它自然等于画布，也就是改动前的形态。
-      ⚠️ 展开态/贴边态必须把它设成 GONE，否则它那个固定边长会把面板与薄片顶开。
-    -->
-    <FrameLayout
-        android:id="@+id/bubbleBox"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content">
-
-    <!--
       ⚠️ 用 BubbleTouchFrame 而不是 FrameLayout：内容层可能是 WebView（视频素材），
          而 WebView 会在 native 层吃掉 ACTION_DOWN，导致挂在父容器上的拖动/点击
          逻辑完全收不到事件（症状：球能显示，但拖不动、点不开）。
@@ -58,7 +31,6 @@
         android:id="@+id/bubbleCircle"
         android:layout_width="44dp"
         android:layout_height="44dp"
-        android:layout_gravity="center"
         android:background="@drawable/bubble_circle_bg"
         android:elevation="8dp">
 
@@ -119,7 +91,6 @@
             android:layout_marginEnd="5dp"
             android:layout_marginBottom="5dp" />
     </com.dsh.android.BubbleTouchFrame>
-    </FrameLayout>
 
     <!-- ══ 贴边态：拖出屏幕后剩下的那条薄片 ══ -->
     <!--

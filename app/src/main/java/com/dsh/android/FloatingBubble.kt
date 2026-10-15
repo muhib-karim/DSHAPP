@@ -5,7 +5,6 @@ import android.animation.ObjectAnimator
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.Region
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
@@ -18,7 +17,6 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -155,6 +153,7 @@ class FloatingBubble(private val context: Context) {
 
         /** 判定"点击"而非"拖动"的位移阈值（dp）。与系统 ViewConfiguration 同量级。 */
         private const val TAP_SLOP_DP = 6
+
         /**
          * 判定"拖出屏幕"的越界阈值（dp）。
          *
@@ -439,9 +438,11 @@ class FloatingBubble(private val context: Context) {
             return true
         }
 
-        /** 读回当前外观配置（JSON 文本）。插件据此做「读取-修改-写回」。 */        fun currentAppearanceJson(): String {
+        /** 读回当前外观配置（JSON 文本）。插件据此做「读取-修改-写回」。 */
+        fun currentAppearanceJson(): String {
             val ctx = appContext ?: return "{}"
             val a = BubbleAppearance.load(ctx)
+            val action = instance?.frameAction ?: BubbleFrames.DEFAULT_ACTION
             return JSONObject().apply {
                 put("state", a.state)
                 put("shape", a.shape)
@@ -450,10 +451,15 @@ class FloatingBubble(private val context: Context) {
                 put("shapePath", a.shapePath)
                 put("shapeViewBox", a.shapeViewBox)
                 put("size", a.size)
-                // ⚠️ 这两个**必须读回**：插件靠「读取-修改-写回」工作，读回里没有
-                //   就会被它当成 undefined 再写回默认值，用户配的会被悄悄抹掉。
-                put("contentSize", a.contentSize)
+                // ⚠️ `0`（自动）要**原样**读回，插件靠它区分「自动」与「钦定了多少」。
+                put("boxWidth", a.boxWidth)
+                put("boxHeight", a.boxHeight)
                 put("showDot", a.showDot)
+                // 解析后的实际画布尺寸（px → dp）—— 自动模式下插件读回这两个就知道
+                // 「按素材自适应」到底算成了多少，不用自己再猜一遍。
+                val (bx, by) = BubbleAppearance.boxPx(ctx, a, action)
+                put("boxWidthPx", bx)
+                put("boxHeightPx", by)
                 put("cornerRadius", a.cornerRadius)
                 put("opacity", a.opacity.toDouble())
                 put("bgOpacity", a.bgOpacity.toDouble())
@@ -635,6 +641,14 @@ class FloatingBubble(private val context: Context) {
         /** 默认描边（8% 黑，与 XML 里的 `#14000000` 一致）。 */
         const val DEFAULT_BORDER = 0x14000000
 
+        /**
+         * 球投影的高度（dp），与 `bubble_window.xml` 的 `android:elevation` 一致。
+         *
+         * ⚠️ 必须是个常量并与 XML 同步：代码里要按 `bgOpacity` 把它压到 0（背景全
+         *   透明时不该留投影），两处写不一致会让"背景透明了还有灰影"复现。
+         */
+        const val ELEVATION_DP = 8f
+
         /** 默认面板底色。 */
         const val DEFAULT_PANEL_BG = 0xFFFFFFFF.toInt()
 
@@ -665,15 +679,6 @@ class FloatingBubble(private val context: Context) {
     /** 视频渲染后端。惰性创建 —— 没有视频素材的用户不会有这个 WebView。 */
     private var videoLayer: BubbleVideoLayer? = null
     private var panelView: View? = null
-
-    /**
-     * 主体包围盒（`bubbleBox`）：**画布的外层**。
-     *
-     * ⚠️ 它的尺寸 = `max(画布, 主体)`，是**窗口真正的大小**。见 [applyAppearanceToViews]
-     *   与 `bubble_window.xml` 里那一大段注释：窗口的 Surface 是硬边界，主体一旦
-     *   大于画布，就必须让窗口跟着变大，否则溢出的像素会被 WindowManager 丢掉。
-     */
-    private var boxView: View? = null
     private var dotView: View? = null
     private var panelDot: View? = null
     private var panelAction: TextView? = null
@@ -922,210 +927,6 @@ class FloatingBubble(private val context: Context) {
     private fun dp(v: Int) = (v * density).roundToInt()
     private fun dp(v: Float) = (v * density).roundToInt()
 
-    /**
-     * **画布**（`bubbleCircle`）的边长，px。它是底色形状的尺寸，也是**碰撞箱**。
-     */
-    private fun canvasSidePx(): Int = dp(appearance.size)
-
-    /**
-     * **主体（宠物形象）**的边长，px。
-     *
-     * ⚠️ [BubbleAppearance.contentSize] 为 0 时**跟随画布**（改动前的行为）。
-     *   `avatarScale` 是叠在它之上的附加缩放，不在这里乘 —— 那是内容层的
-     *   显示缩放，由 [applyContentLayer] 直接设到 ImageView 上。
-     */
-    private fun contentSidePx(): Int {
-        val cs = appearance.contentSize
-        return if (cs > 0) dp(cs) else dp(appearance.size)
-    }
-
-    /**
-     * 收起态**包围盒**的边长，px —— **窗口真正的大小**。
-     *
-     * ## 为什么不能只用画布尺寸当窗口大小
-     *
-     * 窗口的 Surface 是硬边界，画到窗口之外的像素会被 WindowManager 丢掉，
-     * `clipChildren = false` 也救不回来。所以主体一旦大于画布，窗口必须跟着
-     * 变大，否则"主体不被画布裁切"这个诉求物理上做不到。见 `bubble_window.xml`
-     * 里 `bubbleBox` 的那段注释。
-     *
-     * ⚠️ **`contentSize` 没配（0）时严格等于画布尺寸** —— 这是刻意的：那种情况下
-     *   走的是老路径，窗口尺寸、夹取范围、贴边坐标都必须与改动前逐字相同，
-     *   否则老用户会看到球的位置与手感变了。
-     */
-    private fun boxSidePx(): Int =
-        if (appearance.contentSize > 0) maxOf(canvasSidePx(), scaledContentSidePx())
-        else canvasSidePx()
-
-    /** 主体**缩放后**的边长（`avatarScale` 会把它放大，包围盒得容得下）。 */
-    private fun scaledContentSidePx(): Int = (contentSidePx() * appearance.avatarScale).roundToInt()
-
-    /**
-     * 包围盒只在**收起态圆形气泡**下可见。
-     *
-     * ⚠️ 展开态是面板、贴边态是薄片，两者都不该被包围盒那个固定边长顶开 ——
-     *   它是个**固定尺寸**的容器，忘了隐藏会让面板被撑到包围盒大小。
-     */
-    private fun syncBoxVisibility() {
-        boxView?.visibility = if (expanded || edgeCollapsed) View.GONE else View.VISIBLE
-        applyTouchableRegion()
-    }
-
-    /**
-     * 只把**画布**那块设成可触摸，包围盒多出来的透明边距交给下层应用。
-     *
-     * ## 为什么必须做这一步
-     *
-     * 主体比画布大时窗口必须跟着放大（见 [boxSidePx]），而**窗口内部默认全部
-     * 接收触摸**。放大的那片区域是透明的，却会把手指挡住 —— 用户在上面划动
-     * 滚不动底下的列表，也点不到底下的按钮。这是"主体独立"必然带出来的副作用，
-     * 不处理等于给屏幕糊了一块看不见的膜。
-     *
-     * ## 为什么是 `OnComputeInternalInsetsListener` 而不是 `LayoutParams.touchableRegion`
-     *
-     * 后者是**更高版本**才有的成员。真机实测（华为 CDY-TN90 / **Android 10 / API 29**）：
-     * `LayoutParams.declaredFields` 里**根本没有** `touchableRegion`（过滤 `ouch`/`egion`
-     * 后为空表），所以反射必然抛 `NoSuchFieldException` —— 那**不是** hidden API 拦截，
-     * 是这台机器上真的没这个字段（曾误判成拦截，绕了一大圈）。
-     *
-     * API 29 上的正确接缝是 `ViewTreeObserver.OnComputeInternalInsetsListener`：
-     * 回调里拿到 `InternalInsetsInfo`，把 `touchableRegion` 填上并令
-     * `touchableInsets = TOUCHABLE_INSETS_REGION`，系统就只把这块算作可触摸。
-     * 三者都是 `@hide`，所以走反射 + [bypassHiddenApi]。
-     *
-     * ⚠️ **不启用主体独立时一律不碰 `info`** —— 保持系统默认（整个窗口），
-     *   那是改动前的行为，面板与薄片照旧整块可点。
-     */
-    private fun applyTouchableRegion() {
-        val v = root ?: return
-        val p = v.layoutParams as? WindowManager.LayoutParams ?: return
-        installInsetsHook(v)
-        // 监听器只在 layout 参数变化时被系统重新调用，所以这里主动推一次。
-        // 老路径（不独立）也要推：可能刚从独立态切回来，得让系统忘掉旧 region。
-        runCatching { wm.updateViewLayout(v, p) }
-    }
-
-    /**
-     * 当前**应该**可触摸的那块（窗口内坐标）；null = 整个窗口都算数。
-     *
-     * 由 [insetsListener] 在系统回调里读取 —— 与 [applyTouchableRegion] 分开，
-     * 是因为两者发生的时间不同：后者是"我改了配置"，前者是"系统来问我"。
-     */
-    private var touchableRegionRect: android.graphics.Rect? = null
-
-    /** insets 监听器是否已挂上（幂等）。 */
-    private var insetsHookInstalled = false
-
-    /**
-     * 挂 `OnComputeInternalInsetsListener`。
-     *
-     * ⚠️ 反射拿不到接口/方法时**静默退回老行为**（整窗可触摸）：悬浮球是锦上添花，
-     *   一个反射失败不该让它整个不显示。
-     */
-    private fun installInsetsHook(v: View) {
-        if (insetsHookInstalled) return
-        insetsHookInstalled = true
-        // ⚠️ 必须先豁免：`InternalInsetsInfo` 与 `addOnComputeInternalInsetsListener`
-        //   都是 `@hide`，不豁免时反射取到的会是被抹掉的空表（真机实测）。
-        bypassHiddenApi()
-        runCatching {
-            val vto = v.viewTreeObserver
-            val add = vto.javaClass.methods.firstOrNull {
-                it.name == "addOnComputeInternalInsetsListener" && it.parameterTypes.size == 1
-            } ?: error("没有 addOnComputeInternalInsetsListener")
-            val listenerCls = add.parameterTypes[0]
-            val listener = java.lang.reflect.Proxy.newProxyInstance(
-                listenerCls.classLoader, arrayOf(listenerCls)
-            ) { proxy, method, args ->
-                when (method.name) {
-                    "onComputeInternalInsets" -> {
-                        if (args?.size == 1) fillInsets(args[0])
-                        null
-                    }
-                    // ⚠️ 这三个是 Object 的方法，代理必须自己实现：返回 null 会在
-                    //   `hashCode()` 处 NPE（系统拿监听器做 key 时会调到）。
-                    "hashCode" -> System.identityHashCode(proxy)
-                    "equals" -> proxy === args?.firstOrNull()
-                    "toString" -> "DSH-InsetsListener"
-                    else -> null
-                }
-            }
-            add.invoke(vto, listener)
-        }.onFailure {
-            Log.w(TAG, "挂 insets 监听器失败（主体超出画布的部分会挡住下层触摸）: ${it.message}")
-        }
-    }
-
-    /** 回调里按当前形态填 `InternalInsetsInfo`；不独立时不动它（= 老行为）。 */
-    private fun fillInsets(info: Any) {
-        runCatching {
-            if (expanded || edgeCollapsed || appearance.contentSize <= 0) {
-                touchableRegionRect = null
-                return
-            }
-            val pad = (boxSidePx() - canvasSidePx()) / 2
-            val c = canvasSidePx()
-            val rect = android.graphics.Rect(pad, pad, pad + c, pad + c)
-            touchableRegionRect = rect
-            val cls = info.javaClass
-            val region = cls.getField("touchableRegion").get(info) as Region
-            region.set(rect)
-            // TOUCHABLE_INSETS_REGION = 3（见 AOSP ViewTreeObserver.InternalInsetsInfo）
-            val setInsets = cls.getMethod("setTouchableInsets", Int::class.javaPrimitiveType)
-            setInsets.invoke(info, TOUCHABLE_INSETS_REGION)
-        }.onFailure {
-            Log.w(TAG, "填 insets 失败（主体超出画布的部分会挡住下层触摸）: ${it.message}")
-        }
-    }
-
-    /**
-     * 解除本进程的 hidden API 反射限制。
-     *
-     * `VMRuntime.setHiddenApiExemptions(["L"])` 是社区标准做法：`L` 是"所有类"的前缀，
-     * 一次豁免全部。
-     *
-     * ⚠️ **必须经 `Class#getDeclaredMethod` 反射转发来取 `setHiddenApiExemptions`**：
-     *   直连取不到（真机实测 `direct=false`）。这是绕过 dark greylist 的标准写法 ——
-     *   调用方看起来是反射基础设施本身，过滤会被跳过。
-     *
-     * ⚠️ 副作用是**进程级**的（此后本进程所有 hidden API 都能反射）。本 App 只能侧载、
-     *   不上架 Play，没有商店审核层面的顾虑；功能上没有副作用。
-     * ⚠️ 失败只记日志：拿不到字段就退回"整窗可触摸"，不比这更差。
-     */
-    private fun bypassHiddenApi() {
-        val cls = runCatching { Class.forName("dalvik.system.VMRuntime") }
-            .getOrNull() ?: return
-        val setExemptions = runCatching {
-            Class::class.java
-                .getDeclaredMethod(
-                    "getDeclaredMethod", String::class.java, arrayOf<Class<*>>().javaClass
-                )
-                .invoke(cls, "setHiddenApiExemptions", arrayOf(Array<String>::class.java))
-                as java.lang.reflect.Method
-        }.getOrNull()
-        if (setExemptions == null) {
-            Log.w(TAG, "取不到 setHiddenApiExemptions，可触摸区域只能退回整窗")
-            return
-        }
-        val getRuntime = runCatching { cls.getDeclaredMethod("getRuntime") }.getOrNull() ?: return
-        runCatching {
-            setExemptions.invoke(getRuntime.invoke(null), arrayOf("L"))
-        }.onFailure { Log.w(TAG, "hidden API 豁免调用失败: ${it.message}") }
-    }
-
-    /** `TOUCHABLE_INSETS_REGION` 的值（AOSP 常量，SDK stub 里没有）。 */
-    private val TOUCHABLE_INSETS_REGION = 3
-
-    /**
-     * 收起态**球的占位边长**，px —— 夹取、吸附、抛掷的范围都按它算。
-     *
-     * ⚠️ 取的是**包围盒**而不是画布：主体可能比画布大，用画布尺寸算会让主体
-     *   伸出屏幕（画布贴到屏幕边时，主体还有一半在外面）。取包围盒则保证
-     *   **整只宠物**都在可见区域内。
-     * ⚠️ 主体未独立时它就等于画布尺寸，老路径逐字不变。
-     */
-    private fun ballExtentPx(): Int = boxSidePx()
-
     private val tapSlop = dp(TAP_SLOP_DP)
 
     /** 最近一次状态，展开面板时用它填充。 */
@@ -1252,7 +1053,6 @@ class FloatingBubble(private val context: Context) {
         val view = LayoutInflater.from(context).inflate(R.layout.bubble_window, null)
         root = view
         circleView = view.findViewById(R.id.bubbleCircle)
-        boxView = view.findViewById(R.id.bubbleBox)
         avatarView = view.findViewById(R.id.bubbleAvatar)
         videoHost = view.findViewById(R.id.bubbleVideoHost)
         panelView = view.findViewById(R.id.bubblePanel)
@@ -1277,9 +1077,7 @@ class FloatingBubble(private val context: Context) {
         // 位置：优先用上次记住的；没有就贴右侧中部
         val screenW = context.resources.displayMetrics.widthPixels
         val screenH = context.resources.displayMetrics.heightPixels
-        // ⚠️ 用**包围盒**而不是画布算默认位置：主体可能比画布大，按画布算会让
-        //   默认位置把主体顶出屏幕右缘（贴右边时宠物有一半在屏幕外）。
-        val sidePx = ballExtentPx()
+        val sidePx = boxW()
         curX = prefs.getInt(KEY_X, screenW - sidePx - dp(EDGE_MARGIN_DP))
         curY = prefs.getInt(KEY_Y, (screenH * 0.42f).roundToInt())
 
@@ -1297,10 +1095,6 @@ class FloatingBubble(private val context: Context) {
         try {
             wm.addView(view, params)
             attached = true
-            // ⚠️ 必须在 addView 之后、LayoutParams 已经挂在窗口上时设 ——
-            //   它要读 `root.layoutParams` 里那个（由 WindowManager 填好的）
-            //   `touchableRegion` 实例再改，拿早了容器还不存在。
-            applyTouchableRegion()
             Log.i(TAG, "气泡已显示: ($curX, $curY) shape=${appearance.shape} size=${appearance.size}")
             // 主动拉一次当前状态：气泡是刚创建的，错过了之前所有的推送，
             // 不拉的话会停在"空闲"直到下一次状态变化（可能几十秒后）。
@@ -1397,11 +1191,12 @@ class FloatingBubble(private val context: Context) {
             //   布局还没重测，`root.width` 仍是**旧**尺寸（可能是贴边态的 6dp，
             //   也可能是上一版的小球）。拿它算夹取范围，AI 一把球改大，球就会
             //   跑出屏幕右/下边缘 —— 用户看到的是"球消失了"。
-            //   收起态尺寸就是包围盒（主体未独立时等于画布），直接用它算。展开态
-            //   不能用球尺寸（面板宽得多），交给下面那一帧用真实布局尺寸夹。
+            //   收起态尺寸就是画布尺寸，直接用它算。展开态不能用球尺寸
+            //   （面板宽得多），交给下面那一帧用真实布局尺寸夹。
             if (!expanded) {
-                val side = ballExtentPx()
-                clampInto(curX, curY, side, side).let { moveTo(it.first, it.second) }
+                val side = boxW()
+                val sideH = boxH()
+                clampInto(curX, curY, side, sideH).let { moveTo(it.first, it.second) }
             }
             // 展开态尺寸由面板决定，要等布局出来才知道；下一帧再夹一次兜住。
             root?.post {
@@ -1427,98 +1222,54 @@ class FloatingBubble(private val context: Context) {
 
     /** 把 [appearance] 刷到各个 View 上。 */
     private fun applyAppearanceToViews() {
-        val side = dp(appearance.size)
+        val boxW = boxW()
+        val boxH = boxH()
         val dm = context.resources.displayMetrics
-        // ⚠️ 主体独立模式：只有 `contentSize` 配了才进入。留 0 时下面所有分支
-        //   都走老路径（包围盒 = 画布、内容层 match_parent、照旧裁剪），
-        //   老配置的观感与手感逐字不变。
-        val contentIndependent = appearance.contentSize > 0
-
-        // ── 包围盒：窗口真正的大小，必须装得下主体 ─────────────────────
-        boxView?.let { b ->
-            val box = boxSidePx()
-            (b.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.width = box
-                lp.height = box
-                // ⚠️ 画布居中：主体是从画布四周**均匀**溢出的，偏一侧会让宠物
-                //   看起来不在自己该在的位置上。
-                b.layoutParams = lp
-            }
-        }
 
         // ── 球：尺寸、形状、底色、描边 ─────────────────────────────────
         circleView?.let { c ->
-            // ⚠️ **主体独立时容器放大到包围盒**，而不是留在画布尺寸。
-            //
-            //   这是"主体被画布裁掉"的正解。曾试过留在画布尺寸 + `clipChildren = false`
-            //   + `clipToOutline = false` + `elevation = 0`，真机实测**全都无效**：
-            //   avatar 明明是 420×420，`getGlobalVisibleRect` 仍然只有
-            //   `Rect(144,144-276,276)` —— 正好 132×132（= 画布尺寸）。
-            //
-            //   既然拦不住裁剪，就不要越界：容器 = 包围盒，**背景形状改成内缩绘制**
-            //   （见下面的 `InsetDrawable`）。视觉上画布还是 `size` 那么大，
-            //   而主体永远落在父容器边界之内，任何版本的裁剪逻辑都切不到它。
-            //
-            //   未进入独立模式时 `boxSidePx() == canvasSidePx()`，尺寸与改动前逐字相同。
-            val circleSide = if (contentIndependent) boxSidePx() else side
             (c.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.width = circleSide
-                lp.height = circleSide
+                lp.width = boxW
+                lp.height = boxH
                 c.layoutParams = lp
             }
             // 形状层：SVG path 优先，否则退回圆/方/圆角。
-            // 独立模式下把背景**内缩**到画布大小并居中 —— 视觉上画布还是那么大，
-            // 但它不再需要"装下主体"，于是不需要越界，也就不需要反裁剪。
-            val bgInset = if (contentIndependent) (boxSidePx() - canvasSidePx()) / 2 else 0
-            val bg = ballBackground()
-            c.background = if (bgInset > 0) {
-                android.graphics.drawable.InsetDrawable(bg, bgInset, bgInset, bgInset, bgInset)
-            } else {
-                bg
-            }
+            c.background = ballBackground()
             // 背景层的透明度**单独**作用在背景 drawable 上，与整体 opacity 相乘 ——
             // 这正是「背景透明、图片不透明」能成立的原因。
             c.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
-            // ⚠️ **主体独立模式下不许裁子视图** —— 那正是"画布比主体小就把它切了"
-            //   的机制。上面已经把容器放大到包围盒，主体本来就不越界；
-            //   这一条是双保险（某些 ROM 上子视图会被父边界切）。
-            //   `clipChildren` 在 ViewGroup 上，而 `circleView` 声明成 `View`，
-            //   所以要强转一次（它实际就是 BubbleTouchFrame，一个 FrameLayout）。
-            (c as? ViewGroup)?.clipChildren = !contentIndependent
             // 形状可以不是圆的，内容要跟着裁（见 clipToShape 的注释）。
-            // ⚠️ 独立模式下**必须跳过**：`clipToOutline` 是按画布轮廓裁子视图的，
-            //   与"主体不被画布裁切"直接冲突。
-            if (contentIndependent) {
-                c.clipToOutline = false
-            } else {
-                clipToShape(c)
-            }
-            // 状态点跟着球缩放：球小到 24dp 时 14dp 的点会占掉一大半
+            clipToShape(c)
+            // ⚠️ **投影必须跟着背景一起消失。**
+            //   `elevation` 的那圈灰影由 **outline 形状**画，**完全不看背景 drawable
+            //   的 alpha** —— 所以 `bgOpacity:0` 只把卡片涂透明，灰影照旧留在屏幕上。
+            //   用户报的"背景都透明了还留一圈灰影"就是这个：四组对照（改 bg 颜色、
+            //   改 shape、把 shapePath 扩满画布、把画布归零）之所以全对不上，是因为
+            //   它压根不属于任何一个外观字段，而是 `bubble_window.xml` 里写死的
+            //   `android:elevation="8dp"`。把 elevation 与 `bgOpacity` 绑在一起，
+            //   背景全透明时就没有投影。
+            c.elevation = if (appearance.bgOpacity > 0f) ELEVATION_DP * density else 0f
+            // 状态点跟着球缩放：球小到 24dp 时 14dp 的点会占掉一大半。
+            // ⚠️ 默认 `showDot = false` —— 那个绿点压在宠物形象上很碍眼。
             dotView?.let { d ->
-                // ⚠️ `showDot` 默认 false：那个绿点压在宠物形象上，与桌面宠物的
-                //   观感冲突（用户点名要删）。留开关只是给"就想要状态指示"的人。
                 d.visibility = if (appearance.showDot) View.VISIBLE else View.GONE
                 val dotPx = (appearance.size * 0.25f).roundToInt().coerceIn(8, 18)
                 (d.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
                     lp.width = dp(dotPx)
                     lp.height = dp(dotPx)
-                    // ⚠️ 独立模式下容器是包围盒，点要贴**画布**的右下角，
-                    //   所以把内缩量补进 margin，否则点会飘到包围盒的角落上。
-                    val m = dp(5) + bgInset
-                    lp.setMargins(0, 0, m, m)
                     d.layoutParams = lp
                 }
             }
         }
 
         // ── 内容层：内置头像 / 自定义图片 / 动作帧集 / 精灵图 ───────────
-        applyContentSize(contentIndependent)
-        applyActionLayer(contentSidePx())
+        applyActionLayer(boxReq())
+
         // ── 贴边薄片：高度跟随球，宽度固定 ─────────────────────────────
         edgeView?.let { e ->
             (e.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
                 lp.width = dp(EDGE_WIDTH_DP)
-                lp.height = side
+                lp.height = boxH
                 e.layoutParams = lp
             }
             e.background = edgeBackground()
@@ -1546,47 +1297,6 @@ class FloatingBubble(private val context: Context) {
 
         // ── 状态横条宽度上限随球走 ─────────────────────────────────────
         statusText?.maxWidth = statusMaxWidthPx
-
-        // ⚠️ 包围盒是个**固定边长**的容器，展开/贴边时必须收起来，否则它会把
-        //   面板与薄片顶到包围盒那么宽（面板 260dp 会被撑成球那么大）。
-        //   `syncBoxVisibility` 里顺带把可触摸区域收成画布那块（见那里的注释）。
-        syncBoxVisibility()
-    }
-
-    /**
-     * 把内容层两个视图（头像 / 视频宿主）的尺寸设成**主体尺寸**。
-     *
-     * ## 为什么内容层不能再用 `match_parent`
-     *
-     * 改动前内容层是 `match_parent`，父容器（画布）多大它就多大 —— 也就是
-     * "画布与主体必然同尺寸"。现在父容器是画布，而主体要能独立于画布，
-     * 所以必须显式给尺寸并**居中**。
-     *
-     * ⚠️ **未进入主体独立模式时改回 `MATCH_PARENT`**（而不是"设成等于画布的
-     *   固定值"）：两者在正常情况下像素级等价，但 `match_parent` 不受画布
-     *   后续尺寸变化的时序影响 —— 老路径必须逐字保持，免得出现"某次重排后
-     *   主体比画布小了一圈"这种只在特定时序下才复现的偏移。
-     *
-     * ⚠️ `avatarScale` 不在这里乘：它是内容层的**显示缩放**，由 [applyContentLayer]
-     *   设到 `scaleX/scaleY` 上（还带着转身的镜像符号）。这里乘进去会与它
-     *   重复叠加，实际放大变成平方。
-     */
-    private fun applyContentSize(contentIndependent: Boolean) {
-        val box = contentSidePx()
-        for (v in listOfNotNull(avatarView, videoHost)) {
-            (v.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                if (contentIndependent) {
-                    lp.width = box
-                    lp.height = box
-                } else {
-                    lp.width = FrameLayout.LayoutParams.MATCH_PARENT
-                    lp.height = FrameLayout.LayoutParams.MATCH_PARENT
-                }
-                // ⚠️ 居中：父容器是画布，主体比它大时只有居中才是从四周均匀溢出。
-                lp.gravity = Gravity.CENTER
-                v.layoutParams = lp
-            }
-        }
     }
 
     /**
@@ -1604,14 +1314,48 @@ class FloatingBubble(private val context: Context) {
      */
     private fun applyActionLayer(side: Int) {
         val playable = resolvePlayableAction(wantedAction())
+        var req = side
         if (playable != frameAction) {
             // ⚠️ 换动作必须清零帧下标：下标是"第几个动作里的第几帧"，
             //   沿用旧下标会从新动作的中间开始播（甚至越界）。
             frameIndex = 0
             frameLoops = 0
             frameAction = playable
+            // ⚠️ 动作换了 ⇒ **素材可能也换了** ⇒ 自适应画布尺寸要跟着重算。
+            //   不能沿用调用方算好的 `side`：那是**旧动作**的素材比例算出来的，
+            //   拿它去解码新素材，长宽比一变就糊（或浪费一倍内存）。
+            refreshBoxSize()
+            req = boxReq()
         }
-        applyContentLayer(side)
+        applyContentLayer(req)
+    }
+
+    /**
+     * 只把**画布尺寸**刷到受影响的 View 上（不重走整个外观装配）。
+     *
+     * 用在「动作切换导致自适应画布尺寸变化」这一处 —— 那里只需要改尺寸，
+     * 背景 drawable、透明度、动效、面板都不该被重刷。
+     */
+    private fun refreshBoxSize() {
+        val w = boxW()
+        val h = boxH()
+        circleView?.let { c ->
+            (c.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                if (lp.width != w || lp.height != h) {
+                    lp.width = w
+                    lp.height = h
+                    c.layoutParams = lp
+                }
+            }
+        }
+        edgeView?.let { e ->
+            (e.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                if (lp.height != h) {
+                    lp.height = h
+                    e.layoutParams = lp
+                }
+            }
+        }
     }
 
     /**
@@ -1672,12 +1416,12 @@ class FloatingBubble(private val context: Context) {
                 manualRunnable = null
                 clearManualAction()
                 // 姿势到期 → 交回给状态映射/随机链。
-                applyActionLayer(contentSidePx())
+                applyActionLayer(boxReq())
             }
             manualRunnable = r
             root?.postDelayed(r, holdMs)
         }
-        applyActionLayer(contentSidePx())
+        applyActionLayer(boxReq())
     }
 
     /** 清掉手动姿势（不重刷视图，调用方自己决定要不要刷）。 */
@@ -1764,7 +1508,7 @@ class FloatingBubble(private val context: Context) {
         // 钦定动作（配置或脚本）不受运行状态影响，不用白刷一遍。
         if (appearance.action.isNotEmpty() || stateOverrideAction.isNotEmpty()) return
         if (resolvePlayableAction(wantedAction()) == frameAction) return
-        avatarView?.let { applyActionLayer(contentSidePx()) }
+        avatarView?.let { applyActionLayer(boxReq()) }
     }
 
     /**
@@ -1778,7 +1522,7 @@ class FloatingBubble(private val context: Context) {
         if (next == stateOverrideAction) return
         stateOverrideAction = next
         if (resolvePlayableAction(wantedAction()) != frameAction) {
-            applyActionLayer(contentSidePx())
+            applyActionLayer(boxReq())
         }
     }
 
@@ -1975,7 +1719,7 @@ class FloatingBubble(private val context: Context) {
         //   按**旧朝向**渲染一帧，用户看到的是转身之后又弹回原方向。
         consumeTurnFlip()
         rollNextChainAction()
-        applyActionLayer(contentSidePx())
+        applyActionLayer(boxReq())
     }
 
     /**
@@ -2119,7 +1863,7 @@ class FloatingBubble(private val context: Context) {
                 }
                 val before = chainAction
                 rollNextChainAction()
-                if (chainAction != before) applyActionLayer(contentSidePx())
+                if (chainAction != before) applyActionLayer(boxReq())
                 scheduleChain(delayMs)
             }
         }
@@ -2272,9 +2016,8 @@ class FloatingBubble(private val context: Context) {
      *   用全局值 —— 那样 `moveParams` 这个接口等于不存在。
      */
     private fun doWalk() {
-        // ⚠️ 这里要的是**移动范围**的边长（包围盒），不是内容层解码尺寸 ——
-        //   主体比画布大时，用画布尺寸算会让宠物走出屏幕。
-        val side = ballExtentPx()
+        val side = boxW()
+        val sideH = boxH()
         // ① 先抽姿势（抽不到就没配 `move` 池，此时用全局距离）。
         val pose = BubbleAppearance.pickFromPool(
             context, appearance, BubbleAppearance.POOL_MOVE, manualAction,
@@ -2296,11 +2039,11 @@ class FloatingBubble(private val context: Context) {
         val dir = if (Math.random() < 0.5) -1 else 1
         var targetX = curX + (dist * dir).roundToInt()
         // 撞边就朝反方向走，而不是卡在边上（卡住会让"走动"变成"贴边抖动"）。
-        val (clamped, _) = clampInto(targetX, curY, side, side)
+        val (clamped, _) = clampInto(targetX, curY, side, sideH)
         if (clamped == curX && abs(targetX - curX) > 2) {
             targetX = curX - (dist * dir).roundToInt()
         }
-        val (nx, ny) = clampInto(targetX, curY, side, side)
+        val (nx, ny) = clampInto(targetX, curY, side, sideH)
         if (nx == curX) return
         // 朝向：走动方向变了就转身（`flipOnTurn` 关掉时是空操作）。
         setFacing(nx > curX)
@@ -2398,9 +2141,7 @@ class FloatingBubble(private val context: Context) {
         val durations = BubbleFrames.durations(context, appearance.frameIntervalMs, action)
         val loop = BubbleFrames.loop(context, appearance.frameLoop, action)
         val interval = appearance.frameIntervalMs
-        // ⚠️ 这是**解码尺寸**（帧会被缩放到它），要用主体尺寸而不是画布 ——
-        //   否则主体独立时每帧都被解码成画布那么大，放大后一片模糊。
-        val side = contentSidePx()
+        val side = boxReq()
 
         val step = object : Runnable {
             override fun run() {
@@ -2859,11 +2600,33 @@ class FloatingBubble(private val context: Context) {
 
     /** 球的当前宽度（量过就用实测值，否则退回配置里的尺寸）。 */
     private fun circleWidth(): Int = root?.width?.takeIf { !expanded && !edgeCollapsed && it > 0 }
-        ?: ballExtentPx()
+        ?: boxW()
 
     /** 球的当前高度（同上）。 */
     private fun circleHeight(): Int = root?.height?.takeIf { !expanded && !edgeCollapsed && it > 0 }
-        ?: ballExtentPx()
+        ?: boxH()
+
+    /**
+     * 画布（= 主体框）的像素宽 / 高。
+     *
+     * ⚠️ **所有几何都走这两个**，不要在各处自己 `dp(appearance.size)` —— 上一版
+     *   就是有八处各算各的尺寸，加一个字段要追八个调用点，漏一个就出现
+     *   「球是新的、走动范围还是旧的」这类错位。
+     *
+     * 取值来源见 [BubbleAppearance.boxPx]：显式配了就用配的，没配就按当前
+     * **主体素材**的长宽比自适应（正方形素材 ⇒ 老行为）。
+     */
+    private fun boxW(): Int = BubbleAppearance.boxPx(context, appearance, frameAction).first
+
+    /** 画布像素高，见 [boxW]。 */
+    private fun boxH(): Int = BubbleAppearance.boxPx(context, appearance, frameAction).second
+
+    /**
+     * 内容层解码用的**请求边长**：取画布长边。
+     *
+     * 内容层是 `fitCenter` 铺满画布的，只给短边会让长边那一轴解码不足而糊。
+     */
+    private fun boxReq(): Int = maxOf(boxW(), boxH())
 
     private fun baseParams() = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -3003,7 +2766,7 @@ class FloatingBubble(private val context: Context) {
                         //   却还在挣扎。清空后交回状态映射（或 idle 时重抽随机链）。
                         clearManualAction()
                         if (runState == BubbleAppearance.RUN_IDLE) rollNextChainAction()
-                        applyActionLayer(contentSidePx())
+                        applyActionLayer(boxReq())
                     }
                     if (!wasDrag) {
                         if (ev.actionMasked == MotionEvent.ACTION_UP) {
@@ -3055,7 +2818,7 @@ class FloatingBubble(private val context: Context) {
      */
     private fun onTouchUp(allowEdgeCollapse: Boolean) {
         val dm = context.resources.displayMetrics
-        val w = root?.width?.takeIf { it > 0 } ?: ballExtentPx()
+        val w = root?.width?.takeIf { it > 0 } ?: boxW()
         val overshootLeft = -rawX
         val overshootRight = rawX + w - dm.widthPixels
         val overshoot = maxOf(overshootLeft, overshootRight)
@@ -3128,8 +2891,8 @@ class FloatingBubble(private val context: Context) {
                 val dt = ((now - throwLastFrameNs) / 1_000_000_000f).coerceIn(0f, 0.05f)
                 throwLastFrameNs = now
 
-                val w = v.width.takeIf { it > 0 } ?: ballExtentPx()
-                val h = v.height.takeIf { it > 0 } ?: ballExtentPx()
+                val w = v.width.takeIf { it > 0 } ?: boxW()
+                val h = v.height.takeIf { it > 0 } ?: boxH()
                 val dm = context.resources.displayMetrics
                 val minY = dp(TOP_MARGIN_DP).toFloat()
                 val maxY = (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx)
@@ -3238,8 +3001,8 @@ class FloatingBubble(private val context: Context) {
     /** 夹进可见区域（考虑状态栏与底部手势条）。 */
     private fun clampInto(x: Int, y: Int): Pair<Int, Int> {
         val v = root
-        val w = v?.width?.takeIf { it > 0 } ?: ballExtentPx()
-        val h = v?.height?.takeIf { it > 0 } ?: ballExtentPx()
+        val w = v?.width?.takeIf { it > 0 } ?: boxW()
+        val h = v?.height?.takeIf { it > 0 } ?: boxH()
         return clampInto(x, y, w, h)
     }
 
@@ -3270,7 +3033,7 @@ class FloatingBubble(private val context: Context) {
     private fun snapToEdge() {
         val dm = context.resources.displayMetrics
         val v = root ?: return
-        val w = v.width.takeIf { it > 0 } ?: ballExtentPx()
+        val w = v.width.takeIf { it > 0 } ?: boxW()
         val targetX = if (curX + w / 2 < dm.widthPixels / 2) dp(EDGE_MARGIN_DP)
         else dm.widthPixels - w - dp(EDGE_MARGIN_DP)
         val (_, ty) = clampInto(targetX, curY)
@@ -3327,12 +3090,10 @@ class FloatingBubble(private val context: Context) {
         panelView?.visibility = View.GONE
         circleView?.visibility = View.GONE
         edgeView?.visibility = View.VISIBLE
-        // ⚠️ 必须收起包围盒：它尺寸固定，留着会把 6dp 的薄片撑成球那么大。
-        syncBoxVisibility()
 
         val edgeW = dp(EDGE_WIDTH_DP)
         val x = if (side < 0) 0 else (dm.widthPixels - edgeW)
-        val (nx, ny) = clampInto(x, curY, edgeW, canvasSidePx())
+        val (nx, ny) = clampInto(x, curY, edgeW, boxH())
         moveTo(nx, ny)
         prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
         Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny")
@@ -3350,13 +3111,11 @@ class FloatingBubble(private val context: Context) {
         edgeCollapsed = false
         edgeView?.visibility = View.GONE
         circleView?.visibility = View.VISIBLE
-        syncBoxVisibility()
 
-        // ⚠️ 用**包围盒**而不是画布：弹回来之后包围盒又要显示了，按画布算会让
-        //   主体伸出屏幕边缘。
-        val sidePx = ballExtentPx()
+        val sidePx = boxW()
+        val sidePxH = boxH()
         val x = if (edgeSide < 0) dp(EDGE_MARGIN_DP) else dm.widthPixels - sidePx - dp(EDGE_MARGIN_DP)
-        val (nx, ny) = clampInto(x, curY, sidePx, sidePx)
+        val (nx, ny) = clampInto(x, curY, sidePx, sidePxH)
         moveTo(nx, ny)
         prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
         Log.i(TAG, "气泡已从贴边态弹出: side=$edgeSide x=$nx y=$ny")
@@ -3447,8 +3206,6 @@ class FloatingBubble(private val context: Context) {
         expanded = true
         circleView?.visibility = View.GONE
         panelView?.visibility = View.VISIBLE
-        // ⚠️ 必须收起包围盒：面板是 wrap_content，包围盒留着会把面板撑成球那么大。
-        syncBoxVisibility()
         // 展开态才允许聚焦 —— 否则点输入框弹不出键盘（见 applyFocusFlags）。
         applyFocusFlags(focusable = true)
         // 展开态面板里已有同一份信息，收起态那个标签要让位。
@@ -3474,9 +3231,6 @@ class FloatingBubble(private val context: Context) {
         }
         panelView?.visibility = View.GONE
         circleView?.visibility = View.VISIBLE
-        // ⚠️ 收起态要把包围盒放回来（展开时收起了，见 expand）。它同时会把
-        //   可触摸区域收成画布那块，所以**必须在 circleView 可见之后**调。
-        syncBoxVisibility()
         // 回到收起态，状态标签重新露面（内容与之前相同，所以会重新计时 2 秒）。
         statusKey = ""
         lastStatus?.let { refreshStatusBubble(it) }
@@ -3484,10 +3238,11 @@ class FloatingBubble(private val context: Context) {
         //
         // ⚠️ 这里**不能**用 `clampInto(curX, curY)`：那个重载读的是 `root` 当前尺寸，
         //   而此刻布局还没重测完，读到的可能仍是展开态的 300×500，算出来的夹取范围
-        //   是错的。收起态尺寸是恒定的（包围盒），直接按它算。
+        //   是错的。收起态尺寸是恒定的（画布尺寸），直接按它算。
         root?.post {
-            val side = ballExtentPx()
-            val (nx, ny) = clampInto(preExpandX, preExpandY, side, side)
+            val side = boxW()
+            val sideH = boxH()
+            val (nx, ny) = clampInto(preExpandX, preExpandY, side, sideH)
             moveTo(nx, ny)
         }
     }

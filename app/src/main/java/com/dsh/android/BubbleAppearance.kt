@@ -8,6 +8,7 @@ import android.util.Base64
 import com.dsh.android.log.DshLog as Log
 import org.json.JSONObject
 import java.io.File
+import kotlin.math.roundToInt
 
 /**
  * 悬浮球的**外观与行为配置** —— 插件改悬浮窗的唯一接缝。
@@ -54,8 +55,9 @@ import java.io.File
  * | `shape` | string | `circle` / `square` / `rounded` / **`path`**（用 `shapePath`） |
  * | `shapePath` | string | SVG path 的 `d`，如 `M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z` |
  * | `shapeViewBox` | string | `shapePath` 的坐标系，默认 `0 0 100 100` |
- * | `size` | int(dp) | **画布**直径，24~160。既是底色形状的尺寸，也是碰撞箱 |
- * | `contentSize` | int(dp) | **主体**尺寸，0 = 跟随 `size`，1~400。> 0 时主体不被画布裁切 |
+ * | `size` | int(dp) | 球的**边长**，24~160。方形画布时它是宽，也是高 |
+ * | `boxWidth` | int(dp) | **画布宽**，0 = 跟随 `size`（正方形）。16~400 |
+ * | `boxHeight` | int(dp) | **画布高**，0 = 跟随 `size`（正方形）。16~400 |
  * | `showDot` | bool | 是否显示右下角状态点。默认 **false**（不显示） |
  * | `cornerRadius` | int(dp) | `rounded` 形状的圆角 |
  * | `opacity` | float | **整体**不透明度 0.05~1.0 |
@@ -99,45 +101,33 @@ data class BubbleAppearance(
     val shapeViewBox: String = BubbleShapeDrawable.DEFAULT_VIEW_BOX,
     val size: Int = 44,
     /**
-     * **主体（宠物形象）的尺寸**，dp。0 = 跟随 [size]（老行为）。
+     * **画布宽**，dp。0 = 自动（默认）。
      *
-     * ## 为什么要有它
+     * ## 语义（[boxHeight] 同）
      *
-     * 在这之前 [size] **一个数同时管三件事**：球（画布）的直径、内容层的尺寸、
-     * 碰撞范围。于是"画布小、主体大"这个桌面宠物最常见的形态**根本表达不出来** ——
-     * 把 [avatarScale] 调到 1 以上确实能放大主体，但溢出画布的部分会被画布的
-     * `clipChildren` 裁掉，看起来就是"图被切了"。
+     * | 取值 | 含义 |
+     * |---|---|
+     * | `0`（默认） | **自动**：按当前主体素材的长宽比算，长边 = [size] |
+     * | `16~400` | 就是这么多 dp |
      *
-     * 现在拆成两个数：
+     * 只给宽不给高时，高由素材比例推出（反之亦然）；两个都给了就是那个矩形。
      *
-     * ```
-     *   ┌──────────────────────────┐  ← 窗口包围盒 boxPx（透明）
-     *   │        ┌────────┐        │
-     *   │        │  画布  │        │  size        = 底色形状 + **碰撞箱**
-     *   │        │ ┌────┐ │        │
-     *   │        │ │主体│ │        │  contentSize = 宠物形象，**不被画布裁切**
-     *   │        │ └────┘ │        │
-     *   │        └────────┘        │
-     *   └──────────────────────────┘
-     * ```
+     * ## 为什么是"画布长宽"而不是"主体尺寸"
      *
-     * ⚠️ **设了本字段（> 0）就进入"主体独立"模式**，两个行为会跟着变：
-     *   ① 主体不再被画布（含 [shapePath] 的星形/心形轮廓）裁切；
-     *   ② 窗口放大到能容纳主体的包围盒，空白处**不吃触摸**（只有画布那块接收），
-     *      所以透明区域不会挡住下层应用。
-     *
-     * ⚠️ 留 0 时**逐字保持改动前的行为**，老配置零回归。
+     * 用户的诉求是「背景框可以自定义分辨率，也就是长宽」，且**默认按主体素材
+     * 自适应**。所以画布本身就是可长可短的矩形，**主体永远与画布同尺寸** ——
+     * 不存在"主体比画布大"，也就不需要让子视图越出父边界（那正是上一版栽的地方：
+     * 越界的子视图会被父容器裁掉，`clipChildren` / `clipToOutline` / `elevation`
+     * 逐条试过都拦不住）。
      */
-    val contentSize: Int = 0,
+    val boxWidth: Int = 0,
+    /** **画布高**，dp。0 = 自动。语义见 [boxWidth]。 */
+    val boxHeight: Int = 0,
     /**
-     * 是否显示球右下角那个**状态点**（在跑=实心绿，空闲=空心灰）。
+     * 是否显示右下角状态点。
      *
-     * ⚠️ 默认 **false（不显示）**，这是改过的。原来那个点是常显的，但它压在
-     *   宠物形象上，跟桌面宠物的观感冲突 —— 用户点名要删。留 [showDot] 只是为了
-     *   让"我就想要个运行状态指示"的人能开回来。
-     *
-     * ⚠️ 展开面板顶栏那个 `panelDot` **不受本字段影响**：那里是面板自己的图例，
-     *   与球上的角标不是一回事。
+     * ⚠️ 默认 **false**：那个绿点压在宠物形象上，与桌面宠物的观感冲突。
+     *   留这个开关只是给"就想要状态指示"的人。
      */
     val showDot: Boolean = false,
     val cornerRadius: Int = 16,
@@ -492,6 +482,95 @@ data class BubbleAppearance(
         /** 配置落盘的 SharedPreferences 名。与位置共用一个文件，减少一次 I/O。 */
         const val PREFS = "dsh_bubble"
 
+        /** 画布长宽的下限（dp）。再小就看不出主体了。 */
+        const val MIN_BOX_DP = 16
+
+        /** 画布长宽的上限（dp）。防插件传个 `99999` 把窗口撑爆。 */
+        const val MAX_BOX_DP = 400
+
+        /**
+         * 按**当前主体素材**的长宽比算画布尺寸（px）。
+         *
+         * 这是 `boxWidth`/`boxHeight` 为 0（默认）时的取值来源 ——「默认的时候，
+         * 它就是根据主体的那个素材，长宽来自适应」。
+         *
+         * 素材来源按**内容层的优先级**逐条试（与 [FloatingBubble.applyContentLayer]
+         * 的顺序一致，否则会出现"显示的素材和量出来的素材不是同一个"）：
+         *
+         * ① 视频层（`bubble-videos/<动作>.webm`）—— 见下 ⚠️
+         * ② 动作帧集 / 精灵图 → [BubbleFrames.frameSize]
+         * ③ 自定义头像 → 落盘文件的解码边界
+         * ④ 内置头像 `bubble_avatar` 的固有尺寸
+         *
+         * 长边取 `size`，短边按素材比例缩放，**但不超过 `size`** —— 这样
+         * 正方形素材得到的就是原来的 `size × size`（老行为逐字不变）。
+         *
+         * ⚠️ **视频层不参与量取**：webm 的分辨率要 demux 才拿得到，`BubbleVideos`
+         *   没有这个能力（也是刻意不加，那要把整个容器解析搬进来）。所以有视频素材
+         *   时按**正方形**算 —— 用户若需要别的比例，显式给 `boxWidth`/`boxHeight`。
+         */
+        fun autoBox(context: Context, appearance: BubbleAppearance, action: String): Pair<Int, Int> {
+            val density = context.resources.displayMetrics.density
+            val long = (appearance.size * density).roundToInt().coerceAtLeast(1)
+            val ratio = subjectRatio(context, appearance, action)
+            // 长边恒等于 size，短边按比例 —— 于是"正方形素材 = 老行为"自动成立。
+            val w = if (ratio != null && ratio < 1f) (long * ratio).roundToInt() else long
+            val h = if (ratio != null && ratio > 1f) (long / ratio).roundToInt() else long
+            return w.coerceAtLeast(1) to h.coerceAtLeast(1)
+        }
+
+        /** 主体素材的 `宽/高`；量不到返回 null（按正方形处理）。 */
+        private fun subjectRatio(context: Context, appearance: BubbleAppearance, action: String): Float? {
+            val (w, h) = subjectSize(context, appearance, action) ?: return null
+            if (w <= 0 || h <= 0) return null
+            return w.toFloat() / h.toFloat()
+        }
+
+        /** 主体素材的像素长宽；量不到返回 null。 */
+        private fun subjectSize(context: Context, appearance: BubbleAppearance, action: String): Pair<Int, Int>? {
+            // ② 帧集 / 精灵图：磁盘上有这个动作的帧就用它。
+            if (BubbleFrames.available(context, action)) {
+                BubbleFrames.frameSize(context, action)?.let { return it }
+            }
+            // ③ 自定义头像：只解边界，不解码整张图。
+            if (appearance.usesCustomAvatar) {
+                val f = File(context.filesDir, AVATAR_FILE)
+                if (f.isFile && f.length() > 0L) {
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeFile(f.absolutePath, opts)
+                    if (opts.outWidth > 0 && opts.outHeight > 0) return opts.outWidth to opts.outHeight
+                }
+            }
+            // ④ 内置头像：按**当前密度的那一份**量固有尺寸。
+            if (appearance.avatar != AVATAR_NONE) {
+                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeResource(context.resources, R.drawable.bubble_avatar, opts)
+                if (opts.outWidth > 0 && opts.outHeight > 0) return opts.outWidth to opts.outHeight
+            }
+            return null
+        }
+
+        /**
+         * 画布的实际像素长宽（已解析「0 = 自动」）。
+         *
+         * ⚠️ **所有几何计算都必须走这里**，不能各处自己 `dp(appearance.size)` ——
+         *   上一版就是因为有 8 处各算各的尺寸，改一个字段要追 8 个调用点。
+         */
+        fun boxPx(context: Context, appearance: BubbleAppearance, action: String): Pair<Int, Int> {
+            val dm = context.resources.displayMetrics
+            val auto = autoBox(context, appearance, action)
+            val rawW = if (appearance.boxWidth > 0) appearance.boxWidth else 0
+            val rawH = if (appearance.boxHeight > 0) appearance.boxHeight else 0
+            // 两个都没配 → 完全走自动。
+            if (rawW == 0 && rawH == 0) return auto
+            // 只配了一个 → 另一个沿用**自动**那一轴（而不是 size），于是
+            // 「只改宽」不用把高也写一遍，且高会跟着素材比例走。
+            val w = if (rawW > 0) rawW else (auto.first / dm.density).roundToInt()
+            val h = if (rawH > 0) rawH else (auto.second / dm.density).roundToInt()
+            return (w * dm.density).roundToInt().coerceAtLeast(1) to
+                (h * dm.density).roundToInt().coerceAtLeast(1)
+        }
+
         /** 整个配置对象的 key。 */
         const val KEY_APPEARANCE = "appearance"
 
@@ -519,9 +598,11 @@ data class BubbleAppearance(
                 shapePath = textOf(o, "shapePath", base.shapePath, MAX_SHAPE_PATH_CHARS),
                 shapeViewBox = textOf(o, "shapeViewBox", base.shapeViewBox, 64),
                 size = clampInt(o, "size", base.size, 24, 160),
-                // ⚠️ 下界是 0 而不是 1：0 是**合法取值**（= 主体跟随画布，老行为），
-                //   写成 1 会让没法退回"主体跟着画布走"。
-                contentSize = clampInt(o, "contentSize", base.contentSize, 0, 400),
+                // ⚠️ `0` 是**合法取值**（= 自动），所以这里不能再套 `clampInt(o,…,
+                //   24, 160)` —— 那会把 0 夹成 24，配置里写 `boxWidth:0` 反而变成长方形。
+                //   单独用一个 `autoOrInt` 把「0 或 16~400」放行。
+                boxWidth = autoOrInt(o, "boxWidth", base.boxWidth),
+                boxHeight = autoOrInt(o, "boxHeight", base.boxHeight),
                 showDot = if (o.has("showDot")) o.optBoolean("showDot", base.showDot) else base.showDot,
                 cornerRadius = clampInt(o, "cornerRadius", base.cornerRadius, 0, 80),
                 opacity = clampFloat(o, "opacity", base.opacity, 0.05f, 1f),
@@ -1162,6 +1243,19 @@ data class BubbleAppearance(
             return v.coerceIn(min, max)
         }
 
+        /**
+         * 「**0 = 自动**」的尺寸字段（[BubbleAppearance.boxWidth] / [boxHeight]）。
+         *
+         * 存在的唯一理由是 `0` 必须**原样保留** —— 走 [clampInt] 会被夹到下限，
+         * 于是「自动」这个取值根本表达不出来。其余取值仍然照 [MIN_BOX_DP]~[MAX_BOX_DP]
+         * 夹紧，防插件传个 `99999` 把窗口撑爆。
+         */
+        private fun autoOrInt(o: JSONObject, key: String, fallback: Int): Int {
+            if (!o.has(key)) return fallback
+            val v = o.optInt(key, fallback)
+            return if (v <= 0) 0 else v.coerceIn(MIN_BOX_DP, MAX_BOX_DP)
+        }
+
         private fun clampFloat(o: JSONObject, key: String, fallback: Float, min: Float, max: Float): Float {
             if (!o.has(key)) return fallback
             val v = o.optDouble(key, fallback.toDouble()).toFloat()
@@ -1311,9 +1405,11 @@ data class BubbleAppearance(
                 put("shapePath", appearance.shapePath)
                 put("shapeViewBox", appearance.shapeViewBox)
                 put("size", appearance.size)
-                // ⚠️ 与 `size` 一样必须落盘：漏了的话"主体独立"只在本次运行有效，
-                //   重开 App 主体就缩回画布大小 —— 表现为"宠物重启就变小了"。
-                put("contentSize", appearance.contentSize)
+                // ⚠️ `0`（自动）也要写：`load()` 走 `merge`，缺键时保留的是
+                //   `BubbleAppearance()` 的默认值 —— 默认恰好也是 0，所以这里
+                //   漏写不会立刻出错，但**改用非 0 默认值的那一刻就会静默回退**。
+                put("boxWidth", appearance.boxWidth)
+                put("boxHeight", appearance.boxHeight)
                 put("showDot", appearance.showDot)
                 put("cornerRadius", appearance.cornerRadius)
                 put("opacity", appearance.opacity.toDouble())

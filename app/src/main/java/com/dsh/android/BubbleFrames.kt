@@ -360,6 +360,34 @@ object BubbleFrames {
         return meta.optInt("count", 0).takeIf { it > 0 } ?: countFiles(context, action)
     }
 
+    /**
+     * 一帧的像素长宽（精灵图按**单格**算）。探测不到返回 `null`。
+     *
+     * 唯一用途是**自动画布尺寸**要按主体素材的长宽比来算，所以只读
+     * `inJustDecodeBounds` 的边界，不解码整张位图。
+     */
+    fun frameSize(context: Context, action: String = DEFAULT_ACTION): Pair<Int, Int>? {
+        // 精灵图模式下第 0 个文件就是整张图，单格尺寸要从网格切出来。
+        val file = File(dir(context, action), frameName(0))
+        if (!file.isFile) return null
+        return try {
+            val bytes = file.readBytes()
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            var w = opts.outWidth
+            var h = opts.outHeight
+            if (w <= 0 || h <= 0) return null
+            sprite(context, action)?.let { (rows, cols) ->
+                w /= cols
+                h /= rows
+            }
+            if (w <= 0 || h <= 0) null else w to h
+        } catch (t: Throwable) {
+            Log.w(TAG, "探测动作 $action 的帧尺寸失败: ${t.message}")
+            null
+        }
+    }
+
     /** 每帧停留时长（ms）。meta 缺失或长度不符时返回空表，由调用方兜底。 */
     fun durations(context: Context, fallback: Int, action: String = DEFAULT_ACTION): List<Int> {
         val meta = readMeta(context, action) ?: return emptyList()
