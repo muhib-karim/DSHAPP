@@ -117,6 +117,63 @@ interface PageBridge {
     fun rootRecheck()
 
     /**
+     * 读 Shizuku 通道状态。返回 JSON 文本。
+     *
+     * ```json
+     * {"installed":true,"binder":true,"granted":true,"uid":2000,"version":13}
+     * ```
+     *
+     * ## 四个字段为什么必须分开报
+     *
+     * 它们是四种**完全不同的处境**，而用户看到的下一步动作也完全不同：
+     *
+     * | installed | binder | granted | 处境 | 用户该做什么 |
+     * |---|---|---|---|---|
+     * | false | — | — | 没装 Shizuku | 去装 |
+     * | true | false | — | 装了但服务没启动 | 打开 Shizuku，点「启动服务」 |
+     * | true | true | false | 在跑但没给我们授权 | 点「授权」 |
+     * | true | true | true | 可用 | 什么都不用做 |
+     *
+     * ⚠️ 把它们合成一个布尔（"可用/不可用"）正是本工程反复踩的缺陷族：
+     * 「结论与它描述的对象不是同一个」—— 用户会照着错的提示去卸载重装 Shizuku，
+     * 而其实只需要点一下授权。
+     *
+     * ⚠️ **同步返回 String**（同 [bubbleState]）：`@JavascriptInterface` 只支持
+     * 基本类型与 String，返回对象会静默变成 `undefined`。
+     *
+     * ⚠️ **只读当前状态、不触发任何探测**：Shizuku 的 binder 由系统在进程启动时
+     * 送进来（见 `ShizukuProvider`），随时可读，没有"探测"这回事。
+     */
+    fun shizukuState(): String
+
+    /**
+     * 设置页点「授权」：让 Shizuku 弹出它自己的授权确认界面。
+     *
+     * ⚠️ 结果是**异步**回来的（Shizuku 服务端拉起它自己的 Activity，用户点完才回），
+     * 所以立即返回，界面靠轮询 [shizukuState] 拿结论 —— 与 [rootRecheck] 同构。
+     *
+     * ⚠️ 必须在**主线程**调：Shizuku 要用当前 Activity 作为确认界面的宿主。
+     */
+    fun shizukuRequestPermission()
+
+    /**
+     * 设置页点「打开 Shizuku」：拉起 Shizuku 管理器应用。
+     *
+     * ⚠️ 单独开一个方法而不是让用户自己去桌面找：设备上装没装、装的是哪个包
+     * （`moe.shizuku.privileged.api`）用户并不知道，而这是**唯一**能让服务
+     * 从「没启动」变成「已启动」的地方。
+     */
+    fun shizukuOpenManager()
+
+    /**
+     * 设置页点「安装 Shizuku」：打开 Shizuku 的官网/下载页。
+     *
+     * ⚠️ 走浏览器而不是应用商店：Shizuku 在部分国内 ROM 的商店里搜不到，
+     * 而它的官方发布页（GitHub Releases）是权威来源。
+     */
+    fun shizukuOpenDownload()
+
+    /**
      * 设置页点「运行日志与诊断」：拉起原生日志界面（**入口①**）。
      *
      * ## 为什么日志界面在原生侧、而不是做成一个页面插件

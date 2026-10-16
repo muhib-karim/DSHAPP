@@ -57,8 +57,15 @@
  *   不存在**，只剩 legacy 5555；而 5555 没在听时就静默回落成 app 身份。
  *   更糟的是设置页探测走的是宿主半插件自己 spawn（env 完整），于是
  *   **探测说「uid 2000 可用」、模型执行却进不去无线通道**。
+ * - `DSH_SHIZUKU_SOCKET`：Shizuku 桥的抽象 socket 名。**第三处同样的坑**，
+ *   漏传的后果是通道 0 整条不存在。它值得单独列出，因为它是 uid 2000 里
+ *   **唯一不依赖 adbd** 的来源 —— 对 Android 10 及以下（没有无线调试，
+ *   且 `persist.adb.tcp.port` 写不进去 ⇒ 每次重启都要 PC 重来一次）的设备，
+ *   它往往是唯一可行的路。见 ShizukuChannel.kt。
+ *   ⚠️ 传的是**纯名字**，不带 `\0` 前缀：envp 是 C 字符串，NUL 会被静默截断，
+ *   `\0` 由 runner 自己补（见 dsh-android-shell.mjs 的 SHIZUKU_SOCKET）。
  *
- * 这两个变量都是「插件必须转交的引擎事实」：引擎进程自己的 env 里有它们
+ * 这三个变量都是「插件必须转交的引擎事实」：引擎进程自己的 env 里有它们
  * （见 `EngineManager.runEngine()` 里 `put("DSH_...")` 那几处），但子进程默认看不到。
  *
  * @module dsh-android-shell
@@ -172,8 +179,10 @@ function parseExitStatus(text) {
  * @param dshHome `$DSH_HOME`，runner 靠它定位 `adbkey`
  * @param adbHome 内置 adb 工具链目录（`$DSH_ADB_HOME`）；没有（空串）时 runner
  *   只会走 legacy 5555，无线调试通道不可用。**必须原样转交**，理由见模块头注释。
+ * @param shizuku Shizuku 桥的抽象 socket 名（`$DSH_SHIZUKU_SOCKET`）；空串时
+ *   runner 跳过 Shizuku 通道。**必须原样转交**，理由见模块头注释。
  */
-function shellTool(ctx, runner, nodeBin, dshHome, adbHome) {
+function shellTool(ctx, runner, nodeBin, dshHome, adbHome, shizuku) {
 	return {
 		name: TOOL_NAME,
 		description: DESCRIPTION,
@@ -255,9 +264,16 @@ function shellTool(ctx, runner, nodeBin, dshHome, adbHome) {
 					// `ADB_BIN` 变空串 ⇒ 无线调试通道整条不存在 ⇒ 只能靠 legacy 5555。
 					// 而设置页探测是宿主半插件自己 spawn 的（env 完整），会出现
 					// 「探测说可用、模型执行进不去无线通道」。见模块头注释。
+					//
+					// ⚠️ `DSH_SHIZUKU_SOCKET` 是**第三处**同样的坑，漏了它这条通道
+					// 整条不存在（`SHIZUKU_SOCKET` 为空 ⇒ 直接跳过通道 0）。
+					// 它是 uid 2000 里唯一**不依赖 adbd** 的来源：Android 10 及以下
+					// 没有无线调试、`persist.adb.tcp.port` 又写不进去，对这类设备
+					// 它是唯一免 PC 的出路 —— 所以更不能不传。
 					env: {
 						DSH_HOME: dshHome,
 						...(adbHome === '' ? {} : { DSH_ADB_HOME: adbHome }),
+						...(shizuku === '' ? {} : { DSH_SHIZUKU_SOCKET: shizuku }),
 					},
 					signal: exec.signal,
 				})
@@ -312,15 +328,28 @@ export function apply(ctx) {
 		);
 	}
 
+	// Shizuku 桥的 socket 名。缺失**同样不阻止注册** —— 它只是 uid 2000 的
+	// 又一条来源，legacy / 无线调试照常可用。但它是**唯一不依赖 adbd** 的那条，
+	// 对 Android 10 及以下（没有无线调试）的设备往往是唯一出路，所以要报出来。
+	const shizukuRaw = process.env.DSH_SHIZUKU_SOCKET;
+	const shizukuValue = typeof shizukuRaw === 'string' ? shizukuRaw : '';
+	if (shizukuValue === '') {
+		ctx?.logger?.warn?.(
+			'[dsh-android-shell] 未配置 DSH_SHIZUKU_SOCKET —— Shizuku 通道不可用，' +
+				'uid 2000 只能靠 legacy 5555 或无线调试'
+		);
+	}
+
 	// ⚠️ **register 必须包 try/catch**：见 `dsh-android-bubble` 同处的说明 ——
 	// 工具注册抛异常会让 cordis 判定插件 failed，进而
 	// `dsh: startup failed: N required plugin did not activate` ⇒ 引擎退出、
 	// App 完全打不开。真机实测过（`dsh-android-logs` 漏 `output` 声明，54 次）。
 	try {
-		ctx.tools.register(shellTool(ctx, runner, process.execPath, dshHome, adbHomeValue));
+		ctx.tools.register(shellTool(ctx, runner, process.execPath, dshHome, adbHomeValue, shizukuValue));
 		ctx?.logger?.info?.(
 			`[dsh-android-shell] 已注册 uid 2000 特权工具 ${TOOL_NAME}: ${runner}` +
-				(adbHomeValue === '' ? '（无线调试通道不可用）' : `（内置 adb: ${adbHomeValue}）`)
+				(adbHomeValue === '' ? '（无线调试通道不可用）' : `（内置 adb: ${adbHomeValue}）`) +
+				(shizukuValue === '' ? '（Shizuku 通道不可用）' : `（Shizuku: ${shizukuValue}）`)
 		);
 	} catch (error) {
 		ctx?.logger?.warn?.(

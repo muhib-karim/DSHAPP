@@ -4596,6 +4596,79 @@ window.__ModuleLoader__.load({
 			//   写 `**加粗**` 或反引号会原样显示出来（第一版就这么错了）。
 			rootNote: "root 工具只在检测到 uid 0 时才注册。检测方式是真的跑一次 su -c id -u、看输出是不是 0，而不是查 su 文件在不在 —— 占位 su、装了 Magisk 但没授权、root 升级后失效这三种情况文件都在却提不了权。结果会缓存 24 小时。",
 			rootDetailNever: "（无）",
+
+			// ── Shizuku（uid 2000 的第二条来源，不依赖 adbd）────────────
+			//
+			// ⚠️ 这一块的存在理由，就是**修掉本页最大的那个坑**：内置的两条路
+			//   （固定端口 5555 / 无线调试）都以「设备上有一个可连的 adbd」为前提，
+			//   而 Android 10 及以下没有无线调试、`persist.adb.tcp.port` 又不可写，
+			//   于是每次重启都得让用户插上电脑再跑一次 `adb tcpip 5555`。
+			//   真机反馈原话：「他有线调试，按步骤走了，没成功，一切都跟没动一样」。
+			//
+			//   Shizuku 走 **binder**，不碰 adbd、不校验 adbkey、重启后依然有效 ——
+			//   对那批用户这是唯一走得通的路。所以它排在三张路径卡的最前面。
+			shizukuTitle: "Shizuku（不用电脑）",
+			// 四种状态各自对应**完全不同的下一步**，所以文案必须分开。
+			// ⚠️ 判据顺序是 装了 → 服务在跑 → 已授权，不能合并成一个布尔：
+			//   「没装」要引导去下载，「装了没跑」要引导去打开它，
+			//   「跑了没授权」才是点授权 —— 三者按钮完全不同。
+			shizukuAbsent: "未安装",
+			shizukuInstalled: "未启动",
+			shizukuUngranted: "待授权",
+			shizukuGranted: "已就绪",
+			shizukuNextAbsent: "本机还没装 Shizuku。装上它就能免电脑开启特权身份。",
+			shizukuNextStopped: "Shizuku 已安装，但服务没有运行。打开 Shizuku 应用并点「启动」，再回来。",
+			shizukuNextUngranted: "Shizuku 服务已在运行。点右边按钮授权，在弹出的小窗口里点「允许」即可。",
+			shizukuNextGranted: "Shizuku 通道已就绪（uid 2000）。这条通道不依赖 adbd，重启手机后依然有效。",
+			// ⚠️ 授权成功后**不用重启 App**：runner 每次执行命令时才现连 Shizuku，
+			//   所以这里只是让界面去重新探测一次，而不是要求用户重启。
+			shizukuNextGrantedStale: "Shizuku 已授权，但上面的状态还是旧的。点右边按钮重新检测一次即可（不用重启应用）。",
+			shizukuDownload: "下载 Shizuku",
+			shizukuOpen: "打开 Shizuku",
+			shizukuGrant: "授权",
+			shizukuGranting: "等待授权…",
+			shizukuRecheck: "重新检测",
+			shizukuRowService: "服务",
+			shizukuRowUid: "服务身份",
+			shizukuRowVersion: "服务版本",
+			shizukuServiceRunning: "运行中",
+			shizukuServiceStopped: "未运行",
+			shizukuServiceAbsent: "未安装",
+			// Shizuku 的详细步骤（折起）。
+			// ⚠️ 逐条拆成独立键，**不要**用数组：`locale` 字典的值是字符串，
+			//   数组会被当成「取不到」而回落成键名原样显示（这个回落是静默的）。
+			shizukuStep1: "装上 Shizuku 并打开它。",
+			shizukuStep2: "在 Shizuku 里按它自己的提示启动服务 —— 通常要求先用电脑执行一次 adb（或用 root）。这一步只需做一次，之后每次开机它自己会起来。",
+			shizukuStep3: "回到本页点「授权」，在弹出的系统窗口里点「允许」。",
+			shizukuStep4: "回到本页点「重新检测」，上面的身份应变成 uid 2000。",
+			shizukuNote: "Shizuku 只在启动服务那一次需要 adb（或者 root），之后它自己常驻，本应用随时可用 —— 这与「固定端口」那条路每次重启都要电脑重跑 adb tcpip 5555 完全不同。命令同样不经过沙箱。",
+			shizukuNoBridge: "当前环境没有原生桥（DSHAndroid 不可用），无法操作 Shizuku。",
+			// 通道说明：已就绪时告诉用户走的是哪条。
+			chShizuku: "Shizuku（不依赖 adbd，重启也有效）",
+
+			// ── 三条路径的卡片标题（重做后统一结构）────────────────────
+			pathTitle: "开启方式",
+			pathIntro: "三条路任选一条即可，用哪条由本机支持情况决定 —— 卡片上的徽章就是它当前的状态。",
+			pathReady: "可用",
+			pathUnavailable: "不可用",
+			pathTodo: "待配置",
+			pathShowSteps: "查看步骤",
+			pathHideSteps: "收起步骤",
+			// Android 10 上「无线调试」这张卡**整张不渲染**（系统里根本没这个功能，
+			// 渲染出来只会是一堆点不动的按钮）。这里只留一句说明。
+			wlAbsentNote: "本机是 Android 10，系统里没有「无线调试」（它从 Android 11 才有），所以这条路不存在 —— 不必去设置里找。",
+
+			// ── 标签页布局 ──────────────────────────────────────────
+			// 三条通道各自一个标签，标签上的圆点就是它的状态 ——
+			// 不必逐个点开才知道哪条通。
+			tabAdb: "ADB",
+			tabShizuku: "Shizuku",
+			tabRoot: "root",
+			// ⚠️ 只有 ADB 标签需要这段统摄说明：它下面有**两张**卡（无线调试 +
+			//   电脑引导），而另外两个标签各只有一张、卡片自带说明。
+			//   没有它，用户看到两张并列的卡不知道它们同属一条通道。
+			adbIntro: "用内置的 adb 连上设备自己的 adbd，拿到 shell 身份执行命令。两条走法：Android 11+ 用「无线调试」配对，Android 10 及以下只能插电脑引导一次。",
+			rootIntro: "root 是 uid 0，比 uid 2000 还高一层。与上面两条通道互不影响：没有 root 的设备，uid 2000 照常可用。",
 		};
 
 		// ══════════════════════════════════════════════════════════════════
@@ -4792,6 +4865,62 @@ window.__ModuleLoader__.load({
 			//   Markdown markers, they would show up literally.
 			rootNote: "The root tool is registered only when uid 0 is detected. Detection actually runs su -c id -u and checks whether the output is 0, rather than looking for a su file — a placeholder su, Magisk installed but not authorized, and a root that broke after an upgrade all leave the file present while escalation fails. The result is cached for 24 hours.",
 			rootDetailNever: "(none)",
+
+			// ── Shizuku (second source of uid 2000, no adbd needed) ──
+			// ⚠️ This block exists to fix the page's biggest trap: both built-in
+			//   routes assume a reachable adbd. On Android 10 and below there is no
+			//   wireless debugging and persist.adb.tcp.port is not writable, so every
+			//   reboot needs the PC to re-run `adb tcpip 5555`. Shizuku goes over
+			//   binder — no adbd, no adbkey check, survives reboots.
+			shizukuTitle: "Shizuku (no computer needed)",
+			// Four states, four different next steps. Never collapse them into one
+			// boolean: "not installed" must lead to a download, "installed but
+			// stopped" to opening the app, and only "running but unauthorized" to
+			// the grant button.
+			shizukuAbsent: "Not installed",
+			shizukuInstalled: "Not running",
+			shizukuUngranted: "Not authorized",
+			shizukuGranted: "Ready",
+			shizukuNextAbsent: "Shizuku is not installed on this device. Install it to enable the privileged identity without a computer.",
+			shizukuNextStopped: "Shizuku is installed but its service is not running. Open the Shizuku app and tap Start, then come back.",
+			shizukuNextUngranted: "The Shizuku service is running. Tap the button to authorize, then tap Allow in the dialog that appears.",
+			shizukuNextGranted: "The Shizuku channel is ready (uid 2000). It does not depend on adbd and keeps working after a reboot.",
+			shizukuNextGrantedStale: "Shizuku is authorized, but the status above is stale. Tap the button to re-check (no need to restart the app).",
+			shizukuDownload: "Download Shizuku",
+			shizukuOpen: "Open Shizuku",
+			shizukuGrant: "Authorize",
+			shizukuGranting: "Waiting for authorization…",
+			shizukuRecheck: "Re-check",
+			shizukuRowService: "Service",
+			shizukuRowUid: "Service identity",
+			shizukuRowVersion: "Service version",
+			shizukuServiceRunning: "Running",
+			shizukuServiceStopped: "Not running",
+			shizukuServiceAbsent: "Not installed",
+			shizukuStep1: "Install Shizuku and open it.",
+			shizukuStep2: "Follow Shizuku's own instructions to start the service — usually it asks you to run adb once from a computer (or use root). This is needed only once; it starts itself on every boot afterwards.",
+			shizukuStep3: "Come back to this page, tap Authorize, and tap Allow in the dialog that appears.",
+			shizukuStep4: "Tap Re-check here — the identity should become uid 2000.",
+			shizukuNote: "Shizuku needs adb (or root) only for the one-time service start; after that it stays resident and this app can use it anytime. That is unlike the fixed-port route, which needs the PC to re-run adb tcpip 5555 after every reboot. Commands still bypass the sandbox.",
+			shizukuNoBridge: "No native bridge (DSHAndroid unavailable) in this environment — cannot control Shizuku.",
+			chShizuku: "Shizuku (no adbd, survives reboots)",
+
+			// ── Route cards (unified structure after the rework) ──
+			pathTitle: "How to enable it",
+			pathIntro: "Any one of the three routes is enough — which one applies depends on this device, and each card's badge shows its current state.",
+			pathReady: "Available",
+			pathUnavailable: "Unavailable",
+			pathTodo: "Needs setup",
+			pathShowSteps: "Show steps",
+			pathHideSteps: "Hide steps",
+			wlAbsentNote: "This device runs Android 10, which has no \"Wireless debugging\" (it starts at Android 11), so this route does not exist here — no need to look for it in settings.",
+
+			// ── Tab layout ──────────────────────────────────────────
+			tabAdb: "ADB",
+			tabShizuku: "Shizuku",
+			tabRoot: "root",
+			adbIntro: "Connect to the device's own adbd with the bundled adb to run commands as shell. Two routes: pair over \"Wireless debugging\" on Android 11+, or a one-time PC bootstrap on Android 10 and below.",
+			rootIntro: "root is uid 0, one level above uid 2000. It is independent of the two channels above: without root, uid 2000 still works.",
 		};
 
 		// 全内联样式：设置 dialog 里的既有教训是「匹配 dialog 的 CSS 规则会把弹窗
@@ -4856,6 +4985,45 @@ window.__ModuleLoader__.load({
 			// initialization`（整个插件 import 失败、界面直接白屏，踩过一次）。
 			// 所以颜色写死，与 MP_PRIV_TONE.on 保持一致。
 			tagRecommended: { marginLeft: "auto", fontSize: "11px", fontWeight: 600, padding: "2px 8px", borderRadius: "999px", color: "#2f9e44", background: "rgba(47,158,68,0.12)", whiteSpace: "nowrap" },
+
+			// ── 布局重做新增 ────────────────────────────────────────
+			// 三条路径之间的分组标题。比 `heading`（h2，18px）小一号 ——
+			// 它是分节内部的次级标题，与分节标题同分量会让层级糊掉。
+			groupTitle: { margin: "4px 0 0", fontSize: "15px", fontWeight: 600 },
+			// 卡片**内部**的折叠块：与顶层 `fold`（自己有边框、独立成块）区分开 ——
+			// 卡片里再套一个带边框的块会出现「框里套框」的双线，看着很脏。
+			// 这里只用一条上分隔线。
+			foldInline: { borderTop: "0.5px solid var(--dsw-alias-border-l2, #eee)", paddingTop: "8px" },
+
+			// ── 标签页（ADB / Shizuku / root）───────────────────────
+			//
+			// 下划线式标签：底边一条通栏分隔线，选中项盖一条 2px 主色指示条。
+			// ⚠️ 指示条靠 `marginBottom: "-0.5px"` **压在**那条分隔线上 —— 不压的话
+			//   选中项的下划线会比容器底边高半个像素，视觉上「浮」起来。
+			//   这是纯 CSS 手法，不需要额外的定位容器。
+			tabBar: {
+				display: "flex", alignItems: "stretch", gap: "2px",
+				borderBottom: "0.5px solid var(--dsw-alias-border-l2, #e2e2e2)",
+			},
+			tab: {
+				flex: "1 1 0", minWidth: 0,
+				display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
+				border: "none", background: "transparent",
+				color: "var(--dsw-alias-label-tertiary, #888)",
+				font: "inherit", fontSize: "14px",
+				padding: "9px 4px 10px", cursor: "pointer",
+				borderBottom: "2px solid transparent", marginBottom: "-0.5px",
+			},
+			tabActive: {
+				color: "var(--dsw-alias-label-primary, #222)", fontWeight: 600,
+				borderBottom: "2px solid var(--dsw-alias-interactive-bg-primary, #2b6cb0)",
+			},
+			// 标签上的状态点：进页面之前就能看出哪条通道是通的，不必逐个点开。
+			tabDot: { flex: "0 0 auto", width: "7px", height: "7px", borderRadius: "50%" },
+			// 窄屏上「Shizuku」比「ADB」宽得多，不省略的话三个标签宽度会被撑歪。
+			tabLabel: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+			// 标签页内容区：与常驻结论条拉开一点距离，让「上面是总览、下面是当前页」成立。
+			panel: { display: "flex", flexDirection: "column", gap: "12px", paddingTop: "2px" },
 
 			// ── 「交流群」分节 ──────────────────────────────────────
 			// 二维码容器：居中 + 一点上下留白，避免图片紧贴卡片边框。
@@ -5090,6 +5258,115 @@ window.__ModuleLoader__.load({
 				};
 			}, [readRoot]);
 
+			// ══ Shizuku 状态 ═══════════════════════════════════════════════
+			//
+			// 与上面两块**来源又不同**：Shizuku 的「装了没 / 服务在跑没 / 授权没」
+			// 全在**原生**侧（要问 PackageManager、要问 binder），所以走 JS 桥
+			// `window.DSHAndroid.shizukuState()`，与 root 同一套语义（只读缓存、
+			// 不触发探测，同步返回 JSON 文本）。
+			//
+			// ⚠️ **四个字段必须分开存、分开判**（见 PageBridge.shizukuState 的表）：
+			//   合并成一个布尔的话，「没装」和「装了没启动」会给出同一个结论，
+			//   而这两者要引导用户做的事完全不同（去下载 vs 去打开它）。
+			const SHIZUKU_EMPTY = { installed: false, binder: false, granted: false, uid: -1, version: 0 };
+			const [shizuku, setShizuku] = React.useState(SHIZUKU_EMPTY);
+			// 授权是异步的（用户在 Shizuku 自己的窗口里点「允许」），期间按钮要锁住。
+			const [shizukuBusy, setShizukuBusy] = React.useState(false);
+			const shizukuTimers = React.useRef(null);
+			if (shizukuTimers.current === null) shizukuTimers.current = new Set();
+
+			/** 读一次 Shizuku 状态（不触发任何动作）。 */
+			const readShizuku = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.shizukuState !== "function") {
+					setShizuku(SHIZUKU_EMPTY);
+					return;
+				}
+				try {
+					const raw = bridge.shizukuState();
+					const o = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+					setShizuku({
+						installed: !!o.installed,
+						binder: !!o.binder,
+						granted: !!o.granted,
+						uid: Number.isFinite(Number(o.uid)) ? Number(o.uid) : -1,
+						version: Number(o.version) || 0,
+					});
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 读取 Shizuku 状态失败:", e && e.message);
+					setShizuku(SHIZUKU_EMPTY);
+				}
+			}, []);
+
+			React.useEffect(() => { readShizuku(); }, [readShizuku]);
+
+			// 从 Shizuku 授权窗口回来时刷新 —— 那是**别的应用**的界面，本页拿不到
+			// 回调，只能靠 visibilitychange / focus（与 root 同一手法）。
+			React.useEffect(() => {
+				const onVisible = () => { if (!document.hidden) readShizuku(); };
+				document.addEventListener("visibilitychange", onVisible);
+				window.addEventListener("focus", onVisible);
+				return () => {
+					document.removeEventListener("visibilitychange", onVisible);
+					window.removeEventListener("focus", onVisible);
+				};
+			}, [readShizuku]);
+
+			React.useEffect(() => {
+				const timers = shizukuTimers.current;
+				return () => {
+					timers.forEach((id) => window.clearInterval(id));
+					timers.clear();
+				};
+			}, []);
+
+			/**
+			 * 点「授权」：拉起 Shizuku 的确认窗口，然后轮询授权结果。
+			 *
+			 * ⚠️ **必须轮询**：授权结论是 Shizuku 异步给的，原生侧只登记了一个
+			 *   监听器（见 `MainActivity.setupShizukuPermissionListener`），
+			 *   页面拿不到任何 promise。
+			 * ⚠️ 授权成功后再跑一次 `refresh()`：`identity` 那条结论来自 runner
+			 *   的探测（宿主半 HTTP 路由），与 Shizuku 的授权状态是**两件事** ——
+			 *   只更新 Shizuku 状态的话，上面的「当前状态」徽章还停在「未开启」，
+			 *   用户会以为授权没生效。**不需要重启 App**：runner 每次执行命令时
+			 *   才现连 Shizuku。
+			 */
+			const grantShizuku = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.shizukuRequestPermission !== "function") {
+					window.alert(t("shizukuNoBridge"));
+					return;
+				}
+				try {
+					bridge.shizukuRequestPermission();
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 请求 Shizuku 授权失败:", e && e.message);
+					return;
+				}
+				setShizukuBusy(true);
+				const startedAt = Date.now();
+				const timer = window.setInterval(() => {
+					const b = window.DSHAndroid;
+					let granted = false;
+					try {
+						const raw = b && b.shizukuState ? b.shizukuState() : "{}";
+						granted = !!(typeof raw === "string" ? JSON.parse(raw) : (raw || {})).granted;
+					} catch (e) { /* 读失败当作还没授权，继续等 */ }
+					// ⚠️ 上限 20 秒：用户可能正在那个窗口上犹豫，也可能压根没打开。
+					//   到点就解锁按钮并**照常读一次**，让界面显示真实状态 ——
+					//   不能停在「等待授权…」上不动。
+					if (granted || Date.now() - startedAt > 20000) {
+						window.clearInterval(timer);
+						shizukuTimers.current.delete(timer);
+						readShizuku();
+						setShizukuBusy(false);
+						if (granted) refresh();
+					}
+				}, 600);
+				shizukuTimers.current.add(timer);
+			}, [readShizuku, refresh, t]);
+
 			const data = state.phase === "ready" ? state.data : null;
 			// ⚠️ 软截止到期后**不再算 loading**：下一步提示与按钮可用性都按正常态渲染，
 			//   用户立刻拿回控制权（见 SOFT_DEADLINE_MS）。
@@ -5110,8 +5387,9 @@ window.__ModuleLoader__.load({
 			// 当前通道 —— 只有固定端口那条**不依赖无线调试开关**，所以要显式区分，
 			// 否则用户看到「已开启」也不知道关了开关会不会断。
 			const channel = data && data.identity ? data.identity.channel : "none";
-			const channelText = channel === "legacy" ? t("chStable")
-				: channel === "wireless" ? t("chWireless") : "";
+			const channelText = channel === "shizuku" ? t("chShizuku")
+				: channel === "legacy" ? t("chStable")
+					: channel === "wireless" ? t("chWireless") : "";
 
 			// ── 系统版本：决定走哪条引导路径 ──────────────────────
 			//
@@ -5141,10 +5419,34 @@ window.__ModuleLoader__.load({
 				// 四类「密钥侧」的问题，正解都是**再配对一次**，只是原因不同。
 				const keyKind = kind === "no-key" || kind === "key-revoked"
 					|| kind === "key-unauthorized" || kind === "key-blocked";
+				// ⚠️ **Shizuku 的优先级判据**（本次重做新增，是这次布局调整里
+				//   唯一改变「用户实际会去点哪个按钮」的地方）。
+				//
+				//   理由：内置的两条路都以「设备上有个可连的 adbd」为前提，而
+				//   Android 10 上那意味着每次重启都得插电脑。Shizuku 不需要 adbd、
+				//   重启也有效 —— 所以只要它**有可能**走得通，就该排在前面。
+				//
+				//   判据用 `installed || binder` 而不是 `granted`：
+				//     · 装了但没启动 → 用户点一下就能启动，值得推
+				//     · 没装 → 也值得推（下载一次，之后一劳永逸）
+				//   两者都比「去插电脑」轻。真机反馈的那位用户正是这种情况。
+				const shizukuViable = shizuku.installed || shizuku.binder;
 				if (identityOk) {
 					next = channel === "wireless"
 						? { text: t("nextSwitchHint"), action: "switchTcp", label: t("wlTcp") }
 						: { text: t("nextAllGood"), action: null };
+				} else if (shizuku.granted) {
+					// Shizuku 已授权但 runner 还没跟上 —— 只要重新检测，不用重启。
+					next = { text: t("shizukuNextGrantedStale"), action: null };
+				} else if (shizukuViable) {
+					// 有 Shizuku 可用，就别再让用户去碰 adb 那条路。
+					// ⚠️ 这里**必须给按钮**：只写一句「去启动 Shizuku」而不给入口，
+					//   用户得自己在应用列表里找 Shizuku —— 而本页明明知道该点哪里。
+					//   用 `onClick` 而不是 `action`：授权走的是 grantShizuku（要轮询
+					//   结果），不是 doAction 里那种一发即忘的动作。
+					next = shizuku.binder
+						? { text: t("shizukuNextUngranted"), onClick: grantShizuku, label: t("shizukuGrant") }
+						: { text: t("shizukuNextStopped"), action: "shizukuOpen", label: t("shizukuOpen") };
 				} else if (keyKind) {
 					// ⚠️ 只在系统真支持无线调试时才给配对按钮 —— 否则那个按钮在
 					//    Android 10 上永远走不通，点了只是白等（与下面同一条约束）。
@@ -5188,7 +5490,9 @@ window.__ModuleLoader__.load({
 			const doAction = (action) => {
 				const b = window.DSHAndroid;
 				const fn = action === "pair" ? "startWirelessPairing"
-					: action === "switchTcp" ? "switchToTcpMode" : null;
+					: action === "switchTcp" ? "switchToTcpMode"
+						: action === "shizukuOpen" ? "shizukuOpenManager"
+							: action === "shizukuDownload" ? "shizukuOpenDownload" : null;
 				if (fn === null) return;
 				if (!b || typeof b[fn] !== "function") { window.alert(t("wlNoBridge")); return; }
 				// ⚠️ 配对的一切交互（提示、配对码输入框、取消按钮）**都挂在那条常驻
@@ -5318,11 +5622,19 @@ window.__ModuleLoader__.load({
 					: null,
 				next ? e("div", { style: S.next },
 					e("span", { style: S.nextText }, next.text),
-					next.action ? e("button", {
+					// 两种按钮：`action` 走 doAction（原生一侧的一发即忘动作），
+					// `onClick` 走组件内的回调（Shizuku 授权要轮询结果）。
+					next.onClick ? e("button", {
 						type: "button",
 						style: S.btnPrimary,
-						onClick: () => doAction(next.action),
-					}, next.label) : null,
+						disabled: shizukuBusy,
+						onClick: next.onClick,
+					}, shizukuBusy ? t("shizukuGranting") : next.label)
+						: next.action ? e("button", {
+							type: "button",
+							style: S.btnPrimary,
+							onClick: () => doAction(next.action),
+						}, next.label) : null,
 				) : null,
 				// ⚠️ 软截止到期、真结果还没回来时，明确告诉用户「还在探测、你可以不等」，
 				//   并直接给出「重新匹配」入口 —— 而不是留一个没有结论也没有按钮的死界面。
@@ -5374,74 +5686,234 @@ window.__ModuleLoader__.load({
 				) : null,
 			);
 
-			// ── 两条引导路径：按系统版本决定哪条在前、哪条带「推荐」──
-			// （版本判定在函数开头，见 androidMajor / wirelessSupported）
-			const wlCard = e("div", { style: S.card },
+			// ── 三条开启路径：统一成同一种卡片结构 ────────────────────
+			//
+			// ⚠️ **这是本次布局重做的核心。** 原布局里三条路各有各的形状：
+			//   无线调试是一张普通卡（按钮常驻三个）、电脑引导是一个 details、
+			//   Shizuku 根本没有；顺序还随系统版本翻转（Android 10 电脑在前、
+			//   Android 11+ 无线在前）。结果是用户每次打开看到的排版都不一样，
+			//   得重新认一遍哪里是标题、哪里是按钮。
+			//
+			//   现在三条路**结构完全一致**，顺序也**固定**（Shizuku → 无线 → 电脑）：
+			//     标题 + 状态徽章
+			//     一句话说明
+			//     关键事实行（可选）
+			//     按钮行
+			//     折起的步骤（可选）
+			//   动线因此是固定的：先看徽章判断这条路通不通，再看按钮做下一步。
+			const pathCard = (opts) => e("div", { style: S.card },
 				e("div", { style: S.cardHead },
-					e("h3", { style: S.cardTitle }, t("wlTitle")),
-					wirelessSupported ? e("span", { style: S.tagRecommended }, t("recommended")) : null,
+					e("h3", { style: S.cardTitle }, opts.title),
+					e("span", {
+						style: { ...S.badge, color: opts.tone.color, background: opts.tone.bg },
+					}, opts.badge),
 				),
-				// Android 10 上明确说明为什么这条路不通，而不是让用户白找一遍。
-				!wirelessSupported ? e("p", { style: S.note }, t("wlUnsupported")) : null,
-				e("p", { style: S.intro }, t("wlIntro")),
-				e("ol", { style: S.steps }, [
+				opts.intro ? e("p", { style: S.intro }, opts.intro) : null,
+				...(opts.rows || []),
+				opts.actions && opts.actions.length > 0
+					? e("div", { style: S.actions }, ...opts.actions)
+					: null,
+				opts.steps && opts.steps.length > 0 ? e("details", { style: S.foldInline },
+					e("summary", { style: S.foldHead }, t("pathShowSteps")),
+					e("div", { style: S.foldBody }, e("ol", { style: S.steps }, opts.steps)),
+				) : null,
+				...(opts.notes || []),
+			);
+
+			// ① Shizuku —— 唯一不依赖 adbd 的那条，所以固定排第一。
+			//
+			// ⚠️ 四态徽章：装了 / 服务在跑 / 已授权 是**三个独立事实**，
+			//   合并的话「没装」和「装了没启动」会显示成同一个结论，
+			//   而这两者要用户做的事完全不同（去下载 vs 去打开它）。
+			const szTone = !shizuku.installed ? MP_PRIV_TONE.off
+				: !shizuku.binder ? MP_PRIV_TONE.warn
+					: !shizuku.granted ? MP_PRIV_TONE.warn
+						: MP_PRIV_TONE.on;
+			const szBadge = !shizuku.installed ? t("shizukuAbsent")
+				: !shizuku.binder ? t("shizukuInstalled")
+					: !shizuku.granted ? t("shizukuUngranted")
+						: t("shizukuGranted");
+			// 主按钮按状态换：没装→下载，装了没跑→打开它，跑了没授权→授权，
+			// 已授权→不需要主按钮（只留「重新检测」）。
+			//
+			// ⚠️ **一次只给一个主按钮**：原布局在同一屏里摆了五个同等分量的按钮
+			//   （配对/切端口/取消/重新检测/查看详情），用户不知道点哪个才对。
+			const szPrimary = !shizuku.installed
+				? e("button", {
+					type: "button", style: S.btnPrimary,
+					onClick: () => doAction("shizukuDownload"),
+				}, t("shizukuDownload"))
+				: !shizuku.binder
+					? e("button", {
+						type: "button", style: S.btnPrimary,
+						onClick: () => doAction("shizukuOpen"),
+					}, t("shizukuOpen"))
+					: !shizuku.granted
+						? e("button", {
+							type: "button", style: S.btnPrimary,
+							disabled: shizukuBusy,
+							onClick: grantShizuku,
+						}, shizukuBusy ? t("shizukuGranting") : t("shizukuGrant"))
+						: null;
+			const szCard = pathCard({
+				title: t("shizukuTitle"),
+				// 徽章兼「推荐」位：Shizuku 在**两种系统上都能用**且重启有效，
+				// 所以无论 Android 版本都是首推的那条（这正是本次加它的理由）。
+				tone: szTone,
+				badge: szBadge,
+				// ⚠️ intro 是**动态的「现在该做什么」**，不是固定的功能说明。
+				//   固定说明只在「没装」时才有信息量（那时用户确实不知道 Shizuku
+				//   是什么）；装了的人再看一遍等于白占一屏。
+				//   这与首屏 `next` 那条是同一条原则：先说下一步，再说原理。
+				intro: !shizuku.installed ? t("shizukuNextAbsent")
+					: !shizuku.binder ? t("shizukuNextStopped")
+						: !shizuku.granted ? t("shizukuNextUngranted")
+							// ⚠️ 第四种：Shizuku 已授权，但 runner 的探测结论还没跟上
+							//   （identityOk 为假）。此时说「已就绪」与上面的徽章矛盾，
+							//   必须说清「点一下重新检测就好」。
+							: identityOk ? t("shizukuNextGranted")
+								: t("shizukuNextGrantedStale"),
+				rows: [
+					e("div", { key: "svc", style: S.row },
+						e("span", { style: { ...S.dot, background: szTone.color } }),
+						e("span", { style: S.rowLabel }, t("shizukuRowService")),
+						e("span", { style: S.rowValue },
+							!shizuku.installed ? t("shizukuServiceAbsent")
+								: shizuku.binder ? t("shizukuServiceRunning")
+									: t("shizukuServiceStopped")),
+					),
+					// 服务身份/版本只在服务真的在跑时才有值 —— 没跑时显示「未运行」
+					// 是重复上面那行，所以干脆不渲染。
+					shizuku.binder ? e("div", { key: "uid", style: S.row },
+						e("span", { style: { ...S.dot, background: MP_PRIV_TONE.on.color } }),
+						e("span", { style: S.rowLabel }, t("shizukuRowUid")),
+						e("span", { style: S.rowValue }, shizuku.uid >= 0 ? `uid ${shizuku.uid}` : "—"),
+					) : null,
+					shizuku.binder ? e("div", { key: "ver", style: S.row },
+						e("span", { style: { ...S.dot, background: MP_PRIV_TONE.unknown.color } }),
+						e("span", { style: S.rowLabel }, t("shizukuRowVersion")),
+						e("span", { style: S.rowValue }, shizuku.version > 0 ? String(shizuku.version) : "—"),
+					) : null,
+				],
+				actions: [szPrimary, e("button", {
+					type: "button", style: S.btn,
+					onClick: readShizuku,
+				}, t("shizukuRecheck"))].filter(Boolean),
+				steps: [
+					e("li", { key: 0, style: S.step }, t("shizukuStep1")),
+					e("li", { key: 1, style: S.step }, t("shizukuStep2")),
+					e("li", { key: 2, style: S.step }, t("shizukuStep3")),
+					e("li", { key: 3, style: S.step }, t("shizukuStep4")),
+				],
+				notes: [e("p", { key: "note", style: S.note }, t("shizukuNote"))],
+			});
+
+			// ② 无线调试 —— Android 10 上给一张**纯说明卡**，不再是整张消失。
+			//
+			// ⚠️ 这一处改过两轮，方向是相反的，别再改回去：
+			//   原布局保留整张卡、只把配对按钮藏掉 ⇒ 用户看到一张标题写着
+			//   「无线调试」、里面有四个步骤、却没有任何按钮可点的卡，照着做白做
+			//   （真机反馈的「按步骤走了没成功、一切都跟没动一样」有一部分就是它）。
+			//   改成整张不渲染之后又矫枉过正 —— 用户在 ADB 标签下**根本看不到**
+			//   还有这么一条路，只会以为本应用漏做了。
+			//
+			//   现在：**行还在、点得进去、里面说清为什么不支持**。可见性与
+			//   「不骗用户去点一个走不通的按钮」两个要求同时满足 —— 判据是
+			//   「有没有可点的动作」，而不是「这一块在不在」。
+			const wlCard = !wirelessSupported
+				? e("div", { style: S.card },
+					e("div", { style: S.cardHead },
+						e("h3", { style: S.cardTitle }, t("wlTitle")),
+						e("span", {
+							style: {
+								...S.badge,
+								color: MP_PRIV_TONE.unknown.color,
+								background: MP_PRIV_TONE.unknown.bg,
+							},
+						}, t("pathUnavailable")),
+					),
+					e("p", { style: S.intro }, t("wlAbsentNote")),
+				)
+				: pathCard({
+				title: t("wlTitle"),
+				tone: identityOk && channel === "wireless" ? MP_PRIV_TONE.on : MP_PRIV_TONE.off,
+				badge: identityOk && channel === "wireless" ? t("pathReady") : t("pathTodo"),
+				intro: t("wlIntro"),
+				rows: [
+					// 无线端口是「有没有发现到」的最直接证据 —— 没有它，
+					// 用户只能靠「配对按钮点了没反应」来猜，无从下手。
+					// 三态：真的在听（绿）/ 文件里有值但端口已死（灰，说明无线调试关了）/
+					// 没发现（灰）。中间那态以前会误报成绿灯。
+					data ? e("div", { key: "port", style: S.row },
+						e("span", {
+							style: {
+								...S.dot,
+								background: wlPort ? MP_PRIV_TONE.on.color
+									: wlStale ? MP_PRIV_TONE.unknown.color : MP_PRIV_TONE.off.color,
+							},
+						}),
+						e("span", { style: S.rowLabel }, t("wlPort")),
+						e("span", { style: S.rowValue }, wlPort ? String(wlPort)
+							: wlStale ? t("wlPortStale") : t("wlPortNone")),
+					) : null,
+				],
+				actions: [
+					e("button", {
+						type: "button", style: S.btnPrimary,
+						disabled: pairing,
+						onClick: () => doAction("pair"),
+					}, pairing ? t("wlPairing") : t("wlPair")),
+					// ⚠️ 「取消配对」只在**真的在配对时**才出现。原布局让它常驻，
+					//   于是一个没有任何进行中操作的页面上摆着「取消配对」——
+					//   用户会以为有什么正在跑，或者点了它以为取消了什么。
+					pairing ? e("button", {
+						type: "button", style: S.btn,
+						onClick: cancelPairing,
+					}, t("wlCancel")) : null,
+					e("button", {
+						type: "button", style: S.btn,
+						onClick: () => doAction("switchTcp"),
+					}, t("wlTcp")),
+				].filter(Boolean),
+				steps: [
 					e("li", { key: 0, style: S.step }, t("wlStep1")),
 					e("li", { key: 1, style: S.step }, t("wlStep2")),
 					e("li", { key: 2, style: S.step }, t("wlStep3")),
 					e("li", { key: 3, style: S.step }, t("wlStep4")),
-				]),
-				// 无线端口是「有没有发现到」的最直接证据 —— 没有它，
-				// 用户只能靠「配对按钮点了没反应」来猜，无从下手。
-				// 三态：真的在听（绿）/ 文件里有值但端口已死（灰，说明无线调试关了）/
-				// 没发现（灰）。中间那态以前会误报成绿灯。
-				data ? e("div", { style: S.row },
-					e("span", {
-						style: {
-							...S.dot,
-							background: wlPort ? MP_PRIV_TONE.on.color
-								: wlStale ? MP_PRIV_TONE.unknown.color : MP_PRIV_TONE.off.color,
-						},
-					}),
-					e("span", { style: S.rowLabel }, t("wlPort")),
-					e("span", { style: S.rowValue }, wlPort ? String(wlPort)
-						: wlStale ? t("wlPortStale") : t("wlPortNone")),
-				) : null,
-				e("div", { style: S.cmdRow },
-					e("button", {
-						type: "button",
-						style: S.btnPrimary,
-						disabled: pairing,
-						onClick: () => doAction("pair"),
-					}, pairing ? t("wlPairing") : t("wlPair")),
-					e("button", {
-						type: "button",
-						style: S.btn,
-						onClick: () => doAction("switchTcp"),
-					}, t("wlTcp")),
-					e("button", {
-						type: "button",
-						style: S.btnQuiet,
-						onClick: cancelPairing,
-					}, t("wlCancel")),
-				),
-				// 等待期间把「接下来该做什么」直接铺在按钮下面 —— 用户点了配对之后
-				// 眼神还在这块区域，跑到别处去提示等于没提示。
-				pairing ? e("p", { style: S.note }, t("wlPairingHint")) : null,
-				e("p", { style: S.note }, t("wlTcpHint")),
-				e("p", { style: S.note }, t("wlPairHint")),
-			);
+				],
+				notes: [
+					// 等待期间把「接下来该做什么」直接铺在按钮下面 —— 用户点了配对之后
+					// 眼神还在这块区域，跑到别处去提示等于没提示。
+					pairing ? e("p", { key: "hint", style: S.note }, t("wlPairingHint")) : null,
+					e("p", { key: "tcp", style: S.note }, t("wlTcpHint")),
+					// ⚠️ 这条必须留：用户看到「输入配对码」的第一反应是「让 App 自己填」
+					//   或者「复制粘贴」，而 SPAKE2 要求人工输入。不说清就会反复试。
+					e("p", { key: "code", style: S.note }, t("wlPairHint")),
+				].filter(Boolean),
+			});
 
-			// ── 电脑引导 ──────────────────────────────────────────
-			// Android 10 上它是**唯一**可行的路径，所以默认展开、摆前面；
-			// Android 11+ 上它只是备用，折起来放后面。
-			const pcCard = e("details", { style: S.fold, open: !wirelessSupported },
-				e("summary", { style: S.foldHead },
-					wirelessSupported ? t("pcTitle") : t("pcTitlePrimary")),
-				e("p", { style: S.intro }, t("pcIntro")),
-				e("ol", { style: S.steps }, guideSteps),
-			);
+			// ③ 电脑引导（固定端口）—— 所有版本上都成立，所以永远渲染。
+			const pcCard = pathCard({
+				title: wirelessSupported ? t("pcTitle") : t("pcTitlePrimary"),
+				tone: identityOk && channel === "legacy" ? MP_PRIV_TONE.on : MP_PRIV_TONE.off,
+				badge: identityOk && channel === "legacy" ? t("pathReady") : t("pathTodo"),
+				intro: t("pcIntro"),
+				// Android 10 上「无线调试」那张卡整张不渲染，所以它为什么不存在的
+				// 那句话挪到这里 —— 否则用户会以为本应用漏做了这个功能。
+				notes: [!wirelessSupported
+					? e("p", { key: "wl-absent", style: S.note }, t("wlAbsentNote"))
+					: null].filter(Boolean),
+				actions: [e("button", {
+					type: "button", style: S.btn,
+					onClick: () => doAction("switchTcp"),
+				}, t("wlTcp"))],
+				// ⚠️ 这里的步骤**自带命令块**，不能走 pathCard 的纯文本 steps ——
+				//   所以整段作为 details 内容直接传进来。命令必须能一键复制：
+				//   本插件的全局 CSS 把 user-select 压成 none，长按选不中。
+				steps: guideSteps,
+			});
 
-			// ── 注意事项（同样折起）────────────────────────────────
+			// ── 注意事项（折起）────────────────────────────────
 			const notesCard = e("details", { style: S.fold },
 				e("summary", { style: S.foldHead }, t("notesTitle")),
 				e("ul", { style: S.notes },
@@ -5449,11 +5921,11 @@ window.__ModuleLoader__.load({
 				),
 			);
 
-			// ── root（uid 0）卡片 ──────────────────────────────────
+			// ── root（uid 0）二级界面 ─────────────────────────────
 			//
-			// 为什么单独一张卡：uid 2000 与 root 是**两条独立的通道**，可用性互不
-			// 影响（没 root 的设备照样能用 uid 2000）。所以不能把 root 塞进上面那张
-			// 状态卡的徽章里 —— 那个徽章只回答「uid 2000 能不能用」。
+			// 为什么单独一个标签：uid 2000 与 root 是**两条独立的通道**，可用性互不
+			// 影响（没 root 的设备照样能用 uid 2000）。所以不能把 root 塞进 ADB
+			// 那个标签里 —— 那个标签只回答「uid 2000 能不能用」。
 			//
 			// ⚠️ 三态各自对应**完全不同的下一步**（去授权 / 什么都不用做 / 去检测），
 			//   所以文案必须分开，不能合成一句「root 不可用」。
@@ -5479,6 +5951,7 @@ window.__ModuleLoader__.load({
 					e("h3", { style: S.cardTitle }, t("rootTitle")),
 					e("span", { style: { ...S.badge, color: rootTone.color, background: rootTone.bg } }, rootBadge),
 				),
+				e("p", { style: S.intro }, t("rootIntro")),
 				e("div", { style: S.next },
 					e("span", { style: S.nextTextWide }, rootNext),
 					e("button", {
@@ -5503,24 +5976,102 @@ window.__ModuleLoader__.load({
 				e("p", { style: S.note }, t("rootNote")),
 			);
 
+			// ══ 标签页布局 ════════════════════════════════════════════════
+			//
+			// ⚠️ **这是第二次重做，与上一版的结构差异必须说清，否则很容易改回去。**
+			//
+			//   上一版把三条通道**全部平铺**在一屏上（Shizuku 卡 + 无线卡 + 电脑引导卡
+			//   + root 卡），理由是「让用户看到还有别的路」。实测的代价是：一屏里
+			//   四五张结构相似的卡纵向排开，每张都带徽章、说明、按钮、折叠步骤，
+			//   用户在 360px 宽的屏上要滑很久才能看完，而且**看完也不知道该点哪张**
+			//   —— 卡片之间的层级全靠徽章文字区分，那太弱了。
+			//
+			//   现在：三条通道各占一个标签，**标签栏本身就是导航** —— 点标签直接切到
+			//   该通道的二级界面，一屏一件事。
+			//
+			// ⚠️ **不要额外加一层「概览列表」。** 中途试过「标签栏 + 三行概览卡」，
+			//   结果是同一组信息（通道名 + 状态）在一屏里说两遍，而且两处的点击
+			//   行为一样、视觉分量却不同，用户会以为它们是两回事。标签栏的圆点
+			//   已经承担了「不点进去就知道哪条通」的职责，够了。
+			//
+			//   两条约束仍然成立（与上一版一致，不能丢）：
+			//     ① 三条路都**看得见** —— 标签栏常驻，不存在「藏起来」
+			//     ② 顺序固定 Shizuku → ADB → root，不按系统版本翻转
+			//     ③ 走不通的路**不给按钮**，但说明必须看得到（见 wlCard）
+			//
+			// 默认落在**第一个标签**（Shizuku）：它是唯一不依赖 adbd、重启也有效的
+			// 通道，对「Android 10 且只有有线 adb」那类设备是唯一可用的 ——
+			// 打开就停在最可能解决问题的那一页，而不是一个什么都没有的总览。
+			const [tab, setTab] = React.useState("shizuku");
+
+			// 三条通道在标签圆点上的状态色。
+			// ⚠️ 圆点色与卡片徽章色**必须同源**（都用 `MP_PRIV_TONE` 里那几档）——
+			//   分开算迟早会不一致，那种不一致用户一眼就能看到。
+			//
+			// ⚠️ 标签上**不摆徽章文字**。窄屏上三个标签平分 360px，每个只有
+			//   ~110px，「Shizuku」已经占掉大半，再塞「待配置 / 已就绪」会被
+			//   挤成省略号；而状态本身点进去就能看到，圆点已经足够传达「通/不通」。
+			const adbTone = identityOk && channel === "legacy" ? MP_PRIV_TONE.on : MP_PRIV_TONE.off;
+
+			const tabs = [
+				// ⚠️ **Shizuku 排第一**：它不依赖 adbd、重启也有效，是唯一对
+				//   「Android 10 且只有有线 adb」那类设备真正可用的通道。
+				//   ADB 排在它后面不是因为没用，而是因为它的两条走法都有前提。
+				//
+				// ⚠️ 标签只带 `label` / `tone` / `body` 三样，**不带标题与说明**
+				//   —— 那是卡片自己的事（`szCard`/`wlCard`/`pcCard`/`rootCard` 都自带
+				//   `cardHead` + intro）。中途试过在标签栏下面再加一块「通道标题 +
+				//   说明」的头部，结果是同一句话在屏幕上出现两遍，而且两处都是
+				//   「标题 + 徽章」的形状，用户会以为点错了地方。
+				{
+					id: "shizuku", label: t("tabShizuku"), tone: szTone,
+					body: szCard,
+				},
+				{
+					id: "adb", label: t("tabAdb"), tone: adbTone,
+					// ADB 二级界面 = 无线调试卡（Android 11+）或它的说明卡（Android 10）
+					//  + 电脑引导卡。两张都留着：它们同属「ADB 这条路」，只是走法不同。
+					//
+					// ⚠️ 两张卡之前先铺一段统摄说明。没有它，用户看到两张并列的卡
+					//   会以为是两条互不相干的路 —— 而它们其实共用同一套密钥与 adbd。
+					body: e("div", { style: S.stack },
+						e("p", { style: S.intro }, t("adbIntro")),
+						wlCard,
+						pcCard,
+					),
+				},
+				{
+					id: "root", label: t("tabRoot"), tone: rootTone,
+					body: rootCard,
+				},
+			];
+			// 找不到就退回第一个 —— `tab` 是本地 state，不会有非法值，但
+			// `find` 返回 undefined 时若直接解引用会在渲染期抛错、整页白屏。
+			const active = tabs.find((item) => item.id === tab) || tabs[0];
+
 			return e("div", { style: S.section },
 				e("h2", { style: S.heading }, t("title")),
 				e("p", { style: S.intro }, t("intro")),
+
+				// 常驻结论条：无论切到哪个标签都看得见 —— 它是「现在到底能不能用」的
+				// 唯一答案，不该因为切了标签就消失。
 				head,
-				// root 卡片**始终显示**（不像引导那样按状态折叠）—— 它的全部意义就是
-				// 让「本机有没有 root」这件事可见，折起来等于没做。
-				rootCard,
-				// 已就绪时把引导整体折起来 —— 能用的人不该被一堆步骤挡着。
-				// 未就绪时：Android 10 把电脑引导摆前面（那是唯一可行的路），
-				// Android 11+ 反过来 —— 无线调试更省事。
-				identityOk
-					? e("details", { style: S.fold },
-						e("summary", { style: S.foldHead }, t("setupTitle")),
-						e("div", { style: S.foldBody }, wlCard, pcCard),
-					)
-					: e("div", { style: S.stack },
-						...(wirelessSupported ? [wlCard, pcCard] : [pcCard, wlCard])),
-				notesCard,
+
+				e("div", { style: S.stack },
+					e("div", { style: S.tabBar },
+						...tabs.map((item) => e("button", {
+							key: item.id,
+							type: "button",
+							style: item.id === active.id ? { ...S.tab, ...S.tabActive } : { ...S.tab },
+							onClick: () => setTab(item.id),
+						},
+							e("span", { style: { ...S.tabDot, background: item.tone.color } }),
+							e("span", { style: S.tabLabel }, item.label),
+						)),
+					),
+					e("div", { style: S.panel }, active.body),
+					notesCard,
+				),
 			);
 		}
 

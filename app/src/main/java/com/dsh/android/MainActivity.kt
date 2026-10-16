@@ -57,6 +57,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Date
 import java.util.Locale
+import rikka.shizuku.Shizuku
 
 /**
  * 主界面：启动内置引擎，然后把 DSH 自带的 Web GUI 加载进 Web 视图。
@@ -817,7 +818,39 @@ class MainActivity : AppCompatActivity() {
         EngineService.start(this)
         ensureBatteryExempt()
         ensureStorageAccess()
+        setupShizukuPermissionListener()
         bootEngine()
+    }
+
+    /**
+     * 登记 Shizuku 授权结果的监听。
+     *
+     * ## 为什么必须在这里登记
+     *
+     * Shizuku 的授权流程是**异步**的：我们调 `requestPermission()` 之后，
+     * Shizuku 服务端拉起**它自己的**确认界面，用户在那边点「允许」，
+     * 结果才经这个监听器回来。不登记的话用户点完授权，App 侧**永远不知道**，
+     * 设置页会一直显示「未授权」—— 而实际已经授权了，用户只能靠重启 App 才发现
+     * （典型的「结论与事实不符」）。
+     *
+     * ⚠️ **结果只用来打日志，不改任何本地状态**：Shizuku 的授权事实存在它自己那边，
+     * 我们这边每次都是现读（`Shizuku.checkSelfPermission()`，见
+     * [ShizukuChannel.hasPermission]）。再存一份副本就会有两份可能不一致的事实。
+     * 设置页靠轮询 [PageBridge.shizukuState] 拿最新结论。
+     */
+    private fun setupShizukuPermissionListener() {
+        runCatching {
+            Shizuku.addRequestPermissionResultListener { requestCode, grantResult ->
+                Log.i(
+                    DshApplication.TAG,
+                    "Shizuku 授权结果: requestCode=$requestCode " +
+                        "granted=${grantResult == PackageManager.PERMISSION_GRANTED}",
+                )
+            }
+        }.onFailure { t ->
+            // 登记失败只是少了条日志，不影响授权本身（Shizuku 那边照常记）
+            Log.w(DshApplication.TAG, "登记 Shizuku 授权监听失败: ${t.message}")
+        }
     }
 
     /**
@@ -1720,6 +1753,105 @@ class MainActivity : AppCompatActivity() {
                 val result = RootAccess.detect(app, force = true)
                 Log.i(DshApplication.TAG, "root 重新检测结果: ${result.state} ${result.detail}")
             }.start()
+        }
+
+        /**
+         * 读 Shizuku 通道状态。返回 JSON 字符串。
+         *
+         * 四个字段是**四个独立的事实**（装了 / 服务在跑 / 已授权 / 服务端身份），
+         * 合成一个布尔会让用户照错的提示去行动 —— 见 [PageBridge.shizukuState]。
+         *
+         * ⚠️ 全程 `runCatching`：这个方法的结果直接拼进页面 DOM，抛异常会让 JS 桥
+         *   把错误吞掉、那一行变成空白，用户以为功能没做（与 [logSummary] 同理）。
+         */
+        override fun shizukuState(): String = runCatching {
+            JSONObject()
+                .put("installed", ShizukuChannel.isManagerInstalled(this@MainActivity))
+                .put("binder", ShizukuChannel.isBinderAlive())
+                .put("granted", ShizukuChannel.hasPermission())
+                .put("uid", ShizukuChannel.serverUid())
+                .put("version", ShizukuChannel.serverVersion())
+                .toString()
+        }.getOrElse { t ->
+            Log.w(DshApplication.TAG, "读取 Shizuku 状态失败: ${t.message}")
+            "{}"
+        }
+
+        /**
+         * 设置页点「授权」：让 Shizuku 弹它自己的确认界面。
+         *
+         * ⚠️ **必须在主线程**：Shizuku 用当前 Activity 作为确认界面的宿主。
+         * ⚠️ 结果异步回来（用户在 Shizuku 的界面上点「允许」），所以这里立即返回；
+         *   界面靠轮询 [shizukuState] 拿结论，与 [rootRecheck] 同构。
+         */
+        override fun shizukuRequestPermission() {
+            Log.i(DshApplication.TAG, "设置页请求 Shizuku 授权")
+            runOnUiThread {
+                val ok = ShizukuChannel.requestPermission(this@MainActivity, SHIZUKU_REQUEST_CODE)
+                if (!ok) {
+                    // 没有 binder 时 Shizuku 根本没法弹框（确认界面由**服务端**拉起），
+                    // 所以这里要如实告诉用户「先去启动 Shizuku」，而不是静默什么都不发生。
+                    Toast.makeText(
+                        this@MainActivity,
+                        getString(R.string.shizuku_need_service),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+
+        /**
+         * 拉起 Shizuku 管理器应用。
+         *
+         * ⚠️ 用 `getLaunchIntentForPackage` 而不是写死 Activity 名：Shizuku 换过
+         *   主 Activity 的名字，写死会在版本更新后失效（而 `launchIntent` 由系统
+         *   从清单里解析，不会）。取不到时回落到应用详情页 —— 那也是用户能手动
+         *   打开它的地方。
+         */
+        override fun shizukuOpenManager() {
+            Log.i(DshApplication.TAG, "设置页请求打开 Shizuku")
+            runOnUiThread {
+                val pm = packageManager
+                val launch = pm.getLaunchIntentForPackage(ShizukuChannel.MANAGER_PACKAGE)
+                val intent = launch ?: Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:${ShizukuChannel.MANAGER_PACKAGE}"),
+                )
+                startActivitySafely(intent)
+            }
+        }
+
+        /**
+         * 打开 Shizuku 的官方发布页。
+         *
+         * ⚠️ 走浏览器而不是商店：Shizuku 在部分国内 ROM 的应用商店里搜不到，
+         *   而它的 GitHub Releases 是权威来源。
+         */
+        override fun shizukuOpenDownload() {
+            Log.i(DshApplication.TAG, "设置页请求下载 Shizuku")
+            runOnUiThread {
+                startActivitySafely(
+                    Intent(Intent.ACTION_VIEW, Uri.parse(SHIZUKU_DOWNLOAD_URL))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+
+        /**
+         * 起一个外部 Activity，失败时静默记日志。
+         *
+         * ⚠️ 不弹「没有应用能处理」：这类失败对用户没有可操作性（他能做的只是
+         *   自己去找），弹一个 Toast 反而像是 App 出了问题。
+         */
+        private fun startActivitySafely(intent: Intent) {
+            runCatching {
+                if (intent.component == null && intent.action == Intent.ACTION_VIEW) {
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            }.onFailure { t ->
+                Log.w(DshApplication.TAG, "拉起外部界面失败: ${t.message}")
+            }
         }
 
         /**
@@ -3230,6 +3362,17 @@ class MainActivity : AppCompatActivity() {
     internal companion object {
         /** 键盘高度缓存的 SharedPreferences 文件名。 */
         const val IME_PREFS = "dsh_ime"
+
+        /**
+         * Shizuku 授权请求码。
+         *
+         * ⚠️ 只用于 Shizuku 自己的回调（`onRequestPermissionResult`），与 Android
+         *   运行时的 `requestPermissions` 请求码是**两套独立体系**，不要混用。
+         */
+        const val SHIZUKU_REQUEST_CODE = 0x5A17
+
+        /** Shizuku 官方发布页。放常量而不是写在方法里：它是要给用户看的 URL。 */
+        const val SHIZUKU_DOWNLOAD_URL = "https://shizuku.rikka.app/download/"
 
         /**
          * 键盘高度缓存的 key（按朝向分）。

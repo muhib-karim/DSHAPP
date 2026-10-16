@@ -1,13 +1,12 @@
 {
   "name": "dsh-jiuling-remote-desktop",
-  "version": "1.0.2",
-  "description": "DSH 远程目录（电脑端）：把本机 DSH 会话的事件流经 Cloudflare 隧道搬到手机，手机进入电脑目录并发起对话，公网只传文本。",
+  "version": "1.0.14",
+  "description": "DSH 远程目录（电脑端）：把本机 DSH 会话的事件流经 Cloudflare 隧道搬到手机，手机进入电脑目录并发起对话，公网只传文本。含激活码配对流程。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
-    ".": {
-      "default": "./lib/index.js"
-    },
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "keywords": [
@@ -21,6 +20,10 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
     }
   },
   "license": "MIT",

@@ -1,6 +1,6 @@
 {
   "name": "dsh-jiuling-remote-mobile",
-  "version": "1.0.2",
+  "version": "1.0.19",
   "description": "DSH 远程目录（手机端）：在选文件夹流程里多出「电脑」页签，进入电脑目录、在电脑上发起对话，并把电脑的实时消息流同步到手机本地界面（只传文本，不映射桌面）。",
   "type": "module",
   "main": "./lib/index.js",

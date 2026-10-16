@@ -6265,6 +6265,18 @@ class EngineManager private constructor(private val context: Context) {
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
         val privRunner = ensurePrivilegedShell()
+        // ⚠️ **Shizuku 桥必须在引擎启动前起来**，而且**无论 Shizuku 当前可不可用
+        //    都要起**：Shizuku 服务可能是用户稍后才启动的（重启手机后要手动开一次），
+        //    而 socket 名一旦绑定就固定了 —— 起桥时检查可用性会让「先开 App
+        //    再开 Shizuku」永远连不上。见 [ShizukuChannel.start]。
+        //
+        // 这是 uid 2000 的第二条来源，且**不依赖 adbd**：对 Android 10 及以下
+        // （没有无线调试，且 persist.adb.tcp.port 写不进去 ⇒ 每次重启都要 PC
+        // 再跑一次 `adb tcpip 5555`）的用户，这往往是唯一可行的路。
+        if (ShizukuChannel.start(context)) {
+            Log.i(TAG, "Shizuku 桥已就绪: 管理器=${ShizukuChannel.isManagerInstalled(context)} " +
+                "binder=${ShizukuChannel.isBinderAlive()} 已授权=${ShizukuChannel.hasPermission()}")
+        }
         // 无线调试（Android 11+）用的 adb 工具链：让 uid 2000 通道在
         // 「只开了无线调试、没做 adb tcpip」的设备上也能用。见 ensureAdbWireless()。
         val adbWireless = ensureAdbWireless()
@@ -6459,6 +6471,14 @@ class EngineManager private constructor(private val context: Context) {
             // uid 2000 通道脚本的路径，供特权插件读取（见 [ensurePrivilegedPlugin]）。
             // 经环境变量传递而不是让 Kotlin 拼 JS 字面量：路径里可能有反斜杠与引号。
             privRunner?.let { put("DSH_PRIV_RUNNER", it.absolutePath) }
+            // Shizuku 桥的 socket 名，供 runner 走通道 0。
+            // ⚠️ 这里传的是**纯名字**（`<包名>.shizuku`），不是带 `\0` 前缀的路径：
+            //    envp 是 C 字符串，NUL 就是结束符 —— 传带 NUL 的值会被**静默截断**，
+            //    runner 拿到空串、通道 0 整条不生效且毫无报错。`\0` 由 runner 自己补
+            //    （见 runViaShizuku）。理由详见 ShizukuChannel.socketPath 的注释。
+            // ⚠️ 与 DSH_PRIV_RUNNER 同理：引擎的 scrubbedParentEnv() 会剥掉所有
+            //    `DSH_*`，插件必须显式转交（见 dsh-android-shell/lib/index.js）。
+            put("DSH_SHIZUKU_SOCKET", ShizukuChannel.socketName(context))
             // root 通道脚本的路径，供 root 插件读取（见 [ensureRootPlugin]）。
             // 同上：走环境变量而不是拼 JS 字面量。
             rootRunner?.let { put("DSH_ROOT_RUNNER", it.absolutePath) }
@@ -6968,6 +6988,9 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     fun stop() {
+        // Shizuku 桥随引擎一起收：它的接受线程是 daemon、名字随进程释放，
+        // 但显式关掉能让下一次 start() 重新绑定同一个名字而不撞车。
+        ShizukuChannel.stop()
         process?.let { p ->
             Log.i(TAG, "停止引擎")
             // ⚠️ 必须在 destroy 之前置位：destroy 之后 stdout 线程会立刻读到 EOF
@@ -7733,7 +7756,7 @@ class EngineManager private constructor(private val context: Context) {
          * ⚠️ 尤其**重跑 `tools/market-collect.mjs` 更新了 `lib/seed.json` 之后**
          * 也要改 —— 否则老设备会继续用包里那份旧种子。
          */
-        private const val MARKET_VERSION = "1.0.0-4"
+        private const val MARKET_VERSION = "1.0.0-5"
         private const val MARKET_STAMP = ".market_version"
 
         /**
@@ -8087,8 +8110,56 @@ class EngineManager private constructor(private val context: Context) {
          *      而 `.mobile_ui_version` 与 `-CompatVersion` 两戳只要都对得上，
          *      设备上那棵树就会被跳过、继续用旧产物覆盖。为免"源码与设备不一致"
          *      这种最难查的中间态，两个戳一起 bump（见 ⑯ 的 v4~v17 全部先例）。
+         * 1.0.0-63：**特殊权限界面布局重做 + 新增 Shizuku 通道。**
+         *      界面侧（`mobileui/lib/client.js`）：
+         *      ① 新增 Shizuku 卡片，摆在三条路径的第一位 —— 它是**唯一不依赖
+         *         adbd** 的那条（不走 5555、不校验 adbkey、重启后依然有效），
+         *         对 Android 10 那批「每次重启都要插电脑跑 adb tcpip」的用户是
+         *         唯一走得通的路；
+         *      ② 三条路径统一成同一个 `pathCard` 结构、顺序**固定**（原来是按
+         *         系统版本翻转的，换机/升级后版面全变，用户得重新认一遍）；
+         *      ③ 首屏「下一步」的决策树把 Shizuku 排在 adb 两条路之前；
+         *      ④ 按钮去重：一屏最多一个主按钮（原来同屏摆了五个同等分量按钮）。
+         *      原生侧：新增 `ShizukuChannel`（LocalServerSocket + IShizukuService
+         *      .newProcess）、`PageBridge` 四个方法、runner 的 0 号通道。
+         *      ⚠️ **必须同时 bump `tools/build-webview-compat.ps1 -CompatVersion`
+         *      （18 → 19）**：`mobileui/lib/client.js` 是降级编译的输入之一，
+         *      不 bump 就会命中「两戳都一致 → 整棵树跳过」，设备上继续跑旧布局，
+         *      而 `已安装移动端 UI 插件 1.0.0-63` 这行日志看起来一切正常。
+         *      本次真机实测踩到的正是这个形态（设备上 client.js 停在 369105 字节）。
+         * 1.0.0-64：**特殊权限界面改成标签页布局**（用户要求：ADB / Shizuku / root
+         *      各占一个标签页，点进去是二级界面）。
+         *      ① 标签栏替代原来的「三条路径 + root 卡全部平铺」：平铺时一屏里
+         *         四五张结构相似的卡纵向排开，用户在 360px 宽的屏上要滑很久，
+         *         而且**看完也不知道该点哪张** —— 层级全靠徽章文字区分，太弱；
+         *      ② 标签上带状态圆点，不点进去就能看出哪条通道通（圆点色与卡片
+         *         徽章色同源，都取 `MP_PRIV_TONE`）；
+         *      ③ 标签栏**本身就是导航**，不加「返回」按钮 —— 中途试过「标签栏 +
+         *         三行概览卡」，同一组信息在一屏里说两遍，已删；
+         *      ④ 默认停在 **Shizuku** 标签（唯一不依赖 adbd 的那条）；
+         *      ⑤ 无线调试在 Android 10 上**恢复渲染**：上一版整张卡不渲染，
+         *         用户根本看不到还有这条路，只会以为本应用漏做了。现在渲染成
+         *         一张纯说明卡（徽章「不可用」、**不给任何按钮**）——
+         *         判据是「有没有可点的动作」，不是「这一块在不在」。
+         *      ⚠️ **必须同时 bump `tools/build-webview-compat.ps1 -CompatVersion`
+         *      （19 → 20）**，理由同 v63：`mobileui/lib/client.js` 是降级编译的
+         *      输入之一，不 bump 会命中「两戳都一致 → 整棵树跳过」，
+         *      设备上继续跑旧布局，而日志看起来一切正常。
+         * 1.0.0-65：修正 v64 里 `rootIntro` 的 Markdown 标记。
+         *      文案写成「与上面两条通道**互不影响**」，而本页是**纯文本渲染**
+         *      （React 直接塞进 DOM），星号会**原样显示**出来 —— 真机截图上
+         *      就是「两条通道**互不影响**：没有 root 的设备…」。
+         *      ⚠️ **这一版的存在本身就是一条教训，别删**：v64 的标签页布局做完后
+         *      真机验过三个标签都正常，随后才发现星号问题；修完只重打了
+         *      `mobile-ui.zip` 并重跑 `build-webview-compat.ps1`（仍是 v20），
+         *      **忘了再 bump `MOBILE_UI_VERSION`** ⇒ 设备上两戳依旧是
+         *      `1.0.0-64` / `chrome74-v20` ⇒ 解包整体跳过 ⇒ 修正版根本没上机，
+         *      而 `已安装移动端 UI 插件` 那行日志压根不打印（版本没变），
+         *      看起来「什么都没发生」。
+         *      判据：改完 mobile-ui 源码，**两个戳都必须是新值**；
+         *      只要其中一个还是上次的值，设备就会继续跑旧产物。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-62"
+        private const val MOBILE_UI_VERSION = "1.0.0-65"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -8556,20 +8627,35 @@ class EngineManager private constructor(private val context: Context) {
         private val PRIVILEGED_PROMPT_DISABLED = """
             ## 特权身份（uid 2000 / shell）—— 当前不可用
 
-            本机的 shell 身份通道**尚未启用**：还没有导入 ADB 密钥，或设备上的
-            adbd 未开启 / 未授权。**`shell` 工具因此没有被注册**，你只有 `bash`。
+            本机的 shell 身份通道**尚未启用**。**`shell` 工具因此没有被注册**，
+            你只有 `bash`。
 
-            需要用户先用 USB 连接电脑执行一次引导（把电脑上已授权的 ADB 私钥推到设备）：
+            现在有**三条**可用的开启方式，按对用户的代价从低到高：
 
-            ```
-            adb push %USERPROFILE%\.android\adbkey /sdcard/dsh_adbkey
-            ```
+            1. **Shizuku（最省事，推荐先说这条）** —— 一次启动就常驻，不需要数据线、
+               不需要电脑、重启手机也依然有效。引导用户：装好 Shizuku → 在 Shizuku 里
+               启动服务（它自己会提示怎么做，通常要先用电脑跑一次 adb，或直接用 root）
+               → 回到本 App 的「设置 → 特权权限」点「授权」→ 点「重新检测」。
+            2. **无线调试（仅 Android 11 及以上）** —— 本 App 能自己完成配对，不用电脑。
+               在本 App 的设置页点「配对无线调试」，按通知栏提示走。
+            3. **电脑引导（所有版本都能用，但每次重启手机后要重做一次）** ——
+               用 USB 连上电脑后执行：
 
-            然后重启本 App 即可。在此之前：
+               ```
+               adb tcpip 5555
+               adb push %USERPROFILE%\.android\adbkey /sdcard/dsh_adbkey
+               ```
+
+               然后回到本 App 点「重新检测」。
+
+            ⚠️ **先说第 1 条**：第 3 条在 Android 10 及以下每次重启手机都要重做一遍
+            （`persist.adb.tcp.port` 不可写），这是用户抱怨最多的一点。
+
+            在通道启用之前：
 
             - **不要**尝试用任何方式绕过应用身份去执行特权命令，那只会回落成应用身份。
             - 截图、点击屏幕、卸载应用、改系统设置、读 `/dev/input` 这类操作
-              **当前一律做不到**，如实告诉用户并说明需要上面那次引导，不要反复重试。
+              **当前一律做不到**，如实告诉用户并说明上面三条路，不要反复重试。
         """.trimIndent()
 
         /**

@@ -253,8 +253,13 @@ async function probe() {
 	// 这次实际走的是哪条通道 —— 从 runner 自己打的 `通道: …` 行里读，不额外探测。
 	// 只有 legacy 5555 那条**不依赖无线调试开关**，所以设置页要能区分出来，
 	// 否则用户看到「已就绪」也不知道关了无线调试会不会断。
+	//
+	// ⚠️ Shizuku 那条更特殊：它**连 adbd 都不需要**（不依赖 5555、不依赖无线调试、
+	//    也不校验 adbkey）。对 Android 10 及以下它就是唯一免 PC 的出路，
+	//    所以必须单独认出来并显示 —— 否则用户看到「已就绪」会以为还得靠电脑。
 	snapshot.identity.channel = 'none';
-	if (/通道: legacy/.test(result.stderr)) snapshot.identity.channel = 'legacy';
+	if (/通道: Shizuku/.test(result.stderr)) snapshot.identity.channel = 'shizuku';
+	else if (/通道: legacy/.test(result.stderr)) snapshot.identity.channel = 'legacy';
 	else if (/通道: 无线调试/.test(result.stderr)) snapshot.identity.channel = 'wireless';
 
 	if (uid === '2000') {

@@ -25,6 +25,24 @@
  *
  * ## 怎么拿到 uid 2000
  *
+ * 有**三条**来源，按下面的顺序尝试，前一条走不通就落回后一条：
+ *
+ * | 顺序 | 通道 | 前提 |
+ * |---|---|---|
+ * | 0 | **Shizuku** | 设备装了 Shizuku 且已启动、已给我们授权 |
+ * | 1 | legacy 5555 | 有人（PC）执行过 `adb tcpip 5555`，且我们的密钥被信任 |
+ * | 1.5 | 切 TCP 再走 legacy | 无线调试可用时顺手切回固定端口 |
+ * | 2 | 无线调试 | Android 11+，配对过或发现到 `_adb-tls-connect._tcp` |
+ * | 3 | 本地执行 | 以上都不行 ⇒ 以 app 身份跑（不是失败，是降级） |
+ *
+ * **通道 0（Shizuku）不经过 adbd，也不校验 adbkey** —— 它把命令交给原生侧
+ * （`ShizukuChannel.kt`）的本地 socket 桥，由原生调 `IShizukuService.newProcess()`
+ * 在 Shizuku 服务端（uid 2000）执行。所以它对「Android 10 没有无线调试、
+ * `persist.adb.tcp.port` 又写不进去、每次重启都要 PC 重来一次」的处境是**唯一**
+ * 免 PC 的出路。socket 路径由 `DSH_SHIZUKU_SOCKET` 给出。
+ *
+ * ## 通道 1 的密钥从哪来
+ *
  * 设备上的 adbd 以 shell 身份（uid 2000）运行，监听 5555。本脚本直连它，
  * 走标准 ADB 协议认证后执行命令。**不需要 adb 二进制，也不需要 ADB server。**
  *
@@ -1250,6 +1268,137 @@ function withCwd(command, cwd) {
   return `cd ${quoted} 2>/dev/null || { ${notice}cd / 2>/dev/null; }; ${command}`;
 }
 
+// ── Shizuku 通道（经原生侧的本地 socket 桥）─────────────────
+/**
+ * Shizuku 桥的抽象 socket 名，由 Kotlin 侧经 `DSH_SHIZUKU_SOCKET` 传入。
+ *
+ * ⚠️ **`\0` 前缀必须在这里补，不能指望环境变量带上它。**
+ * `execve` 的 `envp` 是 C 字符串数组，NUL 就是结束符 —— Kotlin 侧若把带 NUL 的
+ * 值放进 `ProcessBuilder.environment()`，传过来会被**静默截断成空串**，
+ * 这条通道整条不生效且毫无报错。所以原生侧只传纯名字（`<包名>.shizuku`），
+ * Node 的 `net.connect({ path })` 靠这个 NUL 字节认出「抽象命名空间」。
+ *
+ * ⚠️ 少了这个字节，Node 会去文件系统里找一个同名**文件**，报 `ENOENT` ——
+ * 看起来像「桥没起来」，而桥其实好好的。
+ *
+ * ⚠️ 未设置时给空串（而不是某个猜测的默认值）：猜错的后果是连到一个不存在的
+ * socket 白等一次超时；空串则直接跳过这条通道。
+ */
+const SHIZUKU_SOCKET =
+  process.env.DSH_SHIZUKU_SOCKET === undefined || process.env.DSH_SHIZUKU_SOCKET === ''
+    ? ''
+    : `\u0000${process.env.DSH_SHIZUKU_SOCKET}`;
+
+/**
+ * 单条 Shizuku 命令的超时（毫秒）。
+ *
+ * 取 60 秒：这条通道**不经过 adb server**，省掉了连接与认证，但 `dumpsys`
+ * 这类命令本身就慢。超时的作用只是防止「Shizuku 服务端卡住 ⇒ 特权命令永远不返回」，
+ * 不必设得太紧。
+ */
+const SHIZUKU_TIMEOUT_MS = 60_000;
+
+/** 帧长度上限，与 Kotlin 侧 `ShizukuChannel.MAX_FRAME` **必须一致**。 */
+const SHIZUKU_MAX_FRAME = 32 * 1024 * 1024;
+
+/**
+ * 经 Shizuku 桥执行一条命令。
+ *
+ * ## 为什么这条通道要排在 legacy 之前
+ *
+ * 它绕开了 legacy 通道的**全部**前提：不需要 `adb tcpip 5555`、不需要
+ * adbkey 被设备信任、不需要无线调试。对 Android 10 及以下（没有无线调试，
+ * 且 `persist.adb.tcp.port` 写不进去 ⇒ 每次重启都要 PC 重来一次）的用户来说，
+ * 这往往是**唯一**可行的路。
+ *
+ * 而它失败得也快：桥没起 / Shizuku 没跑时，连 socket 直接 ECONNREFUSED 或
+ * ENOENT，几毫秒就返回，不会拖慢本来就该走 legacy 的设备。
+ *
+ * ## 协议
+ *
+ * 请求 `[4 字节大端长度][UTF-8 JSON]`，响应同构，见 `ShizukuChannel.kt`。
+ * stdout/stderr 用 Base64 传输（原生侧拿到的是原始字节，直接按 UTF-8 解会把
+ * 非法字节序列替换成 U+FFFD，把信息抹掉），这里解回来。
+ *
+ * @param {string} command 要执行的命令（已含 `withCwd` 的包装）。
+ * @param {string|undefined} workdir 工作目录，`newProcess` 的第三个参数。
+ * @returns {Promise<{stdout: string, stderr: string, code: number}|null>}
+ *   成功给结果；**任何失败都给 `null`**，由调用方继续往下回落 ——
+ *   这条通道的失败不该让整条链断掉（与 legacy 通道的写法一致）。
+ */
+function runViaShizuku(command, workdir) {
+  return new Promise((resolve) => {
+    if (SHIZUKU_SOCKET === '') return resolve(null);
+
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.destroy();
+      } catch {
+        // 已经关了
+      }
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => {
+      process.stderr.write(`${TAG} Shizuku 通道超时（${SHIZUKU_TIMEOUT_MS}ms），继续回落\n`);
+      done(null);
+    }, SHIZUKU_TIMEOUT_MS);
+    // ⚠️ 必须 unref：否则这条定时器自己就成了吊住事件循环的 handle，
+    //    与文件尾 armExitBackstop() 的说明同一个原因。
+    timer.unref?.();
+
+    const socket = net.connect({ path: SHIZUKU_SOCKET });
+    let buf = Buffer.alloc(0);
+
+    socket.on('connect', () => {
+      const payload = Buffer.from(JSON.stringify({ command, workdir: workdir ?? null }), 'utf8');
+      const head = Buffer.alloc(4);
+      head.writeUInt32BE(payload.length, 0);
+      socket.write(Buffer.concat([head, payload]));
+    });
+
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length < 4) return;
+      const len = buf.readUInt32BE(0);
+      if (len <= 0 || len > SHIZUKU_MAX_FRAME) {
+        process.stderr.write(`${TAG} Shizuku 桥回了非法帧长度 ${len}，继续回落\n`);
+        return done(null);
+      }
+      if (buf.length < 4 + len) return;
+      let res;
+      try {
+        res = JSON.parse(buf.subarray(4, 4 + len).toString('utf8'));
+      } catch (e) {
+        process.stderr.write(`${TAG} Shizuku 桥响应解析失败: ${e.message}\n`);
+        return done(null);
+      }
+      if (res.ok !== true) {
+        // 桥如实回答了「现在执行不了」，把它的原话透出去（比我们自己猜一句准）。
+        process.stderr.write(
+          `${TAG} Shizuku 通道不可用（${res.code ?? 'unknown'}: ${res.message ?? ''}），继续回落\n`
+        );
+        return done(null);
+      }
+      done({
+        stdout: Buffer.from(res.stdout ?? '', 'base64').toString('utf8'),
+        stderr: Buffer.from(res.stderr ?? '', 'base64').toString('utf8'),
+        code: typeof res.exitCode === 'number' ? res.exitCode : 0,
+      });
+    });
+
+    // ⚠️ 连不上是**正常路径**（多数设备压根没装 Shizuku），不打 `[dsh-adb]`
+    //    前缀的诊断行 —— 那会污染每一条特权命令的 stderr，让用户以为出了问题。
+    //    真正的结论由 `classifyFallback()` 在全部通道都失败时统一给出。
+    socket.on('error', () => done(null));
+    socket.on('close', () => done(null));
+  });
+}
+
 // ── 无线调试通道（经内置 adb 二进制）────────────────────────
 /**
  * 读 Kotlin 侧（`AdbMdns`）写下的端口文件。
@@ -1894,8 +2043,10 @@ function classifyFallback(diag, legacyReason) {
   if (diag.wireless === 'no-port') {
     return {
       kind: 'no-channel',
-      text: '固定端口 5555 与无线调试都不可用 —— 请打开系统的「无线调试」，' +
-        '或在设置页点「切到固定端口」',
+      // ⚠️ 这条文案是**无无线调试设备**（Android 10 及以下）最常见的一屏。
+      //    必须提到 Shizuku：对这类设备它是唯一免 PC 的路，而用户往往已经装了它。
+      text: '固定端口 5555 与无线调试都不可用 —— 请在设置页启用 Shizuku，' +
+        '或用电脑执行一次 `adb tcpip 5555`',
     };
   }
   return {
@@ -2000,14 +2151,38 @@ async function main() {
   const cwd = argv[1];
   const wrapped = withCwd(command, cwd);
 
+  // ── 诊断采集：每条通道各自记下「为什么没走成」──
+  // 旧实现只记通道 1 的原因，导致四种完全不同的处境在设置页长得一模一样
+  // （见 classifyFallback 的表）。这里几条通道分别记账，最后收敛成一条可执行的结论。
+  const diag = { key: 'ok', wireless: '', shizuku: '' };
+
+  // ── 通道 0：Shizuku（不依赖 adbd，优先级最高）──────────────
+  //
+  // ⚠️ **排在 legacy 之前是刻意的。** 它绕开了 legacy 与无线调试的**全部**前提：
+  //    不需要 `adb tcpip 5555`、不需要 adbkey 被设备信任、不需要无线调试开关。
+  //    对 Android 10 及以下（没有无线调试，且 `persist.adb.tcp.port` 写不进去
+  //    ⇒ 每次重启都要 PC 重来一次）的用户，这往往是唯一可行的路。
+  //
+  // ⚠️ 放在 `ensureKey()` / 密钥诊断**之后**：这条通道与密钥无关，
+  //    但下面 key 那几行是**无条件**执行的诊断记账（不是通道门卫），
+  //    所以顺序不影响 Shizuku 的可用性 —— 只是要保持诊断表完整。
+  if (SHIZUKU_SOCKET === '') {
+    diag.shizuku = 'not-configured';
+  } else {
+    const r = await runViaShizuku(wrapped, cwd);
+    if (r !== null) {
+      process.stderr.write(`${TAG} 通道: Shizuku（uid 2000）\n`);
+      return await finish(r.stdout, r.stderr, r.code);
+    }
+    // 失败原因已由 runViaShizuku 自己写进 stderr（超时/桥拒绝/解析失败），
+    // 这里只记一个笼统的标记 —— 细分的 kind 由 Kotlin 侧探测给出，比在这里猜准。
+    diag.shizuku = 'unavailable';
+  }
+
   // 先保证有密钥：可能来自 PC 中转（设备已信任），也可能现场生成（等待配对授权）。
   // 放在通道尝试**之前**，这样两条通道用的是同一把，诊断信息也准确。
   const hasKey = ensureKey();
 
-  // ── 诊断采集：每条通道各自记下「为什么没走成」──
-  // 旧实现只记通道 1 的原因，导致四种完全不同的处境在设置页长得一模一样
-  // （见 classifyFallback 的表）。这里三条通道分别记账，最后收敛成一条可执行的结论。
-  const diag = { key: 'ok', wireless: '' };
   if (!hasKey) {
     diag.key = 'missing';
   } else {
@@ -2018,7 +2193,7 @@ async function main() {
     }
   }
 
-  // ── 通道 1：legacy 5555（自实现协议，最快，Android 10 唯一可用）──
+  // ── 通道 1：legacy 5555（自实现协议，最快）──
   // 先试它是因为成本极低：端口没监听时是立刻 ECONNREFUSED，不拖慢。
   let legacyReason = hasKey ? '' : '没有 ADB 密钥';
   let conn = null;
@@ -2117,7 +2292,7 @@ async function main() {
   const why = classifyFallback(diag, legacyReason);
   process.stderr.write(
     `${TAG} uid 2000 不可用（${why.text}）→ 回落为本地执行\n` +
-      `${TAG} 诊断: kind=${why.kind} key=${diag.key} legacy=${legacyReason || 'n/a'} wireless=${diag.wireless || 'n/a'}\n`,
+      `${TAG} 诊断: kind=${why.kind} key=${diag.key} legacy=${legacyReason || 'n/a'} wireless=${diag.wireless || 'n/a'} shizuku=${diag.shizuku || 'n/a'}\n`,
   );
   process.exitCode = await runLocal(command);
 }

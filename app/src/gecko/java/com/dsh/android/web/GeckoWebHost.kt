@@ -630,6 +630,11 @@ class GeckoWebHost(
                     "bubbleSetEnabled" -> b.bubbleSetEnabled(args.optBoolean(0))
                     "bubbleRequestOverlay" -> b.bubbleRequestOverlay()
                     "rootRecheck" -> b.rootRecheck()
+                    // Shizuku（uid 2000 的第二条来源，见 ShizukuChannel）。
+                    // ⚠️ 与 system 版白名单必须逐条对齐，理由见下面那段的说明。
+                    "shizukuRequestPermission" -> b.shizukuRequestPermission()
+                    "shizukuOpenManager" -> b.shizukuOpenManager()
+                    "shizukuOpenDownload" -> b.shizukuOpenDownload()
                     // 日志与诊断（见 ⑫.6）。⚠️ 与 system 版的 `SystemPageBridge`
                     // 白名单**必须逐条对齐** —— 漏一条的症状是设置页那一块显示成
                     // 「没有原生桥」，不报错、不崩溃，只是静默失效。
@@ -649,7 +654,7 @@ class GeckoWebHost(
                     }
                     // 页面侧不会主动调这两个（它们走快照推送），但留个兜底：
                     // 收到就当「页面想要最新值」，推一次快照。
-                    "bubbleState", "bubbleAppearance", "rootState" -> pushSnapshot()
+                    "bubbleState", "bubbleAppearance", "rootState", "shizukuState" -> pushSnapshot()
                     // console / download 是 content script 自己发起的，见下。
                     "console" -> callbacks.onConsole(args.optString(0))
                     // 下载：页面世界 fetch → base64 分块 → 这里攒起来 → 宿主落盘。
@@ -713,6 +718,12 @@ class GeckoWebHost(
             // 日志摘要（JSON 文本）。页面侧 `logSummary()` 是**同步**读取，所以
             // 只能经快照缓存 —— 与 root/bubble 完全同一套语义。
             .put("logSummary", callbacks.bridge.logSummary())
+            // Shizuku 状态（JSON 文本）。同样是页面侧**同步**读取
+            // （`bridge.shizukuState()`），只能经快照缓存。
+            // ⚠️ 它必须进快照还有一个更硬的理由：Shizuku 的授权是**异步**回来的
+            //   （用户在 Shizuku 自己的确认界面上点「允许」），页面轮询时读的
+            //   就是这个缓存 —— 不推的话用户授权完，设置页永远停在「未授权」。
+            .put("shizuku", callbacks.bridge.shizukuState())
         postToExtension(msg)
     }
 

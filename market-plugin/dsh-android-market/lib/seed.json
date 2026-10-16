@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-15T09:04:01.600Z",
+  "generatedAt": "2026-10-15T16:31:27.439Z",
   "registry": "https://registry.npmjs.org",
   "keywords": {
     "community": "dshapp-plugin",
@@ -8,14 +8,14 @@
   },
   "truncated": false,
   "counts": {
-    "featured": 6,
-    "community": 0,
-    "total": 6
+    "featured": 7,
+    "community": 2,
+    "total": 9
   },
   "plugins": [
     {
       "name": "@jiuling/dsh-mcp-manager",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "description": "MCP 服务器管理器：在 DSH Web GUI 的设置界面中可视化新增 / 编辑 / 删除 / 启停 @deepseek-ai/dsh-mcp-client 配置行，直接读写当前 profile 的 cordis.patch.yml。",
       "keywords": [
         "dsh",
@@ -44,7 +44,7 @@
       },
       "installable": true,
       "risks": [],
-      "publishedAt": "2026-10-15T08:41:21.300Z",
+      "publishedAt": "2026-10-15T10:46:57.222Z",
       "featured": true
     },
     {
@@ -81,6 +81,38 @@
       "installable": true,
       "risks": [],
       "publishedAt": "2026-10-15T08:42:12.312Z",
+      "featured": true
+    },
+    {
+      "name": "dsh-compaction-threshold",
+      "version": "1.0.4",
+      "description": "在上下文监控卡片内直接调节自动压缩的触发阈值。host 半在运行时替换 @deepseek-ai/dsh-compaction-basic 已挂载引擎的 thresholdRatio 并持久化，client 半把滑块画进卡片面板。",
+      "keywords": [
+        "dsh",
+        "dsh-plugin",
+        "compaction",
+        "context",
+        "threshold",
+        "dshapp-plugin",
+        "dshapp-plugin-featured"
+      ],
+      "license": "MIT",
+      "author": null,
+      "publisher": "jiuling",
+      "homepage": null,
+      "repository": null,
+      "engines": {
+        "node": ">=18"
+      },
+      "dsh": {
+        "bundle": true,
+        "client": true,
+        "manifestVersion": null,
+        "dshReleases": null
+      },
+      "installable": true,
+      "risks": [],
+      "publishedAt": "2026-10-15T16:30:00.682Z",
       "featured": true
     },
     {
@@ -217,6 +249,69 @@
       "risks": [],
       "publishedAt": "2026-10-15T08:41:16.127Z",
       "featured": true
+    },
+    {
+      "name": "dsh-jiuling-remote-desktop",
+      "version": "1.0.5",
+      "description": "DSH 远程目录（电脑端）：把本机 DSH 会话的事件流经 Cloudflare 隧道搬到手机，手机进入电脑目录并发起对话，公网只传文本。",
+      "keywords": [
+        "dshapp-plugin",
+        "dsh",
+        "dsh-plugin",
+        "deepseek-harness",
+        "remote",
+        "cloudflare-tunnel"
+      ],
+      "license": "MIT",
+      "author": null,
+      "publisher": "jiuling",
+      "homepage": null,
+      "repository": null,
+      "engines": {
+        "node": ">=20"
+      },
+      "dsh": {
+        "bundle": true,
+        "client": false,
+        "manifestVersion": null,
+        "dshReleases": null
+      },
+      "installable": true,
+      "risks": [],
+      "publishedAt": "2026-10-15T15:20:39.997Z",
+      "featured": false
+    },
+    {
+      "name": "dsh-jiuling-remote-mobile",
+      "version": "1.0.5",
+      "description": "DSH 远程目录（手机端）：在选文件夹流程里多出「电脑」页签，进入电脑目录、在电脑上发起对话，并把电脑的实时消息流同步到手机本地界面（只传文本，不映射桌面）。",
+      "keywords": [
+        "dshapp-plugin",
+        "dsh",
+        "dsh-plugin",
+        "deepseek-harness",
+        "remote",
+        "android",
+        "cloudflare-tunnel"
+      ],
+      "license": "MIT",
+      "author": null,
+      "publisher": "jiuling",
+      "homepage": null,
+      "repository": null,
+      "engines": {
+        "node": ">=20"
+      },
+      "dsh": {
+        "bundle": true,
+        "client": true,
+        "manifestVersion": null,
+        "dshReleases": null
+      },
+      "installable": true,
+      "risks": [],
+      "publishedAt": "2026-10-15T15:23:01.937Z",
+      "featured": false
     }
   ]
 }

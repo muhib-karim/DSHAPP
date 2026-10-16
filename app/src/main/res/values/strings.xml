@@ -70,4 +70,14 @@
     -->
     <string name="rescue_banner_exit">退出并重试</string>
     <string name="rescue_banner_detail">上次为什么失败</string>
+
+    <!--
+      Shizuku 相关文案（设置页「特权权限」分节）。
+
+      Shizuku 是 uid 2000 的第二条来源，也是**唯一不依赖 adbd** 的那条：它不需要
+      设备上的 5555 在监听、不需要无线调试、也不校验我们的 adbkey。对 Android 10
+      及以下（没有无线调试，且每次重启都要电脑再跑一次 `adb tcpip 5555`）的用户，
+      这往往是唯一可行的路。
+    -->
+    <string name="shizuku_need_service">Shizuku 服务没有运行，无法弹出授权界面。请先打开 Shizuku 应用并启动服务，再回来点「授权」。</string>
 </resources>

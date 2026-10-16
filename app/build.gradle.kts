@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 23
+        versionCode = 24
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -79,7 +79,23 @@ android {
         //    新增「插件」动作 —— 列出第三方 bundle，可摘掉/装回，然后重启。
         //    官方 bundle（「@deepseek-ai/」开头）不列出、也拒绝摘除。
         //    versionName 仍不变，靠 versionCode 区分（既有惯例，见上）。
-        versionName = "0.2.9-rescue"
+        //
+        // ⚠️ 24（本次）**换 versionName：0.2.9-rescue → 0.3.0**。这是自 0.2.6
+        //    引入 flavor 之后第一次改前两位版本号，所以特别记一下判据：
+        //    之前十几版都靠 versionCode 区分同名的 `0.2.9-xxx`，是因为那些版本
+        //    彼此只差缺陷修复、对外还是「同一版」。而 0.3.0 有**新产品能力**：
+        //      ① 特殊权限新增 **Shizuku 通道** —— 不需要 adbd 在 5555、不需要
+        //         adbkey 被设备信任、重启后依然有效。对「Android 10 且只有有线
+        //         adb、不支持无线调试」那批用户，此前是**结构性死锁**
+        //         （`persist.adb.tcp.port` 写不进去 ⇒ 每次重启都要插电脑重跑
+        //         `adb tcpip 5555`），现在有解了；
+        //      ② 特殊权限界面重做成 ADB / Shizuku / root 三个标签页
+        //         （原来三条路径 + root 卡全部平铺，一屏滑不到底、也不知道该点哪张）。
+        //    对外可见的能力变化 ⇒ 该换 minor 号，不该再往 `0.2.9-*` 上叠。
+        //    ⚠️ versionCode 必须**继续递增**（23 → 24），不能因为是新名字就重置：
+        //    同一 applicationId 的包靠 versionCode 比大小判升级，重置成 1 会让
+        //    老用户的 `0.2.9-rescue (23)` 变成「比新版还新」，装不上更新。
+        versionName = "0.3.0"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
@@ -215,6 +231,28 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.8.7")
     implementation("com.google.android.material:material:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // ── Shizuku：uid 2000 特权通道的第二条来源 ──────────────────────────
+    //
+    // 原有的 uid 2000 通道**全部**要求「设备上的 adbd 能被我们连上」：
+    // legacy 5555（PC 跑过 `adb tcpip` 且 adbkey 被信任）或 Android 11+ 的无线调试。
+    // 这对两类用户根本不成立：Android 10 及以下（没有无线调试，且每次重启都要
+    // PC 再来一次），以及做不成 `adb tcpip` 的设备。而 Shizuku 只要用户装过、
+    // 启动过，我们就能以 uid 2000 执行 —— 不需要 5555、不需要 adbkey。
+    //
+    // 三个坐标缺一不可，各自的用途不同：
+    //   api      → `rikka.shizuku.Shizuku`（binder 状态、权限、getUid）
+    //   aidl     → `moe.shizuku.server.IShizukuService` / `IRemoteProcess`
+    //              （真正执行命令的接口；`Shizuku.newProcess` 是 private，
+    //                必须经这个接口自己调，见 ShizukuChannel.kt）
+    //   provider → `rikka.shizuku.ShizukuProvider`，清单里声明它才能收到 binder
+    //
+    // ⚠️ 版本锁在 **13.1.5**：`newProcess` 在 Shizuku API **14 计划被移除**
+    //   （见其源码该方法的注释），升上去这条通道会直接编译不过。
+    //   要升就必须同时改 ShizukuChannel 的执行方式，不是改个版本号的事。
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:aidl:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     // 内置内核版：GeckoView（Mozilla 自维护的 Gecko 引擎，随 APK 分发、不依赖
     // 设备上的系统 WebView）。只有 gecko flavor 才需要它。

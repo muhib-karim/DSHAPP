@@ -521,6 +521,23 @@ private class SystemPageBridge(private val impl: PageBridge) {
     @android.webkit.JavascriptInterface
     fun rootRecheck() = impl.rootRecheck()
 
+    // Shizuku（uid 2000 的第二条来源，见 ShizukuChannel）。
+    // ⚠️ 这个白名单是手工维护的 —— 往 PageBridge 加方法必须同步加到这里，
+    //   否则页面侧 `window.DSHAndroid.shizukuState` 是 undefined，
+    //   而插件里写的是「没有原生桥」，症状是那一块显示成没有桥，**不报错**。
+    //   这个坑真踩过一次（openLogs / logSummary 加接口时漏了这里）。
+    @android.webkit.JavascriptInterface
+    fun shizukuState(): String = impl.shizukuState()
+
+    @android.webkit.JavascriptInterface
+    fun shizukuRequestPermission() = impl.shizukuRequestPermission()
+
+    @android.webkit.JavascriptInterface
+    fun shizukuOpenManager() = impl.shizukuOpenManager()
+
+    @android.webkit.JavascriptInterface
+    fun shizukuOpenDownload() = impl.shizukuOpenDownload()
+
     /**
      * 设置页「运行日志与诊断」→ 拉起原生日志界面。
      *
