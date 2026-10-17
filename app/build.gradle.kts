@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 24
+        versionCode = 25
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -95,6 +95,26 @@ android {
         //    ⚠️ versionCode 必须**继续递增**（23 → 24），不能因为是新名字就重置：
         //    同一 applicationId 的包靠 versionCode 比大小判升级，重置成 1 会让
         //    老用户的 `0.2.9-rescue (23)` 变成「比新版还新」，装不上更新。
+        // ⚠️ 25（本次）**versionName 不变（0.3.0），靠 versionCode 区分**。
+        //    内容是缺陷修复，没有对外可见的新能力，所以按惯例不换名：
+        //      ① **白屏真根因（431）**：引擎每次启动都用「?token= → 303 + Set-Cookie」
+        //         换一个**新名字**的鉴权 cookie（`dsh-auth-<随机后缀>`，30 天有效），
+        //         永不覆盖也永不回收。累积到一定数量后请求头超过服务器上限，引擎
+        //         对首页回 **431 且响应体为空** ⇒ 永久白屏，且没有任何 JS 报错可查
+        //         （`#root` 与 `document.scripts` 全空、console 一条不输出）。
+        //         两个 flavor 都中招（gecko 存在 cookies.sqlite，system 存在 WebView
+        //         的 cookie jar），所以两边都在建宿主时清一次。
+        //      ② **GeckoView 不跟随那个 303**：`onLoadRequest` 只调一次、0.35s 后
+        //         `onPageStop success=true`，页面停在 303 的空响应上（同一 URL 在
+        //         系统浏览器里正常渲染）。修法是在页面世界 `fetch` 完成 token→cookie
+        //         交换后 `location.replace('./')`。
+        //      ③ **救援判据漏报**：坏 client bundle 让**整批** `/plugins/??` 失败时，
+        //         console 只有 `[web] error: {}`（Error 序列化成空对象）与
+        //         `首帧正文="HARNESS Loading plugins…"`，原两个判据都不匹配 ⇒
+        //         永不降级 ⇒ 用户点「进入安全模式」也没用。补第三类判据。
+        //      ④ 「进入安全模式」现在会真的把第三方包**挪出** node_modules
+        //         （此前只改 manifest，手装的包仍留在原地，坏 client bundle 照旧被
+        //         合并进前端）。
         versionName = "0.3.0"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构

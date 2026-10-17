@@ -95,6 +95,15 @@ object RescueBoot {
     const val SCHEMA_VERSION = 1
 
     /**
+     * 官方包的命名前缀。
+     *
+     * 用于把「平台自身的包」和「用户装的第三方包」分开（见
+     * `Failure.hasThirdPartyFailure`）。官方包失败属于平台/环境问题，
+     * 摘掉它只会让情况更糟；第三方失败才是「插件问题」。
+     */
+    private const val OFFICIAL_PACKAGE_PREFIX = "@deepseek-ai/"
+
+    /**
      * 启动层级。
      *
      * 顺序 = 降级顺序，**越往后第三方插件参与得越少**。
@@ -105,6 +114,16 @@ object RescueBoot {
 
         /** L1 自动隔离：摘掉了可疑的第三方插件，其余照常。 */
         ISOLATED("isolated", "已隔离可疑插件"),
+
+        /**
+         * L1.5 定向隔离：定位到了**具体某个**插件并把它禁掉，其余插件全部照常。
+         *
+         * ⚠️ 与 [ISOLATED] 的区别是**隔离的对象与手段**，不是程度：
+         * [ISOLATED] 摘的是 `dsh.profile.bundles` 里的第三方**包名**（改 `package.json`），
+         * 本层级禁的是**引擎条目 id**（写 `quarantine.patch.yml` 的 `disabled: true`）。
+         * 两者都命中时以本层级为准 —— 它更精确，且不需要改用户的 `package.json`。
+         */
+        QUARANTINED("quarantined", "已隔离坏插件"),
 
         /** L2 救援启动：不含任何第三方插件的干净 profile。 */
         RESCUE("rescue", "救援模式"),
@@ -200,15 +219,40 @@ object RescueBoot {
     ) {
         /** 是不是「插件问题导致起不来」。
          *
-         * 判据 = 引擎**自己**说了 `required plugin did not activate`。
+         * 两条判据取**或**：
+         *
+         * ① 引擎**自己**说了 `required plugin did not activate`（原有判据）；
+         * ② [hasThirdPartyFailure]：失败清单里存在**非官方**包。
          *
          * ⚠️ **不要用「`Failed plugins` 段落存在」当判据**：那一段里绝大多数是正常的
          * `skipping profile bundle`（版本不兼容，引擎自愿跳过、**不致命**）。
          * 真机反例：那台设备 `Failed plugins (40)` 但引擎**有时仍能起来**
          * （07:14 成功启动过两次）。用「有 Failed plugins 就是坏」会大面积误报。
+         * 判据②比它窄一档：只看**非官方包**，官方包失败是平台问题、不该被摘。
+         *
+         * ⚠️ 为什么必须有判据②：`dsh-app-boot` 的 `requiredStartupEntryIds` 是
+         * **白名单**（agent-loop / webserver / modules / connection /
+         * headless-runner / acp / sdk-jsonrpc-server）。用户自己写的插件**不在**白名单里，
+         * 它激活失败时引擎只 warn、不打 `required plugin did not activate`。
+         * 只有判据①的话，L1 二分对**用户插件**永远不会触发 —— 这是本方案要修的核心缺陷。
          */
         val looksLikePluginProblem: Boolean
-            get() = requiredDidNotActivate != null && requiredDidNotActivate > 0
+            get() = (requiredDidNotActivate != null && requiredDidNotActivate > 0) || hasThirdPartyFailure
+
+        /**
+         * 失败清单里是否含**非官方**包（不是 `@deepseek-ai/` 前缀）。
+         *
+         * 语义依据：`@deepseek-ai/` 是引擎自己的包，它失败属于平台/环境问题，
+         * 摘掉它只会让情况更糟；用户装的第三方包失败才是「插件问题」。
+         *
+         * ⚠️ 空清单返回 false —— 「没解析出失败插件」不等于「没有失败插件」，
+         * 不能据此下结论（本项目缺陷族「结论与它描述的对象不是同一个」）。
+         */
+        val hasThirdPartyFailure: Boolean
+            get() = failedPlugins.any { name ->
+                val n = name.trim()
+                n.isNotEmpty() && !n.startsWith(OFFICIAL_PACKAGE_PREFIX)
+            }
 
         /**
          * 引擎声称的条目数 vs 实际列出的条目数；两者都有且不等时返回
@@ -237,6 +281,17 @@ object RescueBoot {
         val removedBundles: List<String>,
         /** 可恢复点：被隔离的原件路径（L1/L3 用）。 */
         val restorePoint: String?,
+        /**
+         * 被定向隔离的**引擎条目 id** 列表（L1.5 用，见 [Tier.QUARANTINED]）。
+         *
+         * ⚠️ 存的是 `cordis.patch.yml` / overlay 里的 `id`，**不是包名**：
+         * 禁用它靠的是 `cordis-plugin-include` 的 `disabled: true` patch 字段，
+         * 而 patch 按 `id` 定位。存包名会让 patch 匹配不到、静默 warn 后跳过。
+         *
+         * ⚠️ 与 [removedBundles] **不是同一个总体**：那个是「从 profile 摘掉的包」，
+         * 这个是「在 patch 层禁用的条目」。混成一个列表会让读者以为两者是同一回事。
+         */
+        val quarantinedNames: List<String> = emptyList(),
     )
 
     @Volatile
@@ -651,8 +706,14 @@ object RescueBoot {
      * 本项目已确认 27 例「结论与它描述的对象不符」的缺陷，这里是第 28 例的
      * 高危位置：**如果 tier 报 normal 而实际是救援启动，用户会以为一切正常。**
      */
-    fun setTier(tier: Tier, reason: String, removedBundles: List<String> = emptyList(), restorePoint: String? = null): Boolean {
-        val s = State(tier, System.currentTimeMillis(), reason, removedBundles, restorePoint)
+    fun setTier(
+        tier: Tier,
+        reason: String,
+        removedBundles: List<String> = emptyList(),
+        restorePoint: String? = null,
+        quarantinedNames: List<String> = tier().quarantinedNames,
+    ): Boolean {
+        val s = State(tier, System.currentTimeMillis(), reason, removedBundles, restorePoint, quarantinedNames)
         cachedState = s
         val f = fileOf(FILE_STATE) ?: return false
         return try {
@@ -663,6 +724,41 @@ object RescueBoot {
             Log.w(TAG, "救援：启动层级写入失败: ${t.message}")
             false
         }
+    }
+
+    /**
+     * 把 [name] 加入定向隔离列表（幂等）。
+     *
+     * ⚠️ 默认参数 `quarantinedNames = tier().quarantinedNames` 是**刻意的**：
+     * 层级与隔离列表必须一起写，否则 `setTier(NORMAL)` 会把隔离列表清空 ——
+     * 而 [setTier] 的调用点很多（进入救援/安全模式、用户退出降级态……），
+     * 逐处补参数迟早漏一个。默认值让「不关心隔离列表的调用方」保持原有行为，
+     * 而「关心的一方」显式传参。
+     *
+     * @return true = 已写入（或本来就在列表里）；false = 落盘失败。
+     */
+    fun addQuarantine(name: String): Boolean {
+        val n = name.trim()
+        if (n.isEmpty()) return false
+        val cur = tier()
+        if (cur.quarantinedNames.contains(n)) return true
+        val next = cur.quarantinedNames + n
+        val ok = setTier(
+            cur.tier,
+            cur.reason,
+            cur.removedBundles,
+            cur.restorePoint,
+            quarantinedNames = next,
+        )
+        if (ok) Log.w(TAG, "救援：已定向隔离插件条目 $n（累计 ${next.size} 个）")
+        return ok
+    }
+
+    /** 清空定向隔离列表（用户显式要求「把插件放回来」时用）。 */
+    fun clearQuarantine(): Boolean {
+        val cur = tier()
+        if (cur.quarantinedNames.isEmpty()) return true
+        return setTier(cur.tier, cur.reason, cur.removedBundles, cur.restorePoint, quarantinedNames = emptyList())
     }
 
     /** 当前启动层级；没记录过时视为 [Tier.NORMAL]。 */
@@ -686,6 +782,11 @@ object RescueBoot {
                     restorePoint = o.optString("restorePoint")
                         .ifEmpty { null }
                         ?.takeIf { it != "null" },
+                    // ⚠️ 老版本的 state.json 没有这个字段 —— 缺省即空列表，
+                    //   **不能**因此报错或退回 NORMAL（那会把已有层级弄丢）。
+                    quarantinedNames = o.optJSONArray("quarantinedNames")?.let { a ->
+                        (0 until a.length()).map { a.optString(it, "") }.filter { it.isNotEmpty() }
+                    } ?: emptyList(),
                 )
             } catch (t: Throwable) {
                 Log.w(TAG, "救援：启动层级读取失败: ${t.message}")
@@ -730,6 +831,7 @@ object RescueBoot {
         return when (s.tier) {
             Tier.NORMAL -> "正常启动"
             Tier.ISOLATED -> "已隔离 ${s.removedBundles.size} 个可疑插件后启动（其余插件照常）"
+            Tier.QUARANTINED -> "已定向隔离 ${s.quarantinedNames.size} 个坏插件条目后启动（其余插件照常）"
             // ⚠️ 措辞**不能**只说「上次启动失败」：进入本层级有**两条**互斥的路
             //   （见 `EngineManager` 的两处 `escalateToRescue` 调用点）：
             //   ① L1 二分没收敛（引擎**确实起不来**）；
@@ -827,6 +929,7 @@ object RescueBoot {
             .format(java.util.Date(s.since)))
         put("reason", s.reason)
         put("removedBundles", JSONArray(s.removedBundles))
+        put("quarantinedNames", JSONArray(s.quarantinedNames))
         put("restorePoint", s.restorePoint ?: JSONObject.NULL)
     }
 

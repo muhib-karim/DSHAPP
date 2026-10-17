@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.util.Base64
 import com.dsh.android.log.DshLog as Log
@@ -140,7 +142,10 @@ class GeckoWebHost(
                 // ⚠️ 回调签名里没有 URL 参数（WebView 的 onPageFinished 有），
                 //   用 [lastLoadedUrl] —— 本 App 只加载一个地址，且它就是
                 //   `observeEngine` 里刚设过的那个。
-                if (success) callbacks.onPageFinished(lastLoadedUrl.orEmpty())
+                if (success) {
+                    armTokenRedirectFollower()
+                    callbacks.onPageFinished(lastLoadedUrl.orEmpty())
+                }
             }
         }
 
@@ -250,7 +255,8 @@ class GeckoWebHost(
             }
         }
 
-        session.navigationDelegate = object : GeckoSession.NavigationDelegate {            /**
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            /**
              * 外链交给系统浏览器。
              *
              * ⚠️ 与 system 版 `shouldOverrideUrlLoading` 的策略一致：只有本地引擎
@@ -747,6 +753,39 @@ class GeckoWebHost(
     }
 
     /**
+     * 让页面自己完成「`?token=` → cookie」这一步（GeckoView 不跟随引擎那个 303）。
+     *
+     * ## 为什么需要它（真机实测）
+     *
+     * 引擎打印的 URL 带一次性 token（`http://127.0.0.1:<port>/?token=…`），它对主文档
+     * 回 **303 See Other + `Location: ./` + `Set-Cookie`**，靠这次跳转把 token 换成
+     * cookie，之后才是真正的首页请求。
+     *
+     * 系统 WebView 和系统浏览器都会跟随这个 303（**同一个 URL 在华为浏览器里能正常
+     * 渲染 GUI**），但 **GeckoView 不会**：logcat 里 `onLoadRequest` 只出现一次
+     * （带 token 那一次），紧接着 `onPageStop success=true` —— 页面就**停在 303 的
+     * 空响应上**。页面世界实测：`documentURI` 仍是带 token 的地址、`#root` 不存在、
+     * `document.scripts` 为空 ⇒ 永久白屏，且没有任何 JS 错误可查。
+     *
+     * ## 修法
+     *
+     * 不改引擎：在页面世界 `fetch` 一次带 token 的地址 —— fetch 会跟随 303 并把
+     * `Set-Cookie` 落进 cookie jar，随后 `location.replace('./')` 就能拿到真正的首页。
+     *
+     * ⚠️ 必须在**页面世界**跑（走桥的 eval）：宿主既读不到 cookie，也发不出同源请求。
+     * ⚠️ 桥握手可能晚于 `onPageStop`（实测 0.35s 就 stop 了），所以先等再注入。
+     * ⚠️ 只对「地址里还带 token」的页面动手；正常渲染后（`#root` 已出现）脚本自己退出。
+     */
+    private fun armTokenRedirectFollower() {
+        if (!lastLoadedUrl.orEmpty().contains("token=")) return
+        Handler(Looper.getMainLooper()).postDelayed({
+            evaluateJavascript(TOKEN_FOLLOW_JS) { r ->
+                Log.i(DshApplication.TAG, "[nav] token 跟随脚本已注入: $r")
+            }
+        }, TOKEN_FOLLOW_DELAY_MS)
+    }
+
+    /**
      * 重新加载当前 URL（内容进程崩溃 / 被回收后的恢复路径）。
      *
      * ⚠️ `painted` 必须复位：新内容进程的第一帧还没提交，沿用旧的 `true`
@@ -825,6 +864,35 @@ class GeckoWebHost(
         /** 本地引擎的 URL 前缀；其余一律当外链。 */
         const val LOCAL_ENGINE_PREFIX = "http://127.0.0.1"
 
+        /** 注入 token 跟随脚本前的等待（ms）：等桥扩展握手完成。 */
+        const val TOKEN_FOLLOW_DELAY_MS = 2500L
+
+        /**
+         * 页面世界的 token 跟随脚本，见 [armTokenRedirectFollower]。
+         *
+         * ⚠️ 整段包 try/catch：这段跑的时机很早（页面刚 stop），任何异常都不该让
+         *   `evaluateJavascript` 拿到 `null` 而无从判断。
+         */
+        val TOKEN_FOLLOW_JS = """
+            (function () {
+              try {
+                if (location.search.indexOf('token=') < 0) return 'skip-no-token';
+                if (document.getElementById('root')) return 'skip-rendered';
+                var tries = 0;
+                var timer = setInterval(function () {
+                  tries += 1;
+                  if (document.getElementById('root')) { clearInterval(timer); return; }
+                  if (tries > 24) { clearInterval(timer); return; }
+                  if (tries % 2 !== 0) { return; }
+                  fetch(location.href, { credentials: 'same-origin' })
+                    .then(function () { location.replace('./'); })
+                    .catch(function () {});
+                }, 800);
+                return 'armed';
+              } catch (e) { return 'err:' + (e && e.message); }
+            })()
+        """.trimIndent()
+
         /** 桥扩展在 APK assets 里的位置（`resource://android/` 指向 APK 根）。 */
         const val EXTENSION_LOCATION = "resource://android/assets/dsh-bridge/"
 
@@ -865,6 +933,62 @@ class GeckoWebHost(
 }
 
 /**
+ * GeckoView 的 cookie 库文件名（连同 WAL/SHM 一起清，见 [purgeAuthCookies]）。
+ *
+ * ⚠️ 放在**顶层**而不是 `GeckoWebHost` 的 companion 里：`purgeAuthCookies` 与
+ *    `createRuntime` 都是文件级函数，companion 的成员它们看不到（编译报
+ *    `Unresolved reference`）。
+ */
+private val AUTH_COOKIE_FILES = listOf("cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm")
+
+/**
+ * 清掉 GeckoView 累积的鉴权 cookie。
+ *
+ * ## 为什么必须清（真机实测，2026-10-17）
+ *
+ * 引擎打印的 URL 带一次性 token，它对主文档回 **303 + `Set-Cookie`** 完成
+ * token→cookie 交换，而那个 cookie 的名字**每次都不一样**
+ * （`dsh-auth-<随机后缀>`，`Max-Age=2592000` 即 30 天）。GeckoView 把它持久化在
+ * `files/mozilla/<profile>/cookies.sqlite` 里 —— 于是**每启动一次就多一个**，
+ * 且 30 天内不会被回收。
+ *
+ * 累积到一定数量后，请求头里的 `Cookie` 超过服务器上限，引擎对首页直接回
+ * **431 Request Header Fields Too Large 且响应体为空**：
+ *
+ * ```
+ * [fe-diag] probe: "431|len=0|"   ← 页面世界自己 fetch '/' 拿到的结果
+ * ```
+ *
+ * 症状是**永久白屏**，且极具迷惑性 —— 页面地址正确、没有任何 JS 报错、
+ * `document.scripts` 与 `#root` 全空、console 一条不输出。实测累积到
+ * **142 个** cookie 时稳定复现；清掉 cookies 库后同一份代码立刻恢复渲染。
+ *
+ * ## 为什么整体删而不是只删过期的
+ *
+ * 本 App 的 GeckoView 里**只有**引擎的鉴权 cookie（外链一律交系统浏览器，
+ * 见 `onLoadRequest`），而每次启动都会重新交换出一个新的，所以整个库都是
+ * 可丢的。只删过期项要解析 SQLite，收益为零。
+ *
+ * ⚠️ **必须在 `GeckoRuntime.create()` 之前做** —— Runtime 一起来就打开并锁住
+ *    该库，此后再删只会失败（且 Gecko 仍用着内存里的旧数据）。
+ * ⚠️ 目录名带随机 profile 前缀（如 `wyzddpw3.default`），所以按目录扫，不写死。
+ */
+internal fun purgeAuthCookies(context: Context) {
+    val dirs = File(context.filesDir, "mozilla").listFiles() ?: return
+    var purged = 0
+    for (dir in dirs) {
+        if (!dir.isDirectory) continue
+        for (name in AUTH_COOKIE_FILES) {
+            val f = File(dir, name)
+            if (f.exists() && f.delete()) purged++
+        }
+    }
+    if (purged > 0) {
+        Log.i(DshApplication.TAG, "已清理 GeckoView 累积的鉴权 cookie（$purged 个文件）")
+    }
+}
+
+/**
  * 建 GeckoRuntime。
  *
  * ⚠️ 用 `GeckoRuntime.getDefault()` 优先，拿不到才 `create()`：Runtime 是**进程级
@@ -872,6 +996,7 @@ class GeckoWebHost(
  *   `getDefault` 在第一次 `create` 之后就返回同一个实例。
  */
 private fun createRuntime(context: Context): GeckoRuntime {
+    purgeAuthCookies(context)
     val settings = GeckoRuntimeSettings.Builder()
         // 页面要能打 console（转发由 content script 做，见 content.js）。
         .consoleOutput(true)

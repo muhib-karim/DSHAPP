@@ -1133,6 +1133,13 @@ object DiagnosticBundle {
                             "层级仍是 normal。本次引擎是否真的起来了看 crash-scenes 那一项。",
                     )
                     // 降级了但界面能用 ⇒ 不是故障，但**必须让人看见**
+                    RescueBoot.Tier.QUARANTINED -> Check(
+                        "boot-tier", "warn",
+                        "以「已定向隔离坏插件」启动${since?.let { "（自 $it）" } ?: ""}：" +
+                            "App 能打开，但被禁用的插件条目**没有加载**。" +
+                            "已禁用的条目见 rescue/state.json 的 quarantinedNames，" +
+                            "执行层是 quarantine.patch.yml 的 disabled: true（文件没删）",
+                    )
                     RescueBoot.Tier.ISOLATED -> Check(
                         "boot-tier", "warn",
                         "以「已隔离可疑插件」启动${since?.let { "（自 $it）" } ?: ""}：" +

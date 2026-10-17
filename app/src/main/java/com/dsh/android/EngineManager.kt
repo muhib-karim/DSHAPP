@@ -1992,6 +1992,89 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 让引擎**不再因为一个插件的未捕获异常而整个进程退出**（幂等）。
+     *
+     * 这是「用户自己做插件把 App 搞崩」的**唯一根因**，真机实测确认：
+     * 语法写坏、`apply()` 里同步抛错，引擎都只 `warn: N entry did not activate`
+     * 然后照常就绪（因为 `requiredStartupEntryIds` 是白名单，用户插件不在其中）。
+     * 真正会死的是**运行期回调里抛出的未捕获异常**：
+     *
+     * ```
+     * dsh: fatal uncaught exception: Error: BOOM
+     * 引擎已退出: 退出码 1，准备自动重启（第 1 次）
+     * … 反复 3 次后「引擎反复停止」，App 再也起不来
+     * ```
+     *
+     * ⚠️ 这条路径下 `rescue/` 目录**始终是空的**，`RescueBoot.recordFailure`
+     *   一次都不会被调用 —— 因为 App 走的是「引擎退出→重启」分支，不是
+     *   「启动失败」分支，于是 L1/L2/L3 三级降级阶梯**判据全不成立**。
+     *   这就是为什么现有的防崩措施对这个场景完全无效。
+     *
+     * 修法分两步（**两处都必须改，只改一处不行** —— 实测过）：
+     *
+     * 1. `dsh-app-boot` 的 `installFailLoud` 里两处 `proc.exit(1);` → 空注释。
+     * 2. `dsh` 的 `profile-boot` 传给 `installFailLoud` 的 release 回调
+     *    `async () => { await app.current?.fiber.dispose(); }` → 空函数。
+     *
+     * ⚠️ **第 2 步是关键，漏了它整件事白做**：只改第 1 步时进程会以
+     *   `退出码 0` 安静退出 —— 因为 release 把整个应用 fiber 树 dispose 掉了，
+     *   node 没有活干自然退出。表现为「补丁生效了（1→0）但引擎照退」。
+     *
+     * 崩溃的那个插件自身的 entry 已由 Loader 标记失败、不参与后续工作，
+     * 其余插件的服务照常可用 —— 比「整个 App 打不开」好得多。
+     *
+     * ⚠️ 只在 Android 上这么干。桌面端「大声失败后退出」是合理语义，
+     *   那边没有「用户装第三方插件」这条路径。
+     */
+    private fun patchFailLoudExit() {
+        // ── 第 1 步：installFailLoud 里的 proc.exit(1) ──
+        val boot = File(engineDir, "node_modules/@deepseek-ai/dsh-app-boot/lib/index.js")
+        if (!boot.isFile) {
+            Log.w(TAG, "未找到 dsh-app-boot 入口，跳过引擎抗崩溃补丁: ${boot.absolutePath}")
+        } else {
+            try {
+                val source = boot.readText()
+                if (!source.contains(FAIL_LOUD_ANDROID_MARK)) {
+                    if (!source.contains(FAIL_LOUD_EXIT_GUARD)) {
+                        Log.w(TAG, "installFailLoud 结构与预期不符，跳过引擎抗崩溃补丁")
+                    } else {
+                        boot.writeText(source.replace(FAIL_LOUD_EXIT_GUARD, FAIL_LOUD_ANDROID_ANCHOR))
+                        Log.i(TAG, "已让引擎不再因插件的未捕获异常而退出进程: ${boot.name}")
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "应用引擎抗崩溃补丁失败: ${t.message}")
+            }
+        }
+
+        // ── 第 2 步：profile-boot 的 release 回调（不做就白改）──
+        // ⚠️ 文件名带构建 hash（profile-boot-<hash>.js），换引擎版本会变，
+        //   所以先按已知名找，找不到就按前缀扫目录兜底。
+        val dshLib = File(engineDir, "node_modules/@deepseek-ai/dsh/lib")
+        val profileBoot = File(dshLib, "profile-boot-BZ2ZjNWi.js").takeIf { it.isFile }
+            ?: dshLib.listFiles()
+                ?.firstOrNull { it.isFile && it.name.startsWith("profile-boot-") && it.name.endsWith(".js") }
+        if (profileBoot == null || !profileBoot.isFile) {
+            Log.w(TAG, "未找到 profile-boot，跳过引擎抗崩溃补丁第 2 步: ${dshLib.absolutePath}")
+            return
+        }
+        try {
+            val source = profileBoot.readText()
+            if (source.contains(FAIL_LOUD_RELEASE_MARK)) {
+                return
+            }
+            if (!source.contains(FAIL_LOUD_RELEASE_GUARD)) {
+                Log.w(TAG, "profile-boot 的 release 回调结构与预期不符，跳过第 2 步")
+                return
+            }
+            profileBoot.writeText(source.replace(FAIL_LOUD_RELEASE_GUARD, FAIL_LOUD_RELEASE_ANCHOR))
+            Log.i(TAG, "已让引擎在插件崩溃后保留进程: ${profileBoot.name}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "应用引擎抗崩溃补丁第 2 步失败: ${t.message}")
+        }
+    }
+
+    /**
      * 安装移动端 UI 适配插件（幂等）。
      *
      * DSH 自带的前端是桌面布局：侧栏常驻、顶栏按鼠标悬停设计、消息操作按钮
@@ -3849,6 +3932,209 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 写出**定向隔离层** `$DSH_HOME/quarantine.patch.yml`（L1.5 的执行端）。
+     *
+     * 内容 = [RescueBoot.tier] 的 `quarantinedNames` 里每个条目一条
+     * `- id: <id>` + `disabled: true`。**没有隔离项时删掉该文件并返回 null** ——
+     * 留一个空层会让 `--patch` 多传一个空文件，且下次排查时「有文件」会被误读成
+     * 「隔离过东西」。
+     *
+     * 幂等：每次启动整体覆盖，与其它 overlay 同构。
+     *
+     * ⚠️ **不能**把这里做成「扫描并删掉坏插件」：删文件是不可逆的，
+     * 而用户要的是「App 能开」而不是「我的插件没了」。禁用层可一键撤销
+     * （[RescueBoot.clearQuarantine]）。
+     *
+     * @return 写好的文件；无隔离项或写入失败时 null（失败时**不**挂这一层，
+     *   退化成「本轮没隔离」，下次启动重试 —— 绝不让写文件失败变成新的启动失败点）。
+     */
+    private fun writeQuarantinePatch(): File? {
+        val patch = File(dshHome, QUARANTINE_PATCH)
+        val names = RescueBoot.tier().quarantinedNames
+        if (names.isEmpty()) {
+            if (patch.isFile) patch.delete()
+            return null
+        }
+        return try {
+            val body = buildString {
+                appendLine("# 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。")
+                appendLine("# 定向隔离：这些插件条目上次把引擎弄到起不来，本轮禁用它们。")
+                appendLine("# 文件一个没删 —— 想放回来见 rescue/state.json 的 quarantinedNames。")
+                for (n in names) {
+                    appendLine("- id: $n")
+                    appendLine("  disabled: true")
+                }
+            }
+            patch.writeText(body)
+            Log.i(TAG, "已写入定向隔离 overlay: ${patch.name}（${names.size} 项: ${names.joinToString()}）")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入定向隔离 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 安装期**语法预检**：把「一眼就是坏的」插件挡在挂载之前。
+     *
+     * ## 为什么需要它（不是锦上添花）
+     *
+     * L1 二分的代价是 `log2(N)` 次**真实启动**，每次最长 [PROBE_TIMEOUT_MS]
+     * （60 秒），而总预算只有 [ISOLATION_BUDGET_MS]（3 分钟）。真机那个装了
+     * **40 个插件**的用户：`log2(40) ≈ 6` 次探测 × 20~60 秒 ⇒ **必然超预算**，
+     * 二分在收敛到具体插件之前就放弃，然后落 L2（全部插件不生效）。
+     *
+     * 而「语法坏了」是**本地可判**的，一次读取就能定位，不需要启动任何进程。
+     * 把它前置，等于把最常见的那类故障从「6 次真实启动」降到「0 次」。
+     *
+     * ## 判据刻意保守（这一条是实测定的，不是设计出来的）
+     *
+     * 只认两类**结构性**损坏：引号/模板字符串未闭合、块注释未闭合。外加文件为空。
+     *
+     * ⚠️ **第一版还数了括号配平，在真实文件上误判 5/10 个正常插件** ——
+     *   因为 JS 的**正则字面量**合法地含括号与引号（`/^[a-z0-9_-]{1,24}$/`、`/"/g`）。
+     *   加上正则识别后括号也能算对，但仍然不划算：多一条判据就多一份误杀风险，
+     *   而引号/块注释这两类已经覆盖「文件被截断」「粘贴漏引号」这两个最常见坏法，
+     *   且对全部现有插件文件**零误报**（13 个真实文件 + 13 个构造用例实测）。
+     *
+     * ⚠️ **宁可放过，不可错杀**：误判会把一个好插件禁掉，用户看到「插件没生效」
+     *   却查不出原因 —— 比不检更糟。所以读文件失败、编码异常等**一律放行**。
+     *
+     * ## 为什么不用 `node --check`
+     *
+     * 那需要拿得到可执行的 node 并起一个进程。本方法在 `start()` 里被调用，
+     * 此时 node 二进制**可能还没解包完**（[TermuxBootstrap.installNodeRuntime]
+     * 之后才有），而且为一个 200 行的文件起一次 node 进程在低端机上要 300ms+，
+     * 乘 40 个插件就是十几秒 —— 与它要省下的时间相抵。
+     *
+     * @param entry 插件入口（`lib/index.js`）。
+     * @return true = 看着没问题（或无法判断），照常挂载；false = 明显坏了，跳过。
+     */
+    private fun preflightPluginSyntax(entry: File): Boolean {
+        val text = try {
+            entry.readText()
+        } catch (t: Throwable) {
+            // 读不了不是「坏了」—— 可能是权限/编码问题，交给引擎自己判。
+            Log.w(TAG, "插件语法预检：读取失败，放行（${entry.parentFile?.name}）: ${t.message}")
+            return true
+        }
+        if (text.isBlank()) {
+            Log.w(TAG, "插件语法预检：入口文件为空，跳过挂载（${entry.parentFile?.name}）")
+            return false
+        }
+
+        // 逐字符扫描，跳过字符串 / 注释 / **正则字面量**，只判两件事：
+        // 「引号未闭合」与「块注释未闭合」。
+        //
+        // ⚠️ **刻意不数括号**（第一版数了，在真实文件上误判 5/10 个正常插件）。
+        //   原因是 JS 的**正则字面量**里合法地含括号与引号，例如
+        //   `/^[a-z0-9_-]{1,24}$/`、`/"/g`。不处理正则就会把它们当代码括号，
+        //   于是**完全正常的插件被判坏**。而误杀的后果比不检严重得多
+        //   （用户看到插件莫名不生效、还查不出原因）。
+        //   引号/块注释这两类判据经实测对全部现有插件文件**零误报**，
+        //   而它们恰好覆盖「文件被截断」「粘贴时漏了引号」这两种最常见的坏法。
+        //
+        // 状态机用「代码区栈」表达：栈底永远是 CODE，进入模板字符串时压入
+        // 反引号，模板里的 `${` 再压一层 CODE，`}` 弹回模板层。
+        val CODE = '\u0000'
+        val stack = ArrayDeque<Char>()
+        stack.addLast(CODE)
+        var i = 0
+        val n = text.length
+        var inLineComment = false
+        var inBlockComment = false
+        // 正则字面量状态
+        var inRegex = false
+        var inRegexClass = false
+        // 上一个有意义的代码字符，用来判断 `/` 是除号还是正则的开始
+        var prev = ' '
+        while (i < n) {
+            val c = text[i]
+            val next = if (i + 1 < n) text[i + 1] else '\u0000'
+            val top = stack.last()
+
+            if (inLineComment) {
+                if (c == '\n') inLineComment = false
+                i++
+                continue
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') {
+                    inBlockComment = false
+                    i += 2
+                } else {
+                    i++
+                }
+                continue
+            }
+            if (inRegex) {
+                when {
+                    c == '\\' -> { i += 2; continue }
+                    c == '[' -> inRegexClass = true
+                    c == ']' -> inRegexClass = false
+                    c == '/' && !inRegexClass -> {
+                        inRegex = false
+                        i++
+                        while (i < n && text[i].isLetter()) i++
+                        prev = '/'
+                        continue
+                    }
+                }
+                i++
+                continue
+            }
+            // 模板字符串内部
+            if (top == '`') {
+                when {
+                    c == '\\' -> { i += 2; continue }
+                    c == '`' -> { stack.removeLast(); i++; prev = '`'; continue }
+                    c == '$' && next == '{' -> { stack.addLast(CODE); i += 2; continue }
+                    else -> { i++; continue }
+                }
+            }
+            // 普通字符串内部
+            if (top == '\'' || top == '"') {
+                when {
+                    c == '\\' -> { i += 2; continue }
+                    c == top -> { stack.removeLast(); i++; prev = top; continue }
+                    else -> { i++; continue }
+                }
+            }
+
+            // 代码区
+            when {
+                c == '/' && next == '/' -> { inLineComment = true; i += 2; continue }
+                c == '/' && next == '*' -> { inBlockComment = true; i += 2; continue }
+                // `/` 出现在「不是值结尾」的位置 ⇒ 正则字面量的开始。
+                // 值结尾 = 标识符/数字/`)`/`]`/`}`/引号，那些位置上的 `/` 是除号。
+                c == '/' && (prev == ' ' || prev in "=(,:[!&|?{};+-*%<>~^") -> {
+                    inRegex = true
+                    inRegexClass = false
+                    i++
+                    continue
+                }
+                c == '\'' || c == '"' || c == '`' -> { stack.addLast(c); i++; prev = c; continue }
+                c == '}' -> if (stack.size > 1) stack.removeLast()
+            }
+            if (!c.isWhitespace()) prev = c
+            i++
+        }
+        // 只有 CODE 之外的**引号**才算未闭合；模板层残留也是未闭合。
+        val unclosedQuotes = stack.drop(1)
+
+        val problems = ArrayList<String>()
+        if (unclosedQuotes.isNotEmpty()) problems += "引号/模板未闭合（${unclosedQuotes.size} 处）"
+        if (inBlockComment) problems += "块注释未闭合"
+        if (problems.isEmpty()) return true
+        Log.w(
+            TAG,
+            "插件语法预检：疑似损坏，跳过挂载（${entry.parentFile?.parentFile?.name}）：" +
+                problems.joinToString("；"),
+        )
+        return false
+    }
+
+    /**
      * 解出桌面宠物的**状态桥**插件（`pet-bridge.zip` → `$DSH_HOME/pet-bridge/dsh-android-pet/`）。
      *
      * 该插件订阅引擎的 `session/event`（`@deepseek-ai/dsh-session` 声明的 post-commit
@@ -4611,13 +4897,22 @@ class EngineManager private constructor(private val context: Context) {
         //    想装回来只要重新勾一次。
         if (stripThirdPartyBundles(profileDir)) changed = true
 
-        // ③ 引擎目录：删戳 = 下次启动重解包，把 engine/ 下的改动全部还原
+        // ③ 第三方插件**包本身**：把 node_modules 里非核心的目录整个挪走。
+        //    ⚠️ 这一步是 ② 之外**另一道**、而且是更要紧的一道，理由见 [quarantineThirdPartyPackages]：
+        //    ② 只改「清单里写没写它」，而包还在原地时，任何一条没被枚举到的加载路径
+        //    （patch 层里的 insert、引擎自己的兜底扫描、后续版本新增的入口）都能把它捡回来。
+        //    真机现场（OPPO PHY110）：用户点「进入安全模式」后界面**仍旧**停在
+        //    `Failed to load plugins` —— 因为坏插件是 AI 手工塞进 node_modules 的，
+        //    清单摘了、包还在，前端那一批合并 bundle 里照样有它的坏段。
+        if (quarantineThirdPartyPackages(profileDir)) changed = true
+
+        // ④ 引擎目录：删戳 = 下次启动重解包，把 engine/ 下的改动全部还原
         if (stampFile.isFile && stampFile.delete()) {
             Log.w(TAG, "安全模式：已删除引擎版本戳，将重新解包 engine/")
             changed = true
         }
 
-        // ④ Node 运行时：上面三样都在 $DSH_HOME / engine/ 里，**都不碰 $PREFIX**，
+        // ⑤ Node 运行时：上面几样都在 $DSH_HOME / engine/ 里，**都不碰 $PREFIX**，
         //    而 node 损坏会让引擎连一行 JS 都跑不到 —— 真机实测那种坏法报
         //    `Check failed: magic_number_ == SerializedData::kMagicNumber`（V8 反序列化
         //    内嵌启动快照，早于任何 JS）。不带上这一步，用户点了安全模式也照样打不开，
@@ -4682,7 +4977,25 @@ class EngineManager private constructor(private val context: Context) {
             // 核心 bundle 一律保留：它们来自 engine/，重解包就会还原成好的
             if (name.startsWith("@deepseek-ai/")) kept += name else dropped++
         }
-        if (dropped == 0) return false
+
+        // ⚠️ `dependencies` **也要一起清**，这是「摘掉全部插件」的另一半。
+        //   清单里除了 `dsh.profile.bundles`，`dependencies` 同样列着用户装的包；
+        //   引擎启动时会做依赖解析，列着解析不到的包会直接报
+        //   `cannot resolve profile bundle` —— 那正是「点了安全模式还进不去」的
+        //   另一种成因（[enterSafeMode] 的 KDoc 里点名过这种坏法）。官方桌面端的
+        //   「摘掉全部插件并重新加载」就是两处一起动的，这里照同一语义办。
+        //   核心包（`@deepseek-ai/`）保留，否则 App 自己的 patch 层依赖会断。
+        var depsDropped = 0
+        json.optJSONObject("dependencies")?.let { deps ->
+            for (key in deps.keys().asSequence().toList()) {
+                if (!key.startsWith("@deepseek-ai/")) {
+                    deps.remove(key)
+                    depsDropped++
+                }
+            }
+        }
+
+        if (dropped == 0 && depsDropped == 0) return false
 
         // 先备份再写：摘掉的是用户装的插件，配置本身有价值。
         // ⚠️ 备份失败就**不要写** —— 否则会把唯一一份原始清单覆盖掉。
@@ -4704,12 +5017,105 @@ class EngineManager private constructor(private val context: Context) {
             // 反斜杠本身在 org.json 的输出里是 `\\`，所以 `\\\/`（原串为 `\` + `/`）
             // 还原成 `\\/` 后仍解析为 `\` + `/`，与还原前一致。
             manifest.writeText(json.toString(2).replace("\\/", "/"))
-            Log.w(TAG, "安全模式：已摘掉 $dropped 个第三方 bundle，保留 ${kept.joinToString(", ")}")
+            Log.w(
+                TAG,
+                "安全模式：已摘掉 $dropped 个第三方 bundle" +
+                    (if (depsDropped > 0) " + $depsDropped 个第三方依赖" else "") +
+                    "，保留 ${kept.joinToString(", ")}",
+            )
             true
         } catch (t: Throwable) {
             Log.w(TAG, "安全模式：回写 profile 清单失败: ${t.message}")
             false
         }
+    }
+
+    /**
+     * 把 profile 的 `node_modules/` 下**第三方**插件包整体挪进隔离目录（幂等）。
+     *
+     * ## 为什么摘了清单还要摘包
+     *
+     * [stripThirdPartyBundles] 改的是「引擎照着清单去不去加载它」，本方法改的是
+     * 「它还在不在那儿」。两道都要有：
+     *
+     * | 只做其中一道 | 后果 |
+     * |---|---|
+     * | 只摘清单 | 包还在原地，patch 层里的 insert、引擎的兜底扫描、日后新增的加载入口都可能把它捡回来 ⇒ **摘了等于没摘** |
+     * | 只挪包 | 清单里还留着名字，引擎解析不到会报 `cannot resolve profile bundle`，也可能被算成致命 |
+     *
+     * 真机现场（用户「做插件做到一半退出 App」，界面停在 `Failed to load plugins`）：
+     * 坏插件是 AI **手工**塞进 `node_modules/` 的（绕过了 pnpm），只摘清单之后界面
+     * **仍旧**打不开 —— 因为前端那一批合并 bundle 里照样有它的坏段。
+     *
+     * ## 挪到哪、能不能找回来
+     *
+     * 挪进 `profiles/<profile>/.safe-mode-plugins/`，**改名不删**（同 [quarantine]
+     * 的约定）：安全模式只负责让 App 能打开，不替用户销毁插件 —— 想装回来重新勾一次，
+     * 或者直接从那个目录拷回去都行。
+     *
+     * ⚠️ 点开头的条目（`.bin` / `.pnpm` / `.ignored` / `.modules.yaml`）一律不动：
+     * 它们是包管理器的簿记，不是插件包 —— 尤其 `.ignored` 是 pnpm 刻意驱逐的，
+     * 动它反而会让 pnpm 的下一轮安装行为异常。
+     *
+     * ⚠️ `@deepseek-ai/` 下的核心包一律保留：它们来自 `engine/`，重解包就会还原成好的，
+     * 而且 App 自己的 patch 层（mobile-ui 等）依赖它们。
+     *
+     * @return true = 确实挪走了东西。
+     */
+    private fun quarantineThirdPartyPackages(profileDir: File): Boolean {
+        val nm = File(profileDir, "node_modules")
+        if (!nm.isDirectory) return false
+        val spare = File(profileDir, SAFE_MODE_PLUGIN_DIR)
+        var moved = 0
+
+        // 挪一个实体；目标已存在时加时间戳，绝不覆盖（那是用户上一次的插件）
+        fun moveInto(src: File, dest: File): Boolean {
+            if (!src.exists()) return false
+            val target = if (dest.exists()) {
+                File(dest.parentFile, "${dest.name}.bak-${System.currentTimeMillis()}")
+            } else {
+                dest
+            }
+            target.parentFile?.mkdirs()
+            if (src.renameTo(target)) return true
+            // 同卷内 renameTo 正常不会失败；失败（跨卷 / 被占用）时退回拷贝，
+            // 宁可慢也不能漏 —— 漏一个就意味着安全模式可能仍然进不去。
+            return try {
+                src.copyRecursively(target, overwrite = false)
+                src.deleteRecursively()
+                true
+            } catch (t: Throwable) {
+                Log.w(TAG, "安全模式：挪走 ${src.name} 失败: ${t.message}")
+                false
+            }
+        }
+
+        val entries = nm.listFiles() ?: return false
+        for (entry in entries) {
+            val n = entry.name
+            if (n.startsWith(".")) continue
+            if (n == "@deepseek-ai") continue
+            if (n.startsWith("@")) {
+                // scoped 包：逐个成员判，只挪非核心的
+                val members = entry.listFiles() ?: continue
+                for (member in members) {
+                    if (member.name == "deepseek-ai") continue
+                    if (moveInto(member, File(File(spare, n), member.name))) moved++
+                }
+                // scope 目录空了就删掉，免得留个空壳给引擎的扫描看
+                if (entry.listFiles()?.isEmpty() == true) entry.delete()
+            } else if (moveInto(entry, File(spare, n))) {
+                moved++
+            }
+        }
+
+        if (moved > 0) {
+            Log.w(
+                TAG,
+                "安全模式：已挪走 $moved 个第三方插件包 → $SAFE_MODE_PLUGIN_DIR/（想装回来重新勾一次即可）",
+            )
+        }
+        return moved > 0
     }
 
     /**
@@ -5169,12 +5575,18 @@ class EngineManager private constructor(private val context: Context) {
      *
      * ## 四条闸门，缺一不可
      *
-     * ① `tier == NORMAL`：救援态/隔离态下没有可隔离的对象（救援 profile 压根
-     *    不含第三方插件）。不判这一条会在救援态反复跑二分，把界面搅乱。
+     * ① `tier == NORMAL` **或** `tier == QUARANTINED`：救援态/隔离态下没有可隔离
+     *    的对象（救援 profile 压根不含第三方插件）。不判这一条会在救援态反复跑
+     *    二分，把界面搅乱。
+     *    ⚠️ `QUARANTINED` 必须放行：它是「上一轮禁掉一个、还没验证成功」的
+     *    **进行中**状态，挡掉它会让用户卡在死循环里（见方法内注释）。
      * ② `consecutiveFailures >= 2`：单次失败可能是系统回收 —— 与现有
      *    `MAX_ENGINE_RESTARTS = 2` 的口径一致。
      * ③ `looksLikePluginProblem`：引擎**自己**说了「required plugin did not
-     *    activate」。不说这句就不是插件问题，二分毫无意义（还会白改用户配置）。
+     *    activate」，**或**失败清单里含非官方包（见 `Failure.hasThirdPartyFailure`）。
+     *    ⚠️ 后半条是 2026-10-17 加的：`requiredStartupEntryIds` 是**白名单**，
+     *    用户自己写的插件不在里面，它失败时引擎只 warn、不打那句 required 文案。
+     *    只有前半条时，L1 二分对**用户插件永远不触发** —— 而那正是本功能的目标。
      *    ⚠️ 不能用「日志里有 Failed plugins 段落」代替 —— 那一段里绝大多数是
      *    正常的 skip，真机上 `Failed plugins (40)` 时引擎仍能起来过。
      * ④ 环境基线（[activeEnv]）就绪：二分靠 [probeBoot] 判真假，而它的结论只有在
@@ -5188,7 +5600,12 @@ class EngineManager private constructor(private val context: Context) {
      */
     private suspend fun maybeIsolateBadBundles(): IsolationResult? {
         val st = RescueBoot.tier()
-        if (st.tier != RescueBoot.Tier.NORMAL) {
+        // ⚠️ [RescueBoot.Tier.QUARANTINED] **必须**放行（与 NORMAL 同等待遇）：
+        //   它意味着「上一轮已禁掉一个坏插件、但还没验证成功」。若在这里挡掉，
+        //   用户就会卡在「每次启动都禁同一个插件、每次都起不来」的死循环里 ——
+        //   正是闸门①的注释警告的那种「停在原地、永远到不了下一层」。
+        //   QUARANTINED 的语义是**进行中**，不是终点。
+        if (st.tier != RescueBoot.Tier.NORMAL && st.tier != RescueBoot.Tier.QUARANTINED) {
             Log.i(TAG, "L1 隔离：当前层级 ${st.tier.label}，跳过")
             return null
         }
@@ -5279,6 +5696,23 @@ class EngineManager private constructor(private val context: Context) {
                 removedBundles = r.removed,
                 restorePoint = "profiles/$PROFILE_NAME/package.json.bak-l1",
             )
+            // ⚠️ 半成功（摘了、但收尾没验证通过）时，**额外**把已定位的插件
+            //   记进定向隔离层：`package.json` 那条路已经证明不够（还有别的
+            //   致命插件或预算耗尽），而 `disabled: true` 层是**下一轮启动就会
+            //   生效**的第二道保险 —— 即使 `package.json` 被 pnpm 重写、
+            //   被用户改回去、或 `bundles` 列表被重新生成，隔离层依然独立生效。
+            //
+            //   只在 `!r.verified` 时记：已验证成功的那条路（ISOLATED）语义更轻，
+            //   不该让用户看到「已禁用」这种更重的措辞。
+            if (!r.verified) {
+                r.removed.forEach { RescueBoot.addQuarantine(it) }
+                RescueBoot.setTier(
+                    tier = RescueBoot.Tier.QUARANTINED,
+                    reason = r.reason,
+                    removedBundles = r.removed,
+                    restorePoint = "profiles/$PROFILE_NAME/package.json.bak-l1",
+                )
+            }
             return r
         }
 
@@ -5434,6 +5868,17 @@ class EngineManager private constructor(private val context: Context) {
                 (if (shadowed.isNotEmpty()) "，${shadowed.size} 个遮蔽引擎自带包的本地副本" else ""),
         )
 
+        // ⚠️ **语法预检前置**：先把「一眼就是坏的」插件挑出来直接摘掉，**不进二分**。
+        //
+        //   理由（真机算出来的，不是猜的）：二分的代价是 `log2(N)` 次**真实启动**，
+        //   每次最长 [PROBE_TIMEOUT_MS]（60 秒），总预算 [ISOLATION_BUDGET_MS]
+        //   只有 3 分钟。装了 40 个插件时 `log2(40) ≈ 6` 次探测，低端机单次要
+        //   20~60 秒 ⇒ **必然超预算**，二分在收敛前就放弃、落 L2（全部插件失效）。
+        //   而语法坏是本地一次读取就能判的，把它前置等于把最常见那类故障
+        //   从「6 次真实启动」降到「0 次」。
+        //
+        //   ⚠️ 只摘**预检明确判坏**的，判不了的一律留在候选集里走原二分。
+        //     宁可多花时间，不可错杀（见 [preflightPluginSyntax] 的保守原则）。
         // ② 备份失败就什么都不做。备份**只做一次**（幂等，I3）：
         //    判断依据是"已经存在同源备份"，避免每轮都产生一个新的 .bak-<ts>。
         if (!ensureManifestBackup(manifest)) {
@@ -5469,6 +5914,38 @@ class EngineManager private constructor(private val context: Context) {
             )
             recordAttempt(label, keep, ok, r, deadline)
             return ok
+        }
+
+        // ⚠️ **语法预检前置**：先把「一眼就是坏的」插件挑出来直接摘掉，**不进二分**。
+        //
+        //   理由（算出来的，不是猜的）：二分的代价是 `log2(N)` 次**真实启动**，
+        //   每次最长 [PROBE_TIMEOUT_MS]（60 秒），总预算 [ISOLATION_BUDGET_MS]
+        //   只有 3 分钟。装了 40 个插件时 `log2(40) ≈ 6` 次探测，低端机单次要
+        //   20~60 秒 ⇒ **必然超预算**，二分在收敛前就放弃、落 L2（全部插件失效）。
+        //   而语法坏是本地一次读取就能判的，把它前置等于把最常见那类故障
+        //   从「6 次真实启动」降到「0 次」。
+        //
+        //   ⚠️ 只摘**预检明确判坏**的，判不了的一律留在候选集里走原二分。
+        //     宁可多花时间，不可错杀（见 [preflightPluginSyntax] 的保守原则）。
+        val syntaxBad = third.filter { name ->
+            val entry = File(dshHome, "profiles/$PROFILE_NAME/node_modules/$name/lib/index.js")
+            entry.isFile && !preflightPluginSyntax(entry)
+        }
+        if (syntaxBad.isNotEmpty()) {
+            Log.w(TAG, "L1 隔离：语法预检直接判坏 ${syntaxBad.size} 个（${syntaxBad.joinToString()}）")
+            // 先只摘这些、其余照旧，试一次 —— 能起来就一步到位，不必二分。
+            val keepAfterSyntax = third.filter { it !in syntaxBad.toSet() }
+            if (tryWith(keepAfterSyntax, "syntax-precheck")) {
+                Log.w(TAG, "L1 隔离完成：语法预检定位到 ${syntaxBad.size} 个坏插件，摘掉后能正常启动")
+                return@withContext IsolationResult(
+                    syntaxBad,
+                    "语法预检定位到 ${syntaxBad.size} 个损坏的插件（${syntaxBad.joinToString()}），" +
+                        "摘掉后能正常启动（其余 ${third.size - syntaxBad.size} 个保留）",
+                    attempts,
+                    true,
+                )
+            }
+            Log.w(TAG, "L1 隔离：摘掉语法坏的插件后仍起不来 ⇒ 还有别的致命插件，继续二分")
         }
 
         // 基线：摘掉全部第三方。失败 ⇒ 再试一次「摘遮蔽副本」。
@@ -6164,6 +6641,10 @@ class EngineManager private constructor(private val context: Context) {
         patchTerminalShell()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
+        // ⚠️ 用户自己做的插件在运行期抛出未捕获异常时，installFailLoud 会 proc.exit(1)
+        //   把整个引擎杀掉 → 反复重启 → App 再也打不开（三级降级阶梯对此无效，
+        //   因为这条路径下 RescueBoot.recordFailure 一次都不会被调用）。见其 KDoc。
+        patchFailLoudExit()
         // 凭据文件权限过宽（0600 之外）会让 credentials 插件硬抛错 → 9 个插件级联 pending
         // → 整个引擎退出。引擎自己是纯校验不自愈，所以由 App 在启动前收窄。
         ensureCredentialFileMode()
@@ -6305,6 +6786,10 @@ class EngineManager private constructor(private val context: Context) {
         //   读日志不需要任何授权。必须早于引擎启动（overlay 要在 profile 解析前落盘）。
         ensureLogsTool()
         val logsToolPatch = writeLogsToolPatch()
+        // 定向隔离层（L1.5）：把上次定位到的坏插件条目在 patch 层禁掉。
+        // ⚠️ 读的是 `RescueBoot` 的持久化状态，**不依赖**本轮启动的任何中间结果，
+        //   所以放在这里（早于引擎启动、晚于所有 `- insert:` overlay 的生成）就够。
+        val quarantinePatch = writeQuarantinePatch()
         // 桌面宠物状态桥：把引擎的 `session/event` 转成悬浮球的动作切换。
         // ⚠️ 与上面那条**并列且独立**：那条给模型 `bubble` 工具，这条让宠物自己会动。
         ensurePetBridge()
@@ -6379,6 +6864,10 @@ class EngineManager private constructor(private val context: Context) {
             petPatch,
             uiToolPatch,
             logsToolPatch,
+            // ⚠️ **必须排在最后**：这一层只做 `disabled: true`，而它要禁用的条目
+            //   正是前面那些 `- insert:` 插进来的。`--patch` 按顺序应用，排在
+            //   插入之前会让 patch 匹配不到目标 id（官方行为：warn 后跳过，静默失效）。
+            quarantinePatch,
         )
         // ⚠️ 内置号池**刻意不在这个列表里**：它并入 profile 用户配置层，
         // 不走 overlay —— 理由见 [ensureKeyPoolProvider]。
@@ -7326,6 +7815,43 @@ class EngineManager private constructor(private val context: Context) {
             "if (platform !== 'linux' && platform !== 'darwin' && platform !== 'android') {"
 
         /**
+         * `dsh-app-boot/lib/index.js` 里 `installFailLoud` 的两处 `proc.exit(1);`，
+         * 以及换成「什么也不做」之后的文本。见 [patchFailLoudExit]。
+         *
+         * 实测该文件全文**只有这 2 处** `proc.exit(1);`，且都在 `installFailLoud`
+         * 的 `report()` 里（一条在 `release === void 0` 分支，一条在 release 收尾）。
+         * 所以整文件替换是安全的，不会波及别处。
+         *
+         * 替换成一句块注释而不是删成空串：`report` 里那句 stderr 已经写出了完整的
+         * fatal 栈（进 `logs/engine.log`），这里不需要重复记录。
+         */
+        private const val FAIL_LOUD_EXIT_GUARD = "proc.exit(1);"
+        private const val FAIL_LOUD_ANDROID_ANCHOR =
+            "/* DSH-ANDROID-KEEP-ALIVE: 插件崩溃不再杀死整个引擎 */"
+
+        /** 幂等标记：出现在替换**之后**的文本里，官方原文中不会有。 */
+        private const val FAIL_LOUD_ANDROID_MARK = "DSH-ANDROID-KEEP-ALIVE"
+
+        /**
+         * `dsh/lib/profile-boot-BZ2ZjNWi.js` 传给 `installFailLoud` 的 release 回调
+         * 原文，以及换成空函数之后的文本。见 [patchFailLoudExit]。
+         *
+         * ⚠️ **这一处必须和第 1 步一起改**。只改 `proc.exit(1)` 的话，release 仍会把
+         *   整个应用 fiber 树 dispose 掉，node 没有活干自然退出 —— 表现为
+         *   「退出码从 1 变成 0，但引擎照退」，实测踩过。
+         *
+         * ⚠️ 文件名带构建 hash（`profile-boot-BZ2ZjNWi.js`），换引擎版本会变。
+         *   所以 [patchFailLoudExit] 先按固定名找，找不到再按前缀扫目录兜底。
+         */
+        private const val FAIL_LOUD_RELEASE_GUARD =
+            "await app.current?.fiber.dispose();"
+        private const val FAIL_LOUD_RELEASE_ANCHOR =
+            "/* DSH-ANDROID-KEEP-ALIVE-RELEASE: 插件崩溃不再 dispose 整个应用 */"
+
+        /** 幂等标记：第 2 步的替换结果。 */
+        private const val FAIL_LOUD_RELEASE_MARK = "DSH-ANDROID-KEEP-ALIVE-RELEASE"
+
+        /**
          * `dsh-terminal-bash/lib/index.js` 里 `DEFAULT_BASH_SHELL` 的原样文本，
          * 以及换成 Termux bash 之后的文本。见 [patchTerminalShell]。
          *
@@ -7756,7 +8282,7 @@ class EngineManager private constructor(private val context: Context) {
          * ⚠️ 尤其**重跑 `tools/market-collect.mjs` 更新了 `lib/seed.json` 之后**
          * 也要改 —— 否则老设备会继续用包里那份旧种子。
          */
-        private const val MARKET_VERSION = "1.0.0-5"
+        private const val MARKET_VERSION = "1.0.0-6"
         private const val MARKET_STAMP = ".market_version"
 
         /**
@@ -8158,8 +8684,24 @@ class EngineManager private constructor(private val context: Context) {
          *      看起来「什么都没发生」。
          *      判据：改完 mobile-ui 源码，**两个戳都必须是新值**；
          *      只要其中一个还是上次的值，设备就会继续跑旧产物。
+         * 1.0.0-66：设置页「交流群」换成**新群**（「DSHAPP交流群2」，群号 1109733098）。
+         *      ① 群号 `MP_CONTACT_GROUP_NO`：1127652833 → 1109733098；
+         *      ② 二维码 data URI 换成新群二维码（720×720 WebP，52,764 B，
+         *         比旧图小 9,230 B）。用户给的是**带群名/群号/QQ logo 的整张截图**，
+         *         所以先用蓝色像素（`B-R>40 且 B>150`）的包围盒定位二维码本体
+         *         （415×415，`x 81..495, y 305..719`），裁出来、每边留 12% 白边
+         *         （QR 的 quiet zone，缺了会扫不出）、再 LANCZOS 放大到 720；
+         *      ③ 可扫性用 **zxing-cpp** 验证，不用 cv2 —— 这类彩色圆点风格二维码
+         *         `cv2.QRCodeDetector` 解不出来（见上方 `MP_CONTACT_QR` 的注释）。
+         *         实测：原图 / 裁切图 / 最终 PNG / 最终 WebP，以及按真实布局渲染的
+         *         `CSS 240px × dpr1|2|3`、`200|160|120px × dpr3` 各档**全部解码成功**，
+         *         内容一致为 `https://qm.qq.com/q/CkDhCJH1rW`（余量最大缩到 240px 仍可读）。
+         *      ⚠️ **两个戳都要 bump**：`mobileui/lib/client.js` 是降级编译的输入之一，
+         *      只重打 `mobile-ui.zip` 而不 bump `-CompatVersion`（21 → 22），
+         *      设备上会命中「两戳都一致 → 整棵树跳过」，继续跑旧群的二维码 ——
+         *      而日志不会打任何东西（版本没变），看起来像"什么都没发生"（同 v65 的坑）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-65"
+        private const val MOBILE_UI_VERSION = "1.0.0-66"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────
@@ -8445,6 +8987,31 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val LOGS_TOOL_DIR = "logs-tool"
+
+        // ── 定向隔离层（L1.5） ────────────────────────────────────────
+        //
+        // 一个**纯禁用层**：只含 `- id: <条目 id>` + `disabled: true`，
+        // 由 `RescueBoot.quarantinedNames()` 驱动，每次启动整体重写。
+        //
+        // ⚠️ 为什么用 `disabled` 而不是删文件/改 package.json：
+        //   `cordis-plugin-include` 的 `applyEntryPatches` 把除
+        //   `id`/`insert`/`name` 之外的键**原样赋给目标条目**
+        //   （`for (const [key, value] of Object.entries(overrides)) target[key] = value`），
+        //   而 `disabled` 正是 Cordis 条目的标准字段；`auditStartupEntries` 的注释也写明
+        //   「disabled required entries are ignored」。所以这是**官方语义**，
+        //   不需要改用户的任何文件，且随时可撤销（删掉本 overlay 即可）。
+        //
+        // ⚠️ 它必须是 overlay 列表的**最后一项**：`--patch` 按顺序应用，
+        //   禁用一个由前面 `- insert:` 插入的条目，必须排在那条 insert 之后。
+        private const val QUARANTINE_PATCH = "quarantine.patch.yml"
+
+    /**
+     * 安全模式把第三方插件包挪到这里（profile 目录下，**改名不删**）。
+     *
+     * ⚠️ 必须是点开头的名字：`node_modules` 的扫描与 pnpm 的簿记都约定忽略点目录，
+     * 万一将来有人把 `node_modules` 整个交给包管理器，它也不会被当成一个插件包。
+     */
+    private const val SAFE_MODE_PLUGIN_DIR = ".safe-mode-plugins"
 
         // ── 桌面宠物状态桥 ───────────────────────────────────────────
         //

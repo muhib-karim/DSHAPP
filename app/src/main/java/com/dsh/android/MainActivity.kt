@@ -649,6 +649,24 @@ class MainActivity : AppCompatActivity() {
                 // ⚠️ 同上：终态，留着的旧计时器会把这条提示顶掉。
                 invalidateOverlayTimeout()
                 overlayDismissed = false
+                // ⚠️ **先试自动恢复，失败才贴提示。** 重载拿不到首帧最常见的原因不是
+                //   内核坏了，而是**前端整批 client bundle 加载失败**：前端把所有
+                //   client.js 合并成一个 `/plugins/??a,b,c` 请求下发，任何一个有语法
+                //   错误就整批失败 ⇒ 页面永远到不了首帧。那种情况重载一万次也没用，
+                //   而**换个 profile**（救援模式不含任何第三方 bundle）就一定能渲染出来。
+                //   真机复现（CDY-TN90）：界面停在 `Failed to load plugins`，
+                //   而原先这里只弹「界面没能恢复」⇒ 用户点「进入安全模式」也进不去。
+                //   ⚠️ 降级成功时**不要**再贴自己的提示 —— 会把这轮
+                //   「正在进入救援模式…」的层顶掉（同 [maybeRescueFromWebFailure]）。
+                if (
+                    degradeToRescue(
+                        reason = "界面重载 $attempt 次仍无首帧（前端起不来）",
+                        eventName = "web.frame-giveup",
+                        extra = mapOf("attempts" to attempt.toString()),
+                    )
+                ) {
+                    return@postDelayed
+                }
                 showOverlay(
                     "界面没能恢复",
                     hint = "已自动重载 $attempt 次，Web 内核仍未提交首帧。" +
@@ -2808,32 +2826,105 @@ class MainActivity : AppCompatActivity() {
      *   gateway 那条降级路径的取舍完全一致。
      */
     private fun maybeRescueFromWebFailure(line: String) {
-        // 判据：前端自己打印的那句话。⚠️ 大小写与措辞都照抄前端原文。
-        if (!line.contains("Failed to load plugins")) return
-        // ① 判重（这条 console 会重复出现）
-        if (!webRescueInFlight.compareAndSet(false, true)) return
+        // 判据**两类，缺一类就会漏**（真机矩阵实测，2026-10-17）：
+        //
+        //  ① 前端自己打印的那句话（`Failed to load plugins`，大小写措辞照抄原文）。
+        //     它来自 App 自己的客户端插件 `dsh-android-mobile` —— 只有**单批里个别**
+        //     插件失败、整批 bundle 仍能加载时，它才活着并把这句话报出来。
+        //
+        //  ② **整批 `/plugins/??a,b,c` 资源加载失败**。前端把所有 client.js 合并成
+        //     一个请求下发，**任何一个 client bundle 有语法错误都会让整批失败** ——
+        //     于是连 `dsh-android-mobile` 自己都加载不了，**没有任何人上报 ①**。
+        //     真机复现（CDY-TN90）：`页面脚本错误: SyntaxError: expected expression,
+        //     got ';' @…/plugins/??@deepseek-ai/dsh-client-ui-open-in-app/client.js,…`
+        //     ⇒ 界面永久停在 `Failed to load plugins`，而 tier 一直是 normal。
+        //     ⚠️ 判据里那个 `/plugins/??` 不能省：单个插件的「资源加载失败」URL 里
+        //     只有它自己，那一种 ① 一般盖得住，但两者都收也不冲突（③ 保证只推一次）。
+        val selfReported = line.contains("Failed to load plugins")
+        val batchLoadFailed = line.contains("资源加载失败") && line.contains("/plugins/??")
+        //  ③ **首帧正文停在官方启动页**（`首帧正文="HARNESS …`）。
+        //
+        //     这一行由 `dsh-android-mobile` 在「官方启动页消失」时回报，是**唯一**
+        //     稳定可见的渲染结果。正常启动那里是真实 UI（如 `探索未至之境…`），
+        //     而前端 boot 卡住时是官方启动页原文 `HARNESS Loading plugins…` /
+        //     `HARNESS Failed to load plugins …`。
+        //
+        //     真机实测（2026-10-17）：带语法错误的 client bundle 让**整批**失败时，
+        //     console 只有 `[web] error: {}`（Error 序列化成空对象，判据抓不到）
+        //     和这一行，而它恰好抓在 `Loading plugins…` 这个**中间态**上 ——
+        //     ① ② 都不匹配 ⇒ 永不降级 ⇒ 用户点了「进入安全模式」也仍然进不去。
+        val stuckOnBootSplash = line.contains("首帧正文=\"HARNESS")
+        if (!selfReported && !batchLoadFailed && !stuckOnBootSplash) return
+        degradeToRescue(
+            reason = when {
+                selfReported -> "浏览器侧插件加载失败（Failed to load plugins）"
+                batchLoadFailed -> "浏览器侧插件整批加载失败（client bundle 语法错误）"
+                else -> "前端启动卡在官方启动页（插件加载没起来）"
+            },
+            eventName = "web.plugin-load-failed",
+            extra = mapOf("line" to line.take(200)),
+        )
+    }
+
+    /**
+     * 把界面切到救援模式并重启引擎。**两个入口共用**：
+     *
+     * ① [maybeRescueFromWebFailure] —— 前端 console 自报 / 整批 `/plugins/??` 失败；
+     * ② [reloadWithRetry] 耗尽 —— 重载若干次仍拿不到首帧（前端根本没渲染出来）。
+     *
+     * ② 是 ① 的**兜底**：① 依赖前端把话说出来，而前端整个挂掉时它说不了话。
+     * 两条路都判「引擎是好的、坏的是 client 半」，处置完全相同 —— 所以只留一份实现，
+     * 免得两条路的守卫（判重/层级/可用性）各写一遍、日后改一处漏一处。
+     *
+     * ## 为什么救援模式能解决它
+     *
+     * 救援 profile **不含任何第三方 bundle**（见 [EngineManager.ensureRescueProfile]），
+     * 所以那批合并 bundle 里根本不会有坏段 ⇒ 界面正常渲染 ⇒ 用户进得去对话，
+     * 而对话里正好可以让 AI 把插件修好（这正是用户要的）。
+     *
+     * ## ⚠️ 三条守卫，缺一不可
+     *
+     * ① **只推一次**（[webRescueInFlight]）：前端会**重复**打印那句话（重试加载），
+     *    不判重会叠起多次重启。
+     * ② **只在 NORMAL 态推**：已是 RESCUE 还推没有意义，且会把横幅的 `since`
+     *    刷成每次启动的时刻。
+     * ③ **`rescueAvailable == false` 时不推**：那个 profile 建不出来，推过去
+     *    下次启动直接失败。
+     *
+     * ⚠️ 推完**不设 Ready**、状态打 [EngineManager.State.Dead] 而不是 `Failed` ——
+     *   `Failed` 会把用户引向**破坏性**的「安全模式」按钮（推开配置 + 重解包 15 秒），
+     *   而这里引擎是好的，只需要换个 profile 重启。与 `EngineManager` 里
+     *   gateway 那条降级路径的取舍完全一致。
+     *
+     * @return true = 已经推下降级（调用方不要再贴自己的失败提示，否则会把这轮
+     *   「正在进入救援模式…」的层顶掉）。
+     */
+    private fun degradeToRescue(
+        reason: String,
+        eventName: String,
+        extra: Map<String, String>,
+    ): Boolean {
+        // ① 判重
+        if (!webRescueInFlight.compareAndSet(false, true)) return false
         // ② 只在 NORMAL 态推
         val tierNow = RescueBoot.tier().tier
         if (tierNow != RescueBoot.Tier.NORMAL) {
-            Log.w(
-                DshApplication.TAG,
-                "[web-rescue] 浏览器侧插件加载失败，但层级已是 ${tierNow.id}，不再降级",
-            )
-            return
+            Log.w(DshApplication.TAG, "[web-rescue] $reason，但层级已是 ${tierNow.id}，不再降级")
+            return false
         }
         // ③ 救援 profile 必须可用
         val engine = EngineManager.get(this)
         if (!engine.rescueAvailable) {
-            Log.w(DshApplication.TAG, "[web-rescue] 浏览器侧插件加载失败，但救援 profile 不可用，无法降级")
+            Log.w(DshApplication.TAG, "[web-rescue] $reason，但救援 profile 不可用，无法降级")
             webRescueInFlight.set(false)
-            return
+            return false
         }
 
         Log.e(
             DshApplication.TAG,
-            "[web-rescue] 浏览器侧插件加载失败（引擎健康，坏的是 client 半）—— 降级到救援模式并重启界面",
+            "[web-rescue] $reason（引擎健康，坏的是 client 半）—— 降级到救援模式并重启界面",
         )
-        EventLog.record("web.plugin-load-failed", mapOf("line" to line.take(200)))
+        EventLog.record(eventName, extra)
 
         lifecycleScope.launch {
             try {
@@ -2846,12 +2937,9 @@ class MainActivity : AppCompatActivity() {
                 //   同 [autoEnterSafeMode] 的两条论证。
                 resetFirstFrameAwait()
                 overlayDismissed = false
-                RescueBoot.setTier(
-                    RescueBoot.Tier.RESCUE,
-                    "浏览器侧插件加载失败（Failed to load plugins）",
-                )
+                RescueBoot.setTier(RescueBoot.Tier.RESCUE, reason)
                 refreshRescueBanner()
-                engine.requestRestart("浏览器侧插件加载失败，切救援模式")
+                engine.requestRestart("$reason，切救援模式")
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
@@ -2860,6 +2948,7 @@ class MainActivity : AppCompatActivity() {
                 showOverlay("进入救援模式失败", hint = t.message, isError = true)
             }
         }
+        return true
     }
 
     /**
@@ -2948,6 +3037,11 @@ class MainActivity : AppCompatActivity() {
                     "启动时发现 ${st.removedBundles.size} 个插件会让引擎起不来，已把它们改名隔离" +
                     "（没有删除），其余插件照常工作。\n" +
                     "想让 AI 复查或恢复，直接问它就行。"
+            RescueBoot.Tier.QUARANTINED ->
+                "⚠️ 已隔离坏插件$when_\n" +
+                    "启动时定位到 ${st.quarantinedNames.size} 个插件会让引擎起不来，" +
+                    "已用官方 patch 把它们禁用（文件一个没删、其余插件照常）。\n" +
+                    "想让 AI 复查或放回来，直接问它就行。"
             RescueBoot.Tier.SAFE_MODE ->
                 "⚠️ 安全模式$when_\n" +
                     "已推开全部第三方插件配置并重新解包引擎。"
@@ -2994,6 +3088,12 @@ class MainActivity : AppCompatActivity() {
             sb.append("\n已隔离的插件（").append(st.removedBundles.size).append(" 个）：\n")
             st.removedBundles.forEach { sb.append("  · ").append(it).append('\n') }
         }
+        if (st.quarantinedNames.isNotEmpty()) {
+            sb.append("\n已定向禁用的插件条目（").append(st.quarantinedNames.size).append(" 个）：\n")
+            st.quarantinedNames.forEach { sb.append("  · ").append(it).append('\n') }
+            sb.append("  （靠 quarantine.patch.yml 的 disabled: true 生效，")
+                .append("文件一个没删）\n")
+        }
         st.restorePoint?.let {
             sb.append("\n原始配置备份：").append(it)
             sb.append("（想让 AI 恢复就告诉它这个路径）").append('\n')
@@ -3033,10 +3133,53 @@ class MainActivity : AppCompatActivity() {
         }
         sb.append("\n想修的话，直接问 AI：把上面这些告诉它就行。")
         runOnUiThread {
-            androidx.appcompat.app.AlertDialog.Builder(this)
+            val builder = androidx.appcompat.app.AlertDialog.Builder(this)
                 .setTitle("启动失败详情")
                 .setMessage(sb.toString())
                 .setPositiveButton("知道了", null)
+            // ⚠️ 「放回来」必须是**独立按钮 + 二次确认**，不能并进「知道了」：
+            //   它会让用户**回到那个打不开的状态**，是一个可能把人再坑一次的
+            //   动作。现有的「退出并重试」刻意不删任何东西（I5），这里同理 ——
+            //   动作与后果都要显式。
+            if (st.quarantinedNames.isNotEmpty()) {
+                builder.setNeutralButton("放回被禁用的插件") { _, _ ->
+                    confirmRestoreQuarantine(st.quarantinedNames.size)
+                }
+            }
+            builder.show()
+        }
+    }
+
+    /**
+     * 二次确认后清空定向隔离列表并重启（把插件**放回来**）。
+     *
+     * ⚠️ 这是唯一一个「会让用户回到坏状态」的动作，所以：
+     *   ① 必须二次确认，且文案要说清**后果**（可能又打不开）；
+     *   ② 只清 `quarantinedNames`，**不动** `removedBundles` 与 `.bak-l1`
+     *      —— 那是 L1 另一条路径的产物，混在一起清会让两种隔离的恢复语义混淆。
+     *   ③ 层级同时回 NORMAL，否则 `maybeIsolateBadBundles` 的闸门①会把
+     *      下一次启动挡在 QUARANTINED 里。
+     */
+    private fun confirmRestoreQuarantine(count: Int) {
+        runOnUiThread {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("放回 $count 个被禁用的插件？")
+                .setMessage(
+                    "放回后它们会重新加载。如果其中一个正是导致 App 打不开的那个，" +
+                        "下次启动可能又会失败（届时会自动重新禁用，但需要再等一轮）。\n\n" +
+                        "建议先让 AI 看过日志、确认插件已修好再放回。",
+                )
+                .setPositiveButton("确认放回") { _, _ ->
+                    RescueBoot.clearQuarantine()
+                    RescueBoot.setTier(
+                        RescueBoot.Tier.NORMAL,
+                        "用户显式放回被禁用的插件",
+                    )
+                    Log.i(DshApplication.TAG, "用户放回被禁用的插件（$count 个），重启引擎")
+                    engine.requestRestart("用户放回被禁用的插件")
+                    refreshRescueBanner()
+                }
+                .setNegativeButton("取消", null)
                 .show()
         }
     }
