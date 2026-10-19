@@ -10,14 +10,22 @@
     python3 pair_admin.py revoke ABC12345
     python3 pair_admin.py restore ABC12345
     python3 pair_admin.py unregister ABC12345   # 删隧道 + 删 DNS，码可再用
+    python3 pair_admin.py migrate ABC12345      # 老记录补发凭据 + 轮换令牌
+    python3 pair_admin.py devices               # 已配对设备列表（不含任何凭据）
+    python3 pair_admin.py rotate ABC12345       # 一键轮换访问令牌（令牌疑似泄露时用）
 
 `new` 输出的激活码直接发给客户；客户在插件里填一次即可。
+
+⚠️ `migrate` 只对 1.0.16 之前注册的**无设备凭据**记录有意义。这些记录以前走
+「激活码 + 主机名」的一次性认领，那条路径是**静默接管**漏洞，已彻底删除；
+现在必须由管理员显式迁移（会**轮换** `accessToken`，客户机需重新配对）。
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -33,6 +41,14 @@ def secret():
     except OSError as error:
         print("读不到管理密钥 %s：%s" % (SECRET_PATH, error), file=sys.stderr)
         sys.exit(1)
+
+
+def stamp(epoch):
+    """把秒级时间戳打成人类可读的本地时间；无效值回 `-`。"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(epoch)))
+    except (TypeError, ValueError):
+        return "-"
 
 
 def call(path, body=None, method="POST"):
@@ -75,6 +91,19 @@ def main():
 
     sub.add_parser("list", help="列出所有激活码")
 
+    sub.add_parser("devices", help="列出已配对设备（不含任何凭据）")
+
+    rotate = sub.add_parser(
+        "rotate",
+        help="一键轮换访问令牌（令牌疑似泄露时用；不影响设备凭据，无需重新配对）",
+    )
+    rotate.add_argument("code")
+
+    migrate = sub.add_parser(
+        "migrate", help="迁移老记录：补发设备凭据并轮换访问令牌（客户机需重新配对）"
+    )
+    migrate.add_argument("code")
+
     args = parser.parse_args()
 
     if args.command == "new":
@@ -105,6 +134,70 @@ def main():
         print(json.dumps(payload, ensure_ascii=False))
         return
 
+    if args.command == "migrate":
+        # ⚠️ 迁移会**轮换 accessToken**：客户机上那把旧令牌立刻失效，
+        # 必须让客户重新配对一次。这是「零客户」现状下可以接受的代价 ——
+        # 换来的是彻底删掉「凭激活码即可静默接管」那条路径。
+        ok, payload = call("/pair/migrate", {"code": args.code})
+        if not ok:
+            print("失败：%s" % json.dumps(payload, ensure_ascii=False))
+            sys.exit(1)
+        print("已迁移 %s（子域名 %s）" % (args.code, payload.get("subdomain")))
+        print("新的 clientSecret（交付给客户机，或让客户重新配对）：")
+        print("  " + str(payload.get("clientSecret")))
+        print("⚠️ 旧 accessToken 已失效，客户机上的手机需要重新配对。")
+        return
+
+    if args.command == "devices":
+        ok, payload = call("/pair/devices", method="GET")
+        if not ok:
+            print("失败：%s" % json.dumps(payload, ensure_ascii=False))
+            sys.exit(1)
+        devices = payload.get("devices", [])
+        if not devices:
+            print("还没有任何已配对设备。")
+            return
+        print("共 %d 台（激活码只显示前 8 位）：" % payload.get("count", len(devices)))
+        for item in devices:
+            flags = []
+            if item.get("revoked"):
+                flags.append("已停用")
+            if not item.get("hasDeviceSecret"):
+                flags.append("待迁移")
+            if item.get("rotatedAt"):
+                flags.append("轮换于 %s(%s)" % (stamp(item["rotatedAt"]), item.get("rotatedBy")))
+            last_claim = item.get("lastClaimAt")
+            print(
+                "  %-10s %-28s %-16s %s"
+                % (
+                    item.get("code") or "-",
+                    item.get("hostname") or "-",
+                    item.get("deviceLabel") or "-",
+                    # 「最近谁连过」是这张表最有用的一列：一台机器的令牌被
+                    # 别人拿去用了，症状就是这里冒出一个陌生的 IP。
+                    ("最近领取 %s 来自 %s（共 %d 次）"
+                     % (stamp(last_claim), item.get("lastClaimIp") or "?", item.get("claimCount", 0)))
+                    if last_claim
+                    else "尚未被手机领取",
+                )
+            )
+            if flags:
+                print("             %s" % "；".join(flags))
+        return
+
+    if args.command == "rotate":
+        # ⚠️ 走 admin 头（`/pair/rotate` 靠它分流到管理通道），
+        # 所以**不需要 clientSecret** —— 这正是「令牌泄露后还能救」的关键。
+        ok, payload = call("/pair/rotate", {"code": args.code})
+        if not ok:
+            print("失败：%s" % json.dumps(payload, ensure_ascii=False))
+            sys.exit(1)
+        print("已轮换 %s（子域名 %s）" % (args.code, payload.get("subdomain")))
+        print("新的 accessToken（客户机需要更新，或让客户在插件里重新拉一次）：")
+        print("  " + str(payload.get("accessToken")))
+        print("⚠️ 客户端若已配对，本地 pair.json 里的旧令牌已失效 —— 手机端重新配对即可。")
+        return
+
     if args.command == "list":
         # 没有列表接口，直接读状态文件（脚本和 server 在同一台机器上）。
         state = os.environ.get("PAIR_STATE_DIR", "/workspace/dsh-pair")
@@ -119,9 +212,16 @@ def main():
         print("%-10s %-8s %-22s %s" % ("激活码", "状态", "子域名", "备注"))
         for code, entry in sorted(codes.items()):
             record = records.get(code)
-            state_text = "已停用" if entry.get("revoked") else (
-                "已注册" if record else "未使用"
-            )
+            if entry.get("revoked"):
+                state_text = "已停用"
+            elif record and not record.get("clientSecret"):
+                # ⚠️ 老记录：**现在注册会直接被拒**（见 pair_server.register），
+                # 必须 migrate。列在这里是为了让运维一眼看到还有几条没处理。
+                state_text = "待迁移"
+            elif record:
+                state_text = "已注册"
+            else:
+                state_text = "未使用"
             print(
                 "%-10s %-8s %-22s %s"
                 % (code, state_text, (record or {}).get("subdomain", "-"), entry.get("note", ""))

@@ -120,7 +120,11 @@ const ctx = {
 		return () => {};
 	},
 	on: () => {},
-	get: () => undefined,
+	// ⚠️ 桥路由的前置准入用引擎的 `connection.requestRejection`（见
+	// `bridgeRejection`），取不到就是 **503 fail-closed** —— 所以桩必须给一个。
+	// 这个桩「全部放行」，代表引擎判据已就绪；测试要验的是插件的恢复逻辑。
+	get: (name) =>
+		name === 'connection' ? { requestRejection: () => undefined } : undefined,
 	inject: () => {},
 	logger: {
 		info: (m) => logs.push(['info', String(m)]),

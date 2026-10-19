@@ -58,14 +58,18 @@ const SESSION = 'session-file-tree-test';
  */
 const workspaceFiles = {
 	/**
-	 * 官方 `list` 会先 `confine()` 判越界。这里照抄那条判据，否则测不出
-	 * 「官方的拒绝会不会被本插件吞掉」—— 那正是这一节要证明的事。
+	 * ⚠️⚠️ **这里【故意】不实现 confine() —— 与真官方行为保持一致。**
+	 *
+	 * 以前这里照抄了一条 `relative(root, abs).startsWith('..')` 的越界判据，
+	 * 于是 ⑥ 节「`..` 被拒」测出来的是**这个 mock 会拒**，而真官方
+	 * `workspaceFiles` **根本不拒** —— 公网实测能读到 `C:\Windows\win.ini`
+	 * 和 `pair.json`（详见 ⑥ 节的长注释）。
+	 *
+	 * 那种 mock 给的是**假的安全感**：围栏真被删掉时它照样绿。
+	 * 现在让它与真官方一样**不拦**，围栏就成了被测对象。
 	 */
 	async list(scope, path) {
 		const abs = path === scope.workspaceRoot ? path : join(scope.workspaceRoot, path);
-		if (relative(scope.workspaceRoot, abs).startsWith('..')) {
-			throw new Error(`"${path}" is outside the workspace`);
-		}
 		const names = readdirSync(abs);
 		const entries = names.map((name) => {
 			const st = lstatSync(join(abs, name));
@@ -152,15 +156,86 @@ const back = Buffer.from(bytes.data, 'base64');
 check('字节逐位一致', back.equals(png), `${back.length} vs ${png.length}`);
 check('带 version', typeof bytes.version === 'string' && bytes.version !== '');
 
-// ---- ⑥ 越界路径必须被官方拒绝（不是被本插件吞掉）----
-console.log('\n⑥ 越界与不存在');
-let outside = null;
-try {
-	await run('fileList', { sessionId: SESSION, path: '..' });
-} catch (error) {
-	outside = error;
+// ---- ⑥ 越界路径必须被拒 ----
+//
+// ⚠️ **这一节过去是「假通过」的**：mock 的 `list()` 自己照抄了官方那条
+// `relative(root, abs).startsWith('..')` 判据，于是测出来的是「mock 会拒」，
+// 而**真官方 `workspaceFiles` 并不拒** —— 公网实测（1.0.14，真令牌）：
+//
+//   fileStat      { path: 'C:\\Windows\\win.ini' }  → ok=true，92 字节
+//   fileReadBytes { path: '..\\..\\..\\..\\..\\..\\Windows\\win.ini' }
+//                 → ok=true，data 解出真实内容
+//   fileStat      { path: '..\\..\\..\\..\\..\\..\\Users\\XIAOPAN\\.dsh\\dsh-remote\\pair.json' }
+//                 → ok=true，504 字节 —— **连访问令牌都能被读走**
+//
+// 所以现在把 mock 里那条 confine() **删掉**，让它与真官方行为一致（不拦），
+// 这样这一节测的就是**本插件自己那道围栏**。若哪天有人把围栏删了，
+// 这里会立刻变红 —— 而不是像以前那样继续绿着。
+console.log('\n⑥ 越界必须被本插件挡住（mock 不拦，与真官方一致）');
+for (const [method, path] of [
+	['fileList', '..'],
+	['fileStat', '..'],
+	['fileRead', '..'],
+	['fileReadBytes', '..'],
+	['fileList', '..\\..\\..'],
+	['fileStat', '..\\..\\..\\..\\..\\..\\Windows\\win.ini'],
+	['fileStat', 'C:\\Windows\\win.ini'],
+	['fileList', 'C:\\Windows'],
+	['fileRead', '/etc/passwd'],
+]) {
+	let denied = null;
+	try {
+		await run(method, { sessionId: SESSION, path });
+	} catch (error) {
+		denied = error;
+	}
+	check(`${method} 拒绝越界 ${path}`, denied !== null, denied === null ? '⚠️ 逃逸成功' : '');
 }
-check('.. 被拒', outside !== null, outside === null ? '居然成功了' : '');
+// ⚠️ 报错文案要能区分「越界」与「文件不存在」：都吞成一句「加载失败」的话，
+// 手机端分不清是自己路径写错了还是撞上了围栏。
+let fenceMessage = '';
+try {
+	await run('fileStat', { sessionId: SESSION, path: 'C:\\Windows\\win.ini' });
+} catch (error) {
+	fenceMessage = String(error.message);
+}
+check('绝对路径的报错说明是路径问题', fenceMessage.includes('相对路径'), fenceMessage);
+let dotdotMessage = '';
+try {
+	await run('fileStat', { sessionId: SESSION, path: '..\\..\\..' });
+} catch (error) {
+	dotdotMessage = String(error.message);
+}
+check('.. 越界的报错说明是越界', dotdotMessage.includes('越出'), dotdotMessage);
+
+// ⚠️ 反向断言：围栏不能**误伤**。区内路径（含看起来像但实为区内的 `..`）必须照常。
+console.log('\n⑥.5 围栏不误伤区内路径');
+const insideDotDot = await run('fileList', { sessionId: SESSION, path: 'src\\..' });
+check('src\\.. 折回根本身（区内）放行', insideDotDot.entries.map((e) => e.name).includes('README.md'));
+const sibling = await run('fileStat', { sessionId: SESSION, path: 'src/a.js' });
+check('普通相对路径照常', sibling.bytes === 20, String(sibling.bytes));
+
+/** 判两个绝对路径是否同一个（win32 大小写不敏感）。 */
+const samePath = (a, b) =>
+	process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+
+/** 造一个「假兄弟目录」，验前缀比较不会把它误判成区内。 */
+const evilDir = `${root}-evil`;
+mkdirSync(evilDir, { recursive: true });
+writeFileSync(join(evilDir, 'secret.txt'), 'TOPSECRET\n');
+let siblingLeak = null;
+try {
+	await run('fileStat', { sessionId: SESSION, path: `..\\${root.split(/[\\/]/).pop()}-evil\\secret.txt` });
+} catch (error) {
+	siblingLeak = error;
+}
+check('同前缀的兄弟目录（ws → ws-evil）被挡住', siblingLeak !== null, siblingLeak === null ? '⚠️ 逃逸成功' : '');
+check('兄弟目录确实存在（证明上一条不是因为文件缺失）', statSync(join(evilDir, 'secret.txt')).size === 10);
+// 顺手验一下判据本身：`samePath` 只为下面那条大小写断言服务，这里确认它没写反。
+check('samePath 自身正确', samePath(root, root.toUpperCase()) === (process.platform === 'win32'));
+rmSync(evilDir, { recursive: true, force: true });
+
+console.log('\n⑦ 越界与不存在');
 let missing = null;
 try {
 	await run('fileStat', { sessionId: SESSION, path: 'nope.txt' });

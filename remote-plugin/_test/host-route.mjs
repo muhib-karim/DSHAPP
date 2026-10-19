@@ -143,7 +143,7 @@ if (CODE) {
 
 	r = await call('/handshake');
 	check('生成配对码', r.payload.ok === true && /^[0-9A-Z]{6}$/.test(r.payload.pairCode), { code: r.payload.pairCode });
-	check('配对码带二维码 SVG', typeof r.payload.svg === 'string' && r.payload.svg.startsWith('<svg'), { len: r.payload.svg?.length });
+	check('配对码带二维码（data URI，不走 innerHTML）', typeof r.payload.qr === 'string' && r.payload.qr.startsWith('data:image/svg+xml;base64,'), { len: r.payload.qr?.length });
 	const pairCode = r.payload.pairCode;
 
 	// 手机端 claim

@@ -109,6 +109,8 @@ global.fetch = (url, init) => {
 			console.log(`     [mock] refreshAll path=${JSON.stringify(path)} → ${(result.directory.value.entries ?? []).length} 项`);
 		} else if (method === 'remoteSessions') {
 			result = { ids: remoteIds };
+		} else if (method === 'mirrorSlugs') {
+			result = { slugs: mirrorSlugList };
 		} else {
 			result = {};
 		}
@@ -313,13 +315,36 @@ let pairedFlag = true;
 /** `remoteSessions` 回哪些 id —— 第 ⑦ 节用它决定某个会话是不是「电脑的」。 */
 let remoteIds = [];
 
+/**
+ * `mirrorSlugs` 回哪些 slug —— **隔离的真正判据**（见第 ⑦.5 节）。
+ *
+ * 用户 1.0.19 报障后的正解：判据从「会话有没有被我的桥登记过」换成
+ * 「会话的 cwd 落在哪个工作区」。所以这里要能模拟「电脑镜像工作区已存在」。
+ */
+let mirrorSlugList = ['desktop-abc12345'];
+
+/**
+ * 会话列表的 `byId` —— 模型菜单每帧都从这里**同步**读 `cwd`。
+ *
+ * 形状抄官方 `projectList()`（`dsh-api-session-controller/lib/client.js`）：
+ * 会话行里确实带 `cwd`。第 ⑦.5 节靠它证明「侧边栏建的会话」也能被认出来。
+ */
+let sessionRows = {};
+
 const ctx = {
 	effect: (fn) => fn(),
 	slots: {
 		inject: (slot, fn) => { const r = fn(); if (r && typeof r.next === 'function') { let s = r.next(); while (!s.done) s = r.next(); } return r; },
 		register: (spec, component) => { cells.push({ spec, component }); return { dispose() {} }; },
 	},
-	sessions: { binding: () => undefined, create: () => Promise.resolve(), refresh: () => Promise.resolve() },
+	sessions: {
+		binding: () => undefined,
+		create: () => Promise.resolve(),
+		refresh: () => Promise.resolve(),
+		// 官方 `sessions.list` 是 `createSnapshotStore(...)`，`getSnapshot().byId[id].cwd`
+		// 同步可读 —— 插件的 `makeCwdOf` 走的正是这条路。
+		list: { getSnapshot: () => ({ ids: Object.keys(sessionRows), byId: sessionRows }) },
+	},
 	uiWorkspace: {
 		listDirectory: () => Promise.resolve({ path: '/', parent: '', home: '/', entries: [] }),
 		createDirectory: () => Promise.resolve(),
@@ -663,6 +688,126 @@ console.log('\n⑦ 模型菜单按工作区隔离（用户报障：「本地文�
 		'一组都没有时原样返回（不把菜单变成空的）',
 		JSON.stringify(empty.groups),
 	);
+}
+
+// ------------------------------------------- ⑦.5 判据是「工作区」而不是「谁建的会话」
+//
+// ⚠️⚠️ **这是用户 1.0.19 报障的回归断言，整个第 ⑦.5 节都为它而存在。**
+//
+// 用户原话：
+//
+//     我第一次添加我选择的是桌面目录，后面我重新在侧边栏点击新建会话，
+//     这个桌面目录还是会在待选列表的，且默认就是上一个"桌面目录"，
+//     此时已经属于是在电脑工作区了，但是呢我们的模型却还是我们手机本地的模型列表，
+//     也就是说你现在这个架构设计的还是有问题，
+//     **只有我手动添加工作区的时候，才会触发模型和预设的刷新。**
+//
+// 根因：第一代判据是 `remoteSessionIds`（按 **sessionId**），它只在
+// ① 用户从电脑文件夹对话框建会话（走插件的 `createSession` 桥）或
+// ② 宿主 create 拦截器绑过 时才有条目。
+// 而侧边栏「新建会话」走的是**官方原生** `sessionController.create({workspaceId})`,
+// **不经过本插件** —— 宿主的拦截器认得出镜像目录（消息发得对），
+// 但前端那个集合只在 `apply` 时拉过一次全量，**官方这条路前端毫不知情**
+// ⇒ 模型菜单按「本地」筛，显示手机模型。
+//
+// 正解（本节钉的就是它）：判据换成会话的 **cwd 落在哪个工作区**，
+// 与宿主 `desktopPathOfMirror` 同一个轴 —— 与「谁建的会话」完全无关。
+//
+// 这一节**刻意不调 `markRemote`**，正是为了复现「官方那条路」。
+console.log('\n⑦.5 侧边栏「新建会话」走的官方路径（判据必须是工作区，不是谁建的会话）');
+{
+	{
+		const merged = {
+			groups: [
+				{ id: 'deepseek-official', name: '电脑的', desktop: true, models: [{ id: 'deepseek-v4-pro' }] },
+				{ id: 'wk', name: '电脑的', desktop: true, models: [{ id: 'buddy:glm-5.3-flash' }] },
+			],
+			failures: [],
+			localGroups: [{ id: 'agnes', name: '手机的', models: [{ id: 'agnes-3.0-flash' }] }],
+			localFailures: [],
+			default: { provider: 'agnes', model: 'agnes-3.0-flash' },
+		};
+		const MIRROR = '/data/user/0/com.dsh.android/files/home/.dsh/dsh-remote/workspaces/desktop-abc12345';
+		const PHONE = '/data/user/0/com.dsh.android/files/home/workspace';
+		const models = ctx.get('modelDirectories');
+
+		/**
+		 * 模拟「会话出现在列表里」，再拿它的目录 —— **不碰 `markRemote`**。
+		 *
+		 * @param sessionId - 会话 id。
+		 * @param cwd - 列表行里的 cwd（`undefined` = 这一行还没带 cwd）。
+		 * @returns 筛过的那层目录。
+		 */
+		const byWorkspace = (sessionId, cwd) => {
+			currentDirectory = makeDirectory(merged);
+			sessionRows = {};
+			if (cwd !== undefined) sessionRows[sessionId] = { id: sessionId, cwd: cwd };
+			else sessionRows[sessionId] = { id: sessionId };
+			return models.directoryFor(sessionId);
+		};
+
+		// —— ① 用户报的那条路：侧边栏新建会话，cwd 落在电脑镜像工作区 ——
+		const sidebar = byWorkspace('session-sidebar', MIRROR);
+		const sidebarIds = sidebar.store.getSnapshot().groups.map((g) => g.id).sort();
+		check(
+			sidebarIds.join(',') === 'deepseek-official,wk',
+			'侧边栏新建的会话（cwd 在镜像工作区）：只看到电脑的组 —— 不靠任何标记',
+			JSON.stringify(sidebarIds),
+		);
+		check(
+			sidebar.store.getSnapshot().current === null,
+			'侧边栏新建的会话：current 指向被筛掉的手机模型时置空',
+			JSON.stringify(sidebar.store.getSnapshot().current),
+		);
+
+		// —— ② cwd 是手机目录：即使老标记说它是远程，也必须按本地 ——
+		// （老标记可能来自「曾经是远程、后来解绑/换了工作区」，cwd 才是事实。）
+		if (injectedProps.markRemote !== undefined) injectedProps.markRemote('session-phone');
+		const phone = byWorkspace('session-phone', PHONE);
+		const phoneIds = phone.store.getSnapshot().groups.map((g) => g.id).sort();
+		check(
+			phoneIds.join(',') === 'agnes',
+			'cwd 在手机目录：即使留了「远程」老标记也按本地（cwd 说了算）',
+			JSON.stringify(phoneIds),
+		);
+
+		// —— ③ cwd 落在 workspaces 下、但那个 slug 不是电脑镜像 ——
+		// 不能只看 `/workspaces/` 就判远程，必须 slug 真在集合里。
+		const stray = byWorkspace('session-stray', '/data/user/0/com.dsh.android/files/home/.dsh/dsh-remote/workspaces/other-nope');
+		check(
+			stray.store.getSnapshot().groups.map((g) => g.id).join(',') === 'agnes',
+			'cwd 在 workspaces 下但 slug 不是电脑镜像：仍按本地',
+			JSON.stringify(stray.store.getSnapshot().groups.map((g) => g.id)),
+		);
+
+		// —— ④ 列表行还没带 cwd 的那几帧：退回老标记 ——
+		if (injectedProps.markRemote !== undefined) injectedProps.markRemote('session-nocwd');
+		const nocwd = byWorkspace('session-nocwd', undefined);
+		check(
+			nocwd.store.getSnapshot().groups.map((g) => g.id).sort().join(',') === 'deepseek-official,wk',
+			'列表行还没带 cwd 时退回老标记（会话刚建好那几帧不至于闪回手机模型）',
+			JSON.stringify(nocwd.store.getSnapshot().groups.map((g) => g.id)),
+		);
+
+		// —— ⑤ 重拉 slug 集合真的能让结论翻转 ——
+		// 宿主每给一个新电脑目录建镜像工作区，`workspaceMap` 就多一条；
+		// 前端那份是快照，不重拉的话新工作区永远被判成「本地」。
+		const before = byWorkspace('session-newdir-a', '/x/workspaces/fresh-99999999');
+		check(
+			before.store.getSnapshot().groups.map((g) => g.id).join(',') === 'agnes',
+			'新镜像工作区还没进集合时按本地',
+			JSON.stringify(before.store.getSnapshot().groups.map((g) => g.id)),
+		);
+		mirrorSlugList = mirrorSlugList.concat(['fresh-99999999']);
+		await (injectedProps.refreshMirrorSlugs === undefined ? Promise.resolve() : injectedProps.refreshMirrorSlugs());
+		const after = byWorkspace('session-newdir-b', '/x/workspaces/fresh-99999999');
+		check(
+			after.store.getSnapshot().groups.map((g) => g.id).sort().join(',') === 'deepseek-official,wk',
+			'refreshMirrorSlugs 之后同样的 cwd 就按电脑判（新建工作区必须重拉）',
+			JSON.stringify(after.store.getSnapshot().groups.map((g) => g.id)),
+		);
+		mirrorSlugList = mirrorSlugList.filter((s) => s !== 'fresh-99999999');
+	}
 }
 
 console.log(`\n共 ${calls.length} 次桥调用，其中 listDesktop ${listCalls().length} 次`);

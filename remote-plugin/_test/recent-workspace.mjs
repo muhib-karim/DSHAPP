@@ -165,7 +165,15 @@ function makeCtx(opts) {
 			return typeof dispose === 'function' ? dispose : undefined;
 		},
 		inject: () => undefined,
-		get: (name) => (name === 'workspaceRegistry' ? registry : undefined),
+		get: (name) => {
+			if (name === 'workspaceRegistry') return registry;
+			// ⚠️ 桥路由的前置准入要用引擎的 `connection.requestRejection`
+			//（见 `bridgeRejection`），取不到就是 **503 fail-closed**。这里给一个
+			// 「全部放行」的桩，代表「引擎判据已就绪且认这个请求」——测试要验的是
+			// 插件自己的逻辑，不是引擎的鉴权。
+			if (name === 'connection') return { requestRejection: () => undefined };
+			return undefined;
+		},
 		on: () => undefined,
 	};
 	return { ctx, controller, created };
@@ -693,6 +701,11 @@ console.log('\n=== ⑧ 模型目录必须并进电脑的 + 根目录预拉（用
 			}
 			handler(
 				{
+					// ⚠️ **真请求一定带 headers**：桥路由现在有前置准入（Host / Origin /
+					// sec-fetch-site，见 `bridgeRejection`），桩少了 headers 会被 403 掉，
+					// 这一节就会以「解析不到 JSON」的形式假报错 —— 那是桩的问题不是产品的问题。
+					headers: { host: '127.0.0.1:3080', 'content-type': 'application/json' },
+					method: 'POST',
 					on: (name, fn) => {
 						if (name === 'data') fn(body);
 						if (name === 'end') setImmediate(fn);

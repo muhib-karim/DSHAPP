@@ -134,10 +134,14 @@ try {
 		'配对码不含易混字符 0/1/O/I/L（手输友好）',
 	);
 	ok(typeof hs.expiresIn === 'number' && hs.expiresIn > 0, `有效期 ${hs.expiresIn} 秒`);
-	ok(typeof hs.svg === 'string' && hs.svg.startsWith('<svg'), '二维码 SVG 已渲染');
-	ok(hs.svg.includes('</svg>'), '二维码 SVG 是完整的');
+	// ⚠️ 二维码现在是 **data URI**（`data:image/svg+xml;base64,…`）而不是裸 SVG 字符串：
+	// 前端改成 `<img src=…>` 之后就不再有原始 HTML sink（外部审计 M6）。所以要解出来看。
+	ok(typeof hs.qr === 'string' && hs.qr.startsWith('data:image/svg+xml;base64,'), '二维码是 data URI');
+	const qrSvg = Buffer.from((hs.qr ?? '').split(',')[1] ?? '', 'base64').toString('utf8');
+	ok(qrSvg.startsWith('<svg'), '二维码 SVG 已渲染（解码后）');
+	ok(qrSvg.includes('</svg>'), '二维码 SVG 是完整的');
 	// 二维码里只该有那 6 位码：用 qr.js 反查一下矩阵规模是否与 6 字符一致（版本 1）。
-	const svgLen = (hs.svg ?? '').length;
+	const svgLen = qrSvg.length;
 	ok(svgLen > 500, `二维码内容量看起来是 6 字符级别（SVG ${svgLen} 字节）`);
 
 	/* ---------- 第 3 步：手机领取 ---------- */
