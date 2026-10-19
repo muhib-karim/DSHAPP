@@ -2721,7 +2721,7 @@ class EngineManager private constructor(private val context: Context) {
      * 会让老设备永远停在旧版。
      */
     private fun ensureCoreMemory() {
-        val target = File(dshHome, "$CORE_MEMORY_DIR/$CORE_MEMORY_PACKAGE")
+        val target = coreMemoryDir()
         val clientJs = File(target, "lib/client.js")
         val stamp = File(target, CORE_MEMORY_STAMP)
 
@@ -2754,39 +2754,149 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
-     * 写出挂载 dsh-core-memory 的 overlay，返回其路径；不可用时返回 null。
+     * 清掉改造前解在 `$DSH_HOME/core-memory/` 的那一份（幂等）。
      *
-     * 与 [writeAgnesMultimodalPatch] 同构：`--patch` 在 profile 层**之后**应用，优先级
-     * 更高，且完全由本 App 拥有，升级时整体覆盖即可。`name` 用 `file://` 绝对
-     * URL，因为包在 pnpm 管辖之外、按裸包名解析不到。
+     * 包目录从 `$DSH_HOME/core-memory/dsh-core-memory/` 搬到了
+     * `$DSH_HOME/node_modules/dsh-core-memory/`（理由见 [coreMemoryDir]）。老设备上
+     * 旧目录还在 —— 它不再被任何东西引用，留着只是一个永远不更新的死副本，
+     * 将来排查「为什么改了插件没生效」时极易看错。
      *
-     * ⚠️ 浏览器半（「AI 回复风格」设置页）由 `dsh-client-modules` 通过 package.json 的
-     * `dsh.client` 声明 + `exports["./client"]` 自动编入，**不需要**在这里声明。
+     * ⚠️ 只删这一层，**不碰 `$DSH_HOME/memory/`** —— 那里面是用户真正的记忆数据，
+     * 与包目录无关，关掉插件也**不该**删。
      */
-    private fun writeCoreMemoryPatch(): File? {
-        val patch = File(dshHome, CORE_MEMORY_PATCH)
-        val entry = File(dshHome, "$CORE_MEMORY_DIR/$CORE_MEMORY_PACKAGE/lib/index.js")
-        if (!entry.isFile) {
-            Log.w(TAG, "跨会话记忆插件入口不存在，跳过挂载: ${entry.absolutePath}")
-            return null
+    private fun removeLegacyCoreMemoryDir() {
+        val legacy = File(dshHome, CORE_MEMORY_LEGACY_DIR)
+        if (legacy.isDirectory && legacy.deleteRecursively()) {
+            Log.i(TAG, "已清理旧位置的跨会话记忆插件目录: $CORE_MEMORY_LEGACY_DIR")
         }
-        return try {
-            val url = "file://${entry.absolutePath}"
-            patch.writeText(
-                """
-                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
-                # 挂载跨会话持久记忆插件；插件包随 APK 分发，已解到 .dsh/${CORE_MEMORY_DIR}。
-                # 用 file:// 绝对路径挂载：包刻意放在 profile 的 node_modules 之外，
-                # 否则用户每次用插件管理器装东西都会被 pnpm 挪进 .ignored/。
-                - insert:
-                    - id: $CORE_MEMORY_PACKAGE
-                      name: '$url'
-                """.trimIndent() + "\n"
-            )
-            patch
+    }
+
+    /**
+     * dsh-core-memory 的包目录：`$DSH_HOME/node_modules/dsh-core-memory`。
+     *
+     * ## 为什么是这个位置（三个候选逐个否掉后的结论）
+     *
+     * `loadProfileDirectory()` → `resolveBundleDir()` 解析 bundle 名时只认两个锚点：
+     * dsh 安装目录、`<profileDir>/package.json`。后者走 `createRequire().resolve.paths()`
+     * —— 也就是 **Node 的向上查找**：`profiles/web/node_modules` → `profiles/node_modules`
+     * → `$DSH_HOME/node_modules` → …。所以放在 `$DSH_HOME/node_modules` 下能被解析到。
+     *
+     * | 候选 | 结论 |
+     * |---|---|
+     * | `profiles/web/node_modules/`（与第三方插件同级） | ❌ pnpm 会把它挪进 `.ignored/`。AGENTS.md ⑥ 的老坑，移动端 UI 插件就被这么驱逐过 |
+     * | `$DSH_HOME/core-memory/`（改造前的位置） | ❌ require 向上只查到 `$DSH_HOME/node_modules`，查不到这个兄弟目录 ⇒ bundle 解析失败 |
+     * | **`$DSH_HOME/node_modules/`** | ✅ 能被解析，且**不在 pnpm workspace 内**（`pnpm-workspace.yaml` 的 `packages: [.]` 只覆盖 `profiles/web`），pnpm 看不到它 |
+     *
+     * ⚠️ 目录名**必须**是 `dsh-core-memory`：Node 的解析是按包名找
+     * `<某个 node_modules>/<包名>/package.json`，目录名对不上就找不到。
+     */
+    private fun coreMemoryDir(): File =
+        File(dshHome, "node_modules/$CORE_MEMORY_PACKAGE")
+
+    /**
+     * 把 dsh-core-memory 登记成 profile 的一个 **bundle**，让它在「插件 → 已安装插件」
+     * 列表里出现、并能被用户单独开关。
+     *
+     * ## 为什么不再是 `--patch` overlay 里的 `- insert:`
+     *
+     * 改造前它是主机 overlay 的一行 `insert`。那种挂载方式**没有身份**：官方
+     * plugin-manager 的列表只认 `dsh.profile.bundles`（`listBundles()`）与 Loader 里
+     * 由 bundle 层贡献的行，overlay 插进来的条目不在任何一份清单里 —— 于是插件页
+     * 看不到它，用户既关不掉、也不知道它存在。用户原话：「有的用户他可能不太想用
+     * 这个插件」。
+     *
+     * 改成 bundle 之后，「关掉」= 从 `dsh.profile.bundles` 摘掉这个名字，包本身留在
+     * `node_modules`、记忆数据留在 `$DSH_HOME/memory`，随时能再打开。
+     *
+     * ## ⚠️ 幂等判据必须「只看缺失才补」，不能「每次都补齐」
+     *
+     * 这是**与改造前最大的语义差别**。overlay 是 App 每次启动整体覆盖的，用户改不动；
+     * 而 bundle 名单是**用户与 App 共写**的同一份文件。若写成「不在就加上」，用户
+     * 在插件页关掉它、重启 App，这里又会把它加回去 —— 变成「关不掉」。
+     *
+     * 所以判据是「**从来没见过它**才补」：见标记文件 [CORE_MEMORY_MARKER]。
+     * 一旦登记过（标记文件在），此后只在用户保留它时维持现状，绝不自动复活。
+     * 用户想再打开，在插件页把它打开即可，那时的写入由官方插件管理器完成。
+     *
+     * ## ⚠️ `dependencies` 也要写
+     *
+     * `loadProfileDirectory()` 解析 bundle 名时的锚点是「dsh 安装目录」和
+     * 「`<profileDir>/package.json`」。包在 `$DSH_HOME/node_modules/` 下，靠 Node 的
+     * 向上查找命中；但官方 `listBundles()` 的 `installed`、`removable`、版本比较都读
+     * `manifest.dependencies`，只写 `bundles` 会让这一行在插件页**根本不渲染**。
+     * 依赖值用 `link:` 指向真实目录，pnpm 认得这种本地链接、也不会去 registry 找。
+     */
+    private fun registerCoreMemoryBundle() {
+        val manifest = File(dshHome, "profiles/$PROFILE_NAME/package.json")
+        val marker = File(dshHome, CORE_MEMORY_MARKER)
+        if (!File(coreMemoryDir(), "package.json").isFile) {
+            Log.w(TAG, "跨会话记忆插件包不存在，跳过 bundle 登记: ${coreMemoryDir().absolutePath}")
+            return
+        }
+        if (!manifest.isFile) {
+            // profile 还没初始化：官方启动时会用 PROFILE_TEMPLATES.web 建好，
+            // 那时只带两个核心 bundle，下一次启动这里再补。
+            Log.i(TAG, "profile 清单尚不存在，跨会话记忆插件的 bundle 登记推迟到下次启动")
+            return
+        }
+
+        try {
+            val json = JSONObject(manifest.readText())
+            val dsh = json.optJSONObject("dsh") ?: JSONObject().also { json.put("dsh", it) }
+            val profile = dsh.optJSONObject("profile") ?: JSONObject().also { dsh.put("profile", it) }
+            val bundles = profile.optJSONArray("bundles") ?: JSONArray().also { profile.put("bundles", it) }
+
+            var listed = false
+            for (i in 0 until bundles.length()) {
+                if (bundles.optString(i, "") == CORE_MEMORY_PACKAGE) {
+                    listed = true
+                    break
+                }
+            }
+
+            var changed = false
+            if (!listed && !marker.isFile) {
+                // 第一次见到它：补进名单（老用户升级上来也走这一支，见 [CORE_MEMORY_MARKER] 注释）
+                bundles.put(CORE_MEMORY_PACKAGE)
+                changed = true
+                Log.i(TAG, "已把跨会话记忆插件登记为 profile bundle（可在插件页关闭）")
+            }
+            if (!marker.isFile) {
+                marker.parentFile?.mkdirs()
+                marker.writeText("registered")
+            }
+
+            // 依赖项：解析锚点之一，也让官方列表能算出版本与可移除性。
+            // 用户关掉后**不删**这一行 —— 它是包的存在声明，不是启用开关。
+            val deps = json.optJSONObject("dependencies") ?: JSONObject().also { json.put("dependencies", it) }
+            if (!deps.has(CORE_MEMORY_PACKAGE)) {
+                deps.put(CORE_MEMORY_PACKAGE, "link:${coreMemoryDir().absolutePath}")
+                changed = true
+            }
+
+            if (changed) manifest.writeText(json.toString(2) + "\n")
         } catch (t: Throwable) {
-            Log.w(TAG, "写入跨会话记忆 overlay 失败: ${t.message}")
-            null
+            // 登记失败不阻断启动：记忆功能退化成「不挂载」，与包缺失同级
+            Log.w(TAG, "登记跨会话记忆插件 bundle 失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 清掉老版本留下的 dsh-core-memory 主机 overlay（幂等）。
+     *
+     * 改造前它是 `$DSH_HOME/core-memory.patch.yml` 里的一行 `insert`，每次启动被
+     * `--patch` 挂上。现在改走 profile bundle，这份 overlay 若还在，同一个包会被
+     * **挂载两次** —— `insert` 行不按 id 去重，结果是记忆工具重复注册、核心记忆在
+     * 系统提示里出现两遍。
+     *
+     * ⚠️ 不能只在「不再生成它」就算了：老设备上那份文件**已经存在**，App 不生成
+     * 不代表 `--patch` 不传它 —— 传不传由 applyOverlays 里那一串列表决定，而列表
+     * 现在已不含 core-memory 这一项。但文件本身仍要删，否则它会被别的路径读到。
+     */
+    private fun removeCoreMemoryOverlay() {
+        val stale = File(dshHome, CORE_MEMORY_PATCH)
+        if (stale.isFile && stale.delete()) {
+            Log.i(TAG, "已清理旧的跨会话记忆 overlay（改由 profile bundle 挂载）")
         }
     }
 
@@ -2843,7 +2953,7 @@ class EngineManager private constructor(private val context: Context) {
     /**
      * 写出挂载 dsh-android-market 的 overlay，返回其路径；不可用时返回 null。
      *
-     * 与 [writeCoreMemoryPatch] 同构：`--patch` 在 profile 层**之后**应用，优先级
+     * 与其它 `writeXxxPatch` 同构：`--patch` 在 profile 层**之后**应用，优先级
      * 更高，且完全由本 App 拥有，升级时整体覆盖即可。`name` 用 `file://` 绝对
      * URL，因为包在 pnpm 管辖之外、按裸包名解析不到。
      *
@@ -5483,7 +5593,7 @@ class EngineManager private constructor(private val context: Context) {
      * ## ⚠️ 为什么不能另开一个 profile 名
      *
      * 直觉做法是「写一个 `profiles/probe/package.json`，用它试启动」——**错的**。
-     * [resolveBundleDir] 的解析锚点只有两个：dsh 安装目录、`<profileDir>/package.json`。
+     * bundle 名的解析锚点只有两个：dsh 安装目录、`<profileDir>/package.json`。
      * 第三方插件装在 `profiles/web/node_modules/` 下，换一个 profile 名就解析不到，
      * 而解析不到**不是报错**：`loadProfileDirectory` 把它塞进 `skippedBundles`
      * 然后**照常启动成功**。于是探测报「能起来」、真实 web 起不来 —— 一个
@@ -6695,9 +6805,11 @@ class EngineManager private constructor(private val context: Context) {
         // 所以默认位改为补进 profile 的用户配置层（见 [ensurePresetDefault]）。
         ensurePresetDefault()
         // 跨会话持久记忆插件：核心记忆常驻注入 + 归档记忆检索 + 回复风格设置页。
-        // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
+        // 走 profile bundle（不是 overlay）⇒ 用户能在「插件 → 已安装插件」里自己关掉。
         ensureCoreMemory()
-        val coreMemoryPatch = writeCoreMemoryPatch()
+        removeLegacyCoreMemoryDir()
+        removeCoreMemoryOverlay()
+        registerCoreMemoryBundle()
         // 插件市场：从 npm 按关键词收录插件，在设置页浏览/搜索/一键安装。
         // 安装动作复用官方 pluginManager 的 Remote 服务，本插件不自己碰 pnpm。
         // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
@@ -6852,7 +6964,6 @@ class EngineManager private constructor(private val context: Context) {
             mobileUiPatch,
             agnesMmPatch,
             presetRazorPatch,
-            coreMemoryPatch,
             marketPatch,
             sandboxPatch,
             workspacePatch,
@@ -7937,11 +8048,16 @@ class EngineManager private constructor(private val context: Context) {
          *
          * ⚠️ 缩进是**制表符**（首行 1 个、尾行 3/2/1/0 个），与官方发布件逐字一致；
          * 引擎升级后若不再匹配，补丁会跳过并在日志里提示，不会让启动失败。
+         *
+         * ⚠️ **0.2.1-rc.2 起首行从 `map` 变成了 `flatMap`**（空 text 块返回 `[]`
+         *   靠 flatMap 展开）。锚点只认新文本 —— 引擎已固定为 0.2.1，老文本不再需要，
+         *   漏改的后果是补丁静默跳过、assistant 的 tool_use 顺序又变回交错，
+         *   ⑨.5 那个「会话永久发不出去」的故障会复发。
          */
         private const val TOOL_ORDER_GUARD_HEAD =
-            "\treturn message.content.map((block, index) => {"
+            "\treturn message.content.flatMap((block, index) => {"
         private const val TOOL_ORDER_ANCHOR_HEAD =
-            "\tconst mapped = message.content.map((block, index) => {"
+            "\tconst mapped = message.content.flatMap((block, index) => {"
 
         private const val TOOL_ORDER_GUARD_TAIL =
             "\t\t\tdefault: return unsupported(`assistant content \${block.type}`);\n" +
@@ -8057,7 +8173,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val AGNES_MM_DIR = "agnes-multimodal"
 
         /** 插件内容版本戳：改了 `agnes-multimodal.zip` 里任何东西都必须改这里。 */
-        private const val AGNES_MM_VERSION = "1.0.0-2"
+        private const val AGNES_MM_VERSION = "1.0.0-3"
         private const val AGNES_MM_STAMP = ".agnes_mm_version"
 
         /** 插件自己的账号池状态文件（`lib/index.js` 的 `readAccounts()` 读的就是它）。 */
@@ -8128,15 +8244,18 @@ class EngineManager private constructor(private val context: Context) {
          *           - id: persona
          *             name: '@deepseek-ai/dsh-persona'
          *             config:
-         *               suffix: Your working directory is {{cwd}}.
          *               prefix: >-
          *                 You are a coding agent powered by the {{model}} model.
          * ```
+         *
+         * ⚠️ **0.2.1-rc.2 起官方删掉了 `suffix: Your working directory is {{cwd}}.`
+         *   这一行**（工作目录改由 `time-context` / 工具描述承载），锚点必须跟着删，
+         *   否则整个 GUARD 匹配不上 → 补丁静默跳过 → 「快准狠」提示词不再注入。
+         *   实测就是这样：升级后日志出现「创造模式预设的 persona 结构与预期不符」。
          */
         private const val PRESET_CORDIS_PERSONA_GUARD = """          - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
               prefix: >-
                 You are a coding agent powered by the {{model}} model."""
 
@@ -8256,16 +8375,35 @@ class EngineManager private constructor(private val context: Context) {
             append("                  不需要交代，用户要知道会自己问。")
         }.trimEnd()
 
-        /** 跨会话持久记忆插件（dsh-core-memory）：资产名、包名、overlay 文件名。 */
+        /** 跨会话持久记忆插件（dsh-core-memory）：资产名、包名、旧 overlay 文件名。 */
         private const val CORE_MEMORY_ASSET = "core-memory.zip"
         private const val CORE_MEMORY_PACKAGE = "dsh-core-memory"
+
+        /**
+         * 旧版本用它走主机 overlay；改造为 profile bundle 后只用于**清理残留**。
+         * 老设备上这份文件已经存在，不删会被 `--patch` 再次挂上 ⇒ 同一个包挂两遍。
+         */
         private const val CORE_MEMORY_PATCH = "core-memory.patch.yml"
 
-        /** 解包目录，相对 `$DSH_HOME`；与 [MOBILE_UI_DIR] 同理，刻意在 pnpm 管辖之外。 */
-        private const val CORE_MEMORY_DIR = "core-memory"
+        /**
+         * 「本 App 曾经把这个 bundle 登记进 profile」的一次性标记。
+         *
+         * ⚠️ 它存在的唯一理由是**别把用户关掉的插件又打开**：`dsh.profile.bundles`
+         * 是用户与 App 共写的，若每次启动都「不在就补」，用户在插件页关掉、重启 App
+         * 就又回来了 —— 那等于关不掉。有了这个标记，App 只在**从没见过它**时补一次。
+         *
+         * 不随版本变化：它不是内容版本戳，删掉会导致 App 重新「补一次」。
+         */
+        private const val CORE_MEMORY_MARKER = ".core_memory_bundle_registered"
+
+        /**
+         * 改造前的解包目录（相对 `$DSH_HOME`），只用于清理残留。
+         * ⚠️ 别把它和 `$DSH_HOME/memory/` 混淆：那个是用户的记忆数据，永远不删。
+         */
+        private const val CORE_MEMORY_LEGACY_DIR = "core-memory"
 
         /** 内容版本戳：改了 `core-memory.zip` 里任何东西都必须改这里。 */
-        private const val CORE_MEMORY_VERSION = "1.0.0-1"
+        private const val CORE_MEMORY_VERSION = "1.0.0-2"
         private const val CORE_MEMORY_STAMP = ".core_memory_version"
 
         /** 插件市场（dsh-android-market）：资产名、包名、overlay 文件名。 */
