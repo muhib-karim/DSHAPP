@@ -151,6 +151,65 @@ async function getCatalog(ctx, force) {
 }
 
 /**
+ * 目录接口的**准入判据**：直接复用引擎自己那一套（外部审计 5.1 同类问题第二例）。
+ *
+ * ## ⚠️ 为什么原来那样是不行的
+ *
+ * 第一版只判了 `req.method !== 'GET'`。而本路由是**精确路径**注册的，
+ * 引擎的 `match()` 是「精确表优先、再长前缀胜」⇒ `/api/dsh-android/market`(23)
+ * 比 `/api`(4) 长，**引擎自己的 cookie 门根本不会被走到**。实测：
+ * 带 `Host: evil.example` 的无凭据请求拿到 **200 + 全量目录**，而且
+ * `?refresh=1` 能让手机去扫 200+ 个 npm packument（跨站 GET 同样能触发）。
+ *
+ * 攻击者是**手机上任意其它 App**（Android 的 loopback 跨 App 可达），
+ * 前置条件只是「App 在跑」——端口固定 3080。
+ *
+ * ## 判据
+ *
+ * `connection.requestRejection(req)` 是引擎给页面用的那把唯一的门
+ * （`dsh-client-connection`）：它查 `Host` 是不是 loopback + 会话 cookie。
+ * 页面自己的 `fetch` 天然带着 cookie，所以这道门**对页面完全透明**。
+ *
+ * ## ⚠️ 取不到 `connection` 一律 **503（fail-closed）**，绝不降级
+ *
+ * 与手机桥（`dsh-remote-mobile/lib/index.js` 的 `bridgeRejection`）同款取舍，
+ * 理由也一样：cordis 的 `ctx.get(name, strict)` 对尚未 ACTIVE 的提供者返回
+ * `undefined`（`cordis/lib/index.js:770`），而 client-connection 的
+ * `await BrowserAuth.create(...)` 排在 `provide('connection')` 之前 ⇒
+ * 引擎启动 / 插件重载期间本路由**已经在收请求**，而服务还没就绪。
+ *
+ * 「服务缺失」是暂时不可用（界面显示 HTTP 503，点一下刷新就好），
+ * 「降级到不查 cookie 的判据」是一直不安全 —— 后者严重得多。
+ * `requestRejection` 自己抛错同样 503：判据没跑成就等于没有判据。
+ *
+ * @param ctx - Cordis 上下文。
+ * @param req - 请求。
+ * @returns 拒绝时的 HTTP 状态码，放行时 `undefined`。
+ */
+function marketRejection(ctx, req) {
+	const connection = ctx.get?.('connection');
+	if (connection === undefined || typeof connection.requestRejection !== 'function') {
+		if (!marketGateWarned) {
+			marketGateWarned = true;
+			ctx.logger?.warn?.(
+				'[dsh-android-market] connection 服务尚未就绪，目录接口一律 503（fail-closed，不降级到只判方法）',
+			);
+		}
+		return 503;
+	}
+	try {
+		return connection.requestRejection(req);
+	} catch (error) {
+		ctx.logger?.warn?.(
+			`[dsh-android-market] connection.requestRejection 抛错，目录接口一律 503（fail-closed）: ${String(error?.message ?? error)}`,
+		);
+		return 503;
+	}
+}
+
+let marketGateWarned = false;
+
+/**
  * 挂上目录接口。
  *
  * @param {object} ctx - Cordis 上下文（已注入 `webServer`）。
@@ -162,6 +221,19 @@ export function apply(ctx) {
 				kind: 'exact',
 				path: ROUTE,
 				handler: (req, res) => {
+					// ⚠️ **门在最前面**，方法判定在门之后：反过来的话，
+					// 一个 `POST` 会先拿到 405 —— 而那本身就是一个「这个路由存在」
+					// 的存在性信号，还给攻击者省了一次探测。
+					const rejected = marketRejection(ctx, req);
+					if (rejected !== undefined) {
+						ctx.logger?.warn?.(
+							`[dsh-android-market] 目录接口拒绝请求: HTTP ${rejected}`,
+						);
+						res.writeHead(rejected, { 'content-type': 'application/json; charset=utf-8' });
+						res.end(JSON.stringify({ error: 'rejected', status: rejected }));
+						return;
+					}
+
 					if (req.method !== 'GET' && req.method !== 'HEAD') {
 						res.writeHead(405, { allow: 'GET, HEAD' });
 						res.end();

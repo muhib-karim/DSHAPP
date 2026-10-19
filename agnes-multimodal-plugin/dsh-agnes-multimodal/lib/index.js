@@ -34,8 +34,8 @@ import { homedir } from "node:os";
 /** Plugin identity for cordis.yml rows. */
 export const name = "dsh-agnes-multimodal";
 
-/** Services required before mounting: tool registry, web routes, trust fence host list. */
-export const inject = ["tools", "webServer", "webRuntime"];
+/** Services required before mounting: tool registry, web routes, engine trust fence. */
+export const inject = ["tools", "webServer", "connection"];
 
 /** State file name inside the DSH home directory (shared with the old dsh-agconfig). */
 const STATE_FILENAME = "ag-multimodal.json";
@@ -258,25 +258,45 @@ function isTrustedAuthority(hostUrl, trustedHosts) {
 }
 
 /**
- * Decide whether one request may reach the plugin routes: loopback (or a
- * configured trusted authority) Host header and same-origin browser markers.
- * DNS-rebinding / cross-site defense, not authentication.
+ * Decide whether one request may reach the plugin routes.
+ *
+ * DSH 0.2.1 删掉了 `webRuntime` 服务，信任围栏统一收进 `connection`：
+ * `connection.requestRejection(req)` 返回 HTTP 状态码 = 拒绝，`undefined` = 放行。
+ * 它同时查 Host 是 loopback + 会话 cookie，比原来那套只查 Host/Origin 的判据更严
+ * （原来那套是 DNS-rebinding 防御，不是鉴权）。
+ *
+ * ⚠️ 取不到 `connection` 一律 **503（fail-closed）**，绝不降级：
+ * cordis 的 `ctx.get(name)` 对尚未 ACTIVE 的提供者返回 undefined，而引擎启动期间
+ * 本路由已经在收请求 —— 「服务缺失」是暂时不可用（刷新一下就好），
+ * 「降级到只查 Host」是一直不安全。与 `dsh-android-market` 同款取舍。
+ *
+ * @param ctx - Cordis 上下文。
+ * @param req - 请求。
+ * @returns 拒绝时的 HTTP 状态码，放行时 `undefined`。
  */
-function isTrustedApiRequest(req, trustedHosts) {
-	const host = typeof req.headers.host === "string" ? req.headers.host : undefined;
-	if (host === undefined) return false;
-	const hostUrl = parseAuthority(host);
-	if (hostUrl === undefined) return false;
-	if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false;
-	if (req.headers["sec-fetch-site"] === "cross-site") return false;
-	const origin = req.headers.origin;
-	if (origin === undefined) return true;
+function agnesRejection(ctx, req) {
+	const connection = ctx.get?.("connection");
+	if (connection === undefined || typeof connection.requestRejection !== "function") {
+		if (!agnesGateWarned) {
+			agnesGateWarned = true;
+			ctx.logger?.warn?.(
+				"[dsh-agnes-multimodal] connection 服务尚未就绪，接口一律 503（fail-closed，不降级到只判 Host）",
+			);
+		}
+		return 503;
+	}
 	try {
-		return new URL(origin).host === hostUrl.host;
-	} catch {
-		return false;
+		return connection.requestRejection(req);
+	} catch (error) {
+		ctx.logger?.warn?.(
+			`[dsh-agnes-multimodal] connection.requestRejection 抛错，接口一律 503（fail-closed）: ${String(error?.message ?? error)}`,
+		);
+		return 503;
 	}
 }
+
+let agnesGateWarned = false;
+
 
 // ── JSON body / response helpers ───────────────────────────────────────────
 
@@ -1039,7 +1059,7 @@ function registerVideoTool(ctx) {
 
 /**
  * Host loader entry: mount the config API, the PNG route, and both tools.
- * @param ctx - host cordis context (tools, webServer, webRuntime).
+ * @param ctx - host cordis context (tools, webServer, connection).
  */
 export function apply(ctx) {
 	// Config API: account pool read/write + key probe.
@@ -1047,8 +1067,9 @@ export function apply(ctx) {
 		kind: "prefix",
 		path: API_PREFIX,
 		handler: async (req, res) => {
-			if (!isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)) {
-				writeJson(res, 403, { ok: false, error: { code: "forbidden", message: "forbidden" } });
+			const rejected = agnesRejection(ctx, req);
+			if (rejected !== undefined) {
+				writeJson(res, rejected, { ok: false, error: { code: "forbidden", message: "forbidden" } });
 				return;
 			}
 			try {

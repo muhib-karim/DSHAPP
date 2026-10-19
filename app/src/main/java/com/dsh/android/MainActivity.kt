@@ -84,7 +84,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var web: WebHost
 
     /** 资产版本戳：改了引擎内容就改这里，App 会重新解包。 */
-    private val assetStamp = "0.2.0-rc.2-1"
+    private val assetStamp = "0.2.1-rc.2-1"
 
     /**
      * 最近一次已应用的页面底色。
