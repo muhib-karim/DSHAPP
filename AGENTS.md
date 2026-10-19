@@ -71,7 +71,7 @@ adb logcat -d -s DSH:I     # 引擎就绪 / 界面加载完成 / 各 ensureXxx �
 | `engine/` | 引擎解包目录（含 `.stamp` 版本戳） |
 | `home/.dsh/` | `DSH_HOME`：配置、凭据、会话、`profiles/web/` |
 | 　`mobile-ui/`、`shell-tool/`、`bubble-tool/`、`logs-tool/` … | 内置插件，**刻意放在 pnpm 管辖之外** |
-| 　`node_modules/dsh-core-memory/` | 跨会话记忆插件，**唯一走 profile bundle 的内置插件** |
+| 　`node_modules/dsh-core-memory/`、`node_modules/dsh-preset-razor/` | **唯二**走 profile bundle 的内置包，可在「插件 → 已安装插件」里单独开关 |
 | `logs/` | `app.log` / `engine.log` / `events.jsonl` / `crash/` / `export/` |
 
 ## 索引：`docs/agents/`

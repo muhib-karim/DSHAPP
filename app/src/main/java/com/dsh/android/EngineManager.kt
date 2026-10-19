@@ -2479,21 +2479,24 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
-     * 把内置预设 dsh-preset-razor 解到 `$DSH_HOME/preset-razor/dsh-preset-razor/`（幂等）。
+     * 把内置预设 dsh-preset-razor 解到 `$DSH_HOME/node_modules/dsh-preset-razor/`（幂等）。
      *
-     * 与 [ensureMobileUi] / [ensureAgnesMultimodal] 同一套做法、同一套理由：包解到
-     * `$DSH_HOME` 下而不是 profile 的 `node_modules`（那里归 pnpm 管，本包不在 profile
-     * 的 `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`）。
+     * 与 [ensureCoreMemory] 同一套做法、同一套理由 —— 这两个是**唯一走 profile bundle
+     * 的内置包**，其余（mobile-ui / market / bubble…）仍走 `--patch` overlay：
      *
-     * ⚠️ 但本包比它们更简单：它**没有任何 JS 代码**，只有一份 `cordis.patch.yml`。
-     * 那份 YAML 本身就是一份合法的 patch 列表（顶层 `- insert:` 数组），所以既不需要
-     * pnpm、也不需要按包名解析 —— [writePresetRazorPatch] 直接把它当 `--patch` 用。
+     * - 位置必须是 `$DSH_HOME/node_modules/`：bundle 名靠 Node 的向上查找解析
+     *   （`createRequire().resolve.paths()`），require 只查 `node_modules` 这一层，
+     *   查不到兄弟目录。**也不能**放 `profiles/web/node_modules/` —— 那是 pnpm 的地盘，
+     *   会被当「多余依赖」挪进 `.ignored/`。
+     * - 目录名**必须**是包名 `dsh-preset-razor`：解析是按
+     *   `<某个 node_modules>/<包名>/package.json` 找的。
      *
      * 幂等判据是版本戳而不是「文件在不在」：预设随 APK 升级而变，只看文件存在
-     * 会让老设备永远停在旧版提示词。
+     * 会让老设备永远停在旧版提示词（旧提示词里那句已被 0.2.1 删掉的
+     * `你的工作目录是 {{cwd}}。` 正是本次要淘汰的东西）。
      */
     private fun ensurePresetRazor() {
-        val target = File(dshHome, "$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE")
+        val target = presetRazorDir()
         val upstream = File(target, "cordis.patch.yml")
         val stamp = File(target, PRESET_RAZOR_STAMP)
 
@@ -2526,183 +2529,108 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
-     * 写出挂载内置预设的 overlay，返回其路径；不可用时返回 null。
+     * 把内置预设 dsh-preset-razor 登记成 profile 的一个 **bundle**，让它在
+     * 「插件 → 已安装插件」列表里出现、并能被用户单独开关（默认开启）。
      *
-     * 生成的内容 = razor 的**预设声明行原文**（来自解包出来的 `cordis.patch.yml`），
-     * 一行都不多。
+     * ## 为什么不再是 `--patch` overlay 里的 `- insert:`
      *
-     * ## ⚠️ 为什么这里**不能**再写 `agent-preset-registry` 那一行（踩过，就是本次要修的 bug）
+     * 与 [registerCoreMemoryBundle] 完全同因：overlay 插进来的条目**没有身份** ——
+     * 官方 plugin-manager 的列表只认 `dsh.profile.bundles`（`listBundles()`）与 Loader
+     * 里由 bundle 层贡献的行，overlay 的行不在任何一份清单里。于是插件页看不到它，
+     * 用户既关不掉、也不知道它存在。
      *
-     * 老写法把「把 registry 的出厂默认位改成 razor」也塞进这份 overlay：
+     * 改成 bundle 之后，「关掉」= 从 `dsh.profile.bundles` 摘掉这个名字，包本身留在
+     * `node_modules`，随时能再打开。
      *
-     * ```yaml
-     * - id: agent-preset-registry
-     *   name: '@deepseek-ai/dsh-agent-preset-registry'
-     *   config:
-     *     default: razor
-     * ```
+     * ## ⚠️ 幂等判据必须「只看缺失才补」，不能「每次都补齐」
      *
-     * `readProfilePatches()`（`dsh-app-boot/lib/index.js`）把 `--patch` overlay 追加在
-     * 层序**最顶层**，而 patch 语义是**整块替换 config 而不是深合并**：
+     * 这是**与改造前最大的语义差别**。overlay 是 App 每次启动整体覆盖的，用户改不动；
+     * 而 bundle 名单是**用户与 App 共写**的同一份文件。若写成「不在就加上」，用户
+     * 在插件页关掉它、重启 App，这里又会把它加回去 —— 变成「关不掉」。
      *
-     * ```js
-     * const patches = structuredClone([
-     *   ...profile.layers.flatMap((layer) => layer.patches),
-     *   ...loadOptionalPatches(binName, context.patchPath) ?? [],
-     *   ...loadOptionalPatches(binName, join(context.home, "cordis.patch.yml")) ?? [],
-     *   ...context.overlays          // ← 本 App 的 --patch 在这里，最后应用
-     * ]);
-     * ```
+     * 所以判据是「**从来没见过它**才补」：见标记文件 [PRESET_RAZOR_MARKER]。
+     * 一旦登记过（标记文件在），此后只在用户保留它时维持现状，绝不自动复活。
+     * 用户想再打开，在插件页把它打开即可，那时的写入由官方插件管理器完成。
      *
-     * 于是 GUI 里点任何一张预设卡片（发 `settings/update {ns:"agent-preset-registry",
-     * patch:{selectedDefault:"ptc"}}`）都会失败：`dsh-settings` 算出 next 后交给
-     * `config-editor.edit()`，后者写完要用**含 overlay 的完整层序**重新 compose 一遍
-     * 再比对（`lib/index.js:122`）：
+     * ## ⚠️ `dependencies` 也要写
      *
-     * ```js
-     * if (!isDeepStrictEqual(flatten(composeEntries([patches])).find((row) => row.id === entry.options.id)?.config ?? {}, next))
-     *   throw new Error(`Configuration for "${entry.options.id}" is overridden by a home patch or command-line overlay`);
-     * ```
+     * 官方 `listBundles()` 的 `installed`、`removable`、版本比较都读
+     * `manifest.dependencies`，只写 `bundles` 会让这一行在插件页**根本不渲染**
+     * （`listed` 的判据是 `installed || official || error`）。
+     * 依赖值用 `link:` 指向真实目录，pnpm 认得这种本地链接、也不会去 registry 找。
      *
-     * overlay 把 config 盖回 `{default: "razor"}` ⇒ 恒不等于 next ⇒ 抛错。
-     * 用户看到的就是预设页顶部一行红字，**默认预设根本改不了**。
-     *
-     * 这与 AGENTS.md ⑮ 记录的 `llm-pi-ai` 号池老 bug **完全同构**，修法也一致：
-     * 出厂默认位必须落在**用户层**（`profiles/web/cordis.patch.yml`，即 GUI 自己写的
-     * 那份文件），见 [ensurePresetDefault]。这份 overlay 只留 `- insert:` 声明行 ——
-     * `insert` 行不参与 config 覆盖（`inherited()` 对 `patch.insert !== void 0` 直接
-     * 原样返回），所以不影响 GUI 写入校验。
-     *
-     * ## 为什么是改 `default` 而不是 `selectedDefault`
-     *
-     * registry 的 config 有两个字段（`dsh-agent-preset-registry/lib/index.js`）：
-     *
-     * ```js
-     * default: z.string().required(),
-     * selectedDefault: z.string().volatile(),
-     * // …
-     * return this.config.selectedDefault.get() ?? this.config.default;
-     * ```
-     *
-     * `selectedDefault` 是 **volatile** 字段 —— 它由用户在 GUI 里选默认预设时写入，
-     * 且**不由任何 patch 提供**。所以只改 `default`（出厂默认位）：用户没选过时
-     * 新会话用 razor；用户选过之后 `selectedDefault` 优先，**用户在 GUI 里的选择依然
-     * 生效**。反过来若去写 `selectedDefault`，就变成 App 每次启动都把用户的默认设置
-     * 按回 razor —— 那是把「默认用它」做成了「锁死它」。
-     *
-     * ## ⚠️ 与用户自己装同名插件会撞车
-     *
-     * 上游 README 已警告：`- insert:` 行**不按 id 去重**，是无条件追加；若 profile 里
-     * 另有一行用了同样的 `id: razor`，registry 会报 `Duplicate agent preset: razor`
-     * 并让其中一个挂载失败。本 App 已内置，用户无需再装 dsh-preset-razor。
+     * ⚠️ 用户关掉后**不删**这一行 —— 它是包的存在声明，不是启用开关。
      */
-    private fun writePresetRazorPatch(): File? {
-        val patch = File(dshHome, PRESET_RAZOR_PATCH)
-        val upstream = File(dshHome, "$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE/cordis.patch.yml")
-        if (!upstream.isFile) {
-            Log.w(TAG, "内置预设声明不存在，跳过挂载: ${upstream.absolutePath}")
-            return null
-        }
-        return try {
-            val body = upstream.readText().trimStart()
-            patch.writeText(
-                """
-                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
-                # 内置预设 dsh-preset-razor（「快准狠模式（通用）」）的声明行原文，
-                # 来自 .dsh/$PRESET_RAZOR_DIR/$PRESET_RAZOR_PACKAGE/cordis.patch.yml。
-                #
-                # ⚠️ 「默认使用它」那一位**刻意不在这里** —— overlay 在最顶层且 patch 是
-                # 整块替换 config，写进来会让 GUI 的预设页一改默认就报
-                # `Configuration for "agent-preset-registry" is overridden by a home
-                # patch or command-line overlay`。那一位落在 profile 的用户层，见
-                # EngineManager.ensurePresetDefault()。
-
-                """.trimIndent() + "\n" + body + "\n"
-            )
-            patch
-        } catch (t: Throwable) {
-            Log.w(TAG, "写入内置预设 overlay 失败: ${t.message}")
-            null
-        }
-    }
-
-    /**
-     * 确保 registry 的出厂默认预设位是 razor（写进 profile 的**用户层**）。
-     *
-     * 落点、理由与判据与 [ensureKeyPoolProvider] 完全一致：`--patch` overlay 在最顶层
-     * 且 patch 整块替换 config，写进 overlay 会让 GUI 预设页一改默认就报
-     * `Configuration for "agent-preset-registry" is overridden by a home patch or
-     * command-line overlay`（详见 [writePresetRazorPatch] 的注释）。用户层正是 GUI 自己
-     * 写的那份文件，格式一致、语义一致，且 `dsh-settings` 写入时会**整块重述**这一行。
-     *
-     * ## ⚠️ 为什么用「补缺」而不是「每次重述」
-     *
-     * GUI 保存 `selectedDefault` 时，`dsh-settings` 写出的 next 是
-     * `mergeLayers(strip(raw, form), next)` —— `raw` 里本来就有我们写下的
-     * `default: razor`，所以它会被一并写回，不会丢。
-     *
-     * 但我们仍**只补缺**：行存在就一个字节都不动。理由是用户可能在 GUI 里把默认改成
-     * 别的预设（那会重写这一行的 `default`）—— 那是用户意图，必须留住。
-     * 这与 [ensureDefaultModel] 同一取舍。
-     *
-     * 老版本把这一位写在 overlay 里。那份 overlay 每次启动都被 [writePresetRazorPatch]
-     * **整体覆盖**，所以残留行会自动消失，不需要额外清理 —— 但**新写的 overlay 里
-     * 绝不能再出现这一行**，否则 bug 原样复活。
-     */
-    private fun ensurePresetDefault(profile: String = PROFILE_NAME) {
-        val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
-        val existing = try {
-            if (patch.isFile) patch.readText() else ""
-        } catch (t: Throwable) {
-            Log.w(TAG, "读取 profile 用户配置失败: ${t.message}")
+    private fun registerPresetRazorBundle() {
+        val manifest = File(dshHome, "profiles/$PROFILE_NAME/package.json")
+        val marker = File(dshHome, PRESET_RAZOR_MARKER)
+        if (!File(presetRazorDir(), "package.json").isFile) {
+            Log.w(TAG, "内置预设包不存在，跳过 bundle 登记: ${presetRazorDir().absolutePath}")
             return
         }
-        val updated = mergePresetDefault(existing)
-        if (updated == existing) {
-            Log.i(TAG, "内置预设默认位已在 profile 用户配置里（或用户已自选）: ${patch.absolutePath}")
+        if (!manifest.isFile) {
+            // profile 还没初始化：官方启动时会用 PROFILE_TEMPLATES.web 建好，
+            // 那时只带两个核心 bundle，下一次启动这里再补。
+            Log.i(TAG, "profile 清单尚不存在，内置预设的 bundle 登记推迟到下次启动")
             return
         }
         try {
-            patch.parentFile?.mkdirs()
-            patch.writeText(updated)
-            Log.i(TAG, "已把内置预设默认位写入 profile 用户配置: ${patch.absolutePath}")
+            val json = JSONObject(manifest.readText())
+            val dsh = json.optJSONObject("dsh") ?: JSONObject().also { json.put("dsh", it) }
+            val profile = dsh.optJSONObject("profile") ?: JSONObject().also { dsh.put("profile", it) }
+            val bundles = profile.optJSONArray("bundles") ?: JSONArray().also { profile.put("bundles", it) }
+
+            var listed = false
+            for (i in 0 until bundles.length()) {
+                if (bundles.optString(i) == PRESET_RAZOR_PACKAGE) { listed = true; break }
+            }
+
+            var changed = false
+            if (!listed && !marker.isFile) {
+                // 第一次见到它：补进名单（老用户升级上来也走这一支）
+                bundles.put(PRESET_RAZOR_PACKAGE)
+                changed = true
+                Log.i(TAG, "已把内置预设登记为 profile bundle（默认开启，可在插件页关闭）")
+            }
+            if (!marker.isFile) {
+                marker.parentFile?.mkdirs()
+                marker.writeText("registered")
+            }
+
+            val deps = json.optJSONObject("dependencies") ?: JSONObject().also { json.put("dependencies", it) }
+            if (!deps.has(PRESET_RAZOR_PACKAGE)) {
+                deps.put(PRESET_RAZOR_PACKAGE, "link:${presetRazorDir().absolutePath}")
+                changed = true
+            }
+
+            if (changed) manifest.writeText(json.toString(2) + "\n")
         } catch (t: Throwable) {
-            Log.w(TAG, "写入内置预设默认位失败: ${t.message}")
+            // 登记失败不阻断启动：只是预设不出现在选择器里
+            Log.w(TAG, "登记内置预设 bundle 失败: ${t.message}")
         }
     }
 
     /**
-     * 把 registry 的默认预设位并进 profile 用户配置文本（纯函数，便于离线验证）。
+     * 清掉老版本留下的两处 razor 残留（幂等）。
      *
-     * 判据与 [mergeDefaultModel] 同：**只看那一行在不在** —— 用户层里本来就没有
-     * `agent-preset-registry` 这一行（出厂值在 `dsh-web-app/cordis.patch.yml`），
-     * 所以「行存在」⇔「用户或本 App 写过它」。行在就原样保留，用户自选的默认必须留住。
+     * 1. `$DSH_HOME/preset-razor.patch.yml` —— 改造前每次启动被 `--patch` 挂上的
+     *    主机 overlay。若还在，同一个预设会被**挂载两次**（`insert` 行不按 id 去重），
+     *    registry 直接报 `Duplicate agent preset: razor` 并让其中一个挂载失败。
+     * 2. `$DSH_HOME/preset-razor/` —— 改造前的解包目录（`preset-razor/dsh-preset-razor/`）。
+     *    包已经搬到 `$DSH_HOME/node_modules/dsh-preset-razor/`，旧目录不再被任何东西
+     *    引用；留着只会让排查时看到两份同名包、分不清哪份在生效。
      */
-    private fun mergePresetDefault(body: String): String {
-        val lines = body.lines().toMutableList()
-        if (lines.any { isEntryIdLine(it, PRESET_REGISTRY_NS) }) return body
-
-        // 与 mergeKeyPoolProvider 同一处理：先摘掉空模板的顶层 `[]`，否则会变成
-        // `[]` 后面又跟一个 entry —— **非法 YAML**（一个文档不能既是流式空数组
-        // 又是块序列）。注释原样保留，YAML 允许注释出现在数组之前。
-        lines.indexOfFirst { it.isNotBlank() && it.indexOfFirst { c -> c != ' ' } == 0 && it.trim() == "[]" }
-            .takeIf { it >= 0 }?.let { lines.removeAt(it) }
-        while (lines.isNotEmpty() && lines.last().isBlank()) lines.removeAt(lines.size - 1)
-        if (lines.isNotEmpty()) lines.add("")
-        lines.addAll(presetDefaultEntryYaml(0).trimEnd('\n').lines())
-        return lines.joinToString("\n") + "\n"
-    }
-
-    /** registry 默认预设那一行的 YAML，[indent] 为整行基准缩进。 */
-    private fun presetDefaultEntryYaml(indent: Int): String {
-        val pad = " ".repeat(indent)
-        return buildString {
-            appendLine("${pad}- id: $PRESET_REGISTRY_NS")
-            appendLine("$pad  name: '$PRESET_REGISTRY_PACKAGE'")
-            appendLine("$pad  config:")
-            appendLine("$pad    default: $PRESET_RAZOR_ID")
+    private fun removeLegacyPresetRazor() {
+        val overlay = File(dshHome, PRESET_RAZOR_PATCH)
+        if (overlay.isFile && overlay.delete()) {
+            Log.i(TAG, "已清理旧的内置预设 overlay（改由 profile bundle 挂载）")
+        }
+        val legacyDir = File(dshHome, PRESET_RAZOR_LEGACY_DIR)
+        if (legacyDir.isDirectory && legacyDir.deleteRecursively()) {
+            Log.i(TAG, "已清理旧的内置预设解包目录: ${legacyDir.absolutePath}")
         }
     }
+
 
     /**
      * 把跨会话持久记忆插件 dsh-core-memory 解到 `$DSH_HOME/core-memory/dsh-core-memory/`（幂等）。
@@ -2792,6 +2720,17 @@ class EngineManager private constructor(private val context: Context) {
      */
     private fun coreMemoryDir(): File =
         File(dshHome, "node_modules/$CORE_MEMORY_PACKAGE")
+
+    /**
+     * 内置预设的包目录：`$DSH_HOME/node_modules/dsh-preset-razor`。
+     *
+     * 与 [coreMemoryDir] 同一套理由：bundle 名靠 Node 的向上查找解析，只查
+     * `node_modules` 这一层；且**不能**放 `profiles/web/node_modules/`（pnpm 的地盘，
+     * 会被挪进 `.ignored/`）。目录名必须是包名，解析是按
+     * `<某个 node_modules>/<包名>/package.json` 找的。
+     */
+    private fun presetRazorDir(): File =
+        File(dshHome, "node_modules/$PRESET_RAZOR_PACKAGE")
 
     /**
      * 把 dsh-core-memory 登记成 profile 的一个 **bundle**，让它在「插件 → 已安装插件」
@@ -6787,10 +6726,12 @@ class EngineManager private constructor(private val context: Context) {
         // 必须早于引擎启动：插件读不到账号池就会回落到它自带的默认账号。
         seedAgnesAccounts()
         val agnesMmPatch = writeAgnesMultimodalPatch()
-        // 内置预设 dsh-preset-razor（「快准狠模式（通用）」）并默认使用它。
-        // 同样必须在 profile 解析前落盘，否则 --patch 挂不上。
+        // 内置预设 dsh-preset-razor（「快准狠模式（通用）」）。
+        // 走 profile bundle（不是 overlay）⇒ 用户能在「插件 → 已安装插件」里自己关掉，
+        // 默认开启。必须在 profile 解析前解包 + 登记，否则 bundle 解析不到。
         ensurePresetRazor()
-        val presetRazorPatch = writePresetRazorPatch()
+        removeLegacyPresetRazor()
+        registerPresetRazorBundle()
         // 内置**中文 skill**：落到 $DSH_HOME/skills（全局发现根，每个预设都扫得到），
         // 让 AI 做主题/桌面宠物时不必重新摸一遍 DSH 结构。
         ensurePresetSkills()
@@ -6798,12 +6739,17 @@ class EngineManager private constructor(private val context: Context) {
         // ⚠️ 必须在 ensureExtracted() 之后（改的是 engine/ 里的文件），
         //    且每次启动都要重打 —— 引擎重解包会把补丁抹掉，见该函数的 KDoc。
         patchPresetCordisPersona()
-        // ⚠️ **不能**走 `--patch` overlay：overlay 在最顶层整块替换 `agent-preset-registry`
-        // 那一行的 config，GUI 预设页一改默认就报
-        // `Configuration for "agent-preset-registry" is overridden by a home patch or
-        // command-line overlay` —— 用户表现为「默认预设根本改不了」。
-        // 所以默认位改为补进 profile 的用户配置层（见 [ensurePresetDefault]）。
-        ensurePresetDefault()
+        // ⚠️ 这里**不再**写 `agent-preset-registry` 的 `default: razor`。
+        //
+        // 改造前为了让新会话默认用 razor，App 会把出厂默认位补进 profile 的用户层。
+        // 但 razor 现在是**可被用户关掉的 bundle** —— 一旦关掉，registry 的
+        // `resolve()` 就查不到 `razor` 这条定义，直接抛
+        // `agent-preset/not-found: Unknown agent preset: razor`，新建会话全部失败。
+        //
+        // 所以「默认用它」改为靠「默认开启」实现（bundle 在名单里 ⇒ 预设就在选择器里，
+        // 且 registry 的出厂默认位本来就会选中它）。用户关掉之后，由用户在预设页自己
+        // 选一个默认 —— 那是用户意图，App 不替他决定，也不留一个悬空的 default。
+
         // 跨会话持久记忆插件：核心记忆常驻注入 + 归档记忆检索 + 回复风格设置页。
         // 走 profile bundle（不是 overlay）⇒ 用户能在「插件 → 已安装插件」里自己关掉。
         ensureCoreMemory()
@@ -6851,7 +6797,6 @@ class EngineManager private constructor(private val context: Context) {
         //     引擎读不了（`profile "rescue" does not exist`），比不建更糟。
         if (rescueProfileDir != null) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
-            ensurePresetDefault(RESCUE_PROFILE_NAME)
             ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
         }
@@ -6963,7 +6908,6 @@ class EngineManager private constructor(private val context: Context) {
         val overlays = listOfNotNull(
             mobileUiPatch,
             agnesMmPatch,
-            presetRazorPatch,
             marketPatch,
             sandboxPatch,
             workspacePatch,
@@ -8180,35 +8124,39 @@ class EngineManager private constructor(private val context: Context) {
         private const val AGNES_MM_STATE = "ag-multimodal.json"
 
         /**
-         * 内置预设 dsh-preset-razor（「快准狠模式（通用）」）：资产名、包名、overlay 文件名。
+         * 内置预设 dsh-preset-razor（「快准狠模式（通用）」）：资产名、包名、旧 overlay 文件名。
          *
          * ⚠️ 本包与其它插件不同：它**没有任何 JS 代码**，`cordis.patch.yml` 里就一行
          * `- insert:`，挂的是官方包 `@deepseek-ai/dsh-agent-preset`，携带的是一份
-         * **预设定义**（工具组装 + 系统提示词）。所以这里不需要 pnpm、不需要
-         * `node_modules`，只需把那份 YAML 原样解出来当 `--patch` overlay 用。
+         * **预设定义**（工具组装 + 系统提示词）。
+         *
+         * 它和 dsh-core-memory 一样走 **profile bundle**（包放在 `$DSH_HOME/node_modules/`），
+         * 而不是 `--patch` overlay —— 这样用户才能在「插件 → 已安装插件」里自己关掉。
          */
         private const val PRESET_RAZOR_ASSET = "preset-razor.zip"
         private const val PRESET_RAZOR_PACKAGE = "dsh-preset-razor"
-        private const val PRESET_RAZOR_PATCH = "preset-razor.patch.yml"
-
-        /** 解包目录，相对 `$DSH_HOME`；与 [MOBILE_UI_DIR] 同理，刻意在 pnpm 管辖之外。 */
-        private const val PRESET_RAZOR_DIR = "preset-razor"
-
-        /** 内容版本戳：改了 `preset-razor.zip` 里任何东西都必须改这里。 */
-        private const val PRESET_RAZOR_VERSION = "1.0.0-1"
-        private const val PRESET_RAZOR_STAMP = ".preset_razor_version"
-
-        /** 预设标识符，必须与 razor 的 `cordis.patch.yml` 里 `config.id` 一致。 */
-        private const val PRESET_RAZOR_ID = "razor"
 
         /**
-         * registry 的 entry id 与包名。默认预设位（`config.default`）写在这一行上，
-         * 落点是 profile 的**用户层**而不是 `--patch` overlay —— 见 [ensurePresetDefault]。
-         *
-         * ⚠️ `id` 必须与 `dsh-web-app/cordis.patch.yml` 里那一行**逐字一致**才能命中同一行。
+         * 旧版本用它走主机 overlay；改造为 profile bundle 后只用于**清理残留**。
+         * 老设备上这份文件已经存在，不删会被 `--patch` 再次挂上 ⇒ 同一个预设挂两遍，
+         * registry 直接报 `Duplicate agent preset: razor`。
          */
-        private const val PRESET_REGISTRY_NS = "agent-preset-registry"
-        private const val PRESET_REGISTRY_PACKAGE = "@deepseek-ai/dsh-agent-preset-registry"
+        private const val PRESET_RAZOR_PATCH = "preset-razor.patch.yml"
+
+        /** 改造前的解包目录，相对 `$DSH_HOME`；现在只用于清理残留。 */
+        private const val PRESET_RAZOR_LEGACY_DIR = "preset-razor"
+
+        /**
+         * 「本 App 曾经把这个 bundle 登记进 profile」的一次性标记。
+         *
+         * ⚠️ 判据是「标记在不在」，不是「版本变没变」—— 它**不该**随版本 bump。
+         * 一旦用户关掉这个预设，App 重启时绝不能把它加回去，否则就是「关不掉」。
+         */
+        private const val PRESET_RAZOR_MARKER = ".preset_razor_bundle_registered"
+
+        /** 内容版本戳：改了 `preset-razor.zip` 里任何东西都必须改这里。 */
+        private const val PRESET_RAZOR_VERSION = "1.0.3-1"
+        private const val PRESET_RAZOR_STAMP = ".preset_razor_version"
 
         /**
          * 内置**中文 skill**（`dsh-mobile-theme` / `dsh-desktop-pet` 等）。
@@ -8252,6 +8200,13 @@ class EngineManager private constructor(private val context: Context) {
          *   这一行**（工作目录改由 `time-context` / 工具描述承载），锚点必须跟着删，
          *   否则整个 GUARD 匹配不上 → 补丁静默跳过 → 「快准狠」提示词不再注入。
          *   实测就是这样：升级后日志出现「创造模式预设的 persona 结构与预期不符」。
+         *
+         * ⚠️ 但**光删锚点还不够**：`{{cwd}}` 这个模板变量本身在 0.2.1 里也**不再注册**
+         *   （报错原文：`unknown prompt variable "{{cwd}}" in section
+         *   "deployment:persona-suffix"; registered variables: provider, model`）。
+         *   所以补丁正文里的 `suffix` 也不能再写它 —— 否则锚点匹配上了、补丁打上了，
+         *   整个预设却一渲染就失败，表现为「快准狠模式一选中就处理失败」。
+         *   工作目录由 `time-context` 承载，persona 这边不需要再声明。
          */
         private const val PRESET_CORDIS_PERSONA_GUARD = """          - id: persona
             name: '@deepseek-ai/dsh-persona'
@@ -8286,8 +8241,6 @@ class EngineManager private constructor(private val context: Context) {
             append("            name: '@deepseek-ai/dsh-persona'\n")
             append("            config:\n")
             append("              suffix: |-\n")
-            append("                你的工作目录是 {{cwd}}。\n")
-            append("\n")
             append("                【重申铁律】无论思考（思维链、推理过程）还是回复，一律使用中文，禁止用英文思考。\n")
             append("              prefix: |-\n")
             append("                你是一个由 {{model}} 模型驱动的 DSH 定制 Agent，正在与用户配对，")
