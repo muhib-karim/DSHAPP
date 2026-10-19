@@ -274,7 +274,7 @@ check(statSync(outsideFile).size === 13, '工作区外的诱饵文件真实存�
 // ---------------------------------------------------------------- 工作区不能是 DSH_HOME
 //
 // ⚠️ **这是绕过围栏的那条链**（公网实测）：
-//   ① createSession { cwd: 'C:\Users\XIAOPAN' }            → ok
+//   ① createSession { cwd: 'C:\Users\你的用户名' }            → ok
 //   ② fileStat      { path: '.dsh\dsh-remote\pair.json' }  → ok，504 字节
 // 第 ② 步是**相对路径**，围栏判「在不在工作区内」——它**确实在**，所以拦不住。
 // 围栏以工作区为界，而工作区能自由指定，两者叠加围栏就等于没有。

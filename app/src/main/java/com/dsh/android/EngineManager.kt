@@ -4740,7 +4740,7 @@ class EngineManager private constructor(private val context: Context) {
      * 调用方（以及读日志的人）看到 `false` 会以为"体检说没问题"，于是
      * 引擎接下来死掉时，第一反应是往别处查。
      *
-     * 真机证据（2026-10-14，Xiaomi 24122RKC7C / Android 16 / v18，8 次连续启动失败）：
+     * 真机证据（2026-10-14，某小米机型 / Android 16 / v18，8 次连续启动失败）：
      * `--dump-config` 退出码 **0**、4 个 required 条目**全在**，体检因此放行，
      * 引擎照死。**静态干净 ≠ 已验证** —— 这就是新增 [StaticOnly] 的理由。
      *
@@ -7447,7 +7447,7 @@ class EngineManager private constructor(private val context: Context) {
             // 这里传的是**真实启动**的 stdout 尾部 —— 这一点是整个修复的要害：
             // 启动前体检（[preflight]）读的是 `--dump-config` 的**静态输出**，
             // 而它看不见插件在 `apply()` 期抛的异常。真机反例（2026-10-14，
-            // Xiaomi 24122RKC7C / Android 16 / v18）：`dump-config` 退出码 0、
+            // 某小米机型 / Android 16 / v18）：`dump-config` 退出码 0、
             // 4 个 required 条目全在，体检因此**放行**，引擎照死 —— 连续 8 次。
             //
             // 所以判据必须换成「引擎自己说了 required plugin did not activate」，

@@ -18,7 +18,7 @@
 更新 link 转译层（改完 `jni/linkcompat.c` 后）：
 
 ```powershell
-$cc = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd"
+$cc = "C:\Users\你的用户名\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd"
 & $cc -shared -fPIC -O2 -Wall -o app\src\main\assets\linkcompat.bin app\src\main\jni\linkcompat.c -ldl
 ```
 
@@ -27,7 +27,7 @@ $cc = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\l
 更新沙箱两个组件（改完 `jni/boosandbox.c` 或 `jni/boo-sandbox-run.c` 后）：
 
 ```powershell
-$cc = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd"
+$cc = "C:\Users\你的用户名\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd"
 & $cc -shared -fPIC -O2 -Wall -o app\src\main\assets\boosandbox.bin      app\src\main\jni\boosandbox.c -ldl
 & $cc -O2 -Wall              -o app\src\main\assets\boo-sandbox-run.bin app\src\main\jni\boo-sandbox-run.c
 ```

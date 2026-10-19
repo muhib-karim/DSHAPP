@@ -165,7 +165,7 @@ check('带 version', typeof bytes.version === 'string' && bytes.version !== '');
 //   fileStat      { path: 'C:\\Windows\\win.ini' }  → ok=true，92 字节
 //   fileReadBytes { path: '..\\..\\..\\..\\..\\..\\Windows\\win.ini' }
 //                 → ok=true，data 解出真实内容
-//   fileStat      { path: '..\\..\\..\\..\\..\\..\\Users\\XIAOPAN\\.dsh\\dsh-remote\\pair.json' }
+//   fileStat      { path: '..\\..\\..\\..\\..\\..\\Users\\你的用户名\\.dsh\\dsh-remote\\pair.json' }
 //                 → ok=true，504 字节 —— **连访问令牌都能被读走**
 //
 // 所以现在把 mock 里那条 confine() **删掉**，让它与真官方行为一致（不拦），
@@ -267,7 +267,7 @@ const mapPath = (scopePath, desktopRoot, path) => {
 	if (a.startsWith(`${b}/`)) return { path: a.slice(b.length + 1) };
 	return { path: a };
 };
-const mirrorRoot = '/data/user/0/com.dsh.android/files/workspaces/c-users-xiaopan-desktop-c971a62f';
+const mirrorRoot = '/data/user/0/com.dsh.android/files/workspaces/c-users-你的用户名-desktop-c971a62f';
 check('根目录 → 空串', mapPath(mirrorRoot, root, mirrorRoot).path === '');
 check('根目录带尾斜杠 → 空串', mapPath(mirrorRoot, root, `${mirrorRoot}/`).path === '');
 check('子目录 → 相对路径', mapPath(mirrorRoot, root, `${mirrorRoot}/src`).path === 'src');

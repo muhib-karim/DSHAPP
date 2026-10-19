@@ -870,7 +870,7 @@ object DiagnosticBundle {
         // `fail: 0` + headline「发现 N 项需要注意的情况」。
         //
         // 真机实测（服务器 40 个含 `engine-start-failed` 的包）：**14 个**是
-        // `fail=0`。最典型的一台是 Xiaomi 24122RKC7C / Android 16：用户装了 40 个
+        // `fail=0`。最典型的一台是 某小米机型 / Android 16：用户装了 40 个
         // 第三方插件，引擎核心插件 `typert-loader` 被拖挂 ⇒ 连续 2 次启动失败 ⇒
         // **App 打不开**；而它导出的诊断包写的是「发现 2 项需要注意的情况」、
         // `crash-scenes: warn`、「有 2 份**非崩溃**现场」。分析者据此会跳过它。
