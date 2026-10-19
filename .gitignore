@@ -74,6 +74,26 @@ video/clips/
 video-promo/tmp/
 video-promo/clips/
 
+# ── 视频工作目录：整个目录不入库 ─────────────────────────
+#
+# ⚠️ 这三行不是为了"干净"，是为了**性能**。
+#
+# DSH 桌面版内置的 workspace-changes 插件对**每一轮**对话做两次 git 全工作树
+# 快照（turn/start 一次、turn 结束时一次），实现方式是 `git add --all` +
+# `write-tree`，**只排除 gitignored 的路径**。没被 ignore 的大目录会被整份
+# 写成 blob，而且 turn 结束要等这次快照跑完才写 turn/end —— 表现就是
+# 回复早就流出来了，底部「深度求索中，用时 N 秒」还一直转。
+#
+# 实测（2026-10-19）：opus-video/ 1.2 GB / 16,979 文件未 ignore 时，
+# 一次快照 `git add --all` ≈ 105 s + write-tree 7.6 s，对话每轮白卡 25 秒以上；
+# 排除掉之后同样操作 167 ms。
+#
+# 结论：任何体积大、文件多、又不需要入库的目录，一律整目录 ignore，
+# 不要只 ignore 它下面的 tmp/ 和 clips/。
+opus-video/
+video/
+video-promo/
+
 # ── APK 被就地解压的残留：绝不入库 ───────────────────────
 #
 # 症状：仓库根出现 AndroidManifest.xml / resources.arsc / META-INF/ / res/ /
