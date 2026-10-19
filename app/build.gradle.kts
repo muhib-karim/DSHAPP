@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 25
+        versionCode = 26
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -115,6 +115,15 @@ android {
         //      ④ 「进入安全模式」现在会真的把第三方包**挪出** node_modules
         //         （此前只改 manifest，手装的包仍留在原地，坏 client bundle 照旧被
         //         合并进前端）。
+        // ⚠️ 26（本次）**versionName 仍然不变（0.3.0），靠 versionCode 区分**。
+        //      ① **「快准狠模式」改成可开关的插件**：从 `--patch` overlay 挪到 profile
+        //         bundle（与 dsh-core-memory 同一套），出现在「插件 → 已安装插件」里，
+        //         默认开启、用户可自行关掉，关掉后**重启不复活**。
+        //      ② **修 `{{cwd}}` 崩溃**：0.2.1 不再注册这个模板变量，而创造模式注入的
+        //         persona 正文里还留着「你的工作目录是 {{cwd}}。」⇒ 该预设一选中就
+        //         整轮失败（`unknown prompt variable "{{cwd}}" ... registered
+        //         variables: provider, model`）。上一轮只删了锚点没删正文。
+        //      ③ 内置预设源码换成 npm 上已发布的 dsh-preset-razor@1.0.3。
         versionName = "0.3.0"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
