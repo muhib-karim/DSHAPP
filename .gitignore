@@ -112,3 +112,15 @@ video-promo/
 /res/
 /kotlin/
 /assets/
+
+# ── 隧道/配对凭据：绝不入库 ───────────────────────────────
+#
+# 症状：仓库根出现名叫 `12`（或别的裸数字）的文件，内容是
+# { "<设备指纹>": { tunnelToken, accessToken, clientSecret, dnsRecordId, ... } }。
+# 那是 pair-server 下发隧道凭据时**被重定向写错位置**的产物 —— 本来该落在
+# 用户自己的数据目录里。
+#
+# 这些是真实可用的凭据：拿到 tunnelToken 就能接管那条隧道。所以文件名模式
+# 一律忽略，防的是「下次又写到仓库里」。
+/tunnel*.json
+/cloudflared*.json
