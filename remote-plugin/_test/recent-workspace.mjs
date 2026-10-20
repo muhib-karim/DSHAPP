@@ -206,10 +206,10 @@ console.log('\n=== ② 备选区选镜像工作区 → 自动绑成远程会话 
 	relayCalls = [];
 
 	// 造出镜像登记表 + 已配对的凭据。
-	mkdirSync(join(home, 'dsh-remote', 'workspaces', 'c-users-xiaopan-dshapp-deadbeef'), { recursive: true });
+	mkdirSync(join(home, 'dsh-remote', 'workspaces', 'c-users-你的用户名-dshapp-deadbeef'), { recursive: true });
 	writeFileSync(
 		join(home, 'dsh-remote', 'workspaces.json'),
-		JSON.stringify({ workspaces: { 'c-users-xiaopan-dshapp-deadbeef': 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP' } }),
+		JSON.stringify({ workspaces: { 'c-users-你的用户名-dshapp-deadbeef': 'C:\\Users\\你的用户名\\Desktop\\DSHAPP' } }),
 	);
 	writeFileSync(
 		join(home, 'dsh-remote', 'mobile.json'),
@@ -218,7 +218,7 @@ console.log('\n=== ② 备选区选镜像工作区 → 自动绑成远程会话 
 
 	const mod = await import(`${MOBILE.href}?t=${Date.now()}`);
 	const { apply, callRemote, loadConfig } = mod;
-	const mirrorPath = join(home, 'dsh-remote', 'workspaces', 'c-users-xiaopan-dshapp-deadbeef');
+	const mirrorPath = join(home, 'dsh-remote', 'workspaces', 'c-users-你的用户名-dshapp-deadbeef');
 	const { ctx, controller } = makeCtx({ workspacePath: mirrorPath });
 	apply(ctx);
 
@@ -234,7 +234,7 @@ console.log('\n=== ② 备选区选镜像工作区 → 自动绑成远程会话 
 	if (creates.length === 1) {
 		assert(creates[0].params.sessionId === result.sessionId, '两端 sessionId 一致');
 		assert(
-			creates[0].params.cwd === 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP',
+			creates[0].params.cwd === 'C:\\Users\\你的用户名\\Desktop\\DSHAPP',
 			'传给电脑的是**电脑路径**（不是手机镜像路径）',
 			creates[0].params.cwd,
 		);
@@ -266,14 +266,14 @@ console.log('\n=== ③ 未配对时不许绑（否则一发消息就报错）===
 	const home = freshHome();
 	const server = await startFakeRelay();
 	relayCalls = [];
-	mkdirSync(join(home, 'dsh-remote', 'workspaces', 'c-users-xiaopan-dshapp-deadbeef'), { recursive: true });
+	mkdirSync(join(home, 'dsh-remote', 'workspaces', 'c-users-你的用户名-dshapp-deadbeef'), { recursive: true });
 	writeFileSync(
 		join(home, 'dsh-remote', 'workspaces.json'),
-		JSON.stringify({ workspaces: { 'c-users-xiaopan-dshapp-deadbeef': 'C:\\DSHAPP' } }),
+		JSON.stringify({ workspaces: { 'c-users-你的用户名-dshapp-deadbeef': 'C:\\DSHAPP' } }),
 	);
 	// 没有 mobile.json ⇒ 令牌为空 ⇒ 未配对。
 	const mod = await import(`${MOBILE.href}?t=${Date.now()}`);
-	const mirrorPath = join(home, 'dsh-remote', 'workspaces', 'c-users-xiaopan-dshapp-deadbeef');
+	const mirrorPath = join(home, 'dsh-remote', 'workspaces', 'c-users-你的用户名-dshapp-deadbeef');
 	const { ctx, controller } = makeCtx({ workspacePath: mirrorPath });
 	mod.apply(ctx);
 	const result = await controller.create({ workspaceId: 'ws-mirror' });
@@ -343,11 +343,11 @@ console.log('\n=== ⑥ 远程会话的文件树被转给电脑（侧边栏 / 预
 	const port = server.address().port;
 	relayCalls = [];
 
-	const slug = 'c-users-xiaopan-dshapp-deadbeef';
+	const slug = 'c-users-你的用户名-dshapp-deadbeef';
 	mkdirSync(join(home, 'dsh-remote', 'workspaces', slug), { recursive: true });
 	writeFileSync(
 		join(home, 'dsh-remote', 'workspaces.json'),
-		JSON.stringify({ workspaces: { [slug]: 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP' } }),
+		JSON.stringify({ workspaces: { [slug]: 'C:\\Users\\你的用户名\\Desktop\\DSHAPP' } }),
 	);
 	writeFileSync(
 		join(home, 'dsh-remote', 'mobile.json'),
@@ -486,7 +486,7 @@ console.log('\n=== ⑦ 「在此新建对话」那条桥（用户 1.0.16 报障�
 		persist: () => {},
 		desktopCache: undefined,
 		prefetch: () => Promise.resolve(),
-		body: { method: 'createSession', params: { path: 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP' } },
+		body: { method: 'createSession', params: { path: 'C:\\Users\\你的用户名\\Desktop\\DSHAPP' } },
 	};
 
 	let result;
@@ -501,18 +501,18 @@ console.log('\n=== ⑦ 「在此新建对话」那条桥（用户 1.0.16 报障�
 	assert(thrown === null, 'createSession 不抛错（1.0.16 在这里抛 workspaceMap is not defined）', String(thrown?.message ?? thrown));
 	if (thrown === null) {
 		assert(typeof result?.sessionId === 'string' && result.sessionId !== '', '回执带 sessionId', JSON.stringify(result));
-		assert(result?.desktopPath === 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP', '回执带电脑路径', String(result?.desktopPath));
+		assert(result?.desktopPath === 'C:\\Users\\你的用户名\\Desktop\\DSHAPP', '回执带电脑路径', String(result?.desktopPath));
 		assert(remoteSessions.has(result.sessionId), '新会话被登记为远程（prompt 会转发电脑）');
 
 		// `workspaceMap` 必须真的被写进登记表 —— 这正是它被引用的原因，
 		// 只断言「没抛错」会漏掉「传进去了但没写」。
 		const slugs = Object.keys(seenMap);
 		assert(slugs.length === 1, '把 `<slug> → 电脑路径` 写进了登记表', JSON.stringify(seenMap));
-		assert(seenMap[slugs[0]] === 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP', '登记表里是电脑路径', JSON.stringify(seenMap));
+		assert(seenMap[slugs[0]] === 'C:\\Users\\你的用户名\\Desktop\\DSHAPP', '登记表里是电脑路径', JSON.stringify(seenMap));
 
 		const creates = relayCalls.filter((c) => c.method === 'createSession');
 		assert(creates.length === 1, '电脑端被要求建同名会话', `收到 ${creates.length} 次`);
-		assert(creates[0]?.params?.cwd === 'C:\\Users\\XIAOPAN\\Desktop\\DSHAPP', '传给电脑的是电脑路径', String(creates[0]?.params?.cwd));
+		assert(creates[0]?.params?.cwd === 'C:\\Users\\你的用户名\\Desktop\\DSHAPP', '传给电脑的是电脑路径', String(creates[0]?.params?.cwd));
 	}
 
 	// —— 未配对时必须给出可操作的中文提示，而不是抛一个 TypeError ——

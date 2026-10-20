@@ -46,7 +46,7 @@ const API_PREFIX = "/agnes/api";
 /** Max accepted request body (an account pool is tiny; keep a sane cap). */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 /** Default workspace root used when the sandbox-policy service is absent. */
-const DEFAULT_CWD = "C:\\Users\\XIAOPAN\\Desktop\\dsh";
+const DEFAULT_CWD = join(homedir(), "Desktop", "dsh");
 
 /** Built-in default endpoint (CN station). */
 const DEFAULT_ENDPOINT = "https://api.agnes-ai.cn/v1";
