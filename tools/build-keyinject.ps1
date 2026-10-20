@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     从 agnes-keys.properties 生成 keyinject-keys.h，并编译出 assets/keyinject.bin。
 
