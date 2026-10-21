@@ -19,6 +19,15 @@ Status of the fork and answers to the owner's questions. Nothing here changes th
 | Does it have plugin install? | **Yes.** pnpm is bundled, so the harness's own plugin manager works. The app adds a plugin market (`dsh-android-market`: browse npm, featured list, one-tap install, Android compatibility warnings) and an installed-plugins list with remove/restore in the log screen's rescue actions. | `market-plugin/`, `docs/agents/pnpm.md`, `docs/agents/rescue-mode.md` |
 | Google sign-in / API-key first screen? | **No.** The app opens straight into DSH's own web UI. A key is entered in DSH's Settings > Models. There is no Google or DeepSeek web-account sign-in route, and no separate first screen. | `MainActivity.kt` (no sign-in or key screen) |
 
+## Emulator smoke test: what it does and does not cover
+- CI's emulator is an x86_64 Android 14 image that runs arm64 apps through translation. The app ships an arm64 Termux
+  bootstrap only and picks it from `Build.SUPPORTED_ABIS[0]` (x86_64 there). So on that image the engine cannot boot and
+  the app shows its own "引擎启动失败 / Termux 环境未就绪" (engine failed to start / Termux not ready) screen.
+  Booting the emulator with an arm64-first ABI list did not change the image's list. The app is kept as-is.
+- The smoke test therefore covers: install, launch, the first screen, the app's native boot-status screen (safe mode,
+  View log) and the native log viewer. **The DSH chat and settings web UI need a real arm64 device**; the test goes on
+  to them automatically if the engine comes up (for example on an arm64 runner).
+
 ## Gaps (not built here)
 - No Google / DeepSeek web-account route; API key only, through DSH's settings.
 - No in-app update of the DSH harness from npm (only by a new APK).

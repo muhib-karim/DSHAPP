@@ -2,7 +2,9 @@ name: Emulator smoke
 
 # Fork (muhib-karim/DSHAPP): builds the release APKs (Release APK workflow), installs the system-WebView APK on an
 # Android 14 emulator (x86_64 image with arm64 translation; the app is arm64-only), launches it and screenshots the
-# first screen, the chat screen and the settings screen (artifact emulator-screenshots).
+# first screen and the app's native boot-status and log screens (artifact emulator-screenshots). The DSH engine cannot
+# boot on an x86_64 image (the app ships an arm64 Termux bootstrap only), so the chat and settings web UI are checked
+# on a real arm64 device; tools/ci/emulator-smoke.py goes on to them when the engine does come up.
 on:
   push:
     branches: [main]
@@ -45,13 +47,6 @@ jobs:
           disk-size: 8000M
           ram-size: 4096M
           disable-animations: true
-          # The app picks its Termux bootstrap from Build.SUPPORTED_ABIS[0] and ships arm64 only; list arm64 first so the
-          # x86_64 image (which runs arm64 code through its ndk_translation layer) presents itself as an arm64 device.
-          emulator-options: >-
-            -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-            -prop ro.product.cpu.abilist=arm64-v8a,x86_64,x86,armeabi-v7a,armeabi
-            -prop ro.product.cpu.abilist64=arm64-v8a,x86_64
-            -prop ro.product.cpu.abi=arm64-v8a
           script: python3 -I tools/ci/emulator-smoke.py "$(ls dist/DSH*-mk.apk)" com.mkdsh.droid emulator-screenshots
       - name: Upload screenshots, UI dumps and logcat
         if: always()
