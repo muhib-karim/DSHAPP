@@ -107,7 +107,10 @@ jobs:
           fi
           printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$ks" "$KS_PASS" "$KS_ALIAS" "$KEY_PASS" > keystore.properties
       - name: Build both flavors (release)
-        run: bash ./gradlew --no-daemon :app:assembleSystemRelease :app:assembleGeckoRelease
+        run: |
+          # gradle.properties routes Gradle through upstream's local proxy (127.0.0.1:7897); a runner connects directly.
+          sed -i '/^systemProp\.https\?\.proxy\(Host\|Port\)=/d' gradle.properties
+          bash ./gradlew --no-daemon :app:assembleSystemRelease :app:assembleGeckoRelease
       - name: Name, verify and checksum the APKs
         id: name
         run: |
