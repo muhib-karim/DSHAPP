@@ -1,5 +1,23 @@
 # DSH for Android
 
+> **This repository is a fork of [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP) (MIT)**, maintained by
+> [muhib-karim](https://github.com/muhib-karim) and **shipped as-is**: the UI and features are upstream's, and all
+> credit goes to the upstream author. The fork only changes:
+> - **Package names**: `com.mkdsh.droid` (system WebView build) and `com.mkdsh.gecko` (GeckoView build), still exactly
+>   15 characters (see "Two hard constraints"), so the fork installs next to upstream DSHAPP and other
+>   `com.dsh.android` apps. The app name is unchanged ("DSH").
+> - **Version**: 0.3.4 (versionCode 30), the next number after upstream's 0.3.3 (29).
+> - **CI build**: `.github/workflows/release-apk.yml` builds signed release APKs on GitHub Actions and uploads the
+>   APKs plus SHA256SUMS; a `v*` tag publishes a GitHub Release. Where each build asset comes from is in
+>   `tools/ci/assemble-assets.py`. Unchanged binary assets are taken from upstream's v0.3.0 release APK, pinned by
+>   sha256. Plugin zips are packed from this repository's source. The JNI helpers are compiled with the NDK.
+>   `webview-compat.zip` is rebuilt by upstream's own script.
+> - **No built-in account pool**: upstream's `keyinject.bin` (upstream's own API accounts) is not included; use your own
+>   API key.
+> - **Emulator smoke test**: `.github/workflows/emulator-smoke.yml` (first screen, chat and settings screenshots, see
+>   `docs/screenshots/`).
+> - Third-party components and licences: [THIRD-PARTY.md](THIRD-PARTY.md). Upstream's LICENSE is kept unchanged.
+
 **Run a full AI coding agent on your Android phone.**
 
 [中文](README.md) · [Docs](docs/agents/README.md) · [Contributing](CONTRIBUTING.md)
