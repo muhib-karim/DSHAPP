@@ -8972,8 +8972,15 @@ class EngineManager private constructor(private val context: Context) {
           *      6 个 3.71（不达标）+ 2 个 5.8（已达标），统一提亮不会误伤后者。
           *      取值亮 rgb(105,110,115) 5.15:1 / 暗 rgb(165,170,176) 5.96:1。
           *      ⚠️ 两个戳都 bump（本常量 98 → 99，-CompatVersion 32 → 33）。
+          * 1.0.0-100：合并 PR #3 —— 悬浮气泡分节新增「键盘避让」卡片
+          *      （46×26 开关 + 无障碍权限检测 + 独立「去开启权限」按钮）。
+          *      改的仍是 `mobileui/lib/client.js`，降级产物随之变化，必须 bump。
+          *      ⚠️ PR #3 原作把本常量写成 1.0.0-68、`-CompatVersion` 写成 24，
+          *      那是基于旧的 66/22 算的。合并时**必须取本地已推进的值再 +1**
+          *      （99 → 100 / 33 → 34），否则会回退，设备上静默跑回没有这张卡的旧 UI。
+          *      ⚠️ 两个戳都 bump（本常量 99 → 100，-CompatVersion 33 → 34）。
           */
-        private const val MOBILE_UI_VERSION = "1.0.0-99"
+        private const val MOBILE_UI_VERSION = "1.0.0-100"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

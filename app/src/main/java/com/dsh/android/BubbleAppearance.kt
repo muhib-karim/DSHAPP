@@ -716,18 +716,25 @@ data class BubbleAppearance(
 
             // ── 「键盘顶飞」的能力闸门 ──────────────────────────────────────
             //
-            // 它需要读 `dumpsys input_method` 的 `mInputShown`，而那条命令要求
-            // `android.permission.DUMP` —— **普通应用 uid 拿不到**，必须有 Shizuku
-            // 授权或 root。没有特权时这个开关就算开着也不可能工作。
+            // 它有**两条**检测路径，任一条可用就能工作：
             //
-            // 所以这里**强制关掉**，而不是留一个"开着但静默无效"的开关：后者会让
+            // | 路径 | 延迟 | 要求 |
+            // |---|---|---|
+            // | 无障碍哨兵（`BubbleA11yService`） | 事件驱动 + ≤120ms | 用户开一次无障碍 |
+            // | `dumpsys input_method` | **2s 起**（单次命令 95–150ms） | Shizuku / root |
+            //
+            // 两条都没有时**强制关掉**，而不是留一个"开着但静默无效"的开关：后者会让
             // 用户以为功能坏了、反复来报 bug。设置页会用同一判据把开关置灰并说明
-            // 原因（见 ShellPrivilege）。
+            // 原因（见 `KeyboardAvoid.source()`）。
             //
-            // ⚠️ 是「读的时候纠正」，**不写回磁盘**：用户哪天接入了特权，重启 App
-            //   后原来的 true 会自动恢复生效，不需要再手动开一次。
+            // ⚠️ 这里用 `KeyboardAvoid.isAvailable()` 而不是只判 `ShellPrivilege`：
+            //   只看特权的话，开了无障碍（更快的那条）的用户会被误判成"不可用"，
+            //   开关被强制置灰 —— 那正是「用无障碍优先」要解决的问题。
+            //
+            // ⚠️ 是「读的时候纠正」，**不写回磁盘**：用户哪天接入了特权或开了无障碍，
+            //   重启 App 后原来的 true 会自动恢复生效，不需要再手动开一次。
             if (merged.imeFlingEnabled && context != null &&
-                !ShellPrivilege.isAvailable(context)
+                !KeyboardAvoid.isAvailable(context)
             ) {
                 ShellPrivilege.logDenied("键盘顶飞", ShellPrivilege.status(context))
                 merged = merged.copy(imeFlingEnabled = false)

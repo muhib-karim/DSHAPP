@@ -168,6 +168,23 @@ interface PageBridge {
     fun bubbleRequestOverlay()
 
     /**
+     * 读「键盘避让」状态。返回 JSON：`{"enabled":bool,"a11y":bool}`。
+     *
+     * 两个字段是**两件独立的事实**，不要合并：
+     * - `enabled` —— 用户要不要这个功能（本 App 的 SharedPreferences）；
+     * - `a11y`    —— 系统有没有给无障碍授权（`Settings.Secure`，只能去系统设置里开）。
+     *
+     * 开关开着但没授权时，正确文案是「还差一步：去开权限」，而不是笼统的"不可用"。
+     */
+    fun keyboardAvoidState(): String
+
+    /** 开关「键盘避让」。关掉后悬浮球不再避让键盘（仍保留手动拖动）。 */
+    fun keyboardAvoidSetEnabled(enabled: Boolean)
+
+    /** 拉起系统的无障碍设置页 —— 用户在那里打开「DSH 键盘哨兵」。 */
+    fun keyboardAvoidRequestPermission()
+
+    /**
      * 会话转录上报 —— 悬浮窗展开态要显示的**完整**对话内容。
      *
      * 与 [onStatus] 分开的理由见 [com.dsh.android.ChatTranscript] 的头注释：

@@ -5356,6 +5356,23 @@ window.__ModuleLoader__.load({
 			bbAnchorBL: "左下",
 			bbAnchorAbove: "正上",
 			bbAnchorBelow: "正下",
+			kbTitle: "键盘避让",
+			kbRowSwitch: "键盘避让",
+			kbRowPerm: "无障碍权限",
+			kbGrant: "去开启权限",
+			kbNextDisabled: "当前关着。打开后，键盘弹出时悬浮球会自动避让，不会挡在输入区前面。",
+			kbNextNeedPerm: "还差一步：需要「无障碍」权限才知道键盘弹没弹出、弹多高。点右边按钮去系统设置里打开「DSH 键盘哨兵」。",
+			kbNextAllGood: "已就绪：键盘弹出时悬浮球会被弹开，落回键盘上方。",
+			kbNextShellSlow: "能用，但走的是特权通道（dumpsys 轮询，延迟约 2 秒）。开了无障碍会快一个数量级，键盘一弹就避让。",
+			kbNextNoSource: "两条检测路径都不可用：没开无障碍，也没有 Shizuku 或 root。下面任选一条开通后才能启用。",
+			kbRowSource: "检测方式",
+			kbSourceA11y: "无障碍（快）",
+			kbSourceShell: "特权通道（慢）",
+			kbSourceNone: "无",
+			kbHowTitle: "为什么需要无障碍",
+			kbHow1: "普通应用拿不到「键盘是否弹出、弹多高」—— 只有无障碍服务能读输入法窗口的位置和尺寸。",
+			kbHow2: "它只读取窗口的位置与大小，不读取窗口内容，也不记录按键或你输入的文字。",
+			kbHow3: "开启后悬浮球会在键盘弹出时被弹开、落回键盘上方；关掉开关则完全不干预。",
 		};
 		const MP_BUBBLE_EN = {
 			nav: "Floating bubble",
@@ -5492,6 +5509,23 @@ window.__ModuleLoader__.load({
 			bbAnchorBL: "Bottom left",
 			bbAnchorAbove: "Above",
 			bbAnchorBelow: "Below",
+			kbTitle: "Keyboard avoidance",
+			kbRowSwitch: "Keyboard avoidance",
+			kbRowPerm: "Accessibility permission",
+			kbGrant: "Grant",
+			kbNextDisabled: "Currently off. Turn it on and the bubble will get out of the keyboard's way when it appears.",
+			kbNextNeedPerm: "One step left: \"Accessibility\" is required to know whether the keyboard is up and how tall it is. Tap the button to enable \"DSH Keyboard Sentinel\" in system settings.",
+			kbNextAllGood: "Ready: the bubble is pushed away when the keyboard appears and lands above it.",
+			kbNextShellSlow: "Works, but via the privileged channel (dumpsys polling, ~2s latency). Enabling accessibility makes it an order of magnitude faster.",
+			kbNextNoSource: "Neither detection path is available: accessibility is off and there is no Shizuku or root. Enable one of them below first.",
+			kbRowSource: "Detection",
+			kbSourceA11y: "Accessibility (fast)",
+			kbSourceShell: "Privileged (slow)",
+			kbSourceNone: "None",
+			kbHowTitle: "Why accessibility",
+			kbHow1: "A normal app cannot know whether the keyboard is shown or how tall it is — only an accessibility service can read the IME window's position and size.",
+			kbHow2: "It reads window position and size only; no window content, no keystrokes, no typed text.",
+			kbHow3: "When enabled, the bubble bounces off the keyboard and rests above it; when disabled, it is left completely alone.",
 		};
 
 		const MP_PRIV_EN = {
@@ -7753,6 +7787,9 @@ window.__ModuleLoader__.load({
 			const t = typeof props.t === "function" ? props.t : (key) => MP_BUBBLE_ZH[key] ?? key;
 			const [state, setState] = React.useState({ phase: "loading" });
 			const [showDetails, setShowDetails] = React.useState(false);
+			// 键盘避让的状态：开关在 SharedPreferences、无障碍授权在 Settings.Secure，
+			// 两样都只能从原生桥读（与气泡开关同一套事实来源）。
+			const [kb, setKb] = React.useState({ phase: "loading" });
 
 			/**
 			 * 从原生读一次状态。
@@ -7790,6 +7827,42 @@ window.__ModuleLoader__.load({
 			React.useEffect(() => { refresh(); }, [refresh]);
 
 			/**
+			 * 读「键盘避让」状态。
+			 *
+			 * ⚠️ 单独一个方法而不是塞进 `bubbleState()`：两者更新时机不同 ——
+			 *   无障碍授权只在用户离开本页去系统设置时才会变，而气泡开关在本页
+			 *   就会被改。分开读可以各自刷新，互不牵连。
+			 */
+			const refreshKb = React.useCallback(() => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.keyboardAvoidState !== "function") {
+					setKb({ phase: "ready", enabled: false, a11y: false, source: "none", noBridge: true });
+					return;
+				}
+				try {
+					const raw = bridge.keyboardAvoidState();
+					const o = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+					// `source` 是原生算好的最终判据：`a11y`（快）/ `shell`（慢）/
+					// `none`（两条路都没有 ⇒ 开关必须置灰）。页面不自己推导，
+					// 否则同一套优先级要在两处各写一遍，容易漂。
+					setKb({
+						phase: "ready",
+						enabled: !!o.enabled,
+						a11y: !!o.a11y,
+						a11yOn: !!o.a11yOn,
+						shell: !!o.shell,
+						source: o.source || "none",
+						noBridge: false,
+					});
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 读取键盘避让状态失败:", e && e.message);
+					setKb({ phase: "ready", enabled: false, a11y: false, source: "none", noBridge: true });
+				}
+			}, []);
+
+			React.useEffect(() => { refreshKb(); }, [refreshKb]);
+
+			/**
 			 * 从系统设置页回来后刷新。
 			 *
 			 * ⚠️ 授权是**在别的界面**完成的，本页拿不到任何回调。只能监听
@@ -7797,14 +7870,14 @@ window.__ModuleLoader__.load({
 			 *   回来看到的还是「未授权」，会以为没生效。
 			 */
 			React.useEffect(() => {
-				const onVisible = () => { if (!document.hidden) refresh(); };
+				const onVisible = () => { if (!document.hidden) { refresh(); refreshKb(); } };
 				document.addEventListener("visibilitychange", onVisible);
 				window.addEventListener("focus", onVisible);
 				return () => {
 					document.removeEventListener("visibilitychange", onVisible);
 					window.removeEventListener("focus", onVisible);
 				};
-			}, [refresh]);
+			}, [refresh, refreshKb]);
 
 			const toggle = () => {
 				const bridge = window.DSHAndroid;
@@ -7862,7 +7935,28 @@ window.__ModuleLoader__.load({
 					})),
 				);
 
-			if (state.phase === "loading") {
+			// ── 键盘避让的两个动作 ────────────────────────────────────────
+
+			const toggleKb = () => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.keyboardAvoidSetEnabled !== "function") return;
+				try {
+					bridge.keyboardAvoidSetEnabled(!kb.enabled);
+					// 同步重读：桥是同步的，读回来才是"落盘后的事实"。
+					refreshKb();
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 切换键盘避让失败:", e && e.message);
+				}
+			};
+
+			const grantKb = () => {
+				const bridge = window.DSHAndroid;
+				if (bridge && typeof bridge.keyboardAvoidRequestPermission === "function") {
+					try { bridge.keyboardAvoidRequestPermission(); } catch (e) { /* 由原生侧记日志 */ }
+				}
+			};
+
+			if (state.phase === "loading" || kb.phase === "loading") {
 				return React.createElement("div", { style: S.section },
 					React.createElement("h2", { style: S.heading }, t("title")),
 					React.createElement("p", { style: S.intro }, t("statusUnknown")),
@@ -7889,6 +7983,48 @@ window.__ModuleLoader__.load({
 			} else {
 				nextBtn = React.createElement("button", { style: S.btnQuiet, onClick: toggle }, t("disable"));
 			}
+
+			// 键盘避让的「下一步」——只给结论文案，动作交给卡片里的开关与按钮。
+			//
+			// `kb.source` 是原生算好的最终判据（`a11y` / `shell` / `none`），
+			// 页面不自己推导优先级。三条结论互斥且按"用户还差什么"排序：
+			//   none   → 什么都做不了，开关置灰
+			//   shell  → 能用但有延迟，建议开无障碍（这是本卡片存在的意义）
+			//   a11y   → 已就绪
+			const kbNoSource = !kb.noBridge && kb.source === "none";
+			const kbReady = kb.enabled && !kbNoSource &&
+				(kb.source === "a11y" || kb.source === "shell");
+			const kbTone = kbReady ? MP_PRIV_TONE.on : MP_PRIV_TONE.off;
+			let kbNextText = t("kbNextAllGood");
+			if (kb.noBridge) {
+				kbNextText = t("noBridge");
+			} else if (kbNoSource) {
+				kbNextText = t("kbNextNoSource");
+			} else if (!kb.enabled) {
+				kbNextText = t("kbNextDisabled");
+			} else if (kb.source === "shell") {
+				kbNextText = t("kbNextShellSlow");
+			}
+
+			// 开关的样式：做成真正的 switch（宽 46 / 高 26 的轨道 + 白色圆钮）。
+			// 之前这里是一个「打开开关 / 关闭」按钮 —— 用户明确要求改成开关形态：
+			// 开关一眼能看出"当前是开还是关"，按钮要靠读文字才知道。
+			const kbSwitchRow = { display: "flex", alignItems: "center", gap: "10px" };
+			const kbSwitchLabel = { flex: "1 1 auto", fontSize: "13px", lineHeight: "19px" };
+			const kbSwitchTrack = (on, disabled) => ({
+				position: "relative", flex: "0 0 auto", width: "46px", height: "26px",
+				borderRadius: "13px", border: "none", padding: 0,
+				cursor: disabled ? "default" : "pointer",
+				opacity: disabled ? 0.5 : 1,
+				background: on ? MP_PRIV_TONE.on.color : "var(--dsw-alias-border-l2, #cfcfcf)",
+				transition: "background .18s",
+			});
+			const kbSwitchKnob = (on) => ({
+				position: "absolute", top: "3px", left: on ? "23px" : "3px",
+				width: "20px", height: "20px", borderRadius: "10px",
+				background: "#fff", boxShadow: "0 1px 2px rgba(0,0,0,.25)",
+				transition: "left .18s",
+			});
 
 			const dot = (ok) => React.createElement("span", {
 				style: { ...S.dot, background: ok ? MP_PRIV_TONE.on.color : MP_PRIV_TONE.off.color },
@@ -7946,6 +8082,72 @@ window.__ModuleLoader__.load({
 				// 单独一个组件：这里要摆 BubbleAppearance 的全部可调项，
 				// 撑进本分节会让「开关气泡 / 权限状态」那段首屏失控。
 				React.createElement(mpBubblePanel, { t }),
+
+				// ── 键盘避让：与气泡同一套卡片结构（结论优先 + 明细可折叠）──
+				//
+				// ⚠️ 它单独一张卡而不是塞进上面那张：权限是**另一件事**
+				//   （无障碍 vs 悬浮窗），塞进一张卡会让"当前状态"这个徽章
+				//   同时代表两套权限，用户没法判断还差哪一步。
+				React.createElement("div", { style: S.card },
+					React.createElement("div", { style: S.cardHead },
+						React.createElement("h3", { style: S.cardTitle }, t("kbTitle")),
+						React.createElement("span", {
+							style: { ...S.badge, color: kbTone.color, background: kbTone.bg },
+						}, kbReady ? t("statusOn") : t("statusOff")),
+					),
+					// 开关行：功能开关本体，点一下立即生效（原生侧推给正在显示的球）。
+					//
+					// ⚠️ `kbNoSource` 时置灰：两条检测路径都没有（既没开无障碍、
+					//   也没有 Shizuku/root），打开这个开关不会有任何行为 —— 让用户
+					//   打开一个注定不生效的开关，比直接说明原因更糟。
+					React.createElement("div", { style: kbSwitchRow },
+						React.createElement("span", { style: kbSwitchLabel }, t("kbRowSwitch")),
+						React.createElement("button", {
+							role: "switch",
+							"aria-checked": kb.enabled,
+							disabled: kb.noBridge || kbNoSource,
+							title: kb.enabled ? t("on") : t("off"),
+							onClick: toggleKb,
+							style: kbSwitchTrack(kb.enabled, kb.noBridge || kbNoSource),
+						}, React.createElement("span", { style: kbSwitchKnob(kb.enabled) })),
+					),
+					// 权限行：没授权时给一个明确的「去开启权限」按钮。
+					// 开关开着时用实心（这才是当前该做的一步）；开关关着时降级成描边 ——
+					// 功能还没开就先把主按钮推给用户，会显得在硬塞权限。
+					//
+					// ⚠️ 已经走 SHELL（有特权但慢）时也显示这个按钮：那条路延迟 2 秒起，
+					//   开无障碍能把延迟压到一个数量级以下，正是本卡片要推的事。
+					React.createElement("div", { style: S.next },
+						React.createElement("span", { style: S.nextText }, kbNextText),
+						(!kb.noBridge && !kb.a11y)
+							? React.createElement("div", { style: S.actions },
+								React.createElement("button", {
+									style: kb.enabled ? S.btnPrimary : S.btn,
+									onClick: grantKb,
+								}, t("kbGrant")))
+							: null,
+					),
+					React.createElement("div", { style: S.actions },
+						React.createElement("button", { style: S.btn, onClick: refreshKb }, t("recheck")),
+					),
+					React.createElement("div", { style: S.details },
+						row(t("kbRowPerm"), kb.a11y, kb.a11y ? t("granted") : t("notGranted")),
+						row(t("kbRowSource"), kb.source !== "none",
+							kb.source === "a11y" ? t("kbSourceA11y")
+								: kb.source === "shell" ? t("kbSourceShell")
+								: t("kbSourceNone")),
+					),
+				),
+
+				React.createElement("details", { style: S.fold },
+					React.createElement("summary", { style: S.foldHead }, t("kbHowTitle")),
+					React.createElement("div", { style: S.foldBody },
+						React.createElement("ul", { style: S.notes },
+							[t("kbHow1"), t("kbHow2"), t("kbHow3")].map((line, i) =>
+								React.createElement("li", { style: S.note, key: i }, line)),
+						),
+					),
+				),
 
 				React.createElement("details", { style: S.fold },
 					React.createElement("summary", { style: S.foldHead }, t("howTitle")),

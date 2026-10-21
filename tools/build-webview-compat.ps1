@@ -169,7 +169,13 @@ param(
     #      ③ 修复 66：推理等级 High 被误藏（改回显示，字号 10px/opacity 0.65）。
     #      三条都改在 `mobileui/lib/client.js` 里 ⇒ 本戳必须 22 → 23，
     #      否则设备命中「字符串相等 ⇒ 整棵树跳过」，跑的还是旧布局（同 v22 的坑）。
-    [string]$CompatVersion = "33",
+    # v34：合并 PR #3（悬浮球键盘避让）—— 悬浮气泡分节新增「键盘避让」卡片
+    #      （46×26 开关 + 无障碍权限检测 + 独立「去开启权限」按钮）。
+    #      改的仍是 `mobileui/lib/client.js`，降级产物随之变化，必须 bump。
+    #      ⚠️ PR #3 原作把本戳写成 24、把 `MOBILE_UI_VERSION` 写成 1.0.0-68，
+    #      那是基于旧的 22/1.0.0-66 算的。合并时**必须取本地已推进的值再 +1**
+    #      （33 → 34 / 1.0.0-99 → -100），否则会回退，设备上静默跑回旧 UI。
+    [string]$CompatVersion = "34",
 
     [string]$EngineBin,
     [string]$OutZip

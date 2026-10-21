@@ -180,6 +180,55 @@ class FloatingBubble(private val context: Context) {
         /** 键盘顶飞时横向随机分量的幅度（px/s）。避免每次都笔直上冲显得死板。 */
         private const val SHAKE_RANDOM_VX = 260
 
+        /**
+         * 键盘可见时，球与键盘顶之间留的空隙（dp）。
+         *
+         * ⚠️ 不能沿用 [BOTTOM_MARGIN_DP]（48dp）：那个是给手势条 / 导航栏留的，
+         * 键盘顶上本来就没有手势条。
+         *
+         * ⚠️ 也**不能只留几 dp**：键盘上方还有一条「文字选择工具栏」
+         *   （`FloatingActionMode` 的剪切/复制/粘贴条，高约 48dp）。留 8dp 时球正好
+         *   压在这条栏上，真机反馈"挡着文字选择栏了"。64dp = 工具栏 48dp + 余量，
+         *   球停在工具栏**上面**。
+         */
+        private const val IME_FLOOR_PAD_DP = 64
+
+        /** 被键盘盖住时额外弹起的高度（dp）—— 让"撞了一下"看得出来，而不只是挪开。 */
+        private const val IME_BOUNCE_EXTRA_DP = 28
+
+        /**
+         * 弹射初速相对「刚好越过键盘」的放大倍数。
+         *
+         * 1.12 是留余量的系数，再乘 3 是**产品要求**：真机反馈原速"太肉"，
+         * 看不出是"被弹开"，希望至少三倍。按 v² 关系，弹起高度约为原来的 9 倍，
+         * 通常会一路顶到屏幕顶部再落回键盘上弹两下 —— 那正是想要的效果。
+         *
+         * ⚠️ 调这个值会同时改变"飞行时间"，而飞行期间用户可能已经在拖球了；
+         *   拖动会 `stopThrow()`，所以不会打架，只是弹射会被打断。
+         */
+        private const val IME_BOUNCE_GAIN = 3.36f
+
+        /**
+         * 弹射的**水平分量**占竖直分量的比例 —— 让球斜着飞，而不是笔直上下。
+         *
+         * 方向固定朝**屏幕中心**：球在左半边就往右踢、在右半边往左踢。朝外踢的话
+         * 它一出发就撞侧边（`WALL_DAMPING` 削掉 18%），看起来像被墙弹回来而不是
+         * 被键盘弹开。
+         *
+         * 取 0.18 而不是 0.5：竖直速度已经是 3 倍，水平再大的话球会在左右墙之间
+         * 来回撞，轨迹变得像弹珠机。0.18 ≈ 偏离垂直方向 10°，看得出斜、仍以
+         * "上下"为主。
+         */
+        private const val IME_BOUNCE_SIDE_RATIO = 0.18f
+
+        /**
+         * 判定"球正靠在键盘顶上"的容差（dp）。
+         *
+         * 键盘收起时靠它决定要不要让球**掉下去**：只有真的贴着键盘顶的球才落下，
+         * 用户自己放在屏幕中部的球不该因为键盘收起而开始下落。
+         */
+        private const val IME_REST_TOLERANCE_DP = 6
+
         /** 判定"点击"而非"拖动"的位移阈值（dp）。与系统 ViewConfiguration 同量级。 */
         private const val TAP_SLOP_DP = 6
 
@@ -369,6 +418,42 @@ class FloatingBubble(private val context: Context) {
             val cur = instance ?: return
             val transcript = ChatTranscript.parse(json) ?: return
             main.post { cur.applyTranscript(transcript) }
+        }
+
+        /**
+         * 输入法窗口状态变化入口。由 [BubbleA11yService]（无障碍）推送。
+         *
+         * ⚠️ 与 [onStatus] 一样可能在**任意线程**被调用 —— 无障碍回调其实在
+         *   主线程，但这里仍然统一 post 一次：调用方不该关心线程模型。
+         *
+         * @param visible 输入法窗口当前是否真的可见（服务已排掉"零高度/屏幕外"的假窗口）。
+         * @param topPx   键盘顶在屏幕上的 y 坐标（px）。
+         * @param heightPx 键盘高度（px）。
+         */
+        fun onImeWindow(visible: Boolean, topPx: Int, heightPx: Int) {
+            // 无障碍回调本来就在主线程 —— 直接调用，省掉一次 post 的一帧；
+            // 其它线程（将来若有推送）仍然走 post。
+            val cur = instance
+            if (cur != null && Looper.myLooper() == Looper.getMainLooper()) {
+                cur.applyImeWindow(visible, topPx, heightPx)
+            } else {
+                main.post { instance?.applyImeWindow(visible, topPx, heightPx) }
+            }
+        }
+
+        /**
+         * 设置页改了「键盘避让」开关（[KeyboardAvoid.setEnabled] 推过来）。
+         *
+         * 关掉时只改内存里的开关，不打断正在飞的球 —— 打断会让人以为"点开关
+         * 把球点炸了"。下一次落地/拖动就按新地面算。
+         */
+        fun onKeyboardAvoidChanged(enabled: Boolean) {
+            val cur = instance ?: return
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                cur.applyKeyboardAvoidEnabled(enabled)
+            } else {
+                main.post { cur.applyKeyboardAvoidEnabled(enabled) }
+            }
         }
 
         /**
@@ -1198,6 +1283,142 @@ class FloatingBubble(private val context: Context) {
         moveTo(nx, ny)
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // 键盘避让：无障碍看到真实输入法窗口之后，让球"被键盘弹开"
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 收到一次输入法窗口变化（来自 [BubbleA11yService]）。
+     *
+     * 三种情形：
+     * 1. **键盘弹出、球被盖住** ⇒ 向上弹射（见 [bounceOffKeyboard]）；
+     * 2. **键盘收起、球正靠在键盘顶上** ⇒ 交给重力把它带下去（见 [dropFromKeyboard]）；
+     * 3. 其余情况只更新坐标，不动视图。
+     *
+     * ⚠️ 展开态 / 贴边态 / 正在拖动时**一律不弹**：
+     * - 展开态由输入框焦点驱动让位（[applyImeHeight]），再弹一次会两套逻辑打架；
+     * - 贴边态是一条贴在左右边缘的薄片，"弹射"没有可读的方向；
+     * - 拖动中弹射会从用户手指底下把球抢走。
+     */
+    private fun applyImeWindow(visible: Boolean, topPx: Int, heightPx: Int, force: Boolean = false) {
+        val wasVisible = imeWindowVisible
+        val oldTop = imeWindowTopPx
+        if (!force && wasVisible == visible && oldTop == topPx) return
+        imeWindowVisible = visible
+        imeWindowTopPx = if (visible) topPx else 0
+
+        // 功能开关关掉时只记状态、不做动作：地面也不该被键盘抬高（见 maxWindowY）。
+        if (!keyboardAvoidEnabled) return
+        if (expanded || edgeCollapsed || dragging) return
+        if (visible) {
+            // ⚠️ 飞行中不再重复给初速：键盘弹出的那段动画里 `top` 会变几次，
+            //   每次变化都会走到这里 —— 不挡住的话要么把球反复"重新发射"（观感
+            //   是原地抽搐），要么在落地附近反复注入能量。飞行中它自己会落在
+            //   新的地面（键盘顶）上，不需要外力。
+            if (throwState == null) bounceOffKeyboard()
+        } else if (wasVisible) {
+            dropFromKeyboard(oldTop)
+        }
+    }
+
+    /**
+     * 设置页改了「键盘避让」开关。
+     *
+     * - 关掉：不打断当前动作，但地面立刻回到屏幕底（下一次拖动/落点按新状态算）。
+     * - 打开：如果键盘正开着，立刻按真实键盘顶避让一次 —— 否则用户要等下一次
+     *   键盘弹出才看到效果，会以为开关没生效。
+     */
+    private fun applyKeyboardAvoidEnabled(enabled: Boolean) {
+        keyboardAvoidEnabled = enabled
+        Log.i(TAG, "键盘避让开关生效: $enabled")
+        if (enabled && ImeWindowState.visible) {
+            applyImeWindow(true, ImeWindowState.topPx, ImeWindowState.heightPx, force = true)
+        }
+    }
+
+    /**
+     * 球被键盘盖住时，给它一个向上的初速度，让它"被弹开"再落回键盘顶上。
+     *
+     * ## 为什么是算速度而不是直接改坐标
+     *
+     * 直接 `moveTo` 是瞬移，观感是"球被谁拽走了"；而这里要的是**碰撞**：
+     * 球被键盘顶面顶飞、升到顶点、再落回键盘上弹两下（落地挤压由物理循环里的
+     * `step.landed` 自动触发，不需要另写动画）。
+     *
+     * 初速度按能量守恒反推：要升高 [rise] 像素，`v = sqrt(2·g·rise)`。
+     * 乘 1.12 留一点余量（阻尼/掉帧会吃掉一点高度），再压到 [BubblePhysics]
+     * 的抛掷软上限之内 —— 超过上限的那一档本来就会被物理层重新缩放。
+     */
+    private fun bounceOffKeyboard() {
+        val v = root ?: return
+        val h = v.height.takeIf { it > 0 } ?: boxH()
+        val w = v.width.takeIf { it > 0 } ?: boxW()
+        val floorY = maxWindowY(h)
+        // 球顶已经在键盘上方：没被盖住，什么都不做。
+        if (curY <= floorY) return
+
+        val rise = (curY - floorY) + dp(IME_BOUNCE_EXTRA_DP)
+        val v0 = (kotlin.math.sqrt(2f * physics.gravity * rise) * IME_BOUNCE_GAIN)
+            .coerceAtMost(physics.maxThrowSpeed)
+        // 水平分量：朝屏幕中心踢（球在左半边往右、右半边往左），让轨迹斜着出去。
+        val ballCenter = curX + w / 2f
+        val toCenter = if (ballCenter <= context.resources.displayMetrics.widthPixels / 2f) 1f else -1f
+        val vx = v0 * IME_BOUNCE_SIDE_RATIO * toCenter
+        Log.i(
+            TAG,
+            "键盘弹起：键盘顶 $imeWindowTopPx px（高 ${ImeWindowState.heightPx} px），" +
+                "球底 ${curY + h} px 低于可用下限 ${floorY + h} px ⇒ " +
+                "向上弹射 v=(${vx.roundToInt()}, ${(-v0).roundToInt()}) px/s",
+        )
+        // 起跳前先"蹲"一下：与落地挤压共用同一条 Q 弹曲线，手感连贯。
+        playSquash(0.88f)
+        startThrow(vx, -v0)
+    }
+
+    /**
+     * 键盘收起后，原本靠在键盘顶上的球交给重力落下去。
+     *
+     * ⚠️ 只处理**真的停在键盘顶上**的球（容差 [IME_REST_TOLERANCE_DP]）：
+     *   用户自己放在屏幕中部的球不该因为键盘收起而开始下落 —— 那会变成
+     *   "一收键盘球就自己往下掉"，与"扔到哪就待在哪"的产品语义冲突。
+     */
+    private fun dropFromKeyboard(oldTopPx: Int) {
+        val v = root ?: return
+        val h = v.height.takeIf { it > 0 } ?: boxH()
+        val restedOnKeyboard = abs(curY - keyboardRestY(oldTopPx, h)) <= dp(IME_REST_TOLERANCE_DP)
+        if (!restedOnKeyboard) return
+        Log.i(TAG, "键盘收起：球原本停在键盘顶 $oldTopPx，交给重力落回底部")
+        startThrow(0f, 0f)
+    }
+
+    /** 键盘顶 [topPx] 时，球顶应该停在哪（px）。 */
+    private fun keyboardRestY(topPx: Int, h: Int): Int =
+        (topPx - h - dp(IME_FLOOR_PAD_DP)).coerceAtLeast(dp(TOP_MARGIN_DP))
+
+    /**
+     * 当前可用区域的**底边**（px）。
+     *
+     * 键盘可见时是键盘顶；否则是屏幕底减去学到的键盘高度（[imeHeightPx]）。
+     */
+    private fun usableBottomY(): Int {
+        val dm = context.resources.displayMetrics
+        // 开关关掉时假装没看见键盘：球可以停在屏幕最底部（旧行为）。
+        return if (keyboardAvoidEnabled && imeWindowVisible && imeWindowTopPx > 0) imeWindowTopPx
+        else dm.heightPixels - imeHeightPx
+    }
+
+    /**
+     * 球顶允许到达的最低 y（px）—— 物理循环的地面与拖动夹取共用这一个判据。
+     *
+     * ⚠️ 必须**统一**：物理循环用一个地面、`clampInto` 用另一个的话，会出现
+     *   "拖的时候停在键盘上、松手却又弹到别处"这种自相矛盾的行为。
+     */
+    private fun maxWindowY(h: Int): Int {
+        val pad = if (keyboardAvoidEnabled && imeWindowVisible) dp(IME_FLOOR_PAD_DP)
+        else dp(BOTTOM_MARGIN_DP)
+        return (usableBottomY() - h - pad).coerceAtLeast(dp(TOP_MARGIN_DP))
+    }
+
     /**
      * 键盘高度（px）。
      *
@@ -1231,6 +1452,33 @@ class FloatingBubble(private val context: Context) {
     @Volatile
     private var imeHeightPx = 0
 
+    /**
+     * 无障碍观测到的**真实**输入法窗口状态。
+     *
+     * 与 [imeHeightPx] 的分工：
+     * - [imeHeightPx] 是「输入框拿到焦点」推出来的**估计值**，用于展开态提前让位；
+     * - 这两个是系统窗口列表里的**事实**，键盘真的弹出来/收回去时才会变。
+     *
+     * ⚠️ 不能拿 [imeHeightPx] 代替这一对：展开态里它由焦点驱动，收起态里它恒为 0
+     *   —— 而收起态的球正是最需要知道"键盘挡在哪"的那一种。
+     */
+    @Volatile
+    private var imeWindowVisible = false
+
+    /** 键盘顶的 y 坐标（px）；[imeWindowVisible] 为 false 时无意义。 */
+    @Volatile
+    private var imeWindowTopPx = 0
+
+    /**
+     * 「键盘避让」功能开关（设置页可关，默认开）。
+     *
+     * 缓存一份而不是每帧读 SharedPreferences：`maxWindowY()` 在物理循环里每帧
+     * 都被调用，读盘会直接反映成掉帧。开关变化由 [onKeyboardAvoidChanged] 推入。
+     */
+    @Volatile
+    private var keyboardAvoidEnabled = true
+
+
     /** 状态气泡距球顶部的间距（dp）。 */
     private val statusGapPx = dp(8)
 
@@ -1253,6 +1501,8 @@ class FloatingBubble(private val context: Context) {
         }
 
         appearance = BubbleAppearance.load(context)
+        // 每次显示都重新读一次功能开关：设置页可能在气泡隐藏期间改过它。
+        keyboardAvoidEnabled = KeyboardAvoid.isEnabled(context)
 
         val view = LayoutInflater.from(context).inflate(R.layout.bubble_window, null)
         root = view
@@ -1299,10 +1549,18 @@ class FloatingBubble(private val context: Context) {
         try {
             wm.addView(view, params)
             attached = true
+            // 只有球在场时才让无障碍服务兜底轮询键盘（见 ImeWindowState.keepPolling）。
+            ImeWindowState.setKeepPolling(true)
             Log.i(TAG, "气泡已显示: ($curX, $curY) shape=${appearance.shape} size=${appearance.size}")
             // 主动拉一次当前状态：气泡是刚创建的，错过了之前所有的推送，
             // 不拉的话会停在"空闲"直到下一次状态变化（可能几十秒后）。
             EngineService.currentStatus()?.let { applyStatus(it) }
+            // 键盘此刻已经弹着时（从别的 App 切过来、或者球刚被重新创建），
+            // 也得按真实坐标摆一次 —— 否则球会先出现在键盘底下，等下一次
+            // 窗口变化事件才被"弹"出来。
+            if (ImeWindowState.visible) {
+                applyImeWindow(true, ImeWindowState.topPx, ImeWindowState.heightPx)
+            }
             // 插件要求的初始形态（非 auto 时生效）。
             when (appearance.state) {
                 BubbleAppearance.STATE_EXPANDED -> expand()
@@ -1332,6 +1590,7 @@ class FloatingBubble(private val context: Context) {
         if (!attached) return
         val v = root ?: return
         attached = false
+        ImeWindowState.setKeepPolling(false)
         hideStatusBubble()
         // 停掉轮播与动效：视图都要移除了，继续 postDelayed 只是空转耗电，
         // 而且回调里会碰到已经 detach 的 ImageView。
@@ -3314,16 +3573,26 @@ class FloatingBubble(private val context: Context) {
                 val h = v.height.takeIf { it > 0 } ?: boxH()
                 val dm = context.resources.displayMetrics
                 val minY = dp(TOP_MARGIN_DP).toFloat()
-                val maxY = (floorYOverride
-                    ?: (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx).toFloat())
-                    .coerceAtLeast(minY)
+                // 地面有两个来源，优先级：调用方显式指定的落点（键盘顶飞传进来的
+                // `floorYOverride`）> 键盘避让算出的地面 `maxWindowY(h)`。
+                //
+                // ⚠️ 两者不冲突：`maxWindowY` 在无障碍看到键盘时就是键盘顶，而顶飞
+                //   的 override 是「安全线上方」—— 顶飞那一刻球还在键盘底下，两个
+                //   地面都高于它，谁先谁后不影响结论，但 override 必须优先，否则
+                //   这次抛掷会落在键盘顶上而不是用户要的安全线。
+                val floor = (floorYOverride ?: maxWindowY(h).toFloat()).coerceAtLeast(minY)
+                // ⚠️ 球此刻**还压在键盘底下、正在往上飞**（被弹开的第一段）时，
+                //   这一帧绝不能套地面判据：物理层会把"y 大于地面"当成落地，
+                //   立刻把球夹到地面并翻转速度 —— 弹射会变成"原地抖一下"。
+                //   判据是「在地面之下且速度朝上」，越过地面之后自动恢复常规地面。
+                val risingOutOfFloor = st.y > floor && st.vy < 0f
 
                 val step = physics.step(
                     st, dt,
                     minX = 0f,
                     minY = minY,
                     maxX = (dm.widthPixels - w).coerceAtLeast(0).toFloat(),
-                    maxY = maxY,
+                    maxY = if (risingOutOfFloor) Float.POSITIVE_INFINITY else floor,
                 )
 
                 moveTo(st.x.roundToInt(), st.y.roundToInt())
@@ -3414,6 +3683,15 @@ class FloatingBubble(private val context: Context) {
     private fun startImeWatching() {
         if (!appearance.imeFlingEnabled) {
             Log.i(TAG, "键盘顶飞未启用（无特权通道或用户关闭）")
+            return
+        }
+        // ⚠️ **两套检测严格互斥**，见 `KeyboardAvoid.Source`：
+        //   无障碍在跑时它已经能事件驱动地拿到键盘真实边界，再让 `dumpsys`
+        //   轮询只会打架 —— 无障碍说"收起了"、ADB 那条晚 2 秒还认为弹着，
+        //   球的落点会在两个结论之间来回跳。
+        if (KeyboardAvoid.source(context) == KeyboardAvoid.Source.A11Y) {
+            Log.i(TAG, "键盘探针不启动：无障碍哨兵已在提供键盘状态（更快，无需特权）")
+            imeProbe.stop()
             return
         }
         if (!imeProbeWired) {
@@ -3557,8 +3835,9 @@ class FloatingBubble(private val context: Context) {
     private fun clampInto(x: Int, y: Int, w: Int, h: Int): Pair<Int, Int> {
         val dm = context.resources.displayMetrics
         val minY = dp(TOP_MARGIN_DP)
-        // 键盘弹出时可用高度要扣掉键盘，否则"夹进可见区域"会把面板留在键盘底下。
-        val maxY = (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx).coerceAtLeast(minY)
+        // 底边与物理循环共用同一个判据（maxWindowY）：键盘可见时是键盘顶，
+        // 否则是屏幕底减去 [imeHeightPx]。两边各写一份会让"拖动"与"松手"打架。
+        val maxY = maxWindowY(h).coerceAtLeast(minY)
         val nx = x.coerceIn(0, (dm.widthPixels - w).coerceAtLeast(0))
         val ny = y.coerceIn(minY, maxY)
         return nx to ny

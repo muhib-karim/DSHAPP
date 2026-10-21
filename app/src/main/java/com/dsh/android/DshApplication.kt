@@ -108,6 +108,10 @@ class DshApplication : Application() {
         //   通知权限框，错过就再也不问。原实现渠道要等用户点「配对」才建，
         //   于是首次打开 App 永远拿不到那个弹框，必须退出重进（见方法注释）。
         AdbPairingNotifier.ensureChannel(this)
+        // 键盘哨兵（无障碍）是可选能力：用户开过就记一条"已连接"，没开就提示路径。
+        // 只写日志、不弹窗 —— 没开它 App 照样能用，只是悬浮球不会避让键盘。
+        runCatching { BubbleA11yService.logState(this) }
+            .onFailure { DshLog.w(TAG, "检查键盘哨兵状态失败", it) }
         bootstrapTermux()
         // 崩溃后留下的待传诊断包，在这里补传（不阻塞启动，见该方法注释）。
         uploadPendingBundles()

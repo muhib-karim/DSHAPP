@@ -214,3 +214,104 @@ if (allowEdgeCollapse && appearance.edgeSnap && overshoot >= dp(EDGE_OVERSHOOT_D
 
 ⇒ **任何新的插件侧入口都要先确认 `appContext` 已经就位**，别假设它一定是非空的。
 
+#### 键盘弹起时球被盖住 —— 无障碍「键盘哨兵」+ 向上弹射
+
+**症状**：球放在屏幕底部时，用户在别的 App 里一弹键盘，球整个被键盘盖住 ——
+看得见「球在那儿」，却拖不到、点不着，要先关掉键盘。展开态反而没事，它有
+「输入框聚焦 ⇒ 预留键盘高度」那套（见 `applyImeHeight`）。
+
+**根因**：`TYPE_APPLICATION_OVERLAY` 的 z 序在输入法**之下**，而普通应用拿不到
+「全局键盘可见性」：`WindowInsets.Type.ime()` 只属于自己获得焦点的那扇窗。
+收起态的球没有焦点，于是它对键盘一无所知。
+
+**做法**（`BubbleA11yService` + `ImeWindowState`）：
+
+```
+无障碍 getWindows() → TYPE_INPUT_METHOD 窗口 → getBoundsInScreen()
+        └─ rect.top = 键盘顶，屏幕高 - rect.top = 键盘高度
+        └─ ImeWindowState.publish()（去重）
+                └─ FloatingBubble.onImeWindow() → applyImeWindow()
+                        ├─ 球被盖住 → bounceOffKeyboard()：算初速度向上弹射
+                        └─ 键盘收起且球停在键盘顶 → dropFromKeyboard()：交给重力落下
+```
+
+**四个必须记住的判据**：
+
+1. **「窗口在列表里」≠「键盘开着」**。收起时部分 ROM 仍返回一个零高度或屏幕外的
+   IME 窗口，必须同时判 `height() > 0` 与 `top < 屏幕高`，否则键盘会被判成「永远开着」。
+2. **弹射不能沿用「落地」那条地面判据**。球起步时在键盘**底下**（`y > 地面`），
+   而 `BubblePhysics.step()` 见到 `y > maxY` 会立刻夹到地面并翻转速度 ——
+   弹射会退化成「原地抖一下」。物理循环里的判据是「在地面之下 **且** 速度朝上」
+   时不套地面（`risingOutOfFloor`），越过地面之后自动恢复。
+3. **地面只有一个真相源**：`maxWindowY()`。物理循环与 `clampInto()` 都用它 ——
+   各写一份会出现「拖的时候停在键盘上、松手又弹到别处」。
+4. **只有真的靠在键盘顶上的球才在键盘收起时下落**（容差 `IME_REST_TOLERANCE_DP`）。
+   否则会变成「一收键盘，放在屏幕中间的球自己往下掉」，与「扔到哪就待在哪」冲突。
+
+**启用方式**（一次性，用户自己开）：系统设置 → 无障碍 → **DSH 键盘哨兵**。
+也可以走特权通道：
+
+```
+settings put secure enabled_accessibility_services <包名>/com.dsh.android.BubbleA11yService
+settings put secure accessibility_enabled 1
+```
+
+⚠️ 第二条会**覆盖**原有的服务列表，已有的话先读出来、用 `:` 接上再写。
+⚠️ 没启用时一切照旧（只是不避让），启动日志里有一条「键盘哨兵：未启用 —— …」。
+⚠️ 服务只索取 `flagRetrieveInteractiveWindows`（窗口位置/尺寸），代码里**没有**
+`getRootInActiveWindow()`，不读任何窗口内容。
+
+**权限检测与功能开关：只在设置页里，不弹窗**
+
+⚠️ 早期版本在「打开悬浮球开关」和「App 回到前台」时自动弹原生对话框要权限 ——
+**已按用户反馈移除**。理由：无障碍是**键盘避让**这一个功能的权限，而它现在有自己
+的卡片；在"开气泡"这个动作上顺手弹一个无障碍对话框，用户不知道自己在确认什么。
+
+悬浮气泡分节（`mobile-ui-plugin/dsh-android-mobile` 的 `mpBubbleSection`）里的
+「键盘避让」卡片自己承载三件事：
+
+| 元素 | 事实来源 | 动作 |
+|---|---|---|
+| **开关**（46×26 switch，默认开） | `KeyboardAvoid.isEnabled` → SharedPreferences | `keyboardAvoidSetEnabled` |
+| **去开启权限**按钮（未授权时显示） | `BubbleA11yService.isEnabled`（`Settings.Secure`） | `keyboardAvoidRequestPermission` 跳系统设置 |
+| 状态徽章 + 结论文案 | 上面两个字段的组合 | 只读 |
+
+原生三个桥方法（`PageBridge`）：`keyboardAvoidState()`（返回
+`{"enabled":bool,"a11y":bool}`）、`keyboardAvoidSetEnabled()`、
+`keyboardAvoidRequestPermission()`。两个字段**必须分开报** —— 与 `bubbleState`
+的 `enabled`/`granted` 同一套理由：开关开着但没授权时，用户该看到「还差一步：
+去开权限」，而不是笼统的"不可用"。
+
+⚠️ **改 `mobile-ui-plugin/**/client.js` 必须同时 bump 两处**，否则设备上那棵树
+命中「两戳都一致 ⇒ 整棵树跳过」，设置页永远看不到新卡片（静默）：
+`EngineManager.MOBILE_UI_VERSION`（1.0.0-67 → -68）与
+`tools/build-webview-compat.ps1` 的 `-CompatVersion`（23 → 24），并重打
+`mobile-ui.zip` + 重跑该脚本。
+
+**两个手感参数**（真机反馈调过一轮）：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `IME_FLOOR_PAD_DP` | 64 | 球底与键盘顶的间距。8dp 时球压住了键盘上方的**文字选择工具栏**（约 48dp 高），64 = 工具栏 + 余量 |
+| `IME_BOUNCE_GAIN` | 3.36 | 弹射初速倍数（1.12 余量 × 3 倍产品要求）。按 v² 关系，弹起高度约为原来的 9 倍，通常会顶到屏幕顶部再落回键盘上 |
+| `IME_BOUNCE_SIDE_RATIO` | 0.18 | 水平分量占比，方向朝屏幕中心（左半边往右、右半边往左），轨迹斜着出去而不是笔直上下 |
+
+**响应延迟**：纯事件驱动在这台 ROM 上不灵（`TYPE_WINDOWS_CHANGED` 不保证发），
+所以兜底轮询是**唯一**的检测来源。三级节奏：
+
+| 场景 | 常量 | 间隔 |
+|---|---|---|
+| 球不在场 | `POLL_IDLE_MS` | 1000ms（只为状态不卡死） |
+| 球在场，平时 | `POLL_ACTIVE_MS` | 120ms |
+| 收到任何相关事件后的 1.5s | `POLL_TURBO_MS` / `TURBO_MS` | 50ms |
+
+事件类型注册了 `typeViewFocused`：键盘总是紧跟着「输入框获得焦点」出现，
+把焦点事件当作**加速窗口的起跑信号**，比等键盘窗口自己冒出来更早踩到采样点。
+每条事件还会限流打一行 `无障碍事件: …` —— 真机上用它确认这台 ROM 到底发不发事件。
+
+⚠️ 检测到键盘后回调是**直接**在主线程调 `applyImeWindow`（不加 `post`），
+省掉一帧：延迟已经从「轮询间隔」压缩到「窗口出现 + ≤50ms + 一帧」这个量级。
+
+⚠️ 弹射只在 `throwState == null` 时发起：键盘弹出动画期间 `topPx` 会变好几次，
+每次变化都会走一遍 `applyImeWindow`；不挡住的话球会被反复"重新发射"，看起来像原地抽搐。
+
