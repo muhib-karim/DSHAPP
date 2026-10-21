@@ -5,7 +5,7 @@ name: Emulator smoke
 # first screen, the chat screen and the settings screen (artifact emulator-screenshots).
 on:
   push:
-    branches: [main, 'release/**']
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:

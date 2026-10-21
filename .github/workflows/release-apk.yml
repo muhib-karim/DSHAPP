@@ -7,7 +7,7 @@ name: Release APK
 # otherwise a throwaway key made for this run (installs, but cannot update an install signed by another run).
 on:
   push:
-    branches: [main, 'release/**']
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
