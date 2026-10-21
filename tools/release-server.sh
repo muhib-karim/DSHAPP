@@ -75,15 +75,20 @@ mkdir -p "$TMP"
 cp -f "$SYS_APK" "$TMP/DSH$VER.apk"
 cp -f "$GCK_APK" "$TMP/DSH$VER-webview.apk"
 
-# FID 每次都变，必须现查
+# FID 每次都变（同一目录连查 3 次拿到 3 个不同值），**绝不能缓存复用**，
+# 每次操作前必须现查。
+#
+# 返回的 JSON 里字段顺序是：fid → parent_fid → filename，
+# 所以正则必须按「fid 在前、filename 在后」写。
 FID=$(cd "$QUARK" && node scripts/quark-drive.cjs search \
         --keyword 'DSH APP' --search-type dir 2>/dev/null \
-      | grep -oP '"filename":"DSH APP"[^}]*?"fid":"\K[^"]+' | head -1)
-# 兜底：fid 在 filename 之前的情况
+      | grep -oP '"fid":"\K[^"]+(?=","parent_fid":"[^"]*","category":[0-9]+,"filename":"DSH APP")' \
+      | head -1)
+# 兜底：万一夸克改了字段顺序，退化成宽松匹配（先抓含 DSH APP 的那一段，再取段内 fid）
 if [ -z "$FID" ]; then
   FID=$(cd "$QUARK" && node scripts/quark-drive.cjs search \
           --keyword 'DSH APP' --search-type dir 2>/dev/null \
-        | grep -oP '"fid":"\K[^"]+(?=","parent_fid"[^}]*"filename":"DSH APP")' | head -1)
+        | grep -oP '\{"fid":"\K[^"]+(?="[^}]*"filename":"DSH APP")' | head -1)
 fi
 [ -z "$FID" ] && { echo "❌ 查不到「DSH APP」目录的 FID"; exit 1; }
 echo "▶ 目标目录 FID：${FID: -12}"
