@@ -2257,22 +2257,21 @@ class EngineManager private constructor(private val context: Context) {
     /**
      * 把内置号池接到 Agnes 多模态插件上（写 `$DSH_HOME/ag-multimodal.json`）。
      *
-     * ## 为什么这样接得上
-     *
      * 插件调 `readAccounts()` 拿账号池，每条形如 `{endpoint, key}`，然后直接
-     * `Authorization: Bearer <key>` 发出去。而内置号池的真密钥**不在 JS 层** ——
-     * 它们由 `libkeyinject.so` 在 `SSL_write` 里换掉，条件是「头部区域含
-     * [KEY_PLACEHOLDER]」。所以这里写的 `key` 就是那个**占位符**：
-     * 插件照常拼请求头，注入层在加密前把它换成随机抽中的真钥匙，与聊天那条链路
-     * 走的是同一个机制、同一个池子。
+     * `Authorization: Bearer <key>` 发出去。
      *
-     * ## ⚠️ endpoint 必须用国际站域名
+     * ## 号池改为服务端网关后的变化
      *
-     * 抽到国内站钥匙时，注入层靠**等长改写 Host 头**把请求路由到国内站，而基准
-     * 域名只能是较长的 `apihub`（`api.agnes-ai.cn` 加 3 个尾空格才够 18 字节 ——
-     * 18 − 15 = 3，别写成 4，见 `keyinject.c` 的 `KI_HOST_CN` 与那条 `_Static_assert`）。
-     * 这里若写 `api.agnes-ai.cn`，注入层找不到 `KI_HOST_INTL` 可改 —— 抽到国内站
-     * 钥匙就会拿国内站密钥去打国内站域名之外的路由，稳定 401。见 [KEY_BASE_URL]。
+     * 以前这里写的 `key` 是占位符 `sk-ANON…`，由 `libkeyinject.so` 在 `SSL_write`
+     * 里换成真钥匙；`endpoint` 必须用国际站域名，因为要靠等长改写 Host 头做
+     * 两站路由。**那条链路已整体下线**。
+     *
+     * 现在：
+     * - `endpoint` = 网关地址 [KEY_BASE_URL]
+     * - `key`      = 网关令牌 [KEY_PLACEHOLDER]
+     *
+     * 真密钥、两站路由、429 换号重试**全部由服务器负责**，客户端不需要知道
+     * 底下有几个站点、几把钥匙。
      *
      * ## ⚠️ 内置号是「不可删除、不可更改」的，所以每次启动都要修复
      *
@@ -2306,11 +2305,14 @@ class EngineManager private constructor(private val context: Context) {
             // 用户行原样保留、保持原有顺序（它们排在前面 ⇒ 优先级更高）。
             for (i in 0 until accounts.length()) {
                 val row = accounts.optJSONObject(i) ?: continue
-                // 内置行（认标记，也认占位符 —— 老配置里只有 endpoint/key 两个字段）
-                // 一律跳过，下面统一追加权威值。
-                if (row.optBoolean("builtin") || row.optString("key") == KEY_PLACEHOLDER) continue
-                if (row.optString("key").isBlank()) continue
-                next.put(JSONObject().put("endpoint", row.optString("endpoint")).put("key", row.optString("key")))
+                // 内置行一律跳过，下面统一追加权威值。认三种标记：
+                //   - `builtin` 布尔标记（当前写法）
+                //   - 老版本的 TLS 注入占位符 `sk-ANON…`（升级前写下的）
+                //   - 当前网关令牌（用户手改后被纠正）
+                val key = row.optString("key")
+                if (row.optBoolean("builtin") || key == LEGACY_KEY_PLACEHOLDER || key == KEY_PLACEHOLDER) continue
+                if (key.isBlank()) continue
+                next.put(JSONObject().put("endpoint", row.optString("endpoint")).put("key", key))
             }
             // 内置号恒在最后一位（池尾兜底），带 builtin 标记。
             next.put(
@@ -2993,21 +2995,20 @@ class EngineManager private constructor(private val context: Context) {
      * 此时引擎照常启动、只是没有内置号池，用户仍可自己配 provider。
      */
     private fun ensureKeyInject(): File? {
-        val dest = File(context.filesDir, KEYINJECT_FILE)
-        return try {
-            // 每次都覆盖写：库只有 11KB，且它随 APK 升级而变，比对哈希不值当
-            context.assets.open(KEYINJECT_ASSET).use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
-            }
-            dest.setReadable(true, false)
-            dest.setExecutable(true, false)
-            Log.i(TAG, "已解出号池注入库 $KEYINJECT_FILE (${dest.length()} 字节)")
-            dest
-        } catch (t: Throwable) {
-            // 没有资产 = 没跑生成脚本，属于正常状态，不是错误
-            Log.i(TAG, "未内置号池注入库（未运行 tools/build-keyinject.ps1），跳过")
-            null
+        // ⚠️ 号池改为服务端网关后，本方法**不再解出注入库**，恒返回 null。
+        //
+        // 保留这个函数（而不是删掉调用点）有两个原因：
+        //   1. 调用点有三处（start / rescue / LD_PRELOAD 拼接），删函数要连带
+        //      改多处控制流，风险大于收益；
+        //   2. 老安装的 `filesDir/libkeyinject.so` 需要顺手清掉 —— 留着它虽然
+        //      不会再被 LD_PRELOAD 加载，但会让人误以为注入层还在。
+        //
+        // 真正删掉的是：assets/keyinject.bin（不再打进 APK）、
+        // app/src/main/jni/keyinject.c、tools/build-keyinject.ps1 的产物链路。
+        File(context.filesDir, KEYINJECT_FILE).takeIf { it.isFile }?.let {
+            if (it.delete()) Log.i(TAG, "已删除旧的号池注入库: ${it.name}")
         }
+        return null
     }
 
     /**
@@ -3053,7 +3054,7 @@ class EngineManager private constructor(private val context: Context) {
      * 的一部分，用户删掉它就等于弄丢了号池，所以每次启动都要确保它在。但**只补缺**
      * （见 [mergeKeyPoolProvider]），已有 `agnes:` 时一个字节都不动。
      */
-    private fun ensureKeyPoolProvider(inject: File?, profile: String = PROFILE_NAME): Boolean {
+    private fun ensureKeyPoolProvider(profile: String = PROFILE_NAME): Boolean {
         // 老版本把内置号池写成 --patch overlay（keyinject.patch.yml）。那个写法会
         // 在最顶层整块替换 `llm-pi-ai` 那行，把用户自己的 provider 一起盖掉 ——
         // 见 [KEY_POOL_NS]。这份残留**必须无条件删掉**（与号池资产在不在无关）：
@@ -3061,7 +3062,9 @@ class EngineManager private constructor(private val context: Context) {
         File(dshHome, KEYINJECT_PATCH).takeIf { it.isFile }?.let {
             if (it.delete()) Log.i(TAG, "已删除旧的内置号池 overlay: ${it.name}")
         }
-        if (inject == null) return false
+        // ⚠️ 号池改为服务端网关后，不再依赖本地注入库，所以这里**不再**有
+        // 「没有 libkeyinject.so 就跳过」的短路。旧逻辑的因果已经不存在了 ——
+        // 现在只要网关可用，号池就该在（原参数 `inject: File?` 已随之删除）。
 
         val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
@@ -6770,16 +6773,16 @@ class EngineManager private constructor(private val context: Context) {
         val pluginManagerPatch = writePluginManagerPatch()
         // link 兼容层：SELinux 不给 app_data_file 的 link 权限，需在 libc 边界转译
         val linkCompat = ensureLinkCompat()
-        // 内置号池：密钥在 TLS 层注入，配置与磁盘上只有占位符。
-        // 资产缺失（没跑生成脚本）时返回 null，引擎照常启动、只是没有内置号池。
-        val keyInject = ensureKeyInject()
+        // 内置号池：已改为**服务端网关**，本地不再解出注入库。
+        // 这里调用是为了清掉老安装残留的 libkeyinject.so，恒返回 null（结果不使用）。
+        ensureKeyInject()
         // ⚠️ **不能**走 `--patch` overlay：overlay 在最顶层整块替换 `llm-pi-ai`
         // 那一行的 config，会把用户在 GUI 里新建的 provider 一起盖掉，于是
         // `dsh-config-editor` 的写入校验直接抛
         // `Configuration for "llm-pi-ai" is overridden by a home patch or
         // command-line overlay` —— 用户表现为「一添加第三方 API 就报错」。
         // 所以改为把内置号池**补进 profile 的用户配置层**（见 [ensureKeyPoolProvider]）。
-        ensureKeyPoolProvider(keyInject)
+        ensureKeyPoolProvider()
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
@@ -6798,7 +6801,7 @@ class EngineManager private constructor(private val context: Context) {
         //     引擎读不了（`profile "rescue" does not exist`），比不建更糟。
         if (rescueProfileDir != null) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
-            ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
+            ensureKeyPoolProvider(RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
         }
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
@@ -6993,23 +6996,23 @@ class EngineManager private constructor(private val context: Context) {
             // link()/linkat() 语义转译：SELinux 不允许 untrusted_app 对 app_data_file
             // 做硬链接，而 DSH 上游用硬链接做独占原子发布。见 [ensureLinkCompat]。
             //
-            // 号池注入库同在这条链上，所以**必须用列表拼接而不是覆盖** ——
-            // 两个库都要生效。见 [ensureKeyInject]。
+            // ⚠️ 号池注入库已下线（改为服务端网关），现在这里只剩 linkcompat 一个。
+            //    仍用列表拼接而不是覆盖，是为了将来加库时不用改结构。
             //
             // ⚠️ 只加在本进程：LD_PRELOAD 会一并继承给 node spawn 的子进程（如 shell
-            // 工具）。对这两个库都无害（linkcompat 只 hook link/linkat 且先试原生；
-            // keyinject 只 hook SSL_*，没有 TLS 的子进程根本不会碰到），但若将来要
-            // 往 LD_PRELOAD 里追加别的库，务必确认不会破坏系统二进制。
-            val preloads = listOfNotNull(linkCompat, keyInject).map { it.absolutePath }
+            // 工具）。linkcompat 只 hook link/linkat 且先试原生，对系统二进制无害。
+            val preloads = listOfNotNull(linkCompat).map { it.absolutePath }
             if (preloads.isNotEmpty()) {
                 // 空格分隔，与 boo-sandbox-run.c 里追加 LD_PRELOAD 的写法一致
                 put("LD_PRELOAD", preloads.joinToString(" "))
             }
-            // 内置号池的凭据引用指向**占位符**，不是真密钥：真密钥在 TLS 层由
-            // libkeyinject.so 换上。所以这里泄露出去也无所谓 —— 这正是设计意图。
-            if (keyInject != null) {
-                put(KEY_ENV, KEY_PLACEHOLDER)
-            }
+            // 内置号池的凭据引用指向**网关令牌**。
+            //
+            // ⚠️ 与旧逻辑的关键差异：以前这里只在注入库解出成功时才设置，因为
+            // 占位符要靠注入库才会被替换 —— 没有库就宁可不设。现在令牌**不需要
+            // 任何本地组件**，所以必须无条件设置，否则引擎解析 `apiKeyEnv` 时
+            // 拿不到值，会报 `MISSING_CREDENTIAL`，号池直接不可用。
+            put(KEY_ENV, KEY_PLACEHOLDER)
             // 沙箱 runner 靠它定位 LD_PRELOAD 拦截器。runner 会把它追加到子进程
             // 的 LD_PRELOAD 里（保留这里已有的 link 兼容层，两个库都生效）。
             put("BOO_SANDBOX_LIB", File(context.filesDir, SANDBOX_LIB_FILE).absolutePath)
@@ -8118,7 +8121,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val AGNES_MM_DIR = "agnes-multimodal"
 
         /** 插件内容版本戳：改了 `agnes-multimodal.zip` 里任何东西都必须改这里。 */
-        private const val AGNES_MM_VERSION = "1.0.0-3"
+        private const val AGNES_MM_VERSION = "1.0.0-4"
         private const val AGNES_MM_STAMP = ".agnes_mm_version"
 
         /** 插件自己的账号池状态文件（`lib/index.js` 的 `readAccounts()` 读的就是它）。 */
@@ -8384,8 +8387,17 @@ class EngineManager private constructor(private val context: Context) {
         private const val LINKCOMPAT_ASSET = "linkcompat.bin"
         private const val LINKCOMPAT_FILE = "liblinkcompat.so"
 
-        /** 内置号池的注入库（见 `ensureKeyInject()` 与 `app/src/main/jni/keyinject.c`）。 */
-        private const val KEYINJECT_ASSET = "keyinject.bin"
+        /**
+         * **旧版**号池注入库的文件名，仅用于**清理**老安装的残留。
+         *
+         * 号池已改为服务端网关，不再需要 `LD_PRELOAD` 注入。这个常量保留下来
+         * 只为一件事：`ensureKeyInject()` 要把用户设备上残留的
+         * `filesDir/libkeyinject.so` 删掉 —— 留着它虽然不会再被加载，但会让人
+         * 误以为注入层还在，排查问题时造成误导。
+         *
+         * ⚠️ 对应的资产 `assets/keyinject.bin` 与源码 `jni/keyinject.c` **已删除**，
+         * 不要再加回来。旧的 `KEYINJECT_ASSET` 常量也一并删掉了。
+         */
         private const val KEYINJECT_FILE = "libkeyinject.so"
 
         /**
@@ -8430,16 +8442,40 @@ class EngineManager private constructor(private val context: Context) {
         private val EMPTY_INLINE_VALUES = setOf("{}", "[]", "null", "~")
 
         /**
-         * 引擎配置里的匿名占位符。
+         * 网关令牌（替代旧的 TLS 层注入占位符）。
          *
-         * ⚠️ **必须与 `keyinject.c` 的 `KI_PLACEHOLDER` 逐字一致**，长度也必须等于
-         * 密钥长度（51）。等长替换是「不用重算 Content-Length」的前提，长度不等
-         * 会让请求错位失败。`tools/build-keyinject.ps1` 会读这个文件校验两者一致，
-         * 不一致时直接构建失败 —— 所以改这里必须同步改 C 侧。
+         * ## 为什么从「占位符 + LD_PRELOAD 注入」改成「网关令牌」
          *
-         * 占位符**不是秘密**：被粉丝读到也无所谓，它只是一把会被换掉的假钥匙。
+         * 旧方案把 132 把真密钥打进 APK，靠 `libkeyinject.so` 在 `SSL_write` 里
+         * 把占位符换成真钥匙。虽然做了混淆，但**密钥终究落在设备上** —— 一旦
+         * 泄漏就是 132 把一起丢，且换钥匙必须重新发版。
+         *
+         * 现在改为服务端中转：App 只持有这一个网关令牌，请求发到
+         * `agnes.jiulingssh.xyz`，由服务器按严格轮询挑选真密钥并注入。
+         * 好处：
+         *   - 真密钥永不落设备（`strings` / 环境变量 / 抓包都拿不到）
+         *   - 增删密钥只需改服务器上的 `agnes-keys.properties`，**不用发版**
+         *   - 429/5xx 由网关自动换号重试，客户端无感
+         *
+         * ⚠️ 这个令牌**不是秘密**（它随 APK 分发，粉丝能读到），所以网关侧必须
+         * 自己做限流与额度控制。令牌泄漏的后果是「额度被白嫖」，而不是「密钥泄漏」。
+         *
+         * ⚠️ 与旧 `KEY_PLACEHOLDER` 的兼容：老安装的 `ag-multimodal.json` 里可能
+         * 还留着占位符行，[seedAgnesAccounts] 认它并覆盖成新令牌。
          */
-        private const val KEY_PLACEHOLDER = "sk-ANON00000000000000000000000000000000000000000000"
+        private const val KEY_PLACEHOLDER = "sk-agnes-54a388522b26770c2b45aab2f5a22c0700b6be4c0f325a96"
+
+        /**
+         * **旧版**的 TLS 注入占位符，仅用于**识别并覆盖**老安装残留的配置行。
+         *
+         * 升级到网关方案前，`ag-multimodal.json` 与 provider 配置里写的是这个
+         * `sk-ANON…` 串。现在它已经没有意义（没有注入库会去替换它），但它会
+         * 留在用户设备上。`seedAgnesAccounts()` 认它并把整行替换成新令牌，
+         * 避免出现「用户有一条永远 401 的旧内置号」。
+         *
+         * ⚠️ **不要删除这个常量**，也不要把它当成有效配置使用。
+         */
+        private const val LEGACY_KEY_PLACEHOLDER = "sk-ANON00000000000000000000000000000000000000000000"
 
         /**
          * 内置号池的 provider 路由名。
@@ -8457,13 +8493,18 @@ class EngineManager private constructor(private val context: Context) {
         private const val KEY_PROVIDER_NAME = "Agnes"
 
         /**
-         * baseURL **必须**用较长的国际站域名。
+         * 网关地址（替代旧的直连国际站域名）。
          *
-         * combo 靠等长改写 Host 头区分站点：`apihub.agnes-ai.cn`（18 字符）可以
-         * 缩成 `api.agnes-ai.cn` + 3 个尾部空格（同为 18），反过来则没有等长写法。
-         * 所以基准域名只能是国际站 —— 国内站的钥匙由 `keyinject.c` 把 Host 改短。
+         * 旧方案 baseURL 指向 `apihub.agnes-ai.cn`，靠 `keyinject.c` 等长改写
+         * Host 头在两个站点间路由 —— 那条链路已随注入层一起下线。
+         *
+         * 现在指向自建号池网关：两站钥匙的挑选与 Host 路由全部由**服务器**完成，
+         * 客户端只看到一普通 OpenAI 兼容端点，不需要知道底下有几个站点、几把钥匙。
+         *
+         * ⚠️ 保留 `/v1` 后缀：引擎的 `openai-completions` 会拼 `/chat/completions`，
+         * 与 OpenAI 官方 SDK 的习惯一致。
          */
-        private const val KEY_BASE_URL = "https://apihub.agnes-ai.cn/v1"
+        private const val KEY_BASE_URL = "https://agnes.jiulingssh.xyz/v1"
 
         /**
          * `apiKeyEnv` 引用的环境变量名。
@@ -8485,10 +8526,21 @@ class EngineManager private constructor(private val context: Context) {
          * **原样再列一遍**（值与 `dsh-llm/lib/types/retry-policy.js` 的
          * `DEFAULT_RETRYABLE_CODES` 逐字一致），漏掉哪个就等于把那类错误的重试关掉。
          *
-         * 五个默认值之外**多了一个 `AUTH`** —— 这就是本次改动的全部目的：
-         * 号池抽到死钥匙时上游回 401/403，`dsh-llm-pi-ai` 的 `classifyPiAiError`
-         * 把它归成 `AUTH`，而 `AUTH` 不在默认表里 ⇒ 不重试 ⇒ 报错中断用户。
-         * 加进来之后引擎会重发请求，`SSL_write` 重新随机抽钥匙，用户无感。
+         * 五个默认值之外**多了一个 `AUTH`**。
+         *
+         * ⚠️ 这条的**原始动机已随网关改造消失**，但**仍然保留**，理由如下：
+         *
+         * 旧方案里号池是「随机抽钥匙」，抽到死钥匙就回 401/403，所以要靠引擎
+         * 重发请求来换一把。现在网关自己会换号重试（`AGNES_MAX_ATTEMPTS`），
+         * 客户端正常情况下**收不到** 401 了。
+         *
+         * 但保留它仍有两个实际好处：
+         * 1. 网关令牌本身被吊销/更换时，客户端回 401 —— 重试虽无用，但能让
+         *    错误在界面上表现为「重试若干次后失败」，而不是瞬间中断；
+         * 2. 网关若因全池冷却返回 429（`RATE_LIMIT` 已在表里）或临时 5xx，
+         *    重试是有意义的。
+         *
+         * 换言之：`AUTH` 现在大概率是空转，但删掉它不会带来收益，留着无害。
          */
         private val KEY_RETRYABLE_CODES = listOf(
             "EMPTY_RESPONSE",

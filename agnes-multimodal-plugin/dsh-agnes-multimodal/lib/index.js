@@ -108,19 +108,34 @@ function appendLog(record) {
 }
 
 /**
- * 内置号：App 端注入的号池占位符。
+ * 内置号：App 端注入的号池条目。
  *
- * ⚠️ **必须与 `EngineManager.KEY_PLACEHOLDER` 逐字一致。** 它不是一把真密钥 ——
- * 真密钥由 `libkeyinject.so` 在 TLS 层（`SSL_write`）把这段占位符换掉，所以它
- * 落盘、进 JS、被用户看到都无所谓。长度（51）也必须一致：等长替换是「不用重算
- * Content-Length」的前提。
+ * ⚠️ **必须与 `EngineManager.KEY_PLACEHOLDER` 逐字一致。**
  *
- * endpoint 用国际站域名，原因同 App 侧：注入层抽到国内站钥匙时靠**等长**改写
- * Host 头路由，基准域名只能是较长的 `apihub`（`api.agnes-ai.cn` 加 4 个尾空格
- * 才够 18 字节）。
+ * ## 号池已改为服务端网关
+ *
+ * 以前这里是占位符 `sk-ANON…`，由 `libkeyinject.so` 在 TLS 层（`SSL_write`）
+ * 换成真密钥；endpoint 必须用国际站域名，因为要靠等长改写 Host 头做两站路由。
+ * **那条链路已整体下线**。
+ *
+ * 现在：
+ * - `endpoint` = 自建网关 `agnes.jiulingssh.xyz`
+ * - `key`      = 网关令牌
+ *
+ * 真密钥、两站路由、429 换号重试全部由服务器负责。令牌随 APK 分发、不是秘密，
+ * 网关侧靠限流兜底；真密钥永不落设备。
  */
-const BUILTIN_KEY = "sk-ANON00000000000000000000000000000000000000000000";
-const BUILTIN_ENDPOINT = "https://apihub.agnes-ai.cn/v1";
+const BUILTIN_KEY = "sk-agnes-54a388522b26770c2b45aab2f5a22c0700b6be4c0f325a96";
+const BUILTIN_ENDPOINT = "https://agnes.jiulingssh.xyz/v1";
+
+/**
+ * **旧版**的 TLS 注入占位符，仅用于识别老配置里残留的内置行。
+ *
+ * ⚠️ 不要把它当有效凭据使用 —— 没有注入库会去替换它，发出去必然 401。
+ * `isBuiltinAccount()` 认它，是为了把老行识别成内置行并覆盖成新令牌，
+ * 否则用户会留下一条永远失败的内置号。
+ */
+const LEGACY_BUILTIN_KEY = "sk-ANON00000000000000000000000000000000000000000000";
 
 /** 服务端权威的内置号条目 —— 客户端传来的内置条目一律以它为准。 */
 function builtinAccount() {
@@ -133,10 +148,13 @@ function builtinAccount() {
  * 标记优先、占位符兜底：老配置文件里没有 `builtin` 标记（App 早期版本播的种
  * 只有 endpoint/key 两个字段），只认标记会让那一行变成「可删可改的普通账号」，
  * 于是用户能把它删掉、内置号池就丢了。
+ *
+ * ⚠️ 必须同时认**新旧两种** key：升级到网关方案后，老设备上留的是
+ * `LEGACY_BUILTIN_KEY`（`sk-ANON…`），只认新的会把它当成用户自建账号。
  */
 function isBuiltinAccount(row) {
 	return row !== null && typeof row === "object"
-		&& (row.builtin === true || row.key === BUILTIN_KEY);
+		&& (row.builtin === true || row.key === BUILTIN_KEY || row.key === LEGACY_BUILTIN_KEY);
 }
 
 /** 把一行规整成账号条目；不合法返回 undefined。 */

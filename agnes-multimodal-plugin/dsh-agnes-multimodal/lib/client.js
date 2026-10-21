@@ -375,14 +375,18 @@ window.__ModuleLoader__.load({
 					});
 				}
 
-				// 用户行 + 内置号（内置号恒可用，它带的是会被 TLS 层换掉的占位符）。
+				// 用户行 + 内置号（内置号恒可用，它带的是网关令牌）。
 				// 顺序与 host 半一致：用户号在前先试，内置号在池尾兜底。
 				var userValid = accounts.filter(function(a) { return a.key.trim().length > 0; }).length;
 				var valid = userValid + (builtin !== null ? 1 : 0);
+				// ⚠️ 号池改为服务端网关后，内置号不再指向国际站域名，所以下面这个
+				// 「非国内站即算国际站槽位」的旧判据会把内置号误判成国际站。
+				// 这里改成：只统计**用户自己填的**国际站号；内置号单独加一个槽位
+				// （网关内部会自动在两站间路由，对客户端而言它是可用的）。
 				var intl = accounts.filter(function(a) {
 					return a.key.trim().length > 0 && !a.endpoint.includes("api.agnes-ai.cn");
 				}).length;
-				// 内置号的 endpoint 就是国际站，所以它也算一个国际站槽位。
+				// 内置号经网关可用，按一个槽位计入。
 				if (builtin !== null) intl += 1;
 				var imageCapacity = (intl > 0 ? intl : Math.max(valid, 1)) * 10;
 
@@ -455,19 +459,22 @@ window.__ModuleLoader__.load({
 				var builtinRow = null;
 				if (builtin !== null) {
 					var builtinRegion = regionFor(builtin.endpoint);
+					// 号池改为服务端网关后，内置号的 endpoint 不再是两个站点域名之一，
+					// regionFor 返回 null —— 此时显示「内置号池」，不要露出 URL
+					// （对用户无意义，且长度会把整行撑开）。
 					builtinRow = h("div", { className: "am-row am-row-builtin" },
 						h("span", { className: "am-idx" }, "内置"),
 						h("span", { className: "am-badge" }, "内置"),
 						h("span", { className: "am-region-fixed" },
-							builtinRegion !== null ? builtinRegion.label : builtin.endpoint
+							builtinRegion !== null ? builtinRegion.label : "内置号池"
 						),
 						h("input", {
 							className: "am-input",
 							type: "text",
-							value: "sk-ANON••••••••••••••••••••••••••••••••••••••",
+							value: "sk-agnes••••••••••••••••••••••••••••••••••••••",
 							readOnly: true,
 							tabIndex: -1,
-							title: "内置免费号池，密钥在传输层注入，不可查看或修改"
+							title: "内置免费号池，密钥由服务器中转，不可查看或修改"
 						}),
 						h("span", { className: "am-hint" },
 							userValid > 0

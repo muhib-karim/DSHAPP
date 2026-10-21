@@ -62,8 +62,16 @@ case "$BADGING" in
 esac
 
 # 键盘避让是本版新增能力，抽 zip 验一遍（防止 mobile-ui.zip 漏重打）
+#
+# ⚠️ 这里**不能**写成 `unzip ... | grep -q ...`。
+#    本脚本开了 `set -o pipefail`，而 `grep -q` 一命中就立刻退出，
+#    上游 `unzip` 随即收到 SIGPIPE 并以 141 结束 —— pipefail 据此判定整条
+#    管道失败，于是资产明明正确也会报「是旧的」。这个失败具有欺骗性：
+#    单独在命令行复现同样的管道命令往往又"通过"（取决于管道缓冲是否已写完），
+#    极难定位。改为先落盘、再对文件 grep，彻底避开 SIGPIPE。
 unzip -p "$SYS_APK" assets/mobile-ui.zip > "$TMP/mui.zip" 2>/dev/null
-if unzip -p "$TMP/mui.zip" lib/client.js 2>/dev/null | grep -q "kbRowSwitch"; then
+unzip -p "$TMP/mui.zip" lib/client.js > "$TMP/mui-client.js" 2>/dev/null
+if grep -q "kbRowSwitch" "$TMP/mui-client.js" 2>/dev/null; then
   echo "  ✅ mobile-ui 含键盘避让卡片"
 else
   echo "  ❌ mobile-ui.zip 是旧的（不含 kbRowSwitch）—— 需重打 assets/mobile-ui.zip"
@@ -97,7 +105,12 @@ for f in "$TMP/DSH$VER.apk" "$TMP/DSH$VER-webview.apk"; do
   name=$(basename "$f")
   echo "▶ 上传 $name（$(du -m "$f" | cut -f1) MB）…"
   OUT=$(cd "$QUARK" && node scripts/quark-drive.cjs upload "$f" --parent-fid "$FID" 2>&1 | tail -1)
-  if echo "$OUT" | grep -q '"successCount":1'; then
+  # 同上：用 case 做子串匹配，不用 `echo | grep -q`（SIGPIPE + pipefail 会误判）
+  case "$OUT" in
+    *'"successCount":1'*) UPLOAD_OK=1 ;;
+    *) UPLOAD_OK=0 ;;
+  esac
+  if [ "$UPLOAD_OK" = 1 ]; then
     echo "  ✅ 落地：$(echo "$OUT" | grep -oP '"fullPath":"\K[^"]+')"
   else
     echo "  ❌ 上传失败：$OUT"
@@ -107,7 +120,20 @@ done
 
 # ── 4. 归档旧包：根目录只留本次两个 ────────────────────────────────────────
 echo "▶ 整理目录（旧包 → 历史版本）…"
-LIST=$(cd "$QUARK" && node scripts/quark-drive.cjs browse --parent-fid "$FID" --all 2>/dev/null)
+#
+# ⚠️ 夸克 CLI 的 browse 会偶发 `{"code":1007,"msg":"文件列表第 1 页失败"}`
+#    （服务端抖动，非权限问题），返回里没有 filename 字段。不重试的话
+#    这里会拿到空列表 ⇒ 误报「找不到历史版本」并静默跳过归档，
+#    于是根目录越堆越多。必须重试。
+LIST=""
+for i in 1 2 3 4; do
+  LIST=$(cd "$QUARK" && node scripts/quark-drive.cjs browse --parent-fid "$FID" --all 2>/dev/null)
+  case "$LIST" in
+    *'"filename"'*) break ;;
+    *) echo "  ⚠️ browse 第 $i 次失败（夸克抖动），重试…"; sleep 2; LIST="" ;;
+  esac
+done
+[ -z "$LIST" ] && { echo "❌ browse 连续失败，放弃归档（文件已上传成功）"; exit 0; }
 
 HIST_FID=$(echo "$LIST" | grep -oP '"fid":"\K[^"]+(?="[^}]*"filename":"历史版本")' | head -1)
 if [ -z "$HIST_FID" ]; then
@@ -123,7 +149,11 @@ echo "$LIST" | grep -oP '\{"fid":"[^"]+"[^}]*?"filename":"[^"]+\.apk"' | while r
     "DSH$VER.apk"|"DSH$VER-webview.apk") echo "  ⏭ 保留 $fname" ;;
     *)
       R=$(cd "$QUARK" && node scripts/quark-drive.cjs move "$ffid" --target-fid "$HIST_FID" 2>&1 | tail -1)
-      if echo "$R" | grep -q '"move_path"'; then
+      case "$R" in
+        *'"move_path"'*) MOVE_OK=1 ;;
+        *) MOVE_OK=0 ;;
+      esac
+      if [ "$MOVE_OK" = 1 ]; then
         echo "  ✅ $fname → 历史版本"
       else
         echo "  ⚠️ $fname 归档失败：$R"
