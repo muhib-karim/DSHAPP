@@ -8791,8 +8791,18 @@ class EngineManager private constructor(private val context: Context) {
          *      只重打 `mobile-ui.zip` 而不 bump `-CompatVersion`（21 → 22），
          *      设备上会命中「两戳都一致 → 整棵树跳过」，继续跑旧群的二维码 ——
          *      而日志不会打任何东西（版本没变），看起来像"什么都没发生"（同 v65 的坑）。
+         *
+         * 1.0.0-67：悬浮气泡分节新增「键盘避让」卡片（功能开关 + 无障碍权限检测/入口）。
+         *      同 1.0.0-66 的道理：改的是 `mobileui/lib/client.js`，降级产物随之变化，
+         *      **`-CompatVersion` 必须同步 bump 到 23**，否则老设备会命中「两戳都一致
+         *      ⇒ 整棵树跳过」，继续跑没有这张卡的旧版本。
+         *
+         * 1.0.0-68：键盘避让改用**开关形态**（46×26 switch）+ 独立的「去开启权限」按钮；
+         *      同时移除了「打开悬浮球开关时自动弹无障碍对话框」的行为（用户反馈：
+         *      权限申请应该由这张卡触发，而不是开气泡时被弹窗打断）。
+         *      `-CompatVersion` 同步 bump 到 24。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-66"
+        private const val MOBILE_UI_VERSION = "1.0.0-68"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

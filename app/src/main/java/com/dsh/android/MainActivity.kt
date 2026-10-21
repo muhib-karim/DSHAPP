@@ -1630,6 +1630,9 @@ class MainActivity : AppCompatActivity() {
             JSONObject()
                 .put("enabled", FloatingBubble.isEnabled(this@MainActivity))
                 .put("granted", FloatingBubble.canDrawOverlays(this@MainActivity))
+                // 键盘避让所需的无障碍是否已开。与上两项独立：悬浮窗授权了、
+                // 开关也打开了，没有无障碍照样不会避让键盘。
+                .put("a11y", BubbleA11yService.isEnabled(this@MainActivity))
                 .toString()
         } catch (t: Throwable) {
             Log.w(DshApplication.TAG, "读取气泡状态失败: ${t.message}")
@@ -1641,6 +1644,8 @@ class MainActivity : AppCompatActivity() {
             Log.i(DshApplication.TAG, "设置页切换悬浮气泡: $enabled")
             FloatingBubble.setEnabled(this@MainActivity, enabled)
             if (!enabled) FloatingBubble.hideNow()
+            // ⚠️ 这里**不弹关联权限的提示**：键盘避让有自己那张卡片（开关 + 去开启权限），
+            //   在"开气泡"这个动作上顺手弹一个无障碍对话框，用户会不知道自己在确认什么。
         }
 
         /**
@@ -1669,6 +1674,27 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+        }
+
+        // ══ 键盘避让（无障碍）：设置页的开关与权限入口 ══════════════════
+        //
+        // 与气泡开关同一套接缝（JS 桥），理由也一样：开关在 SharedPreferences、
+        // 授权在 Settings.Secure，浏览器进程两样都读不到；拉起系统设置页更是
+        // Android 的能力。设置页只负责展示，事实全在原生侧。
+
+        override fun keyboardAvoidState(): String = KeyboardAvoid.stateJson(this@MainActivity)
+
+        override fun keyboardAvoidSetEnabled(enabled: Boolean) {
+            Log.i(DshApplication.TAG, "设置页切换键盘避让: $enabled")
+            // ⚠️ 这里**不**弹关联权限的提示：键盘避让有自己那张卡片（开关 + 去开启权限），
+            //   在"开气泡"这个动作上顺手弹一个无障碍对话框，用户会不知道自己在确认什么。
+            KeyboardAvoid.setEnabled(this@MainActivity, enabled)
+        }
+
+        override fun keyboardAvoidRequestPermission() {
+            Log.i(DshApplication.TAG, "设置页请求无障碍权限")
+            // ⚠️ 运行在 JS 线程，startActivity 必须回主线程。
+            runOnUiThread { KeyboardAvoid.requestPermission(this@MainActivity) }
         }
 
         // ══ 悬浮球：转录通道 + 插件外观接口 ══════════════════════════════

@@ -162,6 +162,41 @@
         </service>
 
         <!--
+            键盘哨兵（无障碍服务）：让它看到输入法窗口的位置与高度。
+
+            ## 为什么必须是无障碍
+
+            普通应用拿不到「全局键盘可见性」——`WindowInsets.Type.ime()` 只属于
+            自己获得焦点的那扇窗，而悬浮球在后台、没有焦点。`dumpsys input_method`
+            能读，但那要 uid 2000 在线且每次起进程轮询。无障碍的
+            `getWindows()` 是唯一零特权、事件驱动的一条。
+
+            ## 三个属性的理由
+
+            - `android:exported="true"`：**系统**（不是我们的进程）要能 bind 它，
+              不导出则服务永远不会被拉起；
+            - `android:permission="…BIND_ACCESSIBILITY_SERVICE"`：这是**保护**，
+              只有系统持有该权限，别的应用无法 bind 进来借我们的窗口列表；
+            - `android:label`：无障碍设置列表里显示的就是它，用户在那一屏决定
+              要不要授权，所以必须是看得懂的中文名（见 strings.xml）。
+
+            ⚠️ 服务没有在代码里 startService —— 启用后由系统按需拉起，这是
+              无障碍服务的设计，别改成手动启动。
+        -->
+        <service
+            android:name=".BubbleA11yService"
+            android:exported="true"
+            android:label="@string/bubble_a11y_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/bubble_accessibility_service" />
+        </service>
+
+        <!--
             运行日志界面（入口②）。
 
             ⚠️ **必须 `exported="false"`**：它是本进程内的诊断界面，没有任何

@@ -163,7 +163,12 @@ param(
     #      所以**必须 bump**：只重打 `mobile-ui.zip` 而不动这里，设备上那棵树会命中
     #      原有的戳字符串 `chrome74-v21`（**相等 ⇒ 跳过**），继续跑旧群的二维码。
     #      同 v21：判据是字符串相等，不是「这次跑过脚本」。
-    [string]$CompatVersion = "22",
+    # v23：悬浮气泡分节新增「键盘避让」卡片（功能开关 + 无障碍权限检测/入口）。
+    #      改的仍是 `mobileui/lib/client.js`，降级产物随之变化，必须 bump ——
+    #      不 bump 会命中「两戳都一致 → 整棵树跳过」，设备上的设置页继续没有这张卡。
+    # v24：键盘避让改成开关形态（46×26 switch）+ 独立「去开启权限」按钮；
+    #      移除「开气泡时自动弹无障碍对话框」。改的仍是 client.js，必须 bump。
+    [string]$CompatVersion = "24",
 
     [string]$EngineBin,
     [string]$OutZip
