@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 28
+        versionCode = 29
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -152,7 +152,31 @@ android {
         //        · 设置页 8 个说明副标题 3.71
         //      核心教训：同一颜色不可能亮暗两边都达标（亮底要深色、暗底要浅色），
         //      必须写两套；且占位符这类"故意淡"的文字不能拉满对比，会失去语义。
-        versionName = "0.3.2"
+        // 0.3.3（versionCode 29）：悬浮球键盘避让（无障碍）。
+        //      ① 合并 PR #3：新增 `BubbleA11yService`（无障碍哨兵），用
+        //         `getWindows()` 读 `TYPE_INPUT_METHOD` 窗口的真实 bounds ——
+        //         这是普通应用唯一能拿到「全局键盘可见性 + 键盘顶在哪」的路。
+        //         `WindowInsets.Type.ime()` 只属于自己获得焦点的那扇窗，悬浮窗拿不到。
+        //      ② 键盘弹起时按 v=sqrt(2*g*rise) 给球向上初速弹射，落回键盘上方；
+        //         键盘收起时贴键盘顶的球交给重力落下。
+        //      ③ **两套检测严格互斥**（`KeyboardAvoid.Source`）：A11Y（事件驱动
+        //         + ≤120ms）优先，SHELL（`dumpsys input_method` 轮询，2s 起）兜底，
+        //         都没有则 NONE —— 此时设置页开关置灰、原生拒绝打开。
+        //         不做并行：同一个事实两个来源会互相打架（无障碍说收起了、ADB 那条
+        //         晚 2 秒还认为弹着，球的落点在两个结论之间来回跳）。
+        //      ④ `BubbleAppearance` 的能力闸门改用 `KeyboardAvoid.isAvailable()`：
+        //         原来只判 `ShellPrivilege`，会把「开了无障碍（更快那条）但没
+        //         Shizuku」的用户误判成不可用、强制置灰。
+        //      ⑤ 修 0.3.3 自身的回归：`keyboardAvoid*` 三个方法只加进了 `PageBridge`
+        //         接口与 `MainActivity`，**两个 flavor 的 JS 桥白名单都漏了** ⇒
+        //         页面侧 `window.DSHAndroid.keyboardAvoidState` 是 undefined ⇒
+        //         走进 noBridge 分支把开关置灰，而原生日志一切正常（静默失败）。
+        //         两份白名单都是手工维护的，加 `PageBridge` 方法必须同步加进去。
+        //      ⚠️ 版本戳同步 bump：`MOBILE_UI_VERSION` 1.0.0-99 → -100，
+        //         `build-webview-compat.ps1 -CompatVersion` 33 → 34。
+        //         两个都是**字符串相等**判据，不 bump 会命中「戳一致 ⇒ 整棵树跳过」，
+        //         设备上静默跑回旧 UI（本项目已踩过 20 次以上）。
+        versionName = "0.3.3"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
