@@ -1,0 +1,3 @@
+# Upstream DSHAPP ships this fallback key for its multimodal plugin on purpose (upstream ci.yml allowlists the
+# same key: "maintainer intentionally public, not a pool member"). The fork keeps upstream code as-is.
+agnes-multimodal-plugin/dsh-agnes-multimodal/lib/index.js:generic-api-key:54
