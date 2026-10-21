@@ -127,6 +127,24 @@ class SystemWebHost(
             //   `WebChromeClient.onCreateWindow`，而那个方法的**默认实现同样返回
             //   false 表示"不创建新窗口"**。两个必须配对改，见下面的 onCreateWindow。
             setSupportMultipleWindows(true)
+            // ⚠️⚠️ **单开上面那项不够，这一项才是「登录」按钮打不开的真根因。**
+            //
+            // 真机实测日志（`WebView 多窗口:` 那行）在只设 `setSupportMultipleWindows(true)`
+            // 时是 `javaScriptCanOpenWindows=false` —— 此时内核**直接吞掉**
+            // `window.open`，返回 null，而且**连 `onCreateWindow` 都不回调**，
+            // 所以原生侧加多少日志都看不到，极易误判成"回调没实现"。
+            //
+            // 官方登录（`dsh-client-ui-settings-account` 的 `BrowserLogin.begin`）恰好
+            // 就是 `window.open("about:blank", "_blank")`，于是：
+            // `popup` 为 null ⇒ 后面 `popup.location.replace(authorizeUrl)` 静默失败
+            // ⇒ 用户点了「登录」什么都不会发生，只剩对话框里那个「复制登录链接」。
+            javaScriptCanOpenWindowsAutomatically = true
+            Log.i(
+                DshApplication.TAG,
+                "WebView 多窗口: supportMultipleWindows=${supportMultipleWindows()} " +
+                    "javaScriptCanOpenWindows=$javaScriptCanOpenWindowsAutomatically " +
+                    "内核=${runCatching { WebView.getCurrentWebViewPackage()?.versionName }.getOrNull()}",
+            )
         }
         webView.setBackgroundColor(Color.parseColor("#0F1115"))
 
@@ -322,10 +340,28 @@ class SystemWebHost(
                 // 目标 URL 只能从 hitTestResult 里拿（见上面的 ⚠️）。
                 val url = view.hitTestResult?.extra
                 if (url.isNullOrEmpty()) {
-                    // 拿不到 URL（例如页面用 `window.open("")` 或异步触发）：
-                    // 记一笔日志就放弃。**不能**回 true —— 那会留下一个白窗口。
-                    Log.w(DshApplication.TAG, "window.open 拿不到目标 URL，忽略")
-                    return false
+                    // ⚠️⚠️ **这里原本一律 return false，导致「登录」按钮完全打不开。**
+                    //
+                    // 官方登录流程（`dsh-client-ui-settings-account` 的 `BrowserLogin`）
+                    // 是这么做的：
+                    //
+                    //     this.popup = window.open("about:blank", "_blank");   // 预开
+                    //     … 拿到 authorizeUrl 后 …
+                    //     this.popup.location.replace(authorizeUrl);           // 再导航
+                    //
+                    // 也就是说 `window.open` 的目标是 **`about:blank`**，而它
+                    // **不来自 `hitTestResult`**（那是点击命中的链接，这里是 JS 调用），
+                    // 所以 `extra` 是空 —— 旧实现回 false ⇒ 内核不建窗口 ⇒
+                    // `window.open` 返回 null ⇒ 后面 `popup.location.replace` 作用在
+                    // null 上静默失败。用户看到的就是「点登录，什么都没发生」。
+                    //
+                    // 正确做法：**为 `about:blank` 建一个真正的 WebView 窗口**，
+                    // 把它塞进 `resultMsg.obj` 的 `WebView.WebViewTransport`，
+                    // 再回 true 让内核把渲染目标接上去。URL 由页面自己随后导航。
+                    //
+                    // 其余"拿不到 URL"的情形（页面异步调用、没有 transport 等）仍然
+                    // 回 false —— 绝不能对任何无 URL 的请求都建窗口，那会留下白窗口。
+                    return createBlankPopup(view, resultMsg)
                 }
                 // 本地引擎的 URL 不该走这里（那是 SPA 内部导航）。真出现时回 false
                 // 让内核丢弃这次新窗口请求，页面自身的导航不受影响。
@@ -345,6 +381,7 @@ class SystemWebHost(
             }
         }
 
+
         /**
          * 下载接管。
          *
@@ -363,6 +400,72 @@ class SystemWebHost(
             )
         }
     }
+        /**
+         * 为一个 **URL 未知**（`about:blank` 预开）的 `window.open` 建窗口。
+         *
+         * ## 为什么不能复用主 WebView
+         *
+         * 主 WebView 正跑着整个 App 的 UI，把登录页导航进去等于把界面冲掉；而
+         * `window.open` 语义上要一个**独立**的渲染目标。所以这里新建一个最小
+         * WebView（只带必要的 `WebViewClient`，不注入任何 JS 桥）。
+         *
+         * ## 内存与生命周期
+         *
+         * 登录成功后官方会 `popup.close()`，内核随即销毁该窗口的渲染进程；
+         * 我们持有的这个 `WebView` 只是宿主对象，随 Dialog 一起被回收 ——
+         * 不 `addView`，不需要手动 `destroy()`。
+         *
+         * ## 安全
+         *
+         * ⚠️ **不注入 `addJavascriptInterface`**：这是纯粹的 OAuth 授权页，
+         *   第三方页面 + 原生桥 = 给授权页一把你家钥匙。它只需要能跳转。
+         *
+         * @return true = 已把新 WebView 交给内核；false = 放弃（不建窗口）。
+         */
+        private fun createBlankPopup(parent: WebView, resultMsg: android.os.Message): Boolean {
+            val transport = resultMsg.obj as? WebView.WebViewTransport
+            if (transport === null) {
+                Log.w(DshApplication.TAG, "window.open 无可用的 WebViewTransport，忽略")
+                return false
+            }
+            return try {
+                val popup = WebView(parent.context)
+                popup.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    // 授权页可能弹 cookie 同意/第三方跳转，保持与主视图一致。
+                    mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                }
+                // 授权过程会依次跳到 DeepSeek 的多个域，最后回到本地引擎完成登录。
+                // 在这里**不拦 URL**（拦了就会把授权链打断），只做跳转放行。
+                popup.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        v: WebView,
+                        request: WebResourceRequest,
+                    ): Boolean {
+                        val u = request.url.toString()
+                        // 回到本地引擎 = 授权回调已经完成，关掉这个窗口免得留在后台。
+                        if (u.startsWith(LOCAL_ENGINE_PREFIX)) {
+                            Log.i(DshApplication.TAG, "登录授权已回到本地引擎，关闭弹窗")
+                            (v.parent as? android.view.ViewGroup)?.removeView(v)
+                            v.destroy()
+                            return true
+                        }
+                        Log.i(DshApplication.TAG, "登录弹窗导航: ${u.take(100)}")
+                        return false
+                    }
+                }
+                transport.webView = popup
+                // ⚠️ `transport.webView = popup` **之后**才能回 true：
+                //   内核在收到 true 时立刻读 `transport.webView`，赋值晚一步就是白窗口。
+                Log.i(DshApplication.TAG, "window.open 已建空白窗口（等待页面自行导航）")
+                true
+            } catch (t: Throwable) {
+                Log.w(DshApplication.TAG, "建 window.open 窗口失败: ${t.message}")
+                false
+            }
+        }
+
 
     override fun loadUrl(url: String) {
         lastLoadedUrl = url
@@ -493,6 +596,33 @@ private class SystemPageBridge(private val impl: PageBridge) {
 
     @android.webkit.JavascriptInterface
     fun bubbleRequestOverlay() = impl.bubbleRequestOverlay()
+
+    // ── 甩动手感三开关（见「悬浮气泡」设置页）────────────────────────────
+    // ⚠️ 与 gecko 版白名单必须逐条对齐，两边方法名少一个就是「点了没反应」。
+    @android.webkit.JavascriptInterface
+    fun bubbleSetThrow(enabled: Boolean) = impl.bubbleSetThrow(enabled)
+
+    @android.webkit.JavascriptInterface
+    fun bubbleSetShake(enabled: Boolean) = impl.bubbleSetShake(enabled)
+
+    @android.webkit.JavascriptInterface
+    fun bubbleSetImeFling(enabled: Boolean) = impl.bubbleSetImeFling(enabled)
+
+    @android.webkit.JavascriptInterface
+    fun bubbleReportBalance(json: String) = impl.bubbleReportBalance(json)
+
+    @android.webkit.JavascriptInterface
+    fun bubbleBadgeConfig(): String = impl.bubbleBadgeConfig()
+
+    @android.webkit.JavascriptInterface
+    fun bubbleTapRefreshSeq(): Int = impl.bubbleTapRefreshSeq()
+
+    @android.webkit.JavascriptInterface
+    fun writeClipboard(text: String): Boolean = impl.writeClipboard(text)
+
+    /** 页面诊断（写进 app.log，见 `PageBridge.pageDiag` 的说明）。 */
+    @android.webkit.JavascriptInterface
+    fun pageDiag(text: String) = impl.pageDiag(text)
 
     /**
      * 会话转录上报。

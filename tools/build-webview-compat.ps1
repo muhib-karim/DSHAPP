@@ -163,7 +163,13 @@ param(
     #      所以**必须 bump**：只重打 `mobile-ui.zip` 而不动这里，设备上那棵树会命中
     #      原有的戳字符串 `chrome74-v21`（**相等 ⇒ 跳过**），继续跑旧群的二维码。
     #      同 v21：判据是字符串相等，不是「这次跑过脚本」。
-    [string]$CompatVersion = "22",
+    # v23：mobile-ui 三处修复都要进产物 ——
+    #      ① 修复 64：底栏模型名被截断（逐层放宽 flex + 干掉官方 max-width）；
+    #      ② 修复 65：底部遥测栏挤成两行/溢出被裁（nowrap + 降档判据改写）；
+    #      ③ 修复 66：推理等级 High 被误藏（改回显示，字号 10px/opacity 0.65）。
+    #      三条都改在 `mobileui/lib/client.js` 里 ⇒ 本戳必须 22 → 23，
+    #      否则设备命中「字符串相等 ⇒ 整棵树跳过」，跑的还是旧布局（同 v22 的坑）。
+    [string]$CompatVersion = "33",
 
     [string]$EngineBin,
     [string]$OutZip

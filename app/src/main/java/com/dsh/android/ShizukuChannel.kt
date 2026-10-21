@@ -313,8 +313,7 @@ object ShizukuChannel {
      * `ShizukuRemoteProcess` 的构造器是包内可见的，也用它不了 —— 但那没关系：
      * 它只是 `IRemoteProcess` 的一层包装，我们直接用接口即可。
      */
-    private fun runCommand(command: String, workdir: String?): String {
-        val binder = try {
+    private fun runCommand(command: String, workdir: String?): String {        val binder = try {
             Shizuku.getBinder()
         } catch (t: Throwable) {
             null

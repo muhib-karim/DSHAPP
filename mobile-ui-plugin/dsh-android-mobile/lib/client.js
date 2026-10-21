@@ -543,6 +543,429 @@ window.__ModuleLoader__.load({
   gap: 4px !important;
 }
 
+/* ══ 修复 65：底部遥测栏挤成两行 / 溢出视口被裁 ═══════════════════════
+   症状（360px / dpr3 真机截图）：
+     · 底部那行被折成两行：「1 轮 1 步 · 30 / tok/s」「30.5K tok · 缓存命 / 中 9%」，
+       右侧上下文环「12%」孤零零挂在第二行右边；
+     · 更早的版本里它直接溢出视口被裁：dock scrollWidth 382 vs clientWidth 326，
+       左边「1 轮」的「1」被切掉、右边上下文环整个跑到 x=343（视口只有 360）之外。
+
+   根因有两层：
+     ① **CSS 层**：官方这几个药丸是 "white-space: normal"，宽度不够就换行，
+        换行之后 "dock" 高度从 26px 涨到 46px，整块往上顶、把输入框挤走；
+     ② **JS 层**（更隐蔽）：本文件里那套「文案放不下就自动降档」的机制
+        （"processStatsLine" / "mpStatsFits"）**从上线起就没生效过** ——
+        它找的是 "[data-composer-stats] .bOPqQW_root" 和 ".bOPqQW_label"，
+        而官方现在的结构是 ".uV2eYG_dock > span[data-composer-stat]"，
+        三个旧选择器**全部查不到**（真机实测：root null、label 0 个）。
+        所以降档一次都没跑过，长文案原样铺在屏幕上。
+
+   修法两处配合（缺一个都不行）：
+     · CSS：药丸 "nowrap" + "overflow: hidden"，先保证**绝不换行**
+       （换行是视觉上最糟的形态，宁可截断也不换行）；
+     · JS："processStatsLine" 改按 "data-composer-stat" 属性找元素（见那边的注释），
+       "mpStatsFits" 改成「截断/超父容器」判据 —— 这样降档才会真正触发，
+       把文案缩到「1轮 1步」「30.5K·缓存9%」这种一行放得下的基准档。
+   实测最终形态：dock 高 26px、两个药丸 55px/103px 均零截断、上下文环在同一行。
+
+   ⚠️ "uV2eYG_*" / "JObwrW_*" 是官方构建期哈希类名，官方升级可能变；
+      "data-composer-stat" 是语义属性，比哈希稳，所以 JS 侧优先用它。 */
+[data-mobile] .uV2eYG_dock [data-composer-stat] {
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+[data-mobile] .uV2eYG_dock {
+  flex-wrap: nowrap !important;
+}
+
+/* ══ 修复 67：思考正文不换行，把整页推出屏幕左侧 ═══════════════════════
+   症状（真机截图，非常明显）：
+     整个消息列表**向左偏出屏幕**，左侧文字被切一半
+     （「已完成」只看得见「已完成」的右半、「目前没有」只剩「前没有」、
+      消息操作图标只剩右半边），右侧反而留出一片空白。
+     而且页面能被**横向拖动**，拖一下就左右跑。
+
+   根因：思考（reasoning）正文的 span 带了 "white-space: nowrap"，
+   一行到底不换行 —— 实测最长的一条 **1197px**（视口只有 360px）。
+   它把滚动容器 ".wSkVaW_root" 的 scrollWidth 从 360 撑到 **550**，
+   浏览器为了显示光标位置把 scrollLeft 自动设成 **39.67**，
+   于是整页看起来「左移了 40px」。实测：
+     · "_text_1rdzk_17" 的 getBoundingClientRect().width = 1197（多条 700~1200）
+     · ".wSkVaW_root" scrollWidth 550 / clientWidth 360 / scrollLeft 39.67
+     · ".wSkVaW_scrollBody" 的 x = **-40**（负值 = 已跑出屏幕左边界）
+
+   修法：两处一起改，缺一个都不行 ——
+     ① "._text_1rdzk_17" 恢复换行（"white-space: normal" + "overflow-wrap: anywhere"
+        兜住那种一整串没有空格的英文/路径，否则单行还是会顶出去）；
+     ② "._root_1rdzk_1" 官方写的是 "width: max-content"，它在 flex 里会按
+        **内容原始宽度**撑开（哪怕子项已经允许换行），改成 "width: auto" 才会
+        服从父级的 100% 约束。
+   实测修复后：最长文本 1197 → 225px，scrollLeft 归 0，scrollBody 的 x 回到 0，
+   页面不再能横向拖动。
+
+   ⚠️ 这两个都是官方构建期哈希类名，官方升级可能变；失效后果只是
+      "回到能横向拖动"，不影响功能。 */
+[data-mobile] ._root_1rdzk_1 {
+  width: auto !important;
+  max-width: 100% !important;
+}
+[data-mobile] ._text_1rdzk_17 {
+  white-space: normal !important;
+  word-break: break-word !important;
+  overflow-wrap: anywhere !important;
+}
+
+/* ══ 修复 71：整页能横向滚 114px，点一下「更多操作」页面就左偏 ══════════
+   现象（真机复现，两次）：点右上角「⋯」打开菜单后，整个界面**左移 114px** ——
+   标题栏按钮从 x=294 跑到 x=180，输入框、发送键、遥测栏一起跟着跑。
+   实测 bodyX = -114、root.scrollLeft = 114。
+
+   排查过程（避免后人重复走）：
+     · 先怀疑菜单本身超宽 —— 实测菜单只有 148px 宽、right = 194（不溢出），排除。
+     · 再全树扫描「右边界超出视口 2px 以上」的元素，**命中数 0**，排除。
+     · 点「刷新」关菜单后 scrollLeft 自动回 0，说明不是菜单引起的持续性偏移。
+   真凶在 body 的直接子元素里：官方有一对**宽度探针**
+     <div class="wSkVaW_widthHandle" data-side="left"  style="left:-184px">
+     <div class="wSkVaW_widthHandle" data-side="right" style="left:544px">
+   它们 position: absolute、width: 0、height: 691（**视觉上完全不可见**），
+   官方靠它们量容器宽度。但它们把 body 的 scrollWidth 撑到 **550**
+   （360 视口 + 184 左侧 + 6 右侧），于是 root 也变成 550。
+
+   ⚠️ 为什么这个 bug 特别阴：root 的 overflow-x 本来就是 **hidden**，
+      所以**手指横滑没反应**（实测 339.67 → 339.67 纹丝不动），用户很难自己发现；
+      但 overflow: hidden **只挡手势、不挡程序化滚动** —— 实测 scrollLeft = 50
+      照样成功、bodyX 立刻 -50。于是只要有任何一次「把焦点/元素滚进视口」的动作
+      （点视口外的按钮、浏览器自动滚动、键盘弹出后补偿滚动），页面就被永久推偏，
+      而用户既滑不回来、也不知道发生了什么。
+
+   修法：给 body 加 overflow-x: clip。
+     · clip 与 hidden 的区别正是这里要的：**clip 不产生滚动容器**，
+       所以 scrollWidth 不再被算作可滚动范围，程序化滚动也失效（实测滚 50 仍是 0）。
+     · 探针元素本身**不受影响**：实测 x 仍是 -184 / 544，height 仍 691，
+       offsetWidth/clientWidth 仍是 0 —— 官方量宽照常工作。
+     · 实测修复后 root.scrollWidth 550 → **360**，bodyX 恒 0。
+
+   ⚠️ 不用 overflow: hidden（官方已经是了，正是它留下了程序化滚动的口子）。 */
+[data-mobile] .wSkVaW_body {
+  overflow-x: clip !important;
+}
+
+/* ══ 修复 72：宽表格右侧 226px 在手机上**永远看不到** ════════════════════
+   现象（真机截图一眼就能看出来）：助手回复里的宽表格被右边缘硬切掉 ——
+   表头「目标 / p50 / p95 / max」只显示到 p95，**max 整列看不到**，
+   p95 的值（25ms / 1709）也被切了一半。实测两个宽表格：
+     容器 294px，内容 512 / 520px ⇒ **218 / 226px 内容被藏掉**。
+
+   根因：官方给 .md-table-wide 设的是 **overflow-x: hidden**（不是 auto）。
+   它的本意是桌面端 —— 容器带 tabindex="0"，靠**键盘**左右滚动。
+   但手机上既没有键盘、hidden 又**挡掉触摸滑动**：
+     实测 dispatch touchstart+touchmove 后 scrollLeft 仍是 0，
+     而 overflow 明明是 hidden，用户手指横滑完全没反应。
+   ⇒ 结果就是右侧内容**永久不可达**，这不是"设计取舍"，是移动端信息丢失。
+
+   修法：改回 overflow-x: auto（+ iOS 惯性滚动），让它变成正常可横滑的表格。
+     实测修复后：scrollLeft 可到 **218**，滚到最右时 max 列完整可见
+     （x=194~326），四个表头全部可达。
+     overscroll-behavior 官方已设 contain，不会把滑动传染给外层页面。
+
+   ⚠️ 为什么敢改：官方用 hidden 只是想"锁住不让它撑破布局"，
+      auto 同样不会撑破（容器宽仍是 294，只是内部可滚）。
+      这个类名 .md-table-wide 是**语义类名**（不是构建期哈希），稳定性高。 */
+[data-mobile] .md-table-wide {
+  overflow-x: auto !important;
+  -webkit-overflow-scrolling: touch !important;
+}
+
+/* ══ 修复 73：任务卡片半透明 ⇒ 底下的正文**透上来**，主次颠倒 ══════════
+   现象（真机截图一眼可见）：任务卡片（「任务 5 已完成」+ 绿点清单）浮在
+   正文之上，而它的背景只有 **58% 不透明**，于是下面那条消息的文字
+   （「错误信息是「特权通道不可用」…」）**透过卡片显出来**，
+   和卡片自己的清单文字叠在一起，糊成一团。
+
+   实测配色（这就是为什么它特别难看）：
+     背后正文文字   rgb(15,17,21)   近黑
+     卡片背景       rgba(248,249,250,0.58)   58% 浅灰
+     卡片自己的文字 rgb(97,102,107)  中灰
+   把 58% 浅灰叠在近黑文字上做混色：0.58×248 + 0.42×15 ≈ **150**
+   ⇒ 透出来的正文约 rgb(150,152,155)，**比卡片内文字 rgb(97,102,107) 还亮**。
+   也就是说"被遮挡的内容"反而比"该读的内容"更显眼，视觉主次完全颠倒。
+
+   ⚠️ 别以为是 backdrop-filter 没生效：实测内核其实是 **Chrome 114**
+      （不是降级目标 74），backdrop-filter 支持且 computed 值就是
+      "blur(40px) saturate(1.5)"；祖先链上也没有 filter/opacity/transform
+      破坏它。问题纯粹是**基础背景太透明**，模糊压不住高对比度的黑字。
+
+   修法：把背景不透明度提到 **0.97**（保留一点点毛玻璃质感，但不透字）。
+     · 亮色：rgba(248,249,250,0.58) → 0.97
+     · 暗色：rgba(67,69,74,0.45)   → 0.97
+     实测背后内容透出率从 42% 降到 **3%**，截图对比：修复前那行字清晰可读地
+     压在卡片上，修复后卡片区域干净、只剩清单本身。
+
+   ⚠️ 必须分别写亮/暗两套值：两边的底色不同（248,249,250 vs 67,69,74），
+      不能用同一个颜色，也不能只写一套。
+
+   ⚠️ 为什么不去改"卡片不该遮住正文"：卡片在 .wSkVaW_composerStack 内、
+      与 composerSeat 同级，官方就是把它做成浮在内容上的浮动面板
+      （实测滚到 30%/50%/70%/90% 都有 1~6 条消息被它压住，只有滚到最底部
+      才不重叠）。要根治得改官方布局结构，风险远大于收益；而"透字"是纯粹的
+      可读性缺陷，提不透明度即可解决，不影响任何行为。 */
+[data-mobile] .lXshSW_root {
+  background: rgba(248, 249, 250, 0.97) !important;
+}
+[data-mobile] body[data-ds-dark-theme] .lXshSW_root,
+[data-mobile] [data-ds-dark-theme] .lXshSW_root {
+  background: rgba(67, 69, 74, 0.97) !important;
+}
+
+/* ══ 修复 64：模型名在窄屏下被截断（"deepseek-v4.1..." 看不全）═════════
+   症状（360px 宽、dpr 3 真机截图核对）：
+     · 底栏模型按钮里的模型名被 ellipsis 截成 "deepseek-v4.1..."；
+     · 紧随其后的推理等级（Default）**宽度直接是 0**，完全看不见。
+
+   根因不是"文字太长"，而是**这一行有一块 41px 的空地被浪费了**：
+   官方 uV2eYG_row 用的是 "justify-content: space-between"，子项只有
+   uV2eYG_tools（80px，可收缩）和 uV2eYG_trailing（190px，
+   "flex: 0 0 auto" 不收缩）。"space-between" 把剩余空间全推到了两者中间
+   —— 实测 tools 结束于 x=104、trailing 从 x=145 才开始，**中间空 41px**，
+   而右边模型名正因为缺 16px 在截断。把空隙让给 trailing 即可。
+
+   修法（逐层放宽，缺一层都撑不开 —— 实测每层都被上一层的
+   "flex: 0 0 auto" / "display: block" 卡住）：
+     row            space-between → flex-start（不再把空隙推到中间）
+     trailing       0 0 auto → 1 1 0%
+     standardControls / _7KE1Ra_root   0 1 auto → 1 1 0%
+     _7KE1Ra_trigger  max-width: 139.5px → none（官方在这里写死了上限）
+   腾出宽度后模型名完整显示（实测 144px = 内容 144px，零截断）。
+
+   ## 推理等级（Default / High）为什么不藏
+   一开始为了让模型名完整，把推理等级 display:none 掉了，理由是"它是默认值"。
+   **那是错的**：真机 aria-label 显示实际值是 High（用户设过），藏起来就是丢信息。
+   正确做法是腾宽度而不是砍信息 —— 腾出 41px 后模型名与 High 能同时放下
+   （实测模型名 122px + High 28px + 内边距/箭头 = 168px，按钮正好 168px）。
+
+   ⚠️ 两个都是官方构建期哈希类名，官方升级可能变；失效后果只是
+      "回到截断状态"，不影响功能。 */
+[data-mobile] .uV2eYG_row {
+  justify-content: flex-start !important;
+  /* 修复 69：官方 row gap 是 12px，tools 只占 80px，中间那 12px 是纯浪费。
+     缩到 8px 换回 4px 给模型名 —— 正好够把「默认」和模型名拉开到 3px 间距
+     而不再截断模型名。实测：gap 12→8 后按钮 163→167px，
+     模型名 119→123px（= 内容宽度，零截断），推理等级间距 3px。
+     为什么非要这 4px：见下面 _7KE1Ra_trigger 的 gap 注释。 */
+  gap: 8px !important;
+}
+[data-mobile] .uV2eYG_tools {
+  flex: 0 0 auto !important;
+}
+[data-mobile] .uV2eYG_trailing {
+  flex: 1 1 0% !important;
+  min-width: 0 !important;
+}
+[data-mobile] .uV2eYG_standardControls {
+  flex: 1 1 0% !important;
+  min-width: 0 !important;
+}
+[data-mobile] ._7KE1Ra_root {
+  flex: 1 1 0% !important;
+  min-width: 0 !important;
+  width: 100% !important;
+}
+[data-mobile] ._7KE1Ra_trigger {
+  padding-left: 4px !important;
+  padding-right: 0 !important;
+  /* 修复 69：这里原来是 1px（v89 为挤宽度而压到极限）。
+     但 v91 把推理等级改成了中文（Default → 默认），中文字形没有英文那种
+     右侧字距留白，1px 看起来就是「deepseek-v4.1-flash默认」**粘连**。
+     实测各值（配合上面 row gap:8px）：
+       gap 1px → 模型名 123px 完整，但视觉粘连
+       gap 2px → 模型名 121px（122 需求，临界）
+       gap 3px → 模型名 119px（**截断**）  ← 只有 row gap 仍是 12 时才会这样
+     把 row gap 从 12 缩到 8 腾出 4px 后，gap 3px 也能保持模型名 123px 完整，
+     所以最终取 3px —— 既不粘连，也不截断。 */
+  gap: 3px !important;
+  min-width: 0 !important;
+  width: 100% !important;
+  max-width: none !important;
+  justify-content: flex-start !important;
+}
+[data-mobile] ._7KE1Ra_triggerLabel {
+  min-width: 0 !important;
+  /* ══ 修复 70：模型名与推理等级之间出现"幽灵间距" ══════════════════════
+     现象（真机截图，一眼就能看出来）：换到短模型名 agnes-3.0-flash 时，
+     「agnes-3.0-flash    默认」中间空出一大块，而 deepseek-v4.1-flash 却正常。
+
+     根因：官方给这个 label 设了 **text-align: center**，而 v89 起我把它写成
+     **flex: 1 1 auto** ⇒ 盒子会撑满剩余空间，文字在盒子里居中，
+     两边各留一半空白。实测（按钮 172px）：
+       agnes-3.0-flash  盒子 128px / 文字只有 **94px** ⇒ 真实间隙 **20px**
+       deepseek-v4.1-flash 盒子 122px / 文字 122px ⇒ 恰好贴满，看不出问题
+     所以这个 bug 只在**较短的模型名**下暴露 —— deepseek 时一直没发现。
+
+     ⚠️ 别改成 text-align: left 就完事：实测那只是把空白全推到右边，
+        真实间隙反而变成 **37px**（更难看）。问题在盒子太宽，不在对齐。
+     正解是让盒子**按内容收缩**：flex 从 1 1 auto 改成 **0 1 auto**。
+       · 0 = 不主动撑满（盒子=文字宽度）
+       · 1 = 仍可被压缩（超长模型名照样出省略号，不撑破布局）
+     实测三种情况都正确：
+       agnes-3.0-flash       盒子 94 = 文字 94，间隙 3px，不截断
+       deepseek-v4.1-flash   盒子 122 = 文字 122，间隙 3px，不截断
+       a-very-long-model-…   盒子 128，文字 287 ⇒ 截断出省略号（布局不破）
+     text-align: left 保留：盒子已等于内容宽度，对齐方式不再影响布局，
+     但设成 left 能让「文字比盒子窄」的极端情况也贴着左边显示。 */
+  flex: 0 1 auto !important;
+  text-align: left !important;
+}
+/* ⚠️⚠️ 推理等级**必须显示**（修复 66）——上一版把它藏掉了，那是错的。
+   当时理由是「它恒为 Default，默认值藏掉不丢信息」。真机核对 aria-label
+   才发现实际值是 **High**：
+     选择模型，当前 deepseek-v4.1-flash，推理等级 High
+   也就是说**用户设过的非默认推理等级被藏起来了**，实打实的信息丢失。
+   字号 10px + opacity 0.65：它是次级信息，不该和模型名抢视觉重心。
+
+   ⚠️ 修复 68：**光靠 CSS 不够，还要缩文案**。
+   修复 66 只保证了「High 能放下」（22px），但真机打开一个老会话时
+   推理等级是 **Default（33px）**，模型名又被挤成 "deepseek-v4.1-fl..."。
+   逐值实测（按钮固定 168px）：
+     Default 33px → 模型名 115px（截断，需要 122px）
+     Medium  37px → 模型名 111px（截断）
+     Minimal 36px → 模型名 112px（截断）
+     High/Low/Max 19~22px → 模型名 126~129px（放得下）
+   所以只在 CSS 层调 flex 治不了根：**必须让文案本身变短**。
+   做法是 JS 里按表把英文等级缩成中文（"mpAbbreviateEffort"，见文件后半），
+   实测缩短后全部放得下：
+     默认 20px / 中 10px / 最低 20px / 低 10px / 高 10px / 最高 20px / 超高 20px
+   → 模型名一律 128~138px，**任何等级都不再截断**。
+   为什么敢改文案：它是纯装饰性次级标签，"aria-label" 与 "title" 仍保留
+   完整英文原文（"选择模型，当前 …, 推理等级 Default"），可访问性不受影响。 */
+[data-mobile] ._7KE1Ra_triggerEffort {
+  flex: 0 0 auto !important;
+  font-size: 10px !important;
+  /* ══ 修复 74：推理等级「默认」对比度不达标，两种主题下都看不清 ════════
+     现象：底栏「deepseek-v4.1-flash 默认」里那个「默认」发灰，
+     亮色/暗色下都要凑近才看得清。
+
+     实测（WCAG 对比度，AA 正文要求 4.5:1）：
+       亮色：文字 rgb(129,133,140) × opacity 0.65 叠在白底上 → **2.18:1**
+       暗色：同色 × 0.65 叠在 rgb(44,44,46) 上        → **2.42:1**
+     两边都远低于 4.5，不是"稍微浅一点"，是真的读不清。
+
+     ⚠️ 根因是修复 66 里我加的 **opacity: 0.65** —— 当时的理由是
+        "它是次级信息，不该和模型名抢视觉重心"。方向没错，但 0.65 太狠：
+        实测把 opacity 拉到 1 也只有 3.71~3.76:1，**光调透明度永远不够**，
+        因为颜色本身 rgb(129,133,140) 就偏浅。必须同时改颜色。
+
+     ⚠️ 也不能只改一个颜色：亮色底(白)要**深**色才够对比，暗色底(rgb(44,44,46))
+        要**浅**色。实测同一个颜色不可能两边都达标：
+          提亮到 rgb(173,178,184)：暗色 6.53 ✅ / 亮色 2.13 ❌
+          压深到 rgb(97,102,107)： 亮色 5.80 ✅ / 暗色 2.40 ❌
+        ⇒ 必须写**两套**，靠 body[data-ds-dark-theme] 切换。
+
+     最终取值（opacity 一律 1）：
+       亮色 rgb(97,102,107)  → **5.80:1** ✅
+       暗色 rgb(173,178,184) → **6.53:1** ✅
+     两者都过 AA。仍然是 10px 小字、仍然排在模型名之后，
+     视觉层级靠字号与位置区分，不靠把它调淡到看不清。 */
+  opacity: 1 !important;
+  color: rgb(97, 102, 107) !important;
+  white-space: nowrap !important;
+}
+[data-mobile] body[data-ds-dark-theme] ._7KE1Ra_triggerEffort,
+[data-mobile] [data-ds-dark-theme] ._7KE1Ra_triggerEffort {
+  color: rgb(173, 178, 184) !important;
+}
+
+/* ══ 修复 75：输入框占位符对比度只有 2.13:1，手机上几乎读不出 ═══════════
+   现象：输入框里那句「发消息或创建任务, / 调用指令, @ 文件或对话」
+   在亮色下淡得像水印，要凑近才认得出 —— 而这是用户**每次发消息都会看到**
+   的提示文字，可读性直接影响第一印象。
+
+   实测（WCAG AA 正文要求 4.5:1）：
+     亮色：rgb(173,178,184) 叠白底 → **2.13:1**（严重不达标）
+     暗色：rgb(129,133,140) 叠 rgb(44,44,46) → **3.76:1**（也不达标）
+   颜色来自官方变量 --dsw-alias-label-dimmed，不是我设的。
+
+   ⚠️ 但也不能一把拉到全对比：占位符**故意比正文淡**是有语义的
+      （区分"这里还没输入"与"已经输入的内容"）。全拉到 rgb(15,17,21)
+      会让它看起来像已经填好的内容，反而误导。
+      ⇒ 取**刚过 AA** 的值，既读得清、又保持"这是提示"的层次。
+
+   最终取值（都是刚过 4.5，故意不拉满）：
+     亮色 rgb(112,117,122) → **4.65:1** ✅
+     暗色 rgb(165,170,176) → **5.96:1** ✅
+   同样处理了另外两处同色系的次级文字（都从 ~3.5 提到 4.65）：
+     · 代码块左上角的「代码块」标签（._language_1pq26_30）
+     · 标题栏下方「快准狠模式（通用）」（.SVAs4q_label） */
+[data-mobile] .uV2eYG_placeholder {
+  color: rgb(112, 117, 122) !important;
+}
+[data-mobile] body[data-ds-dark-theme] .uV2eYG_placeholder,
+[data-mobile] [data-ds-dark-theme] .uV2eYG_placeholder {
+  color: rgb(165, 170, 176) !important;
+}
+[data-mobile] ._language_1pq26_30,
+[data-mobile] .SVAs4q_label {
+  /* ⚠️ 这两个用 rgb(105,110,115) 而不是占位符的 rgb(112,117,122)：
+     「代码块」标签的实际背景是 rgb(249,250,251)（浅灰），不是纯白。
+     实测 112,117,122 在浅灰底上只有 **4.45:1**，差 0.05 不达标；
+     压到 105,110,115 后是 **4.93:1** ✅。 */
+  color: rgb(105, 110, 115) !important;
+}
+[data-mobile] body[data-ds-dark-theme] ._language_1pq26_30,
+[data-mobile] body[data-ds-dark-theme] .SVAs4q_label,
+[data-mobile] [data-ds-dark-theme] ._language_1pq26_30,
+[data-mobile] [data-ds-dark-theme] .SVAs4q_label {
+  color: rgb(165, 170, 176) !important;
+}
+
+/* ══ 修复 76：抽屉里「工作区」分组标题与「展开其余 N 个会话」读不清 ══════
+   用修复 75 那套对比度扫描把侧边抽屉也过了一遍，命中 6 处 < 4.5:1，
+   其中两处值得修（都是 rgb(129,133,140) → 3.55:1）：
+     · .bhn1Oq_sectionLabel        「工作区」分组标题
+     · .bhn1Oq_sessionOverflowButton 「展开其余 2 个会话」
+   后者尤其要紧：它是**可点击的操作**，文字太淡会让人看不出这里能点，
+   直接影响会话列表的可用性。
+
+   ⚠️ 只修这两处，没有把抽屉里 6 处全拉高：其余（时间戳 05:47、
+      上下文 68%、「空面板」提示、任务卡「5 已完成」）都是**纯次级信息**，
+      全拉到 4.5 会让抽屉失去层次感、看起来一片同等重要。
+      这两处是"导航结构"和"可点操作"，性质不同，才单独提上来。
+
+   取值同修复 75：亮 rgb(105,110,115) → 4.93:1 ✅ / 暗 rgb(165,170,176) → 7.36:1 ✅ */
+[data-mobile] .bhn1Oq_sectionLabel,
+[data-mobile] .bhn1Oq_sessionOverflowButton {
+  color: rgb(105, 110, 115) !important;
+}
+[data-mobile] body[data-ds-dark-theme] .bhn1Oq_sectionLabel,
+[data-mobile] body[data-ds-dark-theme] .bhn1Oq_sessionOverflowButton,
+[data-mobile] [data-ds-dark-theme] .bhn1Oq_sectionLabel,
+[data-mobile] [data-ds-dark-theme] .bhn1Oq_sessionOverflowButton {
+  color: rgb(165, 170, 176) !important;
+}
+
+/* ══ 修复 77：设置页所有说明副标题只有 3.71:1，读着费劲 ═════════════════
+   现象：设置里每一项标题下面那行灰字，比如「选择新会话的默认权限模式」
+   「仅影响会话内容的字号」「选择希望看到多少工具调用细节」——
+   这些是**用户理解这个开关到底干什么的唯一说明**，太淡就等于没有说明。
+
+   实测：rgb(129,133,140) 叠白底 → **3.71:1**（AA 要 4.5:1）。
+
+   ⚠️ 为什么用 [class*="_desc"] 属性选择器而不是逐个写类名：
+      设置页里这批说明文字**至少有三个不同类名**，各模块各自起名：
+        .oY77xG_desc  .bVCLcG_desc  ._2XZxNq_desc  .Pt1bsG_description  .T1PP_q_desc
+      逐个列既漏又难维护（官方一改 hash 前缀就全失效）。实测页面上
+      [class*="_desc"] 命中 8 个，颜色只有两种：6 个 rgb(129,133,140)（不达标）
+      + 2 个 rgb(97,102,107)（已达标）。统一提亮不会误伤后者（本来就比目标值深）。
+
+   取值同修复 75/76：亮 rgb(105,110,115) → **5.15:1** ✅ / 暗 rgb(165,170,176) ✅ */
+[data-mobile] [class*="_desc"] {
+  color: rgb(105, 110, 115) !important;
+}
+[data-mobile] body[data-ds-dark-theme] [class*="_desc"],
+[data-mobile] [data-ds-dark-theme] [class*="_desc"] {
+  color: rgb(165, 170, 176) !important;
+}
+
 
 /* 5. 审批面板浮到输入框上方（面板保留在 Cordis layer 内不动，仅重定位）。
    抽屉打开时 transform 为 identity，fixed 相对视口生效；bottom 用 CSS 变量
@@ -949,10 +1372,88 @@ window.__ModuleLoader__.load({
 			return v.filter((x, i) => x && v.indexOf(x) === i);
 		}
 
+		/* ── 修复 68：推理等级文案缩写（防止它把模型名挤掉）───────────────
+		   背景见上面 "_7KE1Ra_triggerEffort" 那条 CSS 注释：底栏模型按钮
+		   固定 168px，模型名要 122px，留给推理等级的空间只有 ~26px。
+		   逐值实测英文等级占宽：Default 33 / Medium 37 / Minimal 36 /
+		   High 22 / Low 19 / Max 19 —— 前三个都会把模型名挤成省略号。
+
+		   所以按表缩成中文（每个都 ≤20px，实测全部放得下）。
+		   ⚠️ 只改**显示文本**，不动 "aria-label" / "title"：
+		      可访问性与「点开菜单看到的完整选项」都保留英文原文。
+		   ⚠️ 表里没有的值原样返回 —— 官方将来加了新等级时，
+		      最坏结果只是"那一档可能挤一下"，不会显示错。 */
+		const MP_EFFORT_ABBR = {
+			Default: "默认",
+			Medium: "中",
+			Minimal: "最低",
+			Low: "低",
+			High: "高",
+			Max: "最高",
+			XHigh: "超高"
+		};
+
+		/**
+		 * 把底栏的推理等级缩成短中文。幂等：已经是缩写值就直接返回，
+		 * 所以放进 300ms 的 observer 批处理里不会反复写 DOM。
+		 *
+		 * ⚠️ 必须**先读原文再判断**：React 每次重渲染都会把文本写回英文，
+		 *    这里再缩一次 —— 和 processStatsLine 的 MP_STATS_RAW 是同一套思路。
+		 */
+		function mpAbbreviateEffort() {
+			if (!mpIsMobile()) return;
+			const els = document.querySelectorAll("._7KE1Ra_triggerEffort");
+			for (const el of els) {
+				const cur = (el.textContent || "").trim();
+				const short = MP_EFFORT_ABBR[cur];
+				if (short === undefined) continue;      // 已是缩写 / 未知值 → 不写
+				// 把完整英文留在 title 上，长按/无障碍仍能读到原文
+				if (!el.getAttribute("title")) el.setAttribute("title", cur);
+				el.textContent = short;
+			}
+		}
+
+		/**
+		 * 判断底部遥测栏当前文案「是否排得下一行」。
+		 *
+		 * ⚠️⚠️ **修复 65：旧判据在官方换 DOM 之后恒为 true，降档从未触发。**
+		 *
+		 * 旧实现："root.scrollWidth > root.clientWidth"。
+		 * 但现在的根节点 ".uV2eYG_dock" 是 "flex" + **宽度随内容收缩**的
+		 * （内容短时 229px、长时 326px），"scrollWidth" 与 "clientWidth"
+		 * **永远相等** ⇒ 判据恒 false ⇒ 一档都不降。
+		 *
+		 * 真机实测的后果（截图核对）：底部那行挤成**两行**
+		 *（「1 轮 1 步 · 30 / tok/s」「30.5K tok · 缓存命 / 中 9%」），
+		 * 右侧上下文环 "12%" 孤零零挂在第二行右边；更早的版本里
+		 * 它直接超出视口被裁掉（dock scrollWidth 382 vs clientWidth 326）。
+		 *
+		 * 新判据（两条，任一不满足就算「放不下」）：
+		 *  ① **是否换行** —— 用 "getClientRects().length > 1"，这是最直接的
+		 *     "文字被折成多行"信号，与容器宽度怎么算无关；
+		 *  ② **是否超出父容器** —— 内容右边界比父容器右边界还远。
+		 *     兜住 "justify-content: center" 那种「两边一起溢出」的情况
+		 *    （单看 ① 时若容器把文字压在一行却整体溢出，① 会漏判）。
+		 *
+		 * 保持**纯只读**：不写 DOM ⇒ 不触发 MutationObserver ⇒ 不会重演
+		 * 修复 60b 那个把页面卡死的死循环。
+		 */
 		function mpStatsFits(root, labels) {
-			// 内容宽 > 可视宽 ⇒ 溢出（会出省略号）
-			if (root.scrollWidth > root.clientWidth + 1) return false;
-			return labels.every((el) => el.scrollWidth <= el.clientWidth + 1);
+			// ① 任一药丸被折成多行 ⇒ 放不下
+			for (const el of labels) {
+				if (el.getClientRects().length > 1) return false;
+				// 药丸内部自己截断（ellipsis）也算放不下
+				if (el.scrollWidth > el.clientWidth + 1) return false;
+			}
+			// ② 整体超出父容器（两侧都算）
+			const parent = root.parentElement;
+			if (parent !== null) {
+				const rootRect = root.getBoundingClientRect();
+				const parentRect = parent.getBoundingClientRect();
+				if (rootRect.right > parentRect.right + 1) return false;
+				if (rootRect.left < parentRect.left - 1) return false;
+			}
+			return true;
 		}
 
 		/* ⚠️⚠️ 修复 60b（2026-09-28）——上一版这里是**死循环**，把整个页面卡死了，
@@ -979,9 +1480,38 @@ window.__ModuleLoader__.load({
 		     这里的档位只剩「极端数字兜底」：轮→步→纯数字、缓存标签→纯百分比。 */
 		function processStatsLine() {
 			if (!mpIsMobile()) return; // 修复 40：仅移动端；桌面端完全走官方
-			const root = document.querySelector("[data-composer-stats] .bOPqQW_root") || document.querySelector(".bOPqQW_root");
+			// ⚠️⚠️ **修复 65：官方换过 DOM 结构，旧选择器已全部失配。**
+			//
+			// 旧版（本函数原先写的）：
+			//   root   = `[data-composer-stats] .bOPqQW_root` / `.bOPqQW_root`
+			//   labels = `.bOPqQW_label`
+			// 真机实测（2026-10-21）**三个选择器全部查不到**：
+			//   `[data-composer-stats]` → null
+			//   `.bOPqQW_root`          → null
+			//   `.bOPqQW_label`         → 0 个
+			// 也就是说**降档逻辑从上线起就没生效过**（不是"偶发失效"），
+			// 症状就是底部遥测栏超出视口被裁：实测 dock clientWidth 326、
+			// scrollWidth 382（溢出 56px），左边「1 轮」的「1」被切掉、
+			// 右边上下文环「12%」整个跑到 x=343（视口只有 360）之外。
+			//
+			// 新版结构（实测）：
+			//   `.uV2eYG_dock`（flex，justify-content:center，宽 326）
+			//     ├─ span[data-composer-stat="activity"] > button.bOPqQW_pill
+			//     └─ span[data-composer-stat="usage"]    > button.bOPqQW_pill
+			//   ⭐ 药丸类名 `bOPqQW_*` 还在，只是**根节点**从 `bOPqQW_root`
+			//      变成了 `uV2eYG_dock`，且不再有 `data-composer-stats` 包裹层；
+			//      文案也不再是 `.bOPqQW_label`，而是药丸自身的 textContent。
+			//
+			// 所以这里改成**按 `data-composer-stat` 属性找**（语义属性比哈希类名稳，
+			// 官方改样式不会动它），并保留旧选择器作兜底 —— 万一哪天又切回去。
+			const root =
+				document.querySelector(".uV2eYG_dock") ||
+				document.querySelector("[data-composer-stats] .bOPqQW_root") ||
+				document.querySelector(".bOPqQW_root");
 			if (!root) return;
-			const labels = [...root.querySelectorAll(".bOPqQW_label")];
+			// 先按语义属性找；找不到再退回旧的 label 选择器。
+			let labels = [...root.querySelectorAll("[data-composer-stat]")];
+			if (!labels.length) labels = [...root.querySelectorAll(".bOPqQW_label")];
 			if (!labels.length) return;
 
 			// ① 原文快照：只有「当前文本不是我们上次写的那一份」时才认为 React 更新了原文。
@@ -1173,7 +1703,7 @@ window.__ModuleLoader__.load({
 		// 分组（幂等，结构一致时不再改动，避免循环）。
 		// ── 7c. 插件卡片描述 ──
 		// 官方接口（@deepseek-ai/dsh-host-plugin-inventory）每条只返回 entryId /
-		// moduleName / enabled / fiberPhase，**没有 description 字段**；`/plugins/<pkg>/package.json`
+		// moduleName / enabled / fiberPhase，**没有 description 字段**；"/plugins/<pkg>/package.json"
 		// 也不对外提供（实测 404）。所以这里内置一份人工整理的中文描述表，按 moduleName
 		// （取自 .qSYn7G_cardTitle 的 title 属性）匹配，注入到展开后的 .qSYn7G_cardDetails。
 		// 生成方式：读取两个模块根下各包 package.json 的 description 后逐条译写，见
@@ -1647,7 +2177,7 @@ window.__ModuleLoader__.load({
 				}
 			};
 			// 设置页的「退一层」语义（二级 → 一级 → 关闭），返回按钮与**系统返回键**共用。
-			// 系统返回键由原生经 `window.__DSH_MOBILE_BACK__` 调进来，见 §12。
+			// 系统返回键由原生经 "window.__DSH_MOBILE_BACK__" 调进来，见 §12。
 			const backOneLevel = () => {
 				const atList = !content || content.style.display === "none";
 				if (atList) closeDialog();
@@ -1655,7 +2185,7 @@ window.__ModuleLoader__.load({
 			};
 			backBtn.addEventListener("click", backOneLevel);
 			// ⚠️ 用 WeakMap 而不是 DOM 属性存回调：DOM 属性只能存字符串，
-			//   而这里要存的是带闭包的函数（`content`/`closeDialog` 都在闭包里）。
+			//   而这里要存的是带闭包的函数（"content"/"closeDialog" 都在闭包里）。
 			mpDialogBack.set(dialog, backOneLevel);
 			// nav 竖向化 + 分类小标题 + 可滚动
 			const applyNavStyle = () => {
@@ -1761,7 +2291,7 @@ window.__ModuleLoader__.load({
 			let mpCollapseObs = null;
 			let mpCollapseFallback = null;
 			// §12：设置弹窗 → 它的「退一层」回调。用 WeakMap 而非 DOM 属性，
-			//   因为存的是带闭包的函数（`content`/`closeDialog` 都在 setupSettingsDialog 的闭包里）。
+			//   因为存的是带闭包的函数（"content"/"closeDialog" 都在 setupSettingsDialog 的闭包里）。
 			const mpDialogBack = new WeakMap();
 
 			function mpIsNarrow() { return window.innerWidth < MP_NARROW; }
@@ -1803,7 +2333,7 @@ window.__ModuleLoader__.load({
 			// ══════════════════════════════════════════════════════════════════
 		// 修复 55：失效 CSSModule 类名的「别名桥接」
 		//
-		// 官方 CSS Module 的类名是 `{hash}_{local}`（如 ZTP-Xa_frame），hash 每次
+		// 官方 CSS Module 的类名是 "{hash}_{local}"（如 ZTP-Xa_frame），hash 每次
 		// 发版都会变，而本插件的 CSS 与 JS 选择器全部按旧 hash 写死 → 换版本后
 		// 样式与交互同时失效（实测 [class*="pI_x6G"] 命中 0 个元素，布局退化成
 		// 「56px 图标条 + 334px 正文」，抽屉压窄正文、按钮换行错乱）。
@@ -1927,10 +2457,10 @@ window.__ModuleLoader__.load({
 		 * 官方「仍在用」的 hash 累积集合（**只增不减**）。
 		 *
 		 * ⚠️ 为什么必须累积、不能只看当下快照（2026-10-04 第二次踩这个坑）：
-		 *   官方 CSS Module 是**按需注入**的 —— 组件没渲染时它的 `<style>` 压根不在
-		 *   `document.styleSheets` 里。若判据只看当下快照，同一个 hash 会在「出现过」
+		 *   官方 CSS Module 是**按需注入**的 —— 组件没渲染时它的 "<style>" 压根不在
+		 *   "document.styleSheets" 里。若判据只看当下快照，同一个 hash 会在「出现过」
 		 *   与「没出现」之间来回抖动，于是**同一个页面上有的分组头中招、有的正常**
-		 *   （真机实测：22 个 `.O_Ebla_root` 里有 2 个被误加 `bOPqQW_root`，其余正常）。
+		 *   （真机实测：22 个 ".O_Ebla_root" 里有 2 个被误加 "bOPqQW_root"，其余正常）。
 		 *   只要某个 hash **曾经**出现在官方样式表里，就说明官方在用它，永久不再认领。
 		 *   真正过期的 hash 永远不会出现在官方样式表里，因此不受影响。
 		 */
@@ -1940,19 +2470,19 @@ window.__ModuleLoader__.load({
 		 * 预热轮次计数：前 [MP_ALIAS_WARMUP] 轮**只累积证据、不做任何认领**。
 		 *
 		 * ⚠️ 为什么需要（2026-10-04）：官方 CSS Module 是懒注入的，页面刚加载时
-		 *   `document.styleSheets` 里只有少数几张表，`mpOfficialSeen` 因此接近空集。
-		 *   若此时就允许认领，**没过期的** hash（如 `YDXeBa`）会因为「当下没证据」
+		 *   "document.styleSheets" 里只有少数几张表，"mpOfficialSeen" 因此接近空集。
+		 *   若此时就允许认领，**没过期的** hash（如 "YDXeBa"）会因为「当下没证据」
 		 *   而被判为过期，转去认领别的 hash —— 真机日志实测：
-		 *     `CSSModule 别名桥接: YDXeBa→pXSMma (2 个类名)`
-		 *     `CSSModule 别名桥接: YDXeBa→oz9t_a (2 个类名)`
-		 *   这与 `bOPqQW→O_Ebla` 是同一个病，只是发生在启动早期。
-		 *   预热期的长度取自 `mpInstallAliasBridge` 的 600ms 轮询节奏，约 9 秒。
+		 *     "CSSModule 别名桥接: YDXeBa→pXSMma (2 个类名)"
+		 *     "CSSModule 别名桥接: YDXeBa→oz9t_a (2 个类名)"
+		 *   这与 "bOPqQW→O_Ebla" 是同一个病，只是发生在启动早期。
+		 *   预热期的长度取自 "mpInstallAliasBridge" 的 600ms 轮询节奏，约 9 秒。
 		 */
 		const MP_ALIAS_WARMUP = 15;
 		let mpAliasRound = 0;
 
 		/**
-		 * 采集当前存在的全部 `{hash}_{local}` 类名，返回 `byHash`（样式表 + DOM 的并集，用于投票）。
+		 * 采集当前存在的全部 "{hash}_{local}" 类名，返回 "byHash"（样式表 + DOM 的并集，用于投票）。
 		 *
 		 * ⚠️ 两个来源必须区别对待（2026-10-04 踩的坑）：桥接会把旧类名**补到 DOM 元素**上，
 		 *   若把这些补上去的类名也算作证据，下一轮推导就会「自己证明自己」，越套越偏。
@@ -1978,11 +2508,11 @@ window.__ModuleLoader__.load({
 				try { rules = sheet.cssRules; } catch (e) { continue; }
 				if (!rules) continue;
 				/* ⚠️ 必须跳过**插件自己**的样式表：本插件的 CSS 大量使用旧类名
-				 *   （如 `[data-mobile] .bOPqQW_root`），若把它当作「官方仍在用」的
+				 *   （如 "[data-mobile] .bOPqQW_root"），若把它当作「官方仍在用」的
 				 *   证据，所有旧 hash 都会被判为未过期，桥接彻底失效。
 				 *   ⚠️ 判据必须是**全等**比较：官方 DSH 自己也给每个 CSS Module 的
-				 *   `<style>` 打 `dataset.pluginCss`（值是模块路径），
-				 *   只判 `dataset.pluginCss` 是否存在会误伤 140 个官方样式表。 */
+				 *   "<style>" 打 "dataset.pluginCss"（值是模块路径），
+				 *   只判 "dataset.pluginCss" 是否存在会误伤 140 个官方样式表。 */
 				const owner = sheet.ownerNode;
 				if (owner && owner.dataset &&
 					owner.dataset.pluginCss === "dsh-android-mobile/main.css") continue;
@@ -2008,22 +2538,22 @@ window.__ModuleLoader__.load({
 		 *   · **命中必须 ≥2** → 才采纳
 		 *   · 同一新 hash 只允许被一个旧 hash 认领
 		 *
-		 * ⚠️ 2026-10-03 修复：原判据有一条 `|| locals.length === 1` 的豁免
+		 * ⚠️ 2026-10-03 修复：原判据有一条 "|| locals.length === 1" 的豁免
 		 *   （「该旧 hash 只有 1 个局部名时，1 票即可」）。这条豁免在
-		 *   `Nqubda: ["panel"]` 上炸了 —— `panel` 是极通用的局部名，官方
-		 *   右侧栏的 dockkit 面板（`P3OORG_panel`）也用它，于是桥接把
-		 *   `Nqubda_panel` 补到了**那个面板**上；而 §5 的审批浮层规则
-		 *   `[data-mobile] .Nqubda_panel` 随即把它变成 fixed 浮层，
-		 *   盖住整个上半屏（实测 `[24,0,336,458]`），连「添加一个 API Key」
+		 *   "Nqubda: ["panel"]" 上炸了 —— "panel" 是极通用的局部名，官方
+		 *   右侧栏的 dockkit 面板（"P3OORG_panel"）也用它，于是桥接把
+		 *   "Nqubda_panel" 补到了**那个面板**上；而 §5 的审批浮层规则
+		 *   "[data-mobile] .Nqubda_panel" 随即把它变成 fixed 浮层，
+		 *   盖住整个上半屏（实测 "[24,0,336,458]"），连「添加一个 API Key」
 		 *   对话框都被压在下面 → 用户看到半屏白块。
-		 *   同类隐患还有 `zGbnIq: ["title"]`（title 同样通用）。
+		 *   同类隐患还有 "zGbnIq: ["title"]"（title 同样通用）。
 		 *
 		 *   豁免取消后，单名条目一律不参与推导；需要它们的场合改为在 JS 里
 		 *   用「当前 hash」直接定位（见 mpCurrentHash 相关辅助）。
 		 */
 		function mpDeriveAliasMap() {
 			const { byHash: cur } = mpCollectCurrentClasses();
-			/* 预热期内只累积 `mpOfficialSeen`（上面的采集已完成），不认领任何映射。
+			/* 预热期内只累积 "mpOfficialSeen"（上面的采集已完成），不认领任何映射。
 			 * 此时官方样式表还没注入齐，认领必然是误伤。见 [MP_ALIAS_WARMUP]。 */
 			if (mpAliasRound <= MP_ALIAS_WARMUP) return { map: {}, pairs: [] };
 			const owners = {};
@@ -2033,25 +2563,25 @@ window.__ModuleLoader__.load({
 			for (const [oldHash, locals] of Object.entries(MP_LEGACY_HASHES)) {
 				/* ⚠️ 官方样式表里**曾经**出现过这个 hash ⇒ 它没有过期，不能拿它去认领别人。
 				 *
-				 * 2026-10-04 踩的坑：`bOPqQW`（composer 遥测药丸）既登记在旧表里，
+				 * 2026-10-04 踩的坑："bOPqQW"（composer 遥测药丸）既登记在旧表里，
 				 * 又是官方当前仍在用的 hash。原逻辑无条件把它从候选池剔除，于是它
-				 * 丢掉了自己的 4 票证据，转而去认领了恰好共享 `label` + `root` 两个
-				 * 局部名的**无关** hash `O_Ebla`（2 票，刚好够门槛）——
-				 * 而 `O_Ebla_root` 是「执行了命令」分组头，`bOPqQW_root` 带
-				 * `justify-content: center`，于是那行标题被居中、不再左对齐。
+				 * 丢掉了自己的 4 票证据，转而去认领了恰好共享 "label" + "root" 两个
+				 * 局部名的**无关** hash "O_Ebla"（2 票，刚好够门槛）——
+				 * 而 "O_Ebla_root" 是「执行了命令」分组头，"bOPqQW_root" 带
+				 * "justify-content: center"，于是那行标题被居中、不再左对齐。
 				 *
-				 * ⚠️ 判据必须用**累积**集合 `mpOfficialSeen` 而非当下快照：
+				 * ⚠️ 判据必须用**累积**集合 "mpOfficialSeen" 而非当下快照：
 				 *   官方 CSS Module 按需注入，未渲染组件的规则此刻不在表里。
 				 *   用快照会让同一 hash 在「出现过 / 没出现」之间抖动，表现为
 				 *   **同一个页面上有的分组头中招、有的正常**（真机实测 22 个
-				 *   `.O_Ebla_root` 里只有 2 个被误加）。累积后结论稳定。
+				 *   ".O_Ebla_root" 里只有 2 个被误加）。累积后结论稳定。
 				 *
 				 * ⚠️ 判据必须是「样式表 **或** DOM」两者取或，且 DOM 侧必须排除桥接自己补的类名：
 				 *   官方类名可能**先出现在 DOM、样式表随后才懒注入**。只看样式表会让
 				 *   没过期的 hash 在注入空窗期被判成过期 —— 真机日志实测：
-				 *     `CSSModule 别名桥接: YDXeBa→oz9t_a (2 个类名)`
-				 *   `YDXeBa` 是 workspace 的当前 hash（官方样式表里 36 个局部名齐全），
-				 *   却因为那一刻样式表还没到而被误判。这与 `bOPqQW→O_Ebla` 同病。 */
+				 *     "CSSModule 别名桥接: YDXeBa→oz9t_a (2 个类名)"
+				 *   "YDXeBa" 是 workspace 的当前 hash（官方样式表里 36 个局部名齐全），
+				 *   却因为那一刻样式表还没到而被误判。这与 "bOPqQW→O_Ebla" 同病。 */
 				if (mpOfficialSeen.has(oldHash) || cur[oldHash]) continue;
 				const votes = {};
 				for (const l of locals) for (const h of (owners[l] || [])) votes[h] = (votes[h] || 0) + 1;
@@ -2063,17 +2593,17 @@ window.__ModuleLoader__.load({
 				if (hit < 2) continue;
 				/* ⚠️ 光有 2 票远远不够 —— 必须要求**局部名集合高度重合**。
 				 *
-				 * 2026-10-04 真机日志实测的误伤：`YDXeBa→oz9t_a (2 个类名)`。
-				 * `YDXeBa` 是 workspace 的**当前** hash（官方样式表里 36 个局部名齐全），
+				 * 2026-10-04 真机日志实测的误伤："YDXeBa→oz9t_a (2 个类名)"。
+				 * "YDXeBa" 是 workspace 的**当前** hash（官方样式表里 36 个局部名齐全），
 				 * 只是它的组件（侧栏）那一刻还没渲染、样式表也还没懒注入，于是
-				 * 「当下无证据」被判成了「已过期」。它转去认领 `oz9t_a`，只因两者
-				 * 偶然共享 `time` + `chevron` 两个**通用**局部名，把 `YDXeBa_time`
+				 * 「当下无证据」被判成了「已过期」。它转去认领 "oz9t_a"，只因两者
+				 * 偶然共享 "time" + "chevron" 两个**通用**局部名，把 "YDXeBa_time"
 				 * 补到了折叠轮次的时间戳上。
 				 *
 				 * 真正的「过期」是**同一个组件换了 hash**，局部名集合基本不变
-				 * （`bOPqQW` 换成新 hash 时 anchor/label/pill/root 仍全在）。
+				 * （"bOPqQW" 换成新 hash 时 anchor/label/pill/root 仍全在）。
 				 * 所以用**重合率**作判据：命中数要占双方较小集合的 60% 以上。
-				 *   · `YDXeBa`(10) vs `oz9t_a`(10)，命中 2 → 20% ⇒ 拒绝
+				 *   · "YDXeBa"(10) vs "oz9t_a"(10)，命中 2 → 20% ⇒ 拒绝
 				 *   · 真换 hash 时局部名几乎全在 ⇒ 接近 100% ⇒ 采纳
 				 */
 				const otherSize = Object.keys(cur[bestHash] || {}).length;
@@ -2112,9 +2642,9 @@ window.__ModuleLoader__.load({
 		 * 撤掉「已补上去、但当前映射里不再成立」的旧类名。
 		 *
 		 * ⚠️ 为什么必须有（2026-10-04）：推导判据修正后，之前误加的类名**不会自己消失** ——
-		 *   它们留在 DOM 上，而 `.bOPqQW_root` 那条官方规则（`justify-content: center`）
+		 *   它们留在 DOM 上，而 ".bOPqQW_root" 那条官方规则（"justify-content: center"）
 		 *   照旧生效，用户看到的错位不会随代码修复而恢复，除非重启页面。
-		 *   真机实测：修好判据后，已被误加的 2 个 `.O_Ebla_root` 仍然是居中状态。
+		 *   真机实测：修好判据后，已被误加的 2 个 ".O_Ebla_root" 仍然是居中状态。
 		 */
 		function mpPruneStaleAliases() {
 			if (!mpAliasAdded.size) return;
@@ -2201,8 +2731,8 @@ window.__ModuleLoader__.load({
 		 * 「界面什么时候真的能用了」才能收起来。
 		 *
 		 * 四个候选信号，只有最后一个是对的：
-		 *   · `apply()` 返回   → React 还没挂载，界面是白的
-		 *   · `document.readyState === "complete"` → 实测在插件激活**之前**就完成
+		 *   · "apply()" 返回   → React 还没挂载，界面是白的
+		 *   · "document.readyState === "complete"" → 实测在插件激活**之前**就完成
 		 *   · data-mobile 已打上 且 外壳已建 → 只说明**本插件**挂好了
 		 *   · 上面两条 **且官方前端的启动页已消失** → 界面真的能用了 ✅
 		 *
@@ -2217,21 +2747,21 @@ window.__ModuleLoader__.load({
 		 *
 		 * 所以判据必须是「官方前端的启动页没了」。那个页面**没有稳定的 class 或 id**
 		 * （它由官方前端在运行时构建，随版本变化），但它的**文案**是稳定的英文
-		 * `Loading plugins`。这里按文案判定，并做成宽松匹配（大小写不敏感、
+		 * "Loading plugins"。这里按文案判定，并做成宽松匹配（大小写不敏感、
 		 * 允许中间有省略号或空格差异），避免官方改一个字符就失效。
 		 *
 		 * ⚠️ 四条判据的实际分工（真机实测，别想当然）：
-		 *   `apply()` 被调用时，页面通常**已经跑过启动页了** —— 本插件的客户端半有
-		 *   5.5MB，等它解析完就已经接近 `load`，所以 `officialBootVisible()` 在正常
-		 *   路径上测到的是 false（诊断里的 `polls=1 bootSeen=false` 就是这么来的）。
-		 *   真正把收起时机推后的是 `pageLoaded()`。
+		 *   "apply()" 被调用时，页面通常**已经跑过启动页了** —— 本插件的客户端半有
+		 *   5.5MB，等它解析完就已经接近 "load"，所以 "officialBootVisible()" 在正常
+		 *   路径上测到的是 false（诊断里的 "polls=1 bootSeen=false" 就是这么来的）。
+		 *   真正把收起时机推后的是 "pageLoaded()"。
 		 *   但文案判据**不能删** —— 它是更慢的设备、更冷的缓存下唯一能挡住启动页的
 		 *   那一条，只是在本机复现不出来而已。
 		 *
-		 * ⚠️ 为什么不用「#root 有内容」：`#root` 在启动页阶段就已经有 1 个子节点、
+		 * ⚠️ 为什么不用「#root 有内容」："#root" 在启动页阶段就已经有 1 个子节点、
 		 *   24 个字符了（就是那个启动页本身），所以「有内容」判不出来。
 		 *
-		 * ⚠️ 必须轮询而不是监听一次：`mpSyncMobileAttr()` 由 observer 节流驱动
+		 * ⚠️ 必须轮询而不是监听一次："mpSyncMobileAttr()" 由 observer 节流驱动
 		 *   （300ms），首次打上 data-mobile 的时刻不确定，单次检查会漏。
 		 *   上限 [UI_READY_MAX_WAIT_MS] 后无条件上报 —— 宁可早收也不能不收，
 		 *   否则启动页会永久盖住界面（那是最糟的失败方式）。
@@ -2257,8 +2787,8 @@ window.__ModuleLoader__.load({
 			/**
 			 * 官方前端的启动页是否还在。
 			 *
-			 * ⚠️ 判据用 **`body.innerText`** 而不是 `#root.innerText`：
-			 *   实测启动页阶段 `#root` 的 innerText 只有 24 字符，而 `body` 的匹配
+			 * ⚠️ 判据用 **"body.innerText"** 而不是 "#root.innerText"：
+			 *   实测启动页阶段 "#root" 的 innerText 只有 24 字符，而 "body" 的匹配
 			 *   才是可靠的（两者并非总是同一个文本视图）。用 body 更稳。
 			 *
 			 * ⚠️ 只在启动阶段查，不存在"用户聊天内容里恰好出现这个词"的误判风险 ——
@@ -2275,12 +2805,12 @@ window.__ModuleLoader__.load({
 			 * 页面是否已经加载完。
 			 *
 			 * ⚠️ 这一条是**文案判据的保险**，不是重复。若官方前端把启动页文案本地化
-			 *   （中文界面下就不是 "Loading plugins"），`officialBootVisible()` 会永远
+			 *   （中文界面下就不是 "Loading plugins"），"officialBootVisible()" 会永远
 			 *   返回 false → 判据提前满足。加上 readyState 之后，那种情况下至少还能
 			 *   等页面真正加载完再收。
 			 *
-			 * 实测冷启动：`readyState` 从 `interactive`（正文 = "HARNESS Loading plugins…"）
-			 * 变为 `complete` 的时刻，正是真实 UI 出现的时刻（t≈11606ms）。
+			 * 实测冷启动："readyState" 从 "interactive"（正文 = "HARNESS Loading plugins…"）
+			 * 变为 "complete" 的时刻，正是真实 UI 出现的时刻（t≈11606ms）。
 			 */
 			const pageLoaded = () => document.readyState === "complete";
 
@@ -2680,7 +3210,7 @@ window.__ModuleLoader__.load({
 			     所以直接读 getBoundingClientRect().bottom —— 它是 fixed 元素，
 			     页面滚动不影响，读数恒定，也不需要知道系统栏多高。
 
-			   ⚠️ 判据用 `mp-in-header` 类而不是"header 在不在"：这个类正是
+			   ⚠️ 判据用 "mp-in-header" 类而不是"header 在不在"：这个类正是
 			     mpAnchorBurger() 挂载时打的标记（进 header 加、回落 body 摘），
 			     与汉堡的实际归属永远一致，不会出现"类与位置打架"的中间态。
 
@@ -2775,7 +3305,7 @@ window.__ModuleLoader__.load({
 			//   仍留在 DOM 里（只改 display），按存在性判会永远认为"有东西可关"，
 			//   返回键就再也退不出 App 了。
 
-			/** 元素是否真的显示在屏幕上（`display:none` / 已卸载 ⇒ false）。 */
+			/** 元素是否真的显示在屏幕上（"display:none" / 已卸载 ⇒ false）。 */
 			function mpVisible(el) {
 				if (!el || !el.isConnected) return false;
 				try { return el.getClientRects().length > 0; } catch (e) { return false; }
@@ -2792,7 +3322,7 @@ window.__ModuleLoader__.load({
 			 * 派发一次 Escape —— 官方大量组件用它做"退一层"
 			 * （原生返回键在桌面端的对应物）。
 			 *
-			 * ⚠️ 两处都发：官方有的监听在 `document` 上，有的挂在获得焦点的元素上。
+			 * ⚠️ 两处都发：官方有的监听在 "document" 上，有的挂在获得焦点的元素上。
 			 */
 			function mpDispatchEscape() {
 				try {
@@ -2806,28 +3336,28 @@ window.__ModuleLoader__.load({
 				} catch (e) { /* 静默：派发失败也不该让返回键卡住 */ }
 			}
 
-			/** 官方 `ctx.layout` 服务（拿不到就返回 null，绝不抛）。 */
+			/** 官方 "ctx.layout" 服务（拿不到就返回 null，绝不抛）。 */
 			function mpLayout() {
 				if (!mpCtx) return null;
 				try { return mpCtx.get("layout") ?? null; } catch (e) { return null; }
 			}
 
 			/**
-			 * 官方 `ctx.sidebarRight` 服务 —— 右上角那一栏（工作区文件 / 新建终端）。
+			 * 官方 "ctx.sidebarRight" 服务 —— 右上角那一栏（工作区文件 / 新建终端）。
 			 *
-			 * ⚠️ **不要用 `layout.closeRightbar()` 关它**，那是个陷阱：该方法在
-			 *   `ILayout` 上的语义是「**报告**右栏为隐藏」（`dsh-client-ui-layout` 的
+			 * ⚠️ **不要用 "layout.closeRightbar()" 关它**，那是个陷阱：该方法在
+			 *   "ILayout" 上的语义是「**报告**右栏为隐藏」（"dsh-client-ui-layout" 的
 			 *   注释原文 "Report the right panel as hidden"），它是给占用方
-			 *   （`dsh-client-ui-sidebar-right`）上报呈现状态用的。而右栏自己的
-			 *   `expanded` 状态住在 sidebar-right 的 store 里，由它反过来调
-			 *   `openRightbar`/`closeRightbar` 同步给 layout（见其 client.js 的
-			 *   `syncPresentation`）。直接调 layout 只会改 grid 轨道，**右栏的
-			 *   `expanded` 仍是 true**，于是面板被滑到屏幕外却还认为自己开着，
+			 *   （"dsh-client-ui-sidebar-right"）上报呈现状态用的。而右栏自己的
+			 *   "expanded" 状态住在 sidebar-right 的 store 里，由它反过来调
+			 *   "openRightbar"/"closeRightbar" 同步给 layout（见其 client.js 的
+			 *   "syncPresentation"）。直接调 layout 只会改 grid 轨道，**右栏的
+			 *   "expanded" 仍是 true**，于是面板被滑到屏幕外却还认为自己开着，
 			 *   用户再点右上角按钮时行为就错乱了。
 			 *
-			 * 正确的接缝是 `ctx.sidebarRight`（`provide("sidebarRight", controller)`）：
-			 *   · `isExpanded()` —— 「这一层开着吗」，判据与官方自己一致；
-			 *   · `toggleExpanded()` —— 收起/展开，内部走 store action，会正常
+			 * 正确的接缝是 "ctx.sidebarRight"（"provide("sidebarRight", controller)"）：
+			 *   · "isExpanded()" —— 「这一层开着吗」，判据与官方自己一致；
+			 *   · "toggleExpanded()" —— 收起/展开，内部走 store action，会正常
 			 *     同步 layout 轨道与面板滑出动画。
 			 *
 			 * @returns {object|null} 服务实例；拿不到（未装该插件）返回 null。
@@ -3184,6 +3714,7 @@ window.__ModuleLoader__.load({
 			queueMicrotask(() => {
 				statsSyncQueued = false;
 				processStatsLine();
+				mpAbbreviateEffort();   // 修复 68：同批处理，抢在绘制前缩掉长文案
 			});
 		};
 		// ── 修复 35b：轨迹详情面板「不可用」回填闪烁（同步处理，不等节流）──
@@ -3245,6 +3776,7 @@ window.__ModuleLoader__.load({
 				moTimer = 0;
 				document.querySelectorAll(".xzv4MW_timeEnd").forEach(trimMeta);
 				processStatsLine();
+				mpAbbreviateEffort();   // 修复 68：推理等级缩写，防止挤掉模型名
 				watchApproval();
 				mpSyncDrawer();
 				mpAnchorBurger(); // ⭐ 修复 47：兜底重挂（React 摘掉 header 子节点时专用 observer 若漏掉）
@@ -3628,12 +4160,12 @@ window.__ModuleLoader__.load({
 		 * 取节点的文本，**剔除元数据与按钮子树**。
 		 *
 		 * ⚠️ 为什么必须剔除（真机实测）：官方把时间戳与操作按钮放在同一条消息的尾部
-		 *   （`.xzv4MW_actions` 里一个 `.xzv4MW_timeStart` 加一个含 svg 的复制按钮），
-		 *   直接取 `textContent` 会得到「只回复两个字：通了01:14」—— 时间戳粘在用户
+		 *   （".xzv4MW_actions" 里一个 ".xzv4MW_timeStart" 加一个含 svg 的复制按钮），
+		 *   直接取 "textContent" 会得到「只回复两个字：通了01:14」—— 时间戳粘在用户
 		 *   原话后面，看起来像用户自己打的字。
 		 *
-		 * ⚠️ 判据用 **`[data-clock]` + `button`/`svg` 标签**，不用那个哈希类名：
-		 *   `data-clock` 是官方写死的元数据标记（`start` = 时间戳、`end` = 时间戳 +
+		 * ⚠️ 判据用 **"[data-clock]" + "button"/"svg" 标签**，不用那个哈希类名：
+		 *   "data-clock" 是官方写死的元数据标记（"start" = 时间戳、"end" = 时间戳 +
 		 *   用量），实测页面里两处都有；而"消息尾部的操作按钮"永远是 button。
 		 *   类名随官方发版会变，属性不会。取不到就退回原文（多带点噪音，不丢内容）。
 		 */
@@ -3846,7 +4378,7 @@ window.__ModuleLoader__.load({
 		 * 等待「界面真的可用」的上限。
 		 *
 		 * ⚠️ 从 6000 提到 9000：判据里新增了「官方前端的启动页已消失」，
-		 *   而那一项实测要等到 `readyState === complete` 之后才满足
+		 *   而那一项实测要等到 "readyState === complete" 之后才满足
 		 *   （旧判据 10231ms 满足，官方启动页 10475ms 才消失），
 		 *   留足余量避免在正常启动路径上误触发超时兜底。
 		 */
@@ -4102,7 +4634,7 @@ window.__ModuleLoader__.load({
 		/* ══ 修复 64：移走编辑区焦点的**时机**闸门（两个守卫共用）══
 		   真机实测的时序（键盘收起状态点「+」）：
 		     ① 官方 onToggleCommandMenu 是「先把焦点还给编辑区，再 toggle 菜单」
-		        （dsh-client-ui-conversation/lib/client.js:17390 `focusDraftEditor` → `toggleCommandMenu`），
+		        （dsh-client-ui-conversation/lib/client.js:17390 "focusDraftEditor" → "toggleCommandMenu"），
 		        而指令菜单**只在编辑区持焦点时才渲染**；
 		     ② 官方的 keepDraftFocus 还会在 mousedown 里再 focus 一次（preventDefault + focus）。
 		   于是「谁先把焦点从编辑区拿走」就直接决定菜单能不能出现：
@@ -4113,13 +4645,13 @@ window.__ModuleLoader__.load({
 		     | 一直不拿            | ✅ 开   | ❌ 弹回 |
 		     | **菜单出现之后再拿** | ✅ 开   | ✅ 不弹 |
 
-		   所以把「拿焦点」挂到 `[data-trigger-menu]` 出现的这一刻上，而不是手势里。
+		   所以把「拿焦点」挂到 "[data-trigger-menu]" 出现的这一刻上，而不是手势里。
 		   闸门对**两条**抢焦点的路径同时生效（它们都会被官方那次 focus 触发）：
 		     · setupComposerKeyboardGuard 的 onFocusIn 守卫（修复 29）
 		     · setupKeepFocusGuard 的 arm 分支（修复 38b）
 		   ⚠️ 兜底定时器必需：万一菜单始终不出现（官方改了渲染方式），也必须把焦点
 		     还回去，否则键盘会一直挂在那里。
-		   ⚠️ 只对会弹指令菜单的按钮延迟（`button[aria-haspopup="listbox"]`）；发送 /
+		   ⚠️ 只对会弹指令菜单的按钮延迟（"button[aria-haspopup="listbox"]"）；发送 /
 		     停止 / 模型选择等不弹这个菜单，必须维持**立即 blur** —— 对它们延迟等于
 		     白等一个兜底周期，那段时间足够键盘被挂回来。
 		   ⚠️ 不要退回「立即 blur」，也不要改成「在 keepFocus 里 blur」—— 后者同样抢在
@@ -4719,6 +5251,111 @@ window.__ModuleLoader__.load({
 			note2: "气泡靠前台服务推送的状态刷新，约每秒一次；不额外耗电（引擎本来就在跑）。",
 			note3: "气泡里发消息走的是同一个官方输入框，会进入当前会话，和在本应用里打字完全一样。",
 			noBridge: "当前环境没有原生桥（DSHAndroid 不可用），无法控制气泡。",
+			motionTitle: "甩动手感",
+			motionIntro: "让气泡更像一只真的小宠物：甩一甩会飞、会撞墙弹、落地会压扁。",
+			throwName: "拖拽抛掷",
+			throwHint: "手指快速划过气泡再松手，它会朝那个方向飞出去。",
+			shakeName: "晃动甩飞",
+			shakeHint: "快速晃动手机，气泡就像被甩出去一样。不需要任何权限。",
+			imeName: "键盘顶飞",
+			imeHint: "键盘弹出时，气泡从屏幕下方「嗖」地飞上去，不会被挡住。",
+			imeLocked: "不可用",
+			imeLockedWhy: "这个功能要读系统的键盘状态，普通应用没这个权限。接入 Shizuku 或 root 后就能打开。",
+			on2: "开",
+			off2: "关",
+			// ── 外观控制面板 ────────────────────────────────────────
+			panelTitle: "外观与手感",
+			panelIntro: "下面这些就是悬浮球支持的全部可调项，改完立刻生效。分组可以点开收起。",
+			panelUnavailable: "读取当前外观失败（原生桥不可用）。",
+			collapse: "收起",
+			expand: "展开",
+			autoColor: "自动",
+			panelBgAuto: "透明",
+			autoSize: "自动",
+			neverHide: "不隐藏",
+			grpState: "形态",
+			grpLook: "尺寸与形状",
+			grpColor: "配色",
+			grpMotion: "动作与交互",
+			grpAnim: "动画与指示",
+			grpPanel: "展开面板",
+			fState: "默认形态",
+			stAuto: "自动",
+			stCollapsed: "小窗",
+			stExpanded: "大窗",
+			fSize: "直径",
+			fShape: "形状",
+			shapeCircle: "圆形",
+			shapeSquare: "方形",
+			shapeRounded: "圆角",
+			fCorner: "圆角半径",
+			fOpacity: "整体不透明度",
+			fBgOpacity: "背景不透明度",
+			fAvatarOpacity: "头像不透明度",
+			fAvatarScale: "头像缩放",
+			fBorderWidth: "描边粗细",
+			fBorder: "描边颜色",
+			fBg: "背景主色",
+			fBg2: "背景副色（渐变）",
+			fEdgeSnap: "拖出屏幕贴边",
+			fMoveEnabled: "自己会走动",
+			fMoveInterval: "走动间隔",
+			fMoveMin: "单次最少走",
+			fMoveMax: "单次最多走",
+			fFlipOnTurn: "转向时左右翻转",
+			fFrameInterval: "帧间隔",
+			fSpin: "常驻旋转角度",
+			fPulse: "呼吸脉动",
+			fShowDot: "显示状态小圆点",
+			fStatusImageSize: "状态配图尺寸",
+			fPanelWidth: "面板宽度",
+			fPanelHeight: "面板高度",
+			fStatusAutoHide: "状态条自动隐藏",
+			fPanelBg: "面板背景色",
+			fPanelText: "面板文字色",
+			fPanelAccent: "面板强调色",
+
+			grpBalance: "余额徽标",
+			bbEnabledHint: "在球旁边常驻显示 DeepSeek 余额。关掉就完全不占位置。",
+			fBbEnabled: "显示余额徽标",
+			fBbAnchor: "出现位置",
+			fBbTemplate: "显示内容",
+			fBbGap: "与球的距离",
+			fBbFontSize: "字号",
+			fBbRadius: "圆角",
+			fBbPaddingH: "左右内边距",
+			fBbPaddingV: "上下内边距",
+			fBbMaxWidth: "最大宽度",
+			fBbBorderWidth: "描边粗细",
+			fBbBg: "背景色",
+			fBbFg: "文字色",
+			fBbBorder: "描边色",
+			fBbCostFlash: "花钱时跳动",
+			fBbHideIdle: "只在有花费时显示",
+			fBbTurnEnd: "每轮结束刷新",
+			fBbEvery: "定时刷新",
+			fBbTapRefresh: "点球刷新",
+			fBbTapMin: "两次点击的最短间隔",
+			bbFollow: "跟随主题",
+			bbTokenHint: "点下面的词可以加进去",
+			bbPreviewHint: "球旁边会显示成这样",
+			bbRemove: "移除",
+			bbEmpty: "（还没有内容）",
+			bbReset: "恢复默认",
+			bbTokBalance: "余额",
+			bbTokRecharge: "充值",
+			bbTokBonus: "赠送",
+			bbTokCurrency: "币种",
+			bbTokCost: "本次",
+			bbTokCostSession: "本会话",
+			bbOff: "关闭",
+			bbMinute: " 分钟",
+			bbAnchorTR: "右上",
+			bbAnchorTL: "左上",
+			bbAnchorBR: "右下",
+			bbAnchorBL: "左下",
+			bbAnchorAbove: "正上",
+			bbAnchorBelow: "正下",
 		};
 		const MP_BUBBLE_EN = {
 			nav: "Floating bubble",
@@ -4751,6 +5388,110 @@ window.__ModuleLoader__.load({
 			note2: "The bubble is fed by the foreground service's status, about once per second. No extra battery cost — the engine is already running.",
 			note3: "Messages sent from the bubble go through the same official composer and land in the current session, exactly as if you typed them in the app.",
 			noBridge: "No native bridge (DSHAndroid unavailable) in this environment — cannot control the bubble.",
+			motionTitle: "Throw feel",
+			motionIntro: "Make the bubble behave like a real little pet: fling it and it flies, bounces off walls, and squashes on landing.",
+			throwName: "Drag throw",
+			throwHint: "Flick your finger across the bubble and release — it flies off in that direction.",
+			shakeName: "Shake to throw",
+			shakeHint: "Shake the phone and the bubble gets flung, as if thrown by hand. No permission needed.",
+			imeName: "Keyboard launch",
+			imeHint: "When the keyboard opens, the bubble shoots up from the bottom so it never gets covered.",
+			imeLocked: "Unavailable",
+			imeLockedWhy: "This needs to read the system keyboard state, which normal apps cannot access. Enable Shizuku or root to turn it on.",
+			on2: "On",
+			off2: "Off",
+			panelTitle: "Look & feel",
+			panelIntro: "Everything the bubble supports, tunable here. Changes apply instantly. Tap a group to expand or collapse it.",
+			panelUnavailable: "Could not read the current appearance (native bridge unavailable).",
+			collapse: "Collapse",
+			expand: "Expand",
+			autoColor: "Auto",
+			panelBgAuto: "Transparent",
+			autoSize: "Auto",
+			neverHide: "Never",
+			grpState: "Form",
+			grpLook: "Size & shape",
+			grpColor: "Colors",
+			grpMotion: "Motion & interaction",
+			grpAnim: "Animation & indicator",
+			grpPanel: "Expanded panel",
+			fState: "Default form",
+			stAuto: "Auto",
+			stCollapsed: "Collapsed",
+			stExpanded: "Expanded",
+			fSize: "Diameter",
+			fShape: "Shape",
+			shapeCircle: "Circle",
+			shapeSquare: "Square",
+			shapeRounded: "Rounded",
+			fCorner: "Corner radius",
+			fOpacity: "Overall opacity",
+			fBgOpacity: "Background opacity",
+			fAvatarOpacity: "Avatar opacity",
+			fAvatarScale: "Avatar scale",
+			fBorderWidth: "Border width",
+			fBorder: "Border color",
+			fBg: "Background color",
+			fBg2: "Gradient color",
+			fEdgeSnap: "Dock to edge",
+			fMoveEnabled: "Wanders on its own",
+			fMoveInterval: "Wander interval",
+			fMoveMin: "Min step",
+			fMoveMax: "Max step",
+			fFlipOnTurn: "Flip when turning",
+			fFrameInterval: "Frame interval",
+			fSpin: "Constant rotation",
+			fPulse: "Breathing pulse",
+			fShowDot: "Show status dot",
+			fStatusImageSize: "Status image size",
+			fPanelWidth: "Panel width",
+			fPanelHeight: "Panel height",
+			fStatusAutoHide: "Status bar auto-hide",
+			fPanelBg: "Panel background",
+			fPanelText: "Panel text",
+			fPanelAccent: "Panel accent",
+
+			grpBalance: "Balance badge",
+			bbEnabledHint: "Show your DeepSeek balance next to the ball. Off = takes no space at all.",
+			fBbEnabled: "Show balance badge",
+			fBbAnchor: "Position",
+			fBbTemplate: "Text",
+			fBbGap: "Distance from ball",
+			fBbFontSize: "Font size",
+			fBbRadius: "Corner radius",
+			fBbPaddingH: "Side padding",
+			fBbPaddingV: "Top/bottom padding",
+			fBbMaxWidth: "Max width",
+			fBbBorderWidth: "Border width",
+			fBbBg: "Background",
+			fBbFg: "Text colour",
+			fBbBorder: "Border colour",
+			fBbCostFlash: "Pulse when spending",
+			fBbHideIdle: "Only when it cost something",
+			fBbTurnEnd: "Refresh after each turn",
+			fBbEvery: "Timed refresh",
+			fBbTapRefresh: "Refresh on tap",
+			fBbTapMin: "Min gap between taps",
+			bbFollow: "Theme",
+			bbTokenHint: "Tap a field to add it",
+			bbPreviewHint: "It will look like this next to the ball",
+			bbRemove: "Remove",
+			bbEmpty: "(empty)",
+			bbReset: "Reset",
+			bbTokBalance: "Balance",
+			bbTokRecharge: "Recharge",
+			bbTokBonus: "Bonus",
+			bbTokCurrency: "Currency",
+			bbTokCost: "This turn",
+			bbTokCostSession: "This session",
+			bbOff: "Off",
+			bbMinute: " min",
+			bbAnchorTR: "Top right",
+			bbAnchorTL: "Top left",
+			bbAnchorBR: "Bottom right",
+			bbAnchorBL: "Bottom left",
+			bbAnchorAbove: "Above",
+			bbAnchorBelow: "Below",
 		};
 
 		const MP_PRIV_EN = {
@@ -4961,8 +5702,7 @@ window.__ModuleLoader__.load({
 			stack: { display: "flex", flexDirection: "column", gap: "12px" },
 			summary: { margin: 0, fontSize: "13px", lineHeight: "19px" },
 			next: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", padding: "9px 10px", borderRadius: "8px", background: "var(--dsw-alias-interactive-bg-hover, #f2f2f2)" },
-			nextText: { flex: "1 1 160px", minWidth: 0, fontSize: "13px", lineHeight: "19px" },
-			// root 卡片专用的「下一步」文案样式：与上面那条的区别只有换行基线。
+			nextText: { flex: "1 1 160px", minWidth: 0, fontSize: "13px", lineHeight: "19px" },			// root 卡片专用的「下一步」文案样式：与上面那条的区别只有换行基线。
 			//
 			// ⚠️ **不复用 `nextText`**：它的 `flex: "1 1 160px"` 在 360 CSS px 宽的
 			//   卡片里会把长文案挤成每行十来个字的一窄列（root 那三条文案都挺长）。
@@ -5038,6 +5778,182 @@ window.__ModuleLoader__.load({
 			// 群号用等宽字体且**放大一号**：这是要照着念/照着手输的数字，
 			// 与周围的说明文字同等字号会显得不够醒目。
 			mpGroupNo: { flex: "1 1 auto", minWidth: 0, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: "15px", fontWeight: 600, letterSpacing: "0.5px" },
+			// ── 「甩动手感」开关行 ───────────────────────────────────
+			// 一行一个开关：左边名字+说明，右边一枚自绘开关。
+			// ⚠️ 不用 <input type="checkbox">：本插件的全局 CSS 会把原生控件压成
+			//   系统默认样式，在深色主题下几乎看不见。自绘只用两个 div。
+			swRow: { display: "flex", alignItems: "flex-start", gap: "12px", padding: "10px 0", borderTop: "0.5px solid var(--dsw-alias-border-l2, #eee)" },
+			swMain: { flex: "1 1 auto", minWidth: 0, display: "flex", flexDirection: "column", gap: "3px" },
+			swName: { fontSize: "14px", fontWeight: 600 }, 
+			swHint: { fontSize: "12px", lineHeight: "18px", color: "var(--dsw-alias-label-tertiary, #888)" },
+			swWhy: { fontSize: "12px", lineHeight: "18px", color: "#c92a2a" },
+			// 轨道：关=灰、开=主色。宽高固定，thumb 用绝对定位左右滑。
+			swTrack: { flex: "0 0 auto", position: "relative", width: "44px", height: "26px", borderRadius: "999px", border: "none", padding: 0, cursor: "pointer", transition: "background 0.18s ease", marginTop: "2px" },
+			swThumb: { position: "absolute", top: "3px", width: "20px", height: "20px", borderRadius: "50%", background: "#fff", boxShadow: "0 1px 3px rgba(0,0,0,0.28)", transition: "left 0.18s ease" },
+			// ── 「外观控制面板」用的控件 ─────────────────────────────
+			// 分组标题：比 cardTitle 轻一档，用来在长面板里切段。
+			grpTitle: { margin: "14px 0 2px", fontSize: "13px", fontWeight: 700, letterSpacing: "0.4px", color: "var(--dsw-alias-label-tertiary, #888)", textTransform: "uppercase" },
+			// 一行控件：左标签 + 右值。比 swRow 紧凑（无下边框），因为同类行会连排。
+			// ⚠️ 标签列 116px（不是 104px）：本页最长的标签是「显示余额徽标」6 个汉字，
+			//   14px 字号下约需 84px，加上行内 padding 与 gap，104px 会被 `ellipsis`
+			//   截成「显示余额徽标…」。给到 116px 刚好放下，又不至于挤压右侧控件。
+			ctlRow: { display: "grid", gridTemplateColumns: "116px 1fr auto", alignItems: "center", gap: "10px", padding: "7px 0" },
+			ctlLabel: { minWidth: 0, fontSize: "14px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+			ctlValue: { flex: "0 0 auto", fontSize: "13px", fontVariantNumeric: "tabular-nums", color: "var(--dsw-alias-label-tertiary, #888)", minWidth: "46px", textAlign: "right" },
+			// 滑块：原生 range，但只保留轨道与滑块，颜色跟主题走。
+			// ⚠️ accent-color 是关键：不设的话安卓 WebView 会画成系统蓝，与主题撞色。
+			slider: { flex: "1 1 0", minWidth: 0, accentColor: "var(--dsw-alias-interactive-bg-primary, #2b6cb0)", height: "28px", margin: 0 },
+			// 分段选择器：等宽按钮排一行，选中项反色。比 <select> 好按，也比它好看。
+			/**
+			 * 分段选择器。
+			 *
+			 * ⚠️ **不能用 "whiteSpace: nowrap" + 等分平分**：本页的「出现位置」有 6 个
+			 *   中文选项，等分后每格只有约 48px，而「右上」「右下」这类两字标签在
+			 *   13px 字号下需要约 34px + 左右内边距，于是全部被 "ellipsis" 截成
+			 *   「右…」「左…」—— 六个按钮长得一模一样，完全没法选。
+			 *
+			 *   改为：**允许换行**（"flexWrap"）+ 按钮按内容宽度（"0 0 auto"），
+			 *   放不下就折到第二行。宁可多占一行，也不能让文字读不出来。
+			 */
+			seg: { display: "flex", flexWrap: "wrap", flex: "1 1 0", minWidth: 0, gap: "6px" },
+			segBtn: { flex: "0 0 auto", minWidth: 0, border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)", textAlign: "center", background: "transparent", color: "inherit", font: "inherit", fontSize: "13px", padding: "6px 11px", borderRadius: "8px", cursor: "pointer", whiteSpace: "nowrap" },
+			segBtnOn: { background: "var(--dsw-alias-interactive-bg-primary, #2b6cb0)", borderColor: "transparent", color: "#fff", fontWeight: 600 },
+			// 颜色选择：圆形色块 + 原生取色器叠在上面（透明点击层）。
+			// ⚠️ 不用 type=color 直接可见：它渲染出来是个方块，跟整页的圆角风格不搭。
+			/**
+			 * 色块圆点。
+			 *
+			 * ⚠️⚠️ **"position: relative" 与固定宽高必须留在这一层**，因为里面的
+			 *   "<input type="color">" 是 "position: absolute; inset: 0"，它靠这个
+			 *   元素建立包含块。
+			 *
+			 * 踩过：真机上这三个色块的 input 尺寸变成了 **360×764（整个面板）**，
+			 * 于是透明的 input 盖住了下面所有行 ——
+			 *   ① 页面无法上下滑动（滑动事件被它吃掉）；
+			 *   ② 点分组标题「收起」时命中的是它，弹出系统颜色选择器，分组永远收不起来。
+			 * 根因就是包含块没建立起来时 "inset: 0" 会退回最近的可定位祖先（= 整个面板）。
+			 *
+			 * ⚠️ 另外补 "display: block" + "boxSizing: border-box"：这两个色块在
+			 *   "display: grid" 的 "ctlRow" 里，"flex: 0 0 auto" 对 grid 子项**无效**，
+			 *   不加的话 span 会按内容宽度撑开，"width/height" 反而不稳。
+			 */
+			swatchWrap: {
+				position: "relative",
+				display: "block",
+				flex: "0 0 auto",
+				width: "30px",
+				height: "30px",
+				boxSizing: "border-box",
+				borderRadius: "50%",
+				border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)",
+				overflow: "hidden",
+			},
+			swatchInput: {
+				position: "absolute",
+				left: 0,
+				top: 0,
+				width: "100%",
+				height: "100%",
+				// ⚠️ 不要用 `inset: 0` —— 旧内核（本 App 目标 chrome74）对 `inset`
+				//   简写的支持不完整，退化成不定位时就会铺满整个可定位祖先。
+				//   显式写 left/top/width/height 最稳。
+				opacity: 0,
+				border: "none",
+				padding: 0,
+				margin: 0,
+				cursor: "pointer",
+			},
+			// 数字输入：比滑块精确，用于尺寸这类要打准的值。
+			numInput: { flex: "0 0 auto", width: "64px", border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)", borderRadius: "6px", background: "transparent", color: "inherit", font: "inherit", fontSize: "13px", padding: "5px 7px", textAlign: "right" },
+			// 可折叠分组：长面板必须能折叠，否则一屏塞不下、用户永远滚不到底。
+			acc: { border: "0.5px solid var(--dsw-alias-border-l2, #e2e2e2)", borderRadius: "10px", marginTop: "10px", overflow: "hidden" },
+			accHead: { display: "flex", alignItems: "center", gap: "8px", padding: "11px 14px", cursor: "pointer", fontSize: "14px", fontWeight: 600, background: "var(--dsw-alias-interactive-bg-hover, #fafafa)" },
+			// ── 余额徽标「显示内容」的编辑器 ──────────────────────────────
+			//
+			// 三段式：预览 → 当前配方（可删）→ 可加的词（已用则禁用）。
+			bbEditor: { display: "flex", flexDirection: "column", gap: "8px", padding: "8px 0 4px" },
+			bbPreviewRow: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" },
+			// 预览用的"假徽标"：故意做得和真实徽标同形（深底浅字、圆角胶囊），
+			// 让用户一眼认出"这就是球旁边那个东西"。
+			bbPreviewBadge: {
+				background: "rgba(28, 30, 34, 0.92)",
+				color: "#fff",
+				fontSize: "13px",
+				padding: "3px 10px",
+				borderRadius: "999px",
+				fontVariantNumeric: "tabular-nums",
+				whiteSpace: "nowrap",
+				maxWidth: "100%",
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+			},
+			bbTokenRow: { display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center" },
+			// 「可加的词」：浅底、有点击感。
+			bbToken: {
+				border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)",
+				background: "var(--dsw-alias-bg-layer-2, #f4f4f4)",
+				color: "var(--dsw-alias-label-primary, #333)",
+				font: "inherit",
+				fontSize: "12px",
+				padding: "4px 10px",
+				borderRadius: "999px",
+				cursor: "pointer",
+			},
+			// 已经用过的词：置灰且不可点，避免同一个词被点进模板十几遍。
+			bbTokenUsed: {
+				opacity: 0.38,
+				cursor: "not-allowed",
+				background: "transparent",
+			},
+			// 「当前配方」里的胶囊：带删除按钮，视觉上比"可加的词"更实。
+			bbChip: {
+				display: "inline-flex",
+				alignItems: "center",
+				gap: "3px",
+				border: "0.5px solid var(--dsw-alias-interactive-bg-primary, #2b6cb0)",
+				background: "rgba(43, 108, 176, 0.10)",
+				color: "var(--dsw-alias-interactive-bg-primary, #2b6cb0)",
+				fontSize: "12px",
+				padding: "3px 4px 3px 10px",
+				borderRadius: "999px",
+			},
+			// 字面文字（如「剩 」）：不带删除键的普通说明，用中性色。
+			bbChipLit: {
+				display: "inline-flex",
+				alignItems: "center",
+				gap: "3px",
+				border: "0.5px dashed var(--dsw-alias-border-l2, #dcdcdc)",
+				background: "transparent",
+				color: "var(--dsw-alias-label-secondary, #666)",
+				fontSize: "12px",
+				padding: "3px 4px 3px 10px",
+				borderRadius: "999px",
+			},
+			// 未知 token（用户可能在别处写错）：灰底警告色，但不丢。
+			bbChipUnknown: {
+				display: "inline-flex",
+				alignItems: "center",
+				gap: "3px",
+				border: "0.5px solid #e8590c",
+				background: "rgba(232, 89, 12, 0.10)",
+				color: "#e8590c",
+				fontSize: "12px",
+				padding: "3px 4px 3px 10px",
+				borderRadius: "999px",
+			},
+			bbChipX: {
+				border: "none",
+				background: "transparent",
+				color: "inherit",
+				font: "inherit",
+				fontSize: "14px",
+				lineHeight: "1",
+				padding: "0 5px",
+				cursor: "pointer",
+				opacity: 0.75,
+			},
+			accBody: { display: "flex", flexDirection: "column", padding: "2px 14px 10px" },
+			accCount: { marginLeft: "auto", fontSize: "11px", fontWeight: 400, color: "var(--dsw-alias-label-tertiary, #999)" },
 		};
 
 		const MP_PRIV_TONE = {
@@ -5052,12 +5968,12 @@ window.__ModuleLoader__.load({
 		/**
 		 * 把一段文本写进系统剪贴板。
 		 *
-		 * ⚠️ **必须两条路都留**：官方前端跑在 `http://127.0.0.1:3080` 上，
-		 * 而 `navigator.clipboard` 只在**安全上下文**（https / localhost 域名 /
-		 * file:）里存在 —— `127.0.0.1` 虽是回环地址、Chromium 也把它算作
+		 * ⚠️ **必须两条路都留**：官方前端跑在 "http://127.0.0.1:3080" 上，
+		 * 而 "navigator.clipboard" 只在**安全上下文**（https / localhost 域名 /
+		 * file:）里存在 —— "127.0.0.1" 虽是回环地址、Chromium 也把它算作
 		 * potentially trustworthy，但 WebView 上这个判定随内核版本而变，
-		 * 不能赌。所以先用 `navigator.clipboard`，失败或不存在时退回
-		 * `document.execCommand("copy")` + 临时 textarea 的老办法。
+		 * 不能赌。所以先用 "navigator.clipboard"，失败或不存在时退回
+		 * "document.execCommand("copy")" + 临时 textarea 的老办法。
 		 *
 		 * @param {string} text - 要复制的文本。
 		 * @returns {Promise<boolean>} 是否成功。
@@ -5099,8 +6015,8 @@ window.__ModuleLoader__.load({
 		/**
 		 * 「特权权限」分节组件。
 		 *
-		 * 官方向 `settings.section` 的组件注入 `t`（由注册项的 `locale` 命名空间绑定）
-		 * 与 `close`；本组件只用 `t`。
+		 * 官方向 "settings.section" 的组件注入 "t"（由注册项的 "locale" 命名空间绑定）
+		 * 与 "close"；本组件只用 "t"。
 		 *
 		 * @param {object} props - 槽位注入面。
 		 * @returns {object} React 元素。
@@ -5200,7 +6116,7 @@ window.__ModuleLoader__.load({
 			 *   因为探测最多要等 5 秒（首次还会弹授权框），同步等会把页面卡死。
 			 * ⚠️ 轮询上限（10 秒）要比原生的探测超时（5 秒）宽，否则会在原生还没
 			 *   出结论时就把按钮恢复，用户以为检测完了、看到的却是旧结论。
-			 * ⚠️ 判据是**时间戳变化**（`at`），不是结论变化：连续两次都测出
+			 * ⚠️ 判据是**时间戳变化**（"at"），不是结论变化：连续两次都测出
 			 *   「无 root」时结论字符串一样，只看结论会一直轮询到超时。
 			 */
 			const recheckRoot = React.useCallback(() => {
@@ -5324,9 +6240,9 @@ window.__ModuleLoader__.load({
 			 * 点「授权」：拉起 Shizuku 的确认窗口，然后轮询授权结果。
 			 *
 			 * ⚠️ **必须轮询**：授权结论是 Shizuku 异步给的，原生侧只登记了一个
-			 *   监听器（见 `MainActivity.setupShizukuPermissionListener`），
+			 *   监听器（见 "MainActivity.setupShizukuPermissionListener"），
 			 *   页面拿不到任何 promise。
-			 * ⚠️ 授权成功后再跑一次 `refresh()`：`identity` 那条结论来自 runner
+			 * ⚠️ 授权成功后再跑一次 "refresh()"："identity" 那条结论来自 runner
 			 *   的探测（宿主半 HTTP 路由），与 Shizuku 的授权状态是**两件事** ——
 			 *   只更新 Shizuku 状态的话，上面的「当前状态」徽章还停在「未开启」，
 			 *   用户会以为授权没生效。**不需要重启 App**：runner 每次执行命令时
@@ -6078,7 +6994,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * 把「特权权限」分节注册进官方设置页的一级导航。
 		 *
-		 * 用 `ctx.inject` 等 `slots` / `locale` 就绪：本插件声明的 `inject` 是空数组
+		 * 用 "ctx.inject" 等 "slots" / "locale" 就绪：本插件声明的 "inject" 是空数组
 		 * （客户端半刻意不声明依赖，避免因某个服务缺失而整个不激活），所以这里按需
 		 * 开一个子插件来等这两个服务。
 		 *
@@ -6129,11 +7045,708 @@ window.__ModuleLoader__.load({
 		 * 「悬浮气泡」分节组件。
 		 *
 		 * 布局沿用「特权权限」那套**结论优先**的结构：head 卡给状态徽章 + 一条
-		 * 「下一步」+ 直达按钮，明细与说明折进 `<details>`。
+		 * 「下一步」+ 直达按钮，明细与说明折进 "<details>"。
 		 *
-		 * @param {object} props - 槽位注入面（只用 `t`）。
+		 * @param {object} props - 槽位注入面（只用 "t"）。
 		 * @returns {object} React 元素。
 		 */
+		/**
+		 * 悬浮球「外观与手感」控制面板。
+		 *
+		 * ## 为什么单独一个组件
+		 *
+		 * "mpBubbleSection" 已经承担了「开关气泡 / 权限状态 / 下一步」那套结论优先的
+		 * 首屏，把它撑大只会让首屏失控。这里专注一件事：**把 BubbleAppearance 的
+		 * 所有可调项摆出来**，按语义分组、可折叠。
+		 *
+		 * ## 数据流（单向，原生是唯一真源）
+		 *
+		 * ""`
+		 * 挂载 → bubbleAppearance() 读全量 JSON → 本地 state
+		 * 改动 → bubbleApply(JSON.stringify({ 字段: 新值 })) → 重新读回 → 覆盖 state
+		 * ""`
+		 *
+		 * ⚠️ **每次改动都读回**而不是本地乐观更新："BubbleAppearance.merge()" 里有
+		 *   clamp（如 "size" 只收 24–160）和特权闸门（"imeFlingEnabled" 无特权时会被
+		 *   强制置 false）。本地先改会让界面显示一个原生并不接受的值，用户以为设成功了。
+		 *
+		 * ⚠️ "bubbleApply" 只传**差异字段**：merge 的语义是「缺省即保持原值」，
+		 *   传全量会把没动过的字段也写一遍，一旦某个字段解析失败就整体回退。
+		 *
+		 * @param {object} props - "{ onBubbleChange?: Function }"（气泡开关变化时通知父级刷新）
+		 */
+		function mpBubblePanel(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_BUBBLE_ZH[key] ?? key;
+
+			const [ap, setAp] = React.useState(null);
+			const [open, setOpen] = React.useState({});
+
+			/** 读一次全量外观。 */
+			const read = React.useCallback(() => {
+				const b = window.DSHAndroid;
+				if (!b || typeof b.bubbleAppearance !== "function") { setAp(null); return; }
+				try {
+					const raw = b.bubbleAppearance();
+					setAp(typeof raw === "string" ? JSON.parse(raw) : (raw || null));
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 读外观失败:", e && e.message);
+					setAp(null);
+				}
+			}, []);
+
+			React.useEffect(() => { read(); }, [read]);
+
+			/**
+			 * 写一个字段（或一组字段），然后读回。
+			 *
+			 * @param {object} patch - 形如 "{ size: 56 }"。
+			 */
+			const apply = React.useCallback((patch) => {
+				const b = window.DSHAndroid;
+				if (!b || typeof b.bubbleApply !== "function") return;
+				try {
+					b.bubbleApply(JSON.stringify(patch));
+					read();
+				} catch (e) {
+					console.warn("[dsh-android-mobile] 应用外观失败:", e && e.message);
+				}
+			}, [read]);
+
+			if (!ap) {
+				return React.createElement("div", { style: { ...S.intro, padding: "10px 0" } },
+					t("panelUnavailable"));
+			}
+
+			// ── 基础控件 ───────────────────────────────────────────────
+
+			/** 开关行（复用 swRow 的排版）。 */
+			const sw = (label, hint, on, onToggle, disabled, why) =>
+				React.createElement("div", { style: S.swRow, key: label },
+					React.createElement("div", { style: S.swMain },
+						React.createElement("span", { style: S.swName }, label),
+						hint ? React.createElement("span", { style: S.swHint }, hint) : null,
+						why ? React.createElement("span", { style: S.swWhy }, why) : null,
+					),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": on ? "true" : "false",
+						"aria-label": label,
+						disabled: !!disabled,
+						style: {
+							...S.swTrack,
+							background: disabled
+								? "var(--dsw-alias-border-l2, #dcdcdc)"
+								: (on ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)"),
+							cursor: disabled ? "not-allowed" : "pointer",
+							opacity: disabled ? 0.55 : 1,
+						},
+						onClick: disabled ? undefined : onToggle,
+					}, React.createElement("span", { style: { ...S.swThumb, left: on ? "21px" : "3px" } })),
+				);
+
+			/**
+			 * 滑块行。拖动时只更新本地显示，**松手才写盘**。
+			 *
+			 * ⚠️ 不这么拆的话，拖一次会触发几十次 "bubbleApply" + 几十次读回，
+			 *   Shizuku/JSON 往返叠加起来会让滑块卡得像冻住。
+			 */
+			const slider = (label, key, min, max, step, fmt) => {
+				const val = ap[key] ?? min;
+				return React.createElement("div", { style: S.ctlRow, key },
+					React.createElement("span", { style: S.ctlLabel }, label),
+					React.createElement("input", {
+						type: "range", min, max, step,
+						// eslint-disable-next-line no-empty-function
+						defaultValue: val,
+						// ⚠️ 用 key 绑当前值：外部改动（读回）后强制重挂，让滑块跟上。
+						key: key + ":" + val,
+						style: S.slider,
+						"aria-label": label,
+						onInput: (e) => { e.target.dataset.live = e.target.value; },
+						onChange: (e) => apply({ [key]: Number(e.target.value) }),
+					}),
+					React.createElement("span", { style: S.ctlValue },
+						fmt ? fmt(val) : String(val)),
+				);
+			};
+
+			/** 分段选择行。 */
+			const seg = (label, key, options) =>
+				React.createElement("div", { style: S.ctlRow, key },
+					React.createElement("span", { style: S.ctlLabel }, label),
+					React.createElement("div", { style: S.seg, role: "group", "aria-label": label },
+						options.map((o) => React.createElement("button", {
+							key: o.v, type: "button",
+							"aria-pressed": ap[key] === o.v ? "true" : "false",
+							style: { ...S.segBtn, ...(ap[key] === o.v ? S.segBtnOn : null) },
+							onClick: () => apply({ [key]: o.v }),
+						}, o.n)),
+					),
+				);
+
+			/**
+			 * 颜色行。空串表示「自动」，所以额外给一个复位按钮。
+			 *
+			 * @param {string} [autoText] 「自动」这个状态显示成什么字。
+			 *   ⚠️ 面板**底色**的自动语义是**透明**（见原生 "DEFAULT_PANEL_BG = 0"），
+			 *   所以那一行要显式写「透明」而不是「自动」—— 用户看不到"自动"
+			 *   与"透明"的等号，而 "<input type="color">" 又根本选不出透明色。
+			 */
+			const color = (label, key, autoText) => {
+				const cur = ap[key] || "";
+				const autoLabel = autoText || t("autoColor");
+				return React.createElement("div", { style: S.ctlRow, key },
+					React.createElement("span", { style: S.ctlLabel }, label),
+					cur
+						? React.createElement("button", {
+							type: "button", style: S.btnQuiet,
+							onClick: () => apply({ [key]: "" }),
+						}, autoLabel)
+						: React.createElement("span", { style: S.ctlValue }, autoLabel),
+					React.createElement("span", {
+						style: {
+							...S.swatchWrap,
+							background: cur || "repeating-conic-gradient(#e0e0e0 0% 25%, #fff 0% 50%) 50% / 10px 10px",
+						},
+					},
+						React.createElement("input", {
+							type: "color",
+							style: S.swatchInput,
+							"aria-label": label,
+							value: cur || "#2b6cb0",
+							onChange: (e) => apply({ [key]: e.target.value }),
+						}),
+					),
+				);
+			};
+
+			/** 可折叠分组。 */
+			const acc = (id, title, count, children) => {
+				const isOpen = !!open[id];
+				return React.createElement("div", { style: S.acc, key: id },
+					React.createElement("div", {
+						style: S.accHead,
+						role: "button",
+						tabIndex: 0,
+						"aria-expanded": isOpen ? "true" : "false",
+						onClick: () => setOpen((v) => ({ ...v, [id]: !v[id] })),
+						onKeyDown: (e) => {
+							if (e.key === "Enter" || e.key === " ") {
+								e.preventDefault();
+								setOpen((v) => ({ ...v, [id]: !v[id] }));
+							}
+						},
+					},
+						React.createElement("span", null, title),
+						React.createElement("span", { style: S.accCount },
+							count + " · " + (isOpen ? t("collapse") : t("expand"))),
+					),
+					isOpen ? React.createElement("div", { style: S.accBody }, children) : null,
+				);
+			};
+
+			const pct = (v) => Math.round((Number(v) || 0) * 100) + "%";
+
+			// ── 分组 ───────────────────────────────────────────────────
+
+			const appearanceGroup = acc("look", t("grpLook"), 9, [
+				React.createElement("div", { style: S.ctlRow, key: "size" },
+					React.createElement("span", { style: S.ctlLabel }, t("fSize")),
+					React.createElement("input", {
+						type: "range", min: 24, max: 160, step: 2,
+						key: "size:" + ap.size,
+						defaultValue: ap.size, style: S.slider,
+						"aria-label": t("fSize"),
+						onChange: (e) => apply({ size: Number(e.target.value) }),
+					}),
+					React.createElement("span", { style: S.ctlValue }, ap.size + "dp"),
+				),
+				seg(t("fShape"), "shape", [
+					{ v: "circle", n: t("shapeCircle") },
+					{ v: "square", n: t("shapeSquare") },
+					{ v: "rounded", n: t("shapeRounded") },
+				]),
+				slider(t("fCorner"), "cornerRadius", 0, 80, 1, (v) => v + "dp"),
+				slider(t("fOpacity"), "opacity", 0.05, 1, 0.05, pct),
+				slider(t("fBgOpacity"), "bgOpacity", 0, 1, 0.05, pct),
+				slider(t("fAvatarOpacity"), "avatarOpacity", 0, 1, 0.05, pct),
+				slider(t("fAvatarScale"), "avatarScale", 0.2, 2, 0.05, (v) => Number(v).toFixed(2) + "x"),
+				slider(t("fBorderWidth"), "borderWidth", 0, 8, 1, (v) => v + "dp"),
+				color(t("fBorder"), "border"),
+			]);
+
+			const colorGroup = acc("color", t("grpColor"), 2, [
+				color(t("fBg"), "bg"),
+				color(t("fBg2"), "bg2"),
+			]);
+
+			const motionGroup = acc("motion", t("grpMotion"), 5, [
+				React.createElement("div", { style: S.swRow, key: "thr" },
+					React.createElement("div", { style: S.swMain },
+						React.createElement("span", { style: S.swName }, t("throwName")),
+						React.createElement("span", { style: S.swHint }, t("throwHint")),
+					),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.throwEnabled ? "true" : "false",
+						"aria-label": t("throwName"),
+						style: {
+							...S.swTrack,
+							background: ap.throwEnabled ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ throwEnabled: !ap.throwEnabled }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.throwEnabled ? "21px" : "3px" } })),
+				),
+				React.createElement("div", { style: S.swRow, key: "shake" },
+					React.createElement("div", { style: S.swMain },
+						React.createElement("span", { style: S.swName }, t("shakeName")),
+						React.createElement("span", { style: S.swHint }, t("shakeHint")),
+					),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.shakeEnabled ? "true" : "false",
+						"aria-label": t("shakeName"),
+						style: {
+							...S.swTrack,
+							background: ap.shakeEnabled ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ shakeEnabled: !ap.shakeEnabled }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.shakeEnabled ? "21px" : "3px" } })),
+				),
+				React.createElement("div", { style: S.ctlRow, key: "edge" },
+					React.createElement("span", { style: S.ctlLabel }, t("fEdgeSnap")),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.edgeSnap ? "true" : "false",
+						"aria-label": t("fEdgeSnap"),
+						style: {
+							...S.swTrack,
+							background: ap.edgeSnap ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ edgeSnap: !ap.edgeSnap }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.edgeSnap ? "21px" : "3px" } })),
+				),
+				React.createElement("div", { style: S.ctlRow, key: "move" },
+					React.createElement("span", { style: S.ctlLabel }, t("fMoveEnabled")),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.moveEnabled ? "true" : "false",
+						"aria-label": t("fMoveEnabled"),
+						style: {
+							...S.swTrack,
+							background: ap.moveEnabled ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ moveEnabled: !ap.moveEnabled }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.moveEnabled ? "21px" : "3px" } })),
+				),
+				ap.moveEnabled ? slider(t("fMoveInterval"), "moveIntervalSec", 10, 3600, 5, (v) => v + "s") : null,
+				ap.moveEnabled ? slider(t("fMoveMin"), "moveMinDp", 8, 400, 4, (v) => v + "dp") : null,
+				ap.moveEnabled ? slider(t("fMoveMax"), "moveMaxDp", 8, 400, 4, (v) => v + "dp") : null,
+				React.createElement("div", { style: S.ctlRow, key: "flip" },
+					React.createElement("span", { style: S.ctlLabel }, t("fFlipOnTurn")),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.flipOnTurn ? "true" : "false",
+						"aria-label": t("fFlipOnTurn"),
+						style: {
+							...S.swTrack,
+							background: ap.flipOnTurn ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ flipOnTurn: !ap.flipOnTurn }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.flipOnTurn ? "21px" : "3px" } })),
+				),
+			]);
+
+			const animGroup = acc("anim", t("grpAnim"), 5, [
+				slider(t("fFrameInterval"), "frameIntervalMs", 20, 2000, 10, (v) => v + "ms"),
+				React.createElement("div", { style: S.ctlRow, key: "spin" },
+					React.createElement("span", { style: S.ctlLabel }, t("fSpin")),
+					React.createElement("input", {
+						type: "range", min: -720, max: 720, step: 15,
+						key: "spin:" + ap.spin,
+						defaultValue: ap.spin, style: S.slider,
+						"aria-label": t("fSpin"),
+						onChange: (e) => apply({ spin: Number(e.target.value) }),
+					}),
+					React.createElement("span", { style: S.ctlValue }, ap.spin + "°"),
+				),
+				React.createElement("div", { style: S.ctlRow, key: "pulse" },
+					React.createElement("span", { style: S.ctlLabel }, t("fPulse")),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.pulse ? "true" : "false",
+						"aria-label": t("fPulse"),
+						style: {
+							...S.swTrack,
+							background: ap.pulse ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ pulse: !ap.pulse }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.pulse ? "21px" : "3px" } })),
+				),
+				React.createElement("div", { style: S.ctlRow, key: "dot" },
+					React.createElement("span", { style: S.ctlLabel }, t("fShowDot")),
+					React.createElement("button", {
+						type: "button", role: "switch",
+						"aria-checked": ap.showDot ? "true" : "false",
+						"aria-label": t("fShowDot"),
+						style: {
+							...S.swTrack,
+							background: ap.showDot ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)",
+						},
+						onClick: () => apply({ showDot: !ap.showDot }),
+					}, React.createElement("span", { style: { ...S.swThumb, left: ap.showDot ? "21px" : "3px" } })),
+				),
+				slider(t("fStatusImageSize"), "statusImageSizeDp", 32, 200, 4, (v) => v + "dp"),
+			]);
+
+			const panelGroup = acc("panel", t("grpPanel"), 4, [
+				slider(t("fPanelWidth"), "panelWidth", 180, 600, 10, (v) => v + "dp"),
+				slider(t("fPanelHeight"), "panelHeight", 0, 1200, 20,
+					(v) => (Number(v) === 0 ? t("autoSize") : v + "dp")),
+				slider(t("fStatusAutoHide"), "statusAutoHideMs", 0, 10000, 500,
+					(v) => (Number(v) === 0 ? t("neverHide") : (Number(v) / 1000).toFixed(1) + "s")),
+				color(t("fPanelBg"), "panelBg", t("panelBgAuto")),
+				color(t("fPanelText"), "panelText"),
+				color(t("fPanelAccent"), "panelAccent"),
+			]);
+
+			// ── 余额徽标（嵌套对象，需要另一套 helper）─────────────────────
+			//
+			// ⚠️ 上面那些 helper 只会写**顶层字段**（`apply({ [key]: v })`），
+			//   而徽标是一整个 `balanceBadge` 子对象。所以这里另起一套，
+			//   写的时候**整包下发**：原生 `BalanceBadge.merge` 是按子字段判
+			//   "缺省即保持"的，整包下发＝把当前值原样带上，两边语义一致。
+			//
+			// ⚠️ 不要试图让 `apply` 支持点号路径：那条路会顺带改到别处
+			//   （`apply` 是共享的），风险远大于在这里多写二十行。
+			const bb = ap.balanceBadge || {};
+			/** 当前徽标 + 覆盖项 → 整包。 */
+			const bbPatch = (over) => ({ balanceBadge: { ...bb, ...over } });
+
+			const bbSw = (label, key, hint) => {
+				const on = bb[key] === true;
+				// ⚠️ **hint 不能塞在 116px 的标签列里**：`S.ctlLabel` 带 `ellipsis`，
+				//   挤进去会把主标签截成「显示余额徽标在…」（真机截图确认过）。
+				//   所以标签只放 label 本身，hint 作为一个整行的副标题挂在下面。
+				return React.createElement("div", { key: "bb-" + key },
+					React.createElement("div", { style: S.ctlRow },
+						React.createElement("span", { style: S.ctlLabel }, label),
+						React.createElement("button", {
+							type: "button", role: "switch",
+							"aria-checked": on ? "true" : "false",
+							"aria-label": label,
+							style: {
+								...S.swTrack,
+								background: on
+									? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)"
+									: "var(--dsw-alias-border-l2, #c8c8c8)",
+							},
+							onClick: () => apply(bbPatch({ [key]: !on })),
+						}, React.createElement("span", { style: { ...S.swThumb, left: on ? "21px" : "3px" } })),
+					),
+					hint ? React.createElement("div", { style: { ...S.swHint, padding: "-2px 0 6px" } }, hint) : null,
+				);
+			};
+
+			const bbSlider = (label, key, min, max, step, fmt) => {
+				const val = typeof bb[key] === "number" ? bb[key] : min;
+				return React.createElement("div", { style: S.ctlRow, key: "bb-" + key },
+					React.createElement("span", { style: S.ctlLabel }, label),
+					React.createElement("input", {
+						type: "range", min, max, step,
+						defaultValue: val,
+						key: "bb-" + key + ":" + val,
+						style: S.slider,
+						"aria-label": label,
+						onInput: (e) => { e.target.dataset.live = e.target.value; },
+						onChange: (e) => apply(bbPatch({ [key]: Number(e.target.value) })),
+					}),
+					React.createElement("span", { style: S.ctlValue }, fmt ? fmt(val) : String(val)),
+				);
+			};
+
+			const bbSeg = (label, key, options) =>
+				React.createElement("div", { style: S.ctlRow, key: "bb-" + key },
+					React.createElement("span", { style: S.ctlLabel }, label),
+					React.createElement("div", { style: S.seg, role: "group", "aria-label": label },
+						options.map((o) => React.createElement("button", {
+							key: o.v, type: "button",
+							"aria-pressed": bb[key] === o.v ? "true" : "false",
+							style: { ...S.segBtn, ...(bb[key] === o.v ? S.segBtnOn : null) },
+							onClick: () => apply(bbPatch({ [key]: o.v })),
+						}, o.n)),
+					),
+				);
+
+			/**
+			 * 颜色行（"跟随主题"是可选项，用空串表示）。
+			 *
+			 * ⚠️ "type="color"" 不能表达"无值"，所以配一个「跟随主题」按钮复位。
+			 *   没有它的话，用户一旦点了取色器就再也回不到跟随主题。
+			 */
+			const bbColor = (label, key) => {
+				const cur = typeof bb[key] === "string" ? bb[key] : "";
+				// `<input type="color">` 只认 `#RRGGBB`；带 alpha 的 `#AARRGGBB`
+				// 会被浏览器判为非法值并回退成黑色，所以这里截末 6 位。
+				const hex = /^#[0-9a-fA-F]{8}$/.test(cur) ? "#" + cur.slice(3) : (cur || "#888888");
+				return React.createElement("div", { style: S.ctlRow, key: "bb-" + key },
+					React.createElement("span", { style: S.ctlLabel }, label),
+					// ⚠️⚠️ **必须包一层 `swatchWrap`**，不能把 `swatchInput` 直接放进
+					//   `ctlRow`。`swatchInput` 是 `position: absolute`，它需要一个
+					//   `position: relative` 的父元素当包含块；直接放进来时包含块会
+					//   退化成整个面板，透明的 input 铺满全屏 ——
+					//   真机症状：面板不能上下滑，且点分组标题会弹系统颜色选择器。
+					React.createElement("span", {
+						style: {
+							...S.swatchWrap,
+							background: cur || "repeating-conic-gradient(#e0e0e0 0% 25%, #fff 0% 50%) 50% / 10px 10px",
+						},
+					},
+						React.createElement("input", {
+							type: "color",
+							value: hex,
+							style: S.swatchInput,
+							"aria-label": label,
+							onChange: (e) => apply(bbPatch({ [key]: e.target.value })),
+						}),
+					),
+					React.createElement("button", {
+						type: "button",
+						style: { ...S.segBtn, ...(cur === "" ? S.segBtnOn : null) },
+						"aria-pressed": cur === "" ? "true" : "false",
+						onClick: () => apply(bbPatch({ [key]: "" })),
+					}, t("bbFollow")),
+				);
+			};
+
+			/**
+			 * 徽标显示内容的**可视化编辑器**。
+			 *
+			 * ## 为什么不能直接给用户一个装 "{balance}" 的输入框
+			 *
+			 * 用户原话：「这个什么显示内容里面，你为什么显示剩？然后 Balance。你觉得这样
+			 * 对用户体验好吗？还有就是上面写的点下面的词加进显示内容，点不动。」
+			 *
+			 * 两个问题都成立：
+			 *  1. 输入框里躺着一串 "剩 {balance}{balance}…" —— 内部占位符直接摊给用户看，
+			 *     这是**实现细节泄漏**，不是界面。
+			 *  2. 点 chip 会追加一个 token，但界面上**没有任何变化可见**（输入框是
+			 *     uncontrolled、且不重渲染），所以看起来就是"点不动"。真机上因此被
+			 *     连点十几下，模板里堆了 12 个 "{balance}"。
+			 *
+			 * ## 现在的形态
+			 *
+			 * 结构变成三段，全部可视化：
+			 *  - **上面一行是「成品长什么样」**：直接把当前配方渲染成示例徽标，
+			 *    用户改任何东西都能立刻看到结果；
+			 *  - **中间是配方本身**：每个词是一个可删的胶囊（"剩余" "余额" …），
+			 *    点胶囊右侧的 × 就删掉它 —— 删得掉才叫"编辑"；
+			 *  - **下面是可加的词**：点一下**加在末尾**，但**重复的词直接禁用**
+			 *    （已经用过就置灰），从根上杜绝"点十几下堆成 12 个"。
+			 *
+			 * 自定义文字（比如 "剩"）也做成胶囊，但不可点，只作说明。
+			 */
+
+			/** token → 中文名。 */
+			const BB_TOKEN_LABEL = {
+				balance: "余额",
+				recharge: "充值",
+				bonus: "赠送",
+				currency: "币种",
+				cost: "本次花费",
+				costSession: "本会话花费",
+			};
+
+			/**
+			 * 把模板串解析成「词序列」。
+			 *
+			 * "剩 {balance}" ⇒ "[{lit:"剩 "}, {tok:"balance"}]"
+			 *
+			 * ⚠️ 解析失败的 "{xxx}"（未知 token）**按字面保留**，不要丢掉 ——
+			 *   丢掉等于悄悄改用户的东西。它会在界面上显示成一个灰色的未知胶囊。
+			 */
+			const bbParse = (tpl) => {
+				const s = typeof tpl === "string" ? tpl : "";
+				const out = [];
+				const re = /\{([a-zA-Z0-9_]+)\}/g;
+				let last = 0;
+				let m;
+				while ((m = re.exec(s)) !== null) {
+					if (m.index > last) out.push({ lit: s.slice(last, m.index) });
+					out.push({ tok: m[1], known: !!BB_TOKEN_LABEL[m[1]] });
+					last = m.index + m[0].length;
+				}
+				if (last < s.length) out.push({ lit: s.slice(last) });
+				return out;
+			};
+
+			/** 词序列 → 模板串。 */
+			const bbJoin = (parts) => parts.map((p) => (p.tok ? "{" + p.tok + "}" : p.lit)).join("");
+
+			/**
+			 * 干跑一次渲染，只用于预览（不碰原生）。
+			 *
+			 * 用假数据是为了让用户在**还没登录**时也能看清版式 —— 真实余额由
+			 * 原生徽标显示，这里只是"长什么样"的示意。
+			 */
+			const bbPreviewText = (tpl) => {
+				const sample = {
+					balance: "138.56",
+					recharge: "100.00",
+					bonus: "38.56",
+					currency: "¥",
+					cost: "0.0031",
+					costSession: "0.0420",
+				};
+				return String(tpl || "").replace(/\{([a-zA-Z0-9_]+)\}/g, (all, key) => (
+					Object.prototype.hasOwnProperty.call(sample, key) ? sample[key] : all
+				));
+			};
+
+			const bbTemplate = () => {
+				const tpl = typeof bb.template === "string" && bb.template !== ""
+					? bb.template
+					: "{currency}{balance}";
+				const parts = bbParse(tpl);
+				const used = new Set(parts.filter((p) => p.tok).map((p) => p.tok));
+
+				/** 删掉第 i 个词（literal 也可以删）。 */
+				const removeAt = (i) => {
+					const next = parts.slice();
+					next.splice(i, 1);
+					const v = bbJoin(next);
+					apply(bbPatch({ template: v.trim() === "" ? "{currency}{balance}" : v }));
+				};
+
+				return React.createElement("div", { style: S.bbEditor, key: "bb-template" },
+					React.createElement("span", { style: S.ctlLabel }, t("fBbTemplate")),
+
+					// ── ① 成品预览 ────────────────────────────────────
+					React.createElement("div", { style: S.bbPreviewRow },
+						React.createElement("span", { style: S.swHint }, t("bbPreviewHint")),
+						React.createElement("span", { style: S.bbPreviewBadge },
+							bbPreviewText(tpl) || "—"),
+					),
+
+					// ── ② 当前配方（可删） ────────────────────────────
+					React.createElement("div", { style: S.bbTokenRow },
+						...parts.map((p, i) => React.createElement("span", {
+							key: i,
+							style: p.tok && !p.known ? S.bbChipUnknown : (p.tok ? S.bbChip : S.bbChipLit),
+						},
+							React.createElement("span", null, p.tok
+								? (BB_TOKEN_LABEL[p.tok] || p.tok)
+								: p.lit),
+							React.createElement("button", {
+								type: "button",
+								style: S.bbChipX,
+								"aria-label": t("bbRemove") + " " + (p.tok ? (BB_TOKEN_LABEL[p.tok] || p.tok) : p.lit),
+								onClick: () => removeAt(i),
+							}, "×"),
+						)),
+						parts.length === 0
+							? React.createElement("span", { style: S.swHint }, t("bbEmpty"))
+							: null,
+					),
+
+					// ── ③ 可加的词（已用过就禁用） ────────────────────
+					React.createElement("div", { style: S.swHint }, t("bbTokenHint")),
+					React.createElement("div", { style: S.bbTokenRow },
+						...Object.keys(BB_TOKEN_LABEL).map((tok) => {
+							const already = used.has(tok);
+							return React.createElement("button", {
+								key: tok,
+								type: "button",
+								disabled: already,
+								style: {
+									...S.bbToken,
+									...(already ? S.bbTokenUsed : null),
+								},
+								"aria-label": BB_TOKEN_LABEL[tok],
+								onClick: () => {
+									if (already) return;
+									apply(bbPatch({ template: tpl + "{" + tok + "}" }));
+								},
+							}, BB_TOKEN_LABEL[tok]);
+						}),
+					),
+
+					// ── ④ 恢复默认 ────────────────────────────────────
+					//
+					// 用户把顺序点成 `{balance}{currency}` 之后，渲染出来是
+					// `138.56¥` —— 币种跑到金额后面，看着就是错的。胶囊只能
+					// 一个个删再一个个加，太笨；给一个一键回到 `¥138.56` 的出口。
+					React.createElement("div", { style: { display: "flex", gap: "8px" } },
+						React.createElement("button", {
+							type: "button",
+							style: S.btnQuiet,
+							onClick: () => apply(bbPatch({ template: "{currency}{balance}" })),
+						}, t("bbReset")),
+					),
+				);
+			};
+
+			const badgeGroup = acc("badge", t("grpBalance"), 6, [
+				bbSw(t("fBbEnabled"), "enabled", t("bbEnabledHint")),
+				bbSeg(t("fBbAnchor"), "anchor", [
+					{ v: "top-right", n: t("bbAnchorTR") },
+					{ v: "top-left", n: t("bbAnchorTL") },
+					{ v: "bottom-right", n: t("bbAnchorBR") },
+					{ v: "bottom-left", n: t("bbAnchorBL") },
+					{ v: "above", n: t("bbAnchorAbove") },
+					{ v: "below", n: t("bbAnchorBelow") },
+				]),
+				bbTemplate(),
+				bbSlider(t("fBbGap"), "gapDp", -60, 120, 2, (v) => v + "dp"),
+				bbSlider(t("fBbFontSize"), "fontSizeSp", 7, 40, 1, (v) => v + "sp"),
+				bbSlider(t("fBbRadius"), "radiusDp", 0, 100, 1, (v) => v + "dp"),
+				bbSlider(t("fBbPaddingH"), "paddingHDp", 0, 40, 1, (v) => v + "dp"),
+				bbSlider(t("fBbPaddingV"), "paddingVDp", 0, 40, 1, (v) => v + "dp"),
+				bbSlider(t("fBbMaxWidth"), "maxWidthDp", 0, 600, 10,
+					(v) => (Number(v) === 0 ? t("autoSize") : v + "dp")),
+				bbSlider(t("fBbBorderWidth"), "borderWidthDp", 0, 8, 1, (v) => v + "dp"),
+				bbColor(t("fBbBg"), "bg", t("panelBgAuto")),
+				bbColor(t("fBbFg"), "fg"),
+				bbColor(t("fBbBorder"), "border"),
+				bbSw(t("fBbCostFlash"), "showCostFlash"),
+				bbSw(t("fBbHideIdle"), "hideWhenIdle"),
+				bbSw(t("fBbTurnEnd"), "refreshOnTurnEnd"),
+				bbSlider(t("fBbEvery"), "refreshEverySec", 0, 3600, 30,
+					(v) => (Number(v) === 0 ? t("bbOff") : (Number(v) >= 60
+						? (Number(v) / 60).toFixed(0) + t("bbMinute")
+						: v + "s"))),
+				bbSw(t("fBbTapRefresh"), "refreshOnTap"),
+				bbSlider(t("fBbTapMin"), "tapRefreshMinIntervalSec", 1, 600, 1, (v) => v + "s"),
+			]);
+
+			const stateGroup = acc("state", t("grpState"), 1, [
+				seg(t("fState"), "state", [
+					{ v: "auto", n: t("stAuto") },
+					{ v: "collapsed", n: t("stCollapsed") },
+					{ v: "expanded", n: t("stExpanded") },
+				]),
+			]);
+
+			return React.createElement("div", { style: S.section },
+				React.createElement("h2", { style: S.heading }, t("panelTitle")),
+				React.createElement("p", { style: S.intro }, t("panelIntro")),
+				stateGroup,
+				appearanceGroup,
+				colorGroup,
+				motionGroup,
+				animGroup,
+				panelGroup,
+				badgeGroup,
+				React.createElement("div", { style: { ...S.intro, marginTop: "12px" } },
+					React.createElement("button", {
+						type: "button", style: S.btn, onClick: read,
+					}, t("recheck")),
+				),
+			);
+		}
+
 		function mpBubbleSection(props) {
 			const React = mpPrivReact;
 			const S = MP_PRIV_S;
@@ -6145,7 +7758,7 @@ window.__ModuleLoader__.load({
 			 * 从原生读一次状态。
 			 *
 			 * ⚠️ 桥**可能不存在**（非 App 环境、或桥被清理），所以先查再调 ——
-			 *   直接调会抛 `TypeError: Cannot read properties of undefined`。
+			 *   直接调会抛 "TypeError: Cannot read properties of undefined"。
 			 */
 			const refresh = React.useCallback(() => {
 				const bridge = window.DSHAndroid;
@@ -6157,7 +7770,17 @@ window.__ModuleLoader__.load({
 					// 桥返回的是 JSON 字符串（@JavascriptInterface 只支持基本类型与 String）。
 					const raw = bridge.bubbleState();
 					const o = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
-					setState({ phase: "ready", enabled: !!o.enabled, granted: !!o.granted, noBridge: false });
+					setState({
+						phase: "ready",
+						enabled: !!o.enabled,
+						granted: !!o.granted,
+						noBridge: false,
+						throwEnabled: !!o.throwEnabled,
+						imeFlingEnabled: !!o.imeFlingEnabled,
+						imeFlingAvailable: !!o.imeFlingAvailable,
+						imeFlingReason: o.imeFlingReason || null,
+						shakeEnabled: !!o.shakeEnabled,
+					});
 				} catch (e) {
 					console.warn("[dsh-android-mobile] 读取气泡状态失败:", e && e.message);
 					setState({ phase: "ready", enabled: false, granted: false, noBridge: true });
@@ -6170,7 +7793,7 @@ window.__ModuleLoader__.load({
 			 * 从系统设置页回来后刷新。
 			 *
 			 * ⚠️ 授权是**在别的界面**完成的，本页拿不到任何回调。只能监听
-			 *   `visibilitychange`（用户切回来时触发）。不加这个的话，用户授完权
+			 *   "visibilitychange"（用户切回来时触发）。不加这个的话，用户授完权
 			 *   回来看到的还是「未授权」，会以为没生效。
 			 */
 			React.useEffect(() => {
@@ -6201,6 +7824,43 @@ window.__ModuleLoader__.load({
 					try { bridge.bubbleRequestOverlay(); } catch (e) { /* 下面统一提示 */ }
 				}
 			};
+
+			/**
+			 * 一枚自绘开关。
+			 *
+			 * @param {string} name - 名称。
+			 * @param {string} hint - 一句说明。
+			 * @param {boolean} on - 当前值。
+			 * @param {Function} onToggle - 点击回调。
+			 * @param {boolean} disabled - 置灰（无能力时用）。
+			 * @param {string|null} why - 置灰原因，显示在说明下方。
+			 */
+			const sw = (name, hint, on, onToggle, disabled, why) =>
+				React.createElement("div", { style: S.swRow, key: name },
+					React.createElement("div", { style: S.swMain },
+						React.createElement("span", { style: S.swName }, name),
+						React.createElement("span", { style: S.swHint }, hint),
+						why ? React.createElement("span", { style: S.swWhy }, why) : null,
+					),
+					React.createElement("button", {
+						type: "button",
+						role: "switch",
+						"aria-checked": on ? "true" : "false",
+						"aria-label": name,
+						disabled: !!disabled,
+						style: {
+							...S.swTrack,
+							background: disabled
+								? "var(--dsw-alias-border-l2, #dcdcdc)"
+								: (on ? "var(--dsw-alias-interactive-bg-primary, #2b6cb0)" : "var(--dsw-alias-border-l2, #c8c8c8)"),
+							cursor: disabled ? "not-allowed" : "pointer",
+							opacity: disabled ? 0.55 : 1,
+						},
+						onClick: disabled ? undefined : onToggle,
+					}, React.createElement("span", {
+						style: { ...S.swThumb, left: on ? "21px" : "3px" },
+					})),
+				);
 
 			if (state.phase === "loading") {
 				return React.createElement("div", { style: S.section },
@@ -6267,6 +7927,26 @@ window.__ModuleLoader__.load({
 					) : null,
 				),
 
+				// ── 甩动手感：**不在这里放** ─────────────────────────────
+				//
+				// 用户原话：「下面明明已经有了选项，你为什么在界面的最上面还要留有开关呢？
+				// 你留有也就算了，你还有 bug」。
+				//
+				// 确实如此：拖拽抛掷 / 晃动甩飞 / 键盘顶飞 三个开关，在下面
+				// `mpBubblePanel` 的「动作与交互」分组里**已经有完整的一份**，
+				// 而且那一份走 `bubbleApply`（改完立刻推给活的球）。
+				// 上面这一份走 `setMotion` → 原生只 `save` 不 `apply`，
+				// 于是同一个功能两个入口、两种行为 —— 上面那个还慢半拍。
+				//
+				// 所以整块删掉，只留下方那一份。少一处入口，少一处不一致。
+				// （原生侧已顺手修好 `bubbleSetThrow` / `bubbleSetShake` /
+				//  `bubbleSetImeFling` 只落盘不生效的问题，AI 工具与其它调用方
+				//  仍然走那三个桥方法，行为与这里一致。）
+				// ── 外观与手感控制面板 ──────────────────────────────
+				// 单独一个组件：这里要摆 BubbleAppearance 的全部可调项，
+				// 撑进本分节会让「开关气泡 / 权限状态」那段首屏失控。
+				React.createElement(mpBubblePanel, { t }),
+
 				React.createElement("details", { style: S.fold },
 					React.createElement("summary", { style: S.foldHead }, t("howTitle")),
 					React.createElement("div", { style: S.foldBody },
@@ -6292,7 +7972,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * 把「悬浮气泡」注册进设置页一级导航。
 		 *
-		 * 与特权权限分节同一套接缝（`settings.section`），所以不需要碰导航 DOM。
+		 * 与特权权限分节同一套接缝（"settings.section"），所以不需要碰导航 DOM。
 		 *
 		 * @param {object} ctx - 浏览器插件上下文。
 		 */
@@ -6329,24 +8009,24 @@ window.__ModuleLoader__.load({
 		/* ══ 「交流群」分节：二维码 + 群号 ══
 
 		   ⚠️ **二维码必须内联成 data URI，不能放成独立图片文件。**
-		     官方 `dsh-client-modules` 的 `/plugins/<id>/<file>` 路由**只服务
-		     `client.js` 与它的 sourcemap**（`index.js` 的 `PLUGIN_ROUTE` 与
-		     `chunkUrl()` 都写死了这两个后缀），**没有**通用静态资源目录。
-		     把二维码写成 `./qr.webp` 会得到一个 404 的碎图 —— 而且失败方式是
-		     静默的（`<img>` 加载失败不抛异常，只是不显示）。
+		     官方 "dsh-client-modules" 的 "/plugins/<id>/<file>" 路由**只服务
+		     "client.js" 与它的 sourcemap**（"index.js" 的 "PLUGIN_ROUTE" 与
+		     "chunkUrl()" 都写死了这两个后缀），**没有**通用静态资源目录。
+		     把二维码写成 "./qr.webp" 会得到一个 404 的碎图 —— 而且失败方式是
+		     静默的（"<img>" 加载失败不抛异常，只是不显示）。
 		     插件自身也没有别的落地目录可以断言「引擎一定会把它对客户端暴露」。
 
 		   格式选 WebP 而非 PNG：同一张图 PNG 要 93~129 KB，WebP(q92) 只要
 		   31~70 KB，体积约 1/3。而 WebP 从 Chrome 32 就有解码支持，远低于本
-		     项目的最低内核门槛（`MIN_WEBVIEW_MAJOR_COMPAT = 74`），不构成新约束。
+		     项目的最低内核门槛（"MIN_WEBVIEW_MAJOR_COMPAT = 74"），不构成新约束。
 
-		   ⚠️ 源图是**彩色圆点风格**的二维码，`cv2.QRCodeDetector` 解不出来
-		     （实测原图/裁剪/灰度/二值化/放大全 FAIL），换 `zxing-cpp` 立刻成功。
+		   ⚠️ 源图是**彩色圆点风格**的二维码，"cv2.QRCodeDetector" 解不出来
+		     （实测原图/裁剪/灰度/二值化/放大全 FAIL），换 "zxing-cpp" 立刻成功。
 		     验证这类图的可扫性**必须用 zxing**，别因为 OpenCV 报 FAIL 就判定图片
 		     坏了 —— 那是解码器对非标准模块形状的识别能力差异，不是图的问题。
 
 		   可扫性验证方式（比「肉眼看没问题」可靠）：把 data URI 按真实布局
-		     （视口 390 CSS px + `--force-device-scale-factor=3`）用 Chrome 渲染成
+		     （视口 390 CSS px + "--force-device-scale-factor=3"）用 Chrome 渲染成
 		     截图，再交给 zxing 解码。400/512/640/852 四档源图**全部解码成功**，
 		     说明「内联 → WebP 解码 → CSS 缩到 240px → dpr=3 渲染」整条链路的
 		     余量都够。 */
@@ -6398,7 +8078,7 @@ window.__ModuleLoader__.load({
 		 * 纯静态信息（无 bridge、无原生状态），唯一的有状态部分是复制按钮的
 		 * 短暂反馈。布局沿用「特权权限 / 悬浮气泡」那套卡片风格。
 		 *
-		 * @param {object} props - 槽位注入面（只用 `t`）。
+		 * @param {object} props - 槽位注入面（只用 "t"）。
 		 * @returns {object} React 元素。
 		 */
 		function mpContactSection(props) {
@@ -6477,7 +8157,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * 把「交流群」注册进设置页一级导航。
 		 *
-		 * 与前两个分节同一套接缝（`settings.section`），所以不需要碰导航 DOM。
+		 * 与前两个分节同一套接缝（"settings.section"），所以不需要碰导航 DOM。
 		 *
 		 * @param {object} ctx - 浏览器插件上下文。
 		 */
@@ -6514,32 +8194,32 @@ window.__ModuleLoader__.load({
 
 		/* ══ 修复 67：回车 = 换行（移动端）══
 
-		   背景：官方 composer 的键盘映射（`dsh-client-ui-conversation/lib/client.js` 的
-		   `registerComposerKeymap`）是**桌面语义**：
+		   背景：官方 composer 的键盘映射（"dsh-client-ui-conversation/lib/client.js" 的
+		   "registerComposerKeymap"）是**桌面语义**：
 
 		     | 按键            | 官方行为 | 出处 |
 		     |-----------------|----------|------|
-		     | `Enter`         | **发送** | L16704-16716 `handlers.submit(...)` |
-		     | `Shift+Enter`   | 换行     | L16706 `if (event?.shiftKey === true) return false;`（放行给编辑器默认行为） |
-		     | `Ctrl/Cmd+Enter`| 发送     | L16715 `submit(event.ctrlKey === true \|\| event.metaKey === true)` |
+		     | "Enter"         | **发送** | L16704-16716 "handlers.submit(...)" |
+		     | "Shift+Enter"   | 换行     | L16706 "if (event?.shiftKey === true) return false;"（放行给编辑器默认行为） |
+		     | "Ctrl/Cmd+Enter"| 发送     | L16715 "submit(event.ctrlKey === true \|\| event.metaKey === true)" |
 
 		   桌面上有 Shift 键，所以「Enter 发送、Shift+Enter 换行」是合理默认。但**手机
 		   软键盘没有 Shift**（中文输入法更不会给），于是用户想在多行里换行时**做不到**：
 		   一按回车就发出去了，长 prompt 只能挤成一行。这是纯移动端才有的一类缺口。
 
-		   做法：在**捕获阶段**拦下编辑器上的 Enter，把它改写成 `Shift+Enter` 派发回去。
-		   这样官方那条 `shiftKey === true → return false` 的分支就命中了，编辑器执行
+		   做法：在**捕获阶段**拦下编辑器上的 Enter，把它改写成 "Shift+Enter" 派发回去。
+		   这样官方那条 "shiftKey === true → return false" 的分支就命中了，编辑器执行
 		   默认行为（插入换行），而**不需要**去改引擎源码、也不依赖任何私有 API。
 
 		   ⚠️ **必须拦在 composer 编辑区上，不能拦 document**：官方把键盘映射注册在
-		     编辑器实例上（`editor.registerCommand`），拦到别处既无效、又会误伤设置页
+		     编辑器实例上（"editor.registerCommand"），拦到别处既无效、又会误伤设置页
 		     等其它输入框（那些地方回车该是「确认」）。
-		   ⚠️ **必须检查 `isComposing` / `keyCode === 229`**：中文输入法的候选框确认也
+		   ⚠️ **必须检查 "isComposing" / "keyCode === 229"**：中文输入法的候选框确认也
 		     发 Enter。不排除的话，**选词会被当成换行**，用户根本没法打中文。官方
-		     `isComposingEvent()` 用的就是这两个判据（外加 composition 结束 10ms 内的宽限）。
-		   ⚠️ **要用真实焦点上的元素派发**，且 `cancelable: true`、`composed: true`：
+		     "isComposingEvent()" 用的就是这两个判据（外加 composition 结束 10ms 内的宽限）。
+		   ⚠️ **要用真实焦点上的元素派发**，且 "cancelable: true"、"composed: true"：
 		     官方这条命令是挂在该编辑器实例的 root 上的。
-		   ⚠️ **不要试图 preventDefault 后手工插 `\n`**：编辑器是 Lexical（`editor.update()`
+		   ⚠️ **不要试图 preventDefault 后手工插 "\n"**：编辑器是 Lexical（"editor.update()"
 		     那套），直接改 DOM 会被它的模型覆盖掉。走「改写成 Shift+Enter」这条路，
 		     等于让官方自己执行它本来就有的换行分支。 */
 		const MP_ENTER_SEL = "[data-composer-input]";
@@ -6601,22 +8281,22 @@ window.__ModuleLoader__.load({
 
 		/* ══ 修复 68：凭据输入框改用普通键盘（移动端）══
 
-		   背景：官方把「API key / 凭据」输入框渲染成 `<input type="password">`：
+		   背景：官方把「API key / 凭据」输入框渲染成 "<input type="password">"：
 
-		     · `dsh-client-ui-settings-models/lib/client.js` L1380 与 L1692
+		     · "dsh-client-ui-settings-models/lib/client.js" L1380 与 L1692
 		       （模型配置页的两个变体：内置 provider 与自定义 provider）
-		     · `dsh-web-frontend/dist` 里的通用凭据字段组件（`type:"password"`）
+		     · "dsh-web-frontend/dist" 里的通用凭据字段组件（"type:"password""）
 
-		   这是**桌面语义**：桌面上 `type=password` 只意味着「遮挡字符」，键盘还是
-		   物理键盘，`Ctrl+V` 照常可用。但在 Android 上它有一个额外且不明显的后果 ——
+		   这是**桌面语义**：桌面上 "type=password" 只意味着「遮挡字符」，键盘还是
+		   物理键盘，"Ctrl+V" 照常可用。但在 Android 上它有一个额外且不明显的后果 ——
 		   **输入法会据此切换到「安全键盘」**（华为/小米/OPPO 的密码输入法），而
 		   安全键盘**按设计屏蔽剪贴板**：既没有粘贴入口，长按也不出粘贴菜单。
 
-		   而 API key 是一串 51 字符的 `sk-...`，**手抄不现实**，用户唯一的现实
+		   而 API key 是一串 51 字符的 "sk-..."，**手抄不现实**，用户唯一的现实
 		   做法就是从别处复制粘贴。于是「安全键盘」在这里不是安全增强，而是**把
 		   这个功能变不可用**。这是纯移动端才有的一类缺口（同修复 67）。
 
-		   做法：把 `type="password"` 改写成 `type="text"`，并移除 `autocomplete`。
+		   做法：把 "type="password"" 改写成 "type="text""，并移除 "autocomplete"。
 		   这样输入法看到的是普通文本框 ⇒ 普通键盘 ⇒ 剪贴板可用。
 
 		   ⚠️⚠️ **绝对不要为了保留圆点外观而补 CSS 遮蔽 —— 那会让整个修复失效。**
@@ -6624,65 +8304,65 @@ window.__ModuleLoader__.load({
 		     disc !important; }`），结果属性层面全对、行为层面全错。真机实测：
 		       焦点元素的 JS 属性： INPUT type=text  ac=(空)  pwdSel=0   ← 全对
 		       输入法实际收到的：   inputType=0xe1                        ← 仍是密码型
-		     `0xe1` = TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_WEB_PASSWORD。
-		     根因是 blink 的 `Element::ShouldObscureValue()` 只看
-		     `computedStyle.textSecurity != none` —— **CSS 遮蔽本身就是触发条件**，
-		     `type=password` 只是经 UA 样式表拿到同一条声明。
+		     "0xe1" = TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_WEB_PASSWORD。
+		     根因是 blink 的 "Element::ShouldObscureValue()" 只看
+		     "computedStyle.textSecurity != none" —— **CSS 遮蔽本身就是触发条件**，
+		     "type=password" 只是经 UA 样式表拿到同一条声明。
 		     也就是说：**「普通键盘」与「圆点遮蔽」在 Android WebView 上不可兼得。**
 		     用户要的是前者（「跟普通输入框一样」「能粘贴」），所以本插件让 API key
 		     明文可见，不做任何遮蔽补偿。详见「修复 68 的教训」那段 CSS 注释。
 
 		   ⚠️ **必须全局扫描，不能只认某个选择器**：这些输入框**没有稳定的
 		     class / data 属性**可锚（class 是 CSS Modules 的哈希名，随构建变），
-		     且分布在**两个独立编译的包**里。唯一稳定的判据就是 `type="password"`
+		     且分布在**两个独立编译的包**里。唯一稳定的判据就是 "type="password""
 		     这个属性本身 —— 它也正是输入法所用的判据。
 		   ⚠️ **用 MutationObserver 兜住懒挂载与重渲染**：设置页是按需打开的
-		     对话框，`apply()` 执行时它还不存在。同时观察 `type` 属性变化，
+		     对话框，"apply()" 执行时它还不存在。同时观察 "type" 属性变化，
 		     万一 React 把它设回去也能立刻改回来。
 		   ⚠️ **只改 type，不动 value / onChange**：官方那两个框是**受控组件**
-		     （`value={keyDraft}`），字符本身由 React 状态持有。改 type 不碰状态，
+		     （"value={keyDraft}"），字符本身由 React 状态持有。改 type 不碰状态，
 		     React 下次渲染时该属性与虚拟 DOM 一致（React 侧一直是 "password"、
 		     未变化 ⇒ 不会重设），因此不会打架。
-		   ⚠️ **不改 autoComplete**：`new-password` 只影响浏览器的密码管理器提示，
+		   ⚠️ **不改 autoComplete**："new-password" 只影响浏览器的密码管理器提示，
 		     与输入法（安全键盘）无关，动了反而可能引入自动填充弹窗。
-		   ⚠️ 只在移动端生效（修复 40 的惯例）：桌面端 `type=password` 完全正常，
+		   ⚠️ 只在移动端生效（修复 40 的惯例）：桌面端 "type=password" 完全正常，
 		     没有「安全键盘屏蔽剪贴板」这个问题，不该被改。
-		   ⚠️ `data-mp-key` 标记保留：它不再驱动任何 CSS 遮蔽，只作为「本插件
+		   ⚠️ "data-mp-key" 标记保留：它不再驱动任何 CSS 遮蔽，只作为「本插件
 		     处理过这个框」的标记，便于排查时一眼认出（探针就靠它定位焦点元素）。 */
 		const MP_KEY_ATTR = "data-mp-key";
 
 		/**
-		 * ══ 修复 68 的真正生效点：在**原型层**拦掉 `type=password` ══
+		 * ══ 修复 68 的真正生效点：在**原型层**拦掉 "type=password" ══
 		 *
 		 * 为什么必须有这一层 —— 这是本修复第二版才搞明白的关键机制：
 		 *
-		 * 官方那两个凭据输入框除了 `type="password"` 之外，还带 **`autoFocus: true`**
-		 * （`dsh-client-ui-settings-models/lib/client.js` L1699 与 L2552）。React 把
+		 * 官方那两个凭据输入框除了 "type="password"" 之外，还带 **"autoFocus: true"**
+		 * （"dsh-client-ui-settings-models/lib/client.js" L1699 与 L2552）。React 把
 		 * 元素插入 DOM 的**同一帧**就让它获得焦点，WebView 在那时按「密码框」建立了
-		 * 输入连接并把 `inputType` 定成 `TYPE_TEXT_VARIATION_WEB_PASSWORD`(0xe1)。
+		 * 输入连接并把 "inputType" 定成 "TYPE_TEXT_VARIATION_WEB_PASSWORD"(0xe1)。
 		 *
-		 * 而 **WebView 不会为已经建立的连接重算 `inputType`**。所以「先让 password
+		 * 而 **WebView 不会为已经建立的连接重算 "inputType"**。所以「先让 password
 		 * 存在、再由 MutationObserver 改成 text」这条路**必然失败**：改属性发生在
 		 * 聚焦之后，输入法早就拿到密码型类型了。
 		 *
-		 * 真机实测（Huawei CDY-TN90 / Android 10，`dumpsys input_method` 读实时值）：
+		 * 真机实测（Huawei CDY-TN90 / Android 10，"dumpsys input_method" 读实时值）：
 		 *
 		 *   只做事后改属性（第一版行为）：  DOM type=text、ts=none  →  inputType=0xe1 ✗
 		 *   本层拦截，password 从未出现：   DOM type=text、ts=none  →  inputType=0x80a1 ✓
 		 *
 		 * 顺带排除掉的几个嫌疑（都实测过，**不是**触发条件，别再去改它们）：
-		 *   · `data-mp-key` 标记本身 —— 带它的纯净 input 仍是 0x0
-		 *   · CSS `-webkit-text-security` —— 已确认可读，焦点框实测 `ts=none`
-		 *   · blur + focus 重建连接 —— 实测刷不动 `inputType`
+		 *   · "data-mp-key" 标记本身 —— 带它的纯净 input 仍是 0x0
+		 *   · CSS "-webkit-text-security" —— 已确认可读，焦点框实测 "ts=none"
+		 *   · blur + focus 重建连接 —— 实测刷不动 "inputType"
 		 *
-		 * 做法：重定义 `HTMLInputElement.prototype` 的 `type` 访问器与 `setAttribute`，
-		 * 把写入的 `"password"` 就地换成 `"text"`。React 完全无感 —— 它写 password、
+		 * 做法：重定义 "HTMLInputElement.prototype" 的 "type" 访问器与 "setAttribute"，
+		 * 把写入的 ""password"" 就地换成 ""text""。React 完全无感 —— 它写 password、
 		 * 读回来的也是它自己以为的 password（React 的受控逻辑只认自己的 props，
 		 * 不读 DOM 属性），而真实 DOM 里**从头到尾没有出现过 password**。
 		 *
-		 * ⚠️ 只拦 `type`，**不碰 value / onChange / required**：官方那两个框是受控组件，
+		 * ⚠️ 只拦 "type"，**不碰 value / onChange / required**：官方那两个框是受控组件，
 		 *    字符由 React 状态持有，本层不介入数据流。
-		 * ⚠️ `autocomplete` 仍交给下面的 MutationObserver 摘（它不影响输入连接，
+		 * ⚠️ "autocomplete" 仍交给下面的 MutationObserver 摘（它不影响输入连接，
 		 *    早一步晚一步都行）。
 		 * ⚠️ 只在移动端生效（修复 40 的惯例）：桌面端没有安全键盘问题，不该被改。
 		 */
@@ -6759,14 +8439,14 @@ window.__ModuleLoader__.load({
 			}
 
 			/**
-			 * 兜底扫描 + 摘 `autocomplete`。
+			 * 兜底扫描 + 摘 "autocomplete"。
 			 *
 			 * ⚠️ 装了拦截器之后，这里**不再**是主路径（password 压根不会出现），
 			 *    它的职责变成两件：
 			 *      ① 万一拦截器没生效（环境差异）时的补救；
-			 *      ② 摘掉 `autocomplete="new-password"` —— 拦截器不管这个属性。
+			 *      ② 摘掉 "autocomplete="new-password"" —— 拦截器不管这个属性。
 			 *    所以判断条件放宽成「带 data-mp-key 或 autocomplete 的输入框」，
-			 *    而不是只认 `type=password`。
+			 *    而不是只认 "type=password"。
 			 */
 			function tidy(el) {
 				if (!el || el.nodeType !== 1 || el.tagName !== "INPUT") return false;
@@ -6833,10 +8513,10 @@ window.__ModuleLoader__.load({
 		   ⚠️ **为什么不把日志界面做成页面插件**：因为它要能在「页面根本打不开」
 		     的时候用。插件没激活、前端 bundle 挂了、引擎没起来 —— 这三种情况
 		     恰好都是最需要看日志的时候，而那时页面插件自己也活不了。
-		     所以真正的界面在原生侧（`LogViewerActivity`），本分节只是个入口。
+		     所以真正的界面在原生侧（"LogViewerActivity"），本分节只是个入口。
 
-		   ⚠️ 另一个入口在**启动/崩溃浮层**上（`activity_main.xml` 的
-		     `@+id/overlayLogs`），它常驻显示、不依赖任何 Web 层。两条路合起来
+		   ⚠️ 另一个入口在**启动/崩溃浮层**上（"activity_main.xml" 的
+		     "@+id/overlayLogs"），它常驻显示、不依赖任何 Web 层。两条路合起来
 		     覆盖「界面能开」与「界面开不了」两种情况。 */
 
 		const MP_LOGS_NS = "dsh-android-mobile.logs";
@@ -6917,13 +8597,13 @@ window.__ModuleLoader__.load({
 		 * 「运行日志与诊断」分节组件。
 		 *
 		 * 布局沿用「特权权限」「悬浮气泡」那套**结论优先**的结构：
-		 * head 卡给状态徽章 + 一条「下一步」+ 直达按钮，明细折进 `<details>`。
+		 * head 卡给状态徽章 + 一条「下一步」+ 直达按钮，明细折进 "<details>"。
 		 *
-		 * ⚠️ 摘要数据来自 `DSHAndroid.logSummary()`（同步返回 JSON 字符串）。
+		 * ⚠️ 摘要数据来自 "DSHAndroid.logSummary()"（同步返回 JSON 字符串）。
 		 *   它刻意只读内存缓冲 + 一个小 JSON，**不读磁盘日志** —— 设置页每次
 		 *   打开都会调它，读几 MB 的文件算行数会明显卡顿。
 		 *
-		 * @param {object} props - 槽位注入面（只用 `t`）。
+		 * @param {object} props - 槽位注入面（只用 "t"）。
 		 * @returns {object} React 元素。
 		 */
 		function mpLogsSection(props) {
@@ -6937,9 +8617,9 @@ window.__ModuleLoader__.load({
 			 * 从原生读一次摘要。
 			 *
 			 * ⚠️ 桥**可能不存在**（非 App 环境、或桥被清理），先查再调 ——
-			 *   直接调会抛 `TypeError: Cannot read properties of undefined`。
+			 *   直接调会抛 "TypeError: Cannot read properties of undefined"。
 			 *
-			 * ⚠️ **必须补读一次**（`again=true` 的那趟）：gecko 版的 `logSummary()`
+			 * ⚠️ **必须补读一次**（"again=true" 的那趟）：gecko 版的 "logSummary()"
 			 *   读的是**快照缓存**（native messaging 只能异步，见 content.js），
 			 *   第一次拿到的可能是旧值；那边在读取时顺带请求原生重推快照，
 			 *   所以隔一拍再读就是新值。system 版是同步真值，补读无副作用。
@@ -6983,7 +8663,7 @@ window.__ModuleLoader__.load({
 			 * 从日志界面回来后刷新。
 			 *
 			 * ⚠️ 用户点「清空」或「上传」是在**另一个 Activity** 里做的，本页拿不到
-			 *   任何回调。只能监听 `visibilitychange` —— 不加的话用户清空完回来
+			 *   任何回调。只能监听 "visibilitychange" —— 不加的话用户清空完回来
 			 *   看到的还是旧数字，会以为没生效（悬浮气泡分节踩过同一个坑）。
 			 */
 			React.useEffect(() => {
@@ -7094,9 +8774,9 @@ window.__ModuleLoader__.load({
 		/**
 		 * 把「运行日志与诊断」注册进设置页一级导航。
 		 *
-		 * 与特权权限/悬浮气泡同一套接缝（`settings.section`），不需要碰导航 DOM。
+		 * 与特权权限/悬浮气泡同一套接缝（"settings.section"），不需要碰导航 DOM。
 		 *
-		 * ⚠️ `order` 取 28：排在「悬浮气泡」（26）与「交流群」（27）之后，
+		 * ⚠️ "order" 取 28：排在「悬浮气泡」（26）与「交流群」（27）之后，
 		 *   也就是设置列表最末。日志是**排障入口**，不该占据日常设置的显眼位置，
 		 *   但必须存在。
 		 *
@@ -7134,6 +8814,467 @@ window.__ModuleLoader__.load({
 		/** 最近一次组字结束的时间戳（0 = 从未）。见 setupEnterAsNewline。 */
 		let mpLastCompositionEnd = 0;
 
+		/**
+		 * 余额桥：页面侧拉 DeepSeek 余额 + 算本轮花费，回传给原生徽标。
+		 *
+		 * ## 为什么在页面侧拉，而不是引擎插件里
+		 *
+		 * 引擎插件层**拿不到** "ctx.remote"——实测两条路都不通：
+		 * "inject: ['remote']" 会 "pending (waiting for service: remote)"
+		 * 等一个永远不来的服务；不 inject 则读取直接抛
+		 * "cannot get property "remote" without inject"。
+		 * 而且同层的 "tools" / "agents" / "sessions" 全都是不可达的。
+		 *
+		 * 页面侧不一样：官方 "dsh-client-ui-settings-account" 就是用
+		 * "ctx.remote.account.getBalance()" 显示余额的，说明这条路在浏览器
+		 * 插件里是通的。所以这里按它的做法，用 "ctx.inject(["remote"], scope => …)"
+		 * 开一个**子 fiber** 再取服务。
+		 *
+		 * ## 与原生怎么对接
+		 *
+		 * 走 "DSHAndroid.bubbleReportBalance(json)"（见 "PageBridge"）。
+		 * 原生只负责画，不碰网络；页面只负责取数，不碰 View。
+		 *
+		 * @module mpBalanceBridge
+		 */
+
+		/** 页面侧余额状态（模板渲染由原生做，这里只负责取数与算钱）。 */
+		const mpBalance = {
+			/** 充值钱包 "[{currency,balance}]"。 */
+			wallets: [],
+			/** 赠送钱包。 */
+			bonusWallets: [],
+			/** 上次单轮花费（USD）。 */
+			costLast: 0,
+			/** 本会话累计（USD）。 */
+			costSession: 0,
+			/** 上次错误。 */
+			lastError: '',
+			/** 是否正在拉取（防重入）。 */
+			fetching: false,
+		};
+
+		/**
+		 * DeepSeek 单价（USD / 1M tokens）。**估算值，不是账单**。
+		 *
+		 * 官方随时可能调价，这里写死必然过期；而且真实扣费只有官方后台知道。
+		 * 界面上应理解为"大约花了多少"。
+		 *
+		 * ⚠️ 缓存命中单独一档：不区分的话会把便宜十倍的缓存读按原价算，虚高得离谱。
+		 * ⚠️ **不算 cacheWriteTokens**：DeepSeek 不单独收缓存写费（与 OpenAI 不同，
+		 *   别照抄那边的计价模型，会凭空多出一笔）。
+		 */
+		const MP_BALANCE_PRICING = {
+			inputMiss: 0.27 / 1_000_000,
+			inputHit: 0.07 / 1_000_000,
+			output: 1.1 / 1_000_000,
+		};
+
+		/**
+		 * 账号接口要的客户端版本号。
+		 *
+		 * ⚠️ 必须非空，否则官方那段 "accountClientMetadata()" 自己也抛
+		 *   "this client build carries no DSH_CLIENT_VERSION"。
+		 *   这里不跟着引擎版本走：它只用于平台侧的兼容性判断，写死一个
+		 *   稳定的 App 版本号最省事，也不会因为引擎升级而失效。
+		 */
+		const MP_CLIENT_VERSION = "0.3.0";
+
+		/**
+		 * 把 token 用量折算成金额。
+		 *
+		 * @param {object} usage - 引擎的 "TokenUsage"。
+		 * @returns {number} 估算金额（USD）。
+		 */
+		function mpCostOf(usage) {
+			if (usage === null || typeof usage !== "object") return 0;
+			const num = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
+			return num(usage.inputTokens) * MP_BALANCE_PRICING.inputMiss
+				+ num(usage.cacheReadTokens) * MP_BALANCE_PRICING.inputHit
+				+ num(usage.outputTokens) * MP_BALANCE_PRICING.output;
+		}
+
+		/** 把当前余额推给原生。失败静默（徽标不更新而已，不影响页面）。 */
+		function mpPushBalance() {
+			const b = window.DSHAndroid;
+			if (!b || typeof b.bubbleReportBalance !== "function") return;
+			try {
+				b.bubbleReportBalance(JSON.stringify({
+					wallets: mpBalance.wallets,
+					bonusWallets: mpBalance.bonusWallets,
+					costLast: mpBalance.costLast,
+					costSession: mpBalance.costSession,
+					error: mpBalance.lastError,
+				}));
+			} catch (e) {
+				console.warn("[dsh-android-mobile] 上报余额失败:", e && e.message);
+			}
+		}
+
+		/**
+		 * 拉一次余额。**账号通道优先**，无该通道时静默返回（不吵）。
+		 *
+		 * @param {object} remote - "ctx.get("remote")" 拿到的 remote 服务。
+		 * @param {string} reason - 触发原因（日志用）。
+		 */
+		async function mpRefreshBalance(remote, reason) {
+			if (mpBalance.fetching) return;
+			if (!remote?.account?.getBalance) {
+				// ⚠️ 这里**必须留痕**：静默返回是真机上最坑的形态 ——
+				//   用户点了球，看不出任何反应，日志里也什么都没有。
+				try {
+					window.DSHAndroid?.pageDiag?.(
+						`余额刷新跳过(${reason}): remote.account.getBalance 不存在`,
+					);
+				} catch { /* ignore */ }
+				return;
+			}
+			mpBalance.fetching = true;
+			try {
+				// ⚠️⚠️ **参数结构不能自己编。**
+				//
+				// 这里原来写的是 `{clientVersion, locale, utcOffsetSec}` —— 三个字段
+				// 名字全错，网关直接拒：
+				//   `typert gateway: account/getBalance: wire field "client" failed
+				//    boundary validation`
+				// 而页面侧的 catch 只把它记成一句"不可用"，徽标永远显示不出余额。
+				//
+				// 正确结构来自官方 `dsh-client-ui-settings-account` 的
+				// `accountClientMetadata()`：
+				//   `{ version, locale, timezoneOffsetSeconds }`
+				// 且 `version` 必须非空，否则官方那段自己也抛。
+				const out = await remote.account.getBalance({
+					version: MP_CLIENT_VERSION,
+					locale: "zh-CN",
+					timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+				});
+				if (out?.ok && out.value?.status === "ready") {
+					mpBalance.wallets = Array.isArray(out.value.value) ? out.value.value : [];
+					mpBalance.bonusWallets = Array.isArray(out.value.bonusWallets) ? out.value.bonusWallets : [];
+					mpBalance.lastError = "";
+					console.log(`[dsh-android-mobile] 余额已刷新（${reason}）: ${mpBalance.wallets.length} 个钱包`);
+					try {
+						window.DSHAndroid?.pageDiag?.(
+							`余额刷新(${reason}) 成功: ${mpBalance.wallets.length} 个钱包, 赠送 ${mpBalance.bonusWallets.length}`,
+						);
+					} catch { /* ignore */ }
+				} else if (out?.ok && out.value?.status === "failed") {
+					mpBalance.lastError = "账号余额接口返回失败";
+					try {
+						window.DSHAndroid?.pageDiag?.(`余额刷新(${reason}) 平台返回 failed`);
+					} catch { /* ignore */ }
+				} else if (out && out.ok === false) {
+					mpBalance.lastError = `账号余额不可用: ${out.error?.message ?? out.error ?? "未知"}`;
+					try {
+						window.DSHAndroid?.pageDiag?.(
+							`余额刷新(${reason}) 不可用: ${String(out.error?.message ?? out.error)}`,
+						);
+					} catch { /* ignore */ }
+				} else {
+					// `value === null` = 未登录。这不是错误，只是没这条路。
+					mpBalance.lastError = "未登录 DeepSeek 账号";
+					try {
+						window.DSHAndroid?.pageDiag?.(
+							`余额刷新(${reason}) 未登录: value=${JSON.stringify(out?.value)?.slice(0, 40)} status=${out?.value?.status}`,
+						);
+					} catch { /* ignore */ }
+				}
+				mpPushBalance();
+			} catch (e) {
+				mpBalance.lastError = `余额通道异常: ${e?.message ?? e}`;
+				try {
+					window.DSHAndroid?.pageDiag?.(`余额刷新(${reason}) 抛异常: ${e && e.message}`);
+				} catch { /* ignore */ }
+				mpPushBalance();
+			} finally {
+				mpBalance.fetching = false;
+			}
+		}
+
+		/**
+		 * 读原生的徽标刷新配置。
+		 *
+		 * 原生存在 SharedPreferences 里，页面读不到，所以走桥问。
+		 * **读不到就用默认值**，绝不能让刷新因为一次桥调用失败而整个不工作。
+		 *
+		 * @returns {{refreshEverySec:number, refreshOnTurnEnd:boolean, refreshOnTap:boolean}}
+		 */
+		function mpBadgeRefreshConfig() {
+			const fallback = { refreshEverySec: 0, refreshOnTurnEnd: true, refreshOnTap: false };
+			try {
+				const raw = window.DSHAndroid?.bubbleBadgeConfig?.();
+				if (typeof raw !== "string" || raw === "") return fallback;
+				const o = JSON.parse(raw);
+				return {
+					refreshEverySec: Number.isFinite(o?.refreshEverySec) ? Math.max(0, o.refreshEverySec) : 0,
+					refreshOnTurnEnd: o?.refreshOnTurnEnd !== false,
+					refreshOnTap: o?.refreshOnTap === true,
+					// ⚠️ 必须带下来：页面用它限流，读不到就只能瞎猜（曾经写死 20s）。
+					tapRefreshMinIntervalSec: Number.isFinite(o?.tapRefreshMinIntervalSec)
+						? o.tapRefreshMinIntervalSec
+						: 3,
+				};
+			} catch {
+				return fallback;
+			}
+		}
+
+		/**
+		 * 让 "navigator.clipboard.writeText" 走原生剪贴板。
+		 *
+		 * ## 为什么必须打这个补丁
+		 *
+		 * "http://127.0.0.1" 属于**潜在可信来源**，所以 WebView 里
+		 * "navigator.clipboard" **存在**、"isSecureContext" 也是 "true" —— 看起来一切正常。
+		 * 但 WebView 的剪贴板写权限由原生 "WebChromeClient.onPermissionRequest" 授予，
+		 * 本 App 没有实现它，于是**每次调用都抛**
+		 * "NotAllowedError: Write permission denied."
+		 *
+		 * 这种"API 在、一用就炸"的形态最难查：官方的「复制登录链接」只把异常吞成一句
+		 * 「复制失败」，没有任何线索。
+		 *
+		 * ## 做法
+		 *
+		 * 用 "Object.defineProperty" 覆盖 "navigator.clipboard.writeText"，内部转调
+		 * 原生桥 "DSHAndroid.writeClipboard"。**只改 writeText**，"readText" 等一律不动
+		 * （读剪贴板牵出隐私面，而需求只有复制）。
+		 *
+		 * ⚠️ 必须在 "apply()" 里调用："DSHAndroid" 桥在页面脚本执行时可能还没注入，
+		 *   模块顶层直接取会拿到 "undefined"。
+		 *
+		 * @returns {boolean} 是否成功安装。
+		 */
+		function mpInstallClipboardBridge() {
+			try {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.writeClipboard !== "function") return false;
+				const clip = navigator.clipboard;
+				if (!clip) return false;
+				const patched = function writeText(text) {
+					return new Promise((resolve, reject) => {
+						let ok = false;
+						try {
+							ok = bridge.writeClipboard(String(text == null ? "" : text));
+						} catch (e) {
+							reject(e);
+							return;
+						}
+						// 原生返回 false 时**必须 reject**：官方那段代码靠 catch 才会
+						// 显示「复制失败」，回 resolve 会让用户以为复制成功但剪贴板是空的。
+						if (ok) resolve();
+						else reject(new Error("writeClipboard failed"));
+					});
+				};
+				try {
+					Object.defineProperty(clip, "writeText", {
+						value: patched,
+						configurable: true,
+						writable: true,
+					});
+				} catch (e) {
+					clip.writeText = patched;
+				}
+				return true;
+			} catch (e) {
+				return false;
+			}
+		}
+
+		/**
+		 * 安装余额桥。
+		 *
+		 * @param {object} ctx - 浏览器插件上下文。
+		 * @returns {Function} dispose 函数。
+		 */
+		function mpInstallBalanceBridge(ctx) {
+			let refreshFn = null;
+			let timer = null;
+			let disposed = false;
+
+			// ⚠️ **必须让 `package.json` 的 `dsh.client.inject` 里有 `remote`**，
+			//   否则这一行会抛 `cannot get property "remote" without inject`。
+			//   实测过的三条死路：
+			//   ① 不声明就 `ctx.remote` → 抛 without inject；
+			//   ② 用 `ctx.get("remote")` → **拿不到**（`get` 绕过 inject 检查，
+			//      而服务本身是按 fiber 依赖表投放的，绕过后就是 undefined）；
+			//   ③ 用 `ctx.inject(["remote"], scope => …)` 子 fiber → 回调**永不执行**
+			//      （等一个不会来的服务，且不报错，完全静默）。
+			//
+			//   正解是官方 `dsh-client-ui-settings-account` 的写法：模块/清单级声明
+			//   依赖，然后直接读 `ctx.remote`。
+			//
+			//   风险与取舍：`remote` 缺席会让整个 mobile-ui 不激活（移动端布局崩）。
+			//   但 `remote` 是引擎核心服务，官方账号页就靠它，缺席的概率极低；
+			//   而这条路是**唯一**能拿到余额的。
+			let remote = null;
+			try {
+				remote = ctx.remote ?? null;
+			} catch (e) {
+				console.warn("[dsh-android-mobile] 取 remote 服务失败:", e && e.message);
+			}
+			if (!remote?.account?.getBalance) {
+				// 这个引擎版本没有账号通道：安静退出，不装任何监听。
+				// 徽标会一直显示"未登录"，那是**正确**的反馈，不是 bug。
+				// ⚠️ 诊断日志带上 `remote` 的真实形状 —— 否则"通道不在"这句话
+				//   既可能是没 inject 到，也可能是注进来了但结构不同，无从分辨。
+				let shape = "null";
+				try {
+					shape = remote === null || remote === undefined
+						? String(remote)
+						: `keys=[${Object.keys(remote).slice(0, 12).join(",")}] account=${
+							remote.account === undefined ? "undefined" : `{${Object.keys(remote.account).slice(0, 8).join(",")}}`
+						} namespaces=${
+							remote.namespaces === undefined
+								? "undefined"
+								: (() => {
+									try { return `[${Object.keys(remote.namespaces).slice(0, 20).join(",")}]`; }
+									catch { return String(remote.namespaces); }
+								})()
+						}`;
+				} catch (e) {
+					shape = `形状探测失败: ${e && e.message}`;
+				}
+				console.log(`[dsh-android-mobile] 无 remote.account 通道，余额桥不启用（remote ${shape}）`);
+				return () => { disposed = true; };
+			}
+
+			refreshFn = (reason) => void mpRefreshBalance(remote, reason);
+
+			/**
+			 * 诊断输出：同时写 "console" 和 "app.log"。
+			 *
+			 * ⚠️ 页面的 "console.log" **不进 "logs/app.log"**（只到 WebView 控制台），
+			 *   所以排查"余额不出数"这类问题时必须在真机上可读。"pageDiag" 是为此
+			 *   新加的原生桥（见 "PageBridge.pageDiag"）。
+			 */
+			const diag = (msg) => {
+				try { console.log("[dsh-android-mobile] " + msg); } catch { /* ignore */ }
+				try { window.DSHAndroid?.pageDiag?.(String(msg)); } catch { /* ignore */ }
+			};
+
+			// ── 定时刷新 ───────────────────────────────────────────
+			// 配置由原生下发（`bubbleBadgeConfig`）。0 = 不启用。
+			// ⚠️ 上限夹到 3600s：这是个会打平台接口的定时器，用户若配了 1 秒
+			//   就是在拿自己的账号刷接口限流。
+			const cfg = mpBadgeRefreshConfig();
+			const everySec = Math.min(Math.max(cfg.refreshEverySec, 0), 3600);
+
+			// ── 一次启动诊断：把真实形状打进 app.log ──────────────────
+			//
+			// ⚠️ 必须放在 `cfg` 之后：踩过 `Cannot access 'cfg' before initialization`，
+			//   那行 TDZ 报错会把整段安装逻辑后面的代码一起带崩（静默）。
+			//
+			// 内容要自洽：有没有 account、有没有 getBalance，一眼能分辨是
+			// "没 inject 到" 还是 "注进来了但结构不同"。
+			try {
+				const acct = remote?.account;
+				diag(
+					"余额桥已装: remote=" + (remote ? "有" : "无") +
+					" account=" + (acct ? "有" : "无") +
+					" getBalance=" + (typeof acct?.getBalance) +
+					" 定时=" + (cfg.refreshEverySec || 0) + "s" +
+					" 点击刷新=" + (cfg.refreshOnTap ? "开" : "关") +
+					" 点击限流=" + (cfg.tapRefreshMinIntervalSec || "?") + "s",
+				);
+			} catch (e) {
+				diag("余额桥诊断失败: " + (e && e.message));
+			}
+
+			if (everySec > 0) {
+				timer = window.setInterval(() => refreshFn?.("定时"), everySec * 1000);
+				console.log(`[dsh-android-mobile] 余额定时刷新已启用: ${everySec}s`);
+			}
+
+			// ── 点击刷新 ───────────────────────────────────────────
+			// 原生侧在球被点击时经 `bubbleReportBalance` 之外的另一条路通知页面？
+			// 不 —— 页面是**发起方**，原生不方便反向调页面里的 JS 函数。
+			// 所以这里由原生在点击时写一个 `tapRefresh` 计数到一个可读的桥方法上，
+			// 页面轮询它。轮询很轻（300ms 读一个数字），比反向注入 JS 稳。
+			let lastTapSeq = 0;
+			let lastTapAt = 0;
+			// ⚠️ **必须跟用户的配置走，不能写死。**
+			//
+			//   这里原来写死 `20 * 1000`，而设置页给的默认值是 10 秒。后果：
+			//   用户点一下球，10 秒内再点**一律被这里静默丢掉**，页面上完全
+			//   没有反应 —— 用户原话「我点这个球…还是没有看到余额」，看着就像
+			//   功能坏了。而原生侧本来就按 `tapRefreshMinIntervalSec` 限过一次，
+			//   这里再叠一个更长的硬限流纯属帮倒忙。
+			//
+			//   现在读配置里的秒数（原生已夹在 1–600），且**再放宽容错**：
+			//   万一配置没读到就用 3 秒兜底，而不是 20 秒。
+			const tapMinGapMs = Math.max(
+				1000,
+				Math.min(600, Number(cfg.tapRefreshMinIntervalSec) || 3) * 1000,
+			);
+			let tapPoll = null;
+			if (cfg.refreshOnTap) {
+				tapPoll = window.setInterval(() => {
+					try {
+						const seq = window.DSHAndroid?.bubbleTapRefreshSeq?.();
+						const n = typeof seq === "number" ? seq : Number(seq);
+						if (!Number.isFinite(n) || n <= lastTapSeq) return;
+						lastTapSeq = n;
+						const now = Date.now();
+						if (now - lastTapAt < tapMinGapMs) {
+							diag("点球刷新被限流: 距上次 " + Math.round((now - lastTapAt) / 1000) + "s < " + (tapMinGapMs / 1000) + "s");
+							return;
+						}
+						lastTapAt = now;
+						refreshFn?.("点击");
+					} catch {
+						/* 读不到就算了，下一轮再试 */
+					}
+				}, 300);
+			}
+
+			// 启动先拉一次：用户一进 App 就该看到余额。
+			refreshFn("启动");
+
+			// 每轮结束刷新。
+			// ⚠️ 包 try/catch：余额是锦上添花，绝不能因为它在事件回调里抛错
+			//   而影响会话本身。
+			try {
+				const off = ctx.on?.("session/event", (_session, event) => {
+					try {
+						const type = event?.type;
+						if (typeof type !== "string") return;
+						if (type === "assistant/message" || type === "assistant/attempt") {
+							// usage 在这两个事件上；`step/end` **不带**（已核对引擎源码）。
+							const cost = mpCostOf(event?.data?.usage);
+							if (cost > 0) {
+								mpBalance.costLast = Number(cost.toFixed(6));
+								mpBalance.costSession = Number((mpBalance.costSession + cost).toFixed(6));
+								mpPushBalance();
+							}
+						} else if (type === "turn/end") {
+							// 用户可以在徽标设置里关掉轮末刷新（比如他配了大额定时刷新）。
+							if (mpBadgeRefreshConfig().refreshOnTurnEnd) refreshFn?.("轮末");
+						}
+					} catch (e) {
+						console.warn("[dsh-android-mobile] 余额事件处理失败:", e && e.message);
+					}
+				});
+				if (typeof off === "function") {
+					// cordis 的 `ctx.on` 返回 dispose 函数，登记到当前 fiber。
+					ctx.effect?.(() => off);
+				}
+			} catch (e) {
+				console.warn("[dsh-android-mobile] 余额事件订阅失败:", e && e.message);
+			}
+
+			return () => {
+				disposed = true;
+				if (timer !== null) {
+					window.clearInterval(timer);
+					timer = null;
+				}
+				if (tapPoll !== null) {
+					window.clearInterval(tapPoll);
+					tapPoll = null;
+				}
+			};
+		}
+
 		function apply(ctx) {
 			mpCtx = ctx;
 			mpSessionsCache = ctx.get("sessions") ?? null;
@@ -7163,6 +9304,13 @@ window.__ModuleLoader__.load({
 			const disposePressFeedback = setupPressFeedback();
 			const disposeStatusBridge = mpInstallStatusBridge();
 			const disposeTranscriptBridge = mpInstallTranscriptBridge();
+			// 余额桥：页面侧拉 DeepSeek 余额 + 按 usage 算花费，回给原生徽标。
+			// ⚠️ 必须在这里装而不是模块顶层：它靠 `ctx.inject(["remote"])` 开子 fiber，
+			//   而那个 `ctx` 只有 apply 时才拿得到。
+			const disposeBalanceBridge = mpInstallBalanceBridge(ctx);
+			// 剪贴板补丁：WebView 里 `navigator.clipboard.writeText` 必抛
+			// `NotAllowedError`，转调原生桥（见 mpInstallClipboardBridge 的注释）。
+			mpInstallClipboardBridge();
 			const disposeImePrejudge = setupImePrejudge();   /* 修复 65 */
 			mo.observe(document.body, { childList: true, subtree: true, characterData: true });
 			// 启动爆发：apply() 执行时 React 尚未挂载，而 observer 有 300ms 节流，
@@ -7173,6 +9321,7 @@ window.__ModuleLoader__.load({
 				mpSyncMobileAttr();
 				mpSyncDrawer();
 				bindTitleRename();
+				mpAbbreviateEffort();      /* 修复 68：首屏就把长等级缩掉，避免闪一下截断 */
 				mpInstallPendingTrust();   /* 修复 51 兜底 */
 				if (++mpBootBursts >= 10) window.clearInterval(mpBootBurstTimer);
 			}, 120);
@@ -7180,7 +9329,7 @@ window.__ModuleLoader__.load({
 			const t = window.setInterval(watchApproval, 5000);
 			/* 启动动画收尾信号：告诉原生「界面真的能用了」。
 			 *
-			 * ⚠️ 不能在这里直接报 —— apply() 返回时 React 还没挂载，`data-mobile`
+			 * ⚠️ 不能在这里直接报 —— apply() 返回时 React 还没挂载，"data-mobile"
 			 *   属性与外壳按钮都还不存在，此刻报等于骗原生提前收起启动页，
 			 *   用户会看到一块空白的 WebView。
 			 *   真机实测：apply() 之后约 1.4~1.7s 界面才真正可用。
@@ -7209,7 +9358,30 @@ window.__ModuleLoader__.load({
 		}
 
 		exports.apply = apply;
-		exports.inject = [];
+		/**
+		 * 本插件依赖的 cordis 服务。
+		 *
+		 * ⚠️ **"remote" 是给余额桥用的**（见 "mpInstallBalanceBridge"）：页面侧要调
+		 *   "ctx.remote.account.getBalance()" 读 DeepSeek 余额，而 cordis 要求
+		 *   当前 fiber 声明过依赖才能读该服务，否则抛
+		 *   "cannot get property "remote" without inject"。
+		 *
+		 * ⚠️ 声明在这里而不是 "package.json" 的 "dsh.client.inject"：那个字段写的是
+		 *   **npm 包名**（"@deepseek-ai/dsh-api-remotes" 之类），不是服务名，
+		 *   两者不是一回事。这个文件是手写的模块加载器格式，依赖表就在这里。
+		 *
+		 * 代价："remote" 缺席会让整个 mobile-ui 不激活。但它是引擎核心服务
+		 * （官方「设置 → 账号」页就靠它），缺席概率极低，而这是唯一能拿到余额的路。
+		 *
+		 * ⚠️ **必须同时声明 ""remote.account""**（带点号）。只声明 ""remote"" 时
+		 *   "ctx.remote" 是个**未展开的命名空间宿主**（实测形状：
+		 *   "{ctx,name,ownerCtx,connection,namespaces,hostFacts,streams,events,mutations}"，
+		 *   **没有 "account" 属性**）。cordis 只会把**显式声明过的点号子服务**
+		 *   代理到 "remote" 上。官方 "dsh-client-ui-settings-account" 就是这么写的：
+		 *   "inject = ["slots","locale","remote","remote.account","remote.session",…]"
+		 *   —— 少了那条点号的，"ctx.remote.account" 一定是 undefined。
+		 */
+		exports.inject = ["remote", "remote.account"];
 		return module.exports;
 	}
 });

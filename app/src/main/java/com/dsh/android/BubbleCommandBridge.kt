@@ -71,6 +71,19 @@ object BubbleCommandBridge {
      */
     private const val STATE_FILE = "bubble-state.json"
 
+    /**
+     * **余额信箱**文件名（单向、无回执）。
+     *
+     * 由 `dsh-android-balance` 插件写：它订阅引擎的 `assistant/message`
+     * 拿 usage、按定价折算成本轮花费，并定期拉官方账号余额。
+     *
+     * ⚠️ 用**独立文件**而不是塞进 [STATE_FILE]：两者的写入频率差一个量级
+     *   （状态是每 120ms 一次、余额是每轮/每几分钟一次），混在一起会让
+     *   余额的高频覆盖掉一条刚到的状态，或者反过来 —— 表现为"宠物动作
+     *   偶尔卡一下"这种没法归因的问题。
+     */
+    private const val BALANCE_FILE = "bubble-balance.json"
+
     /** 轮询间隔。见类注释里为什么是粗粒度。 */
     private const val POLL_MS = 250L
 
@@ -115,6 +128,9 @@ object BubbleCommandBridge {
         // ⚠️ 顺序不能反 —— 命令分支在极端情况下会 return（缺 id 时丢弃请求），
         //   放在它后面会让状态播报跟着一起漏读一拍。
         pollState(dir)
+        // 余额信箱与状态播报同级：都是单向、读到就删、互不影响。
+        // 放在命令分支之前同理 —— 命令分支会 return，不该连累余额刷新。
+        pollBalance(dir)
         val cmd = File(dir, CMD_FILE)
         if (!cmd.isFile) return
 
@@ -237,6 +253,69 @@ object BubbleCommandBridge {
             Log.w(TAG, "应用悬浮球运行状态失败: ${t.message}")
         }
         f.delete()
+    }
+
+    /**
+     * 读一次**余额信箱**（单向）。
+     *
+     * 与 [pollState] 同一套规矩：先读内容、解析成功后再删；解析失败不删，下一拍再试。
+     *
+     * 载荷结构见 `dsh-android-balance/lib/index.js` 的 `flush()`：
+     * `{ wallets, bonusWallets, costLast, costSession, at, error }`。
+     *
+     * ⚠️ 与状态播报不同，这里**必须**把 `wallets` 当数组逐项解析：余额是按币种
+     *   分开的，只取第一个会在"有美元余额"的账号上显示错币种的数字。
+     */
+    private fun pollBalance(dir: File) {
+        val f = File(dir, BALANCE_FILE)
+        if (!f.isFile) return
+        val text = try {
+            f.readText()
+        } catch (t: Throwable) {
+            return
+        }
+        val json = try {
+            JSONObject(text)
+        } catch (t: Throwable) {
+            return
+        }
+        val wallets = json.optJSONArray("wallets")
+        val bonusWallets = json.optJSONArray("bonusWallets")
+        // `costLast` / `costSession` 是 Number（Double），用字符串转 BigDecimal
+        // 以避开 `0.1+0.2` 那类浮点尾数问题（金额显示两位小数时尤其明显）。
+        val costLast = decimalOf(json.opt("costLast"))
+        val costSession = decimalOf(json.opt("costSession"))
+        val error = json.optString("error", "")
+
+        val snap = BalanceSnapshot.fromWallets(
+            rechargeJson = wallets,
+            bonusJson = bonusWallets,
+            costLast = costLast,
+            previous = null,
+        ).let { base ->
+            // `fromWallets` 会把 costLast 累加进 session；但插件给的 costSession
+            // 是**它自己算的权威值**，直接用，避免两边算法漂移。
+            base.copy(costSession = costSession, error = error)
+        }
+
+        try {
+            FloatingBubble.applyBalanceToActive(snap)
+        } catch (t: Throwable) {
+            Log.w(TAG, "应用余额快照失败: ${t.message}")
+        }
+        f.delete()
+    }
+
+    /**
+     * 把 JSON 里的数字/字符串转成 `BigDecimal`。
+     *
+     * @returns 解析失败时返回 0（金额显示上比抛异常合理）。
+     */
+    private fun decimalOf(v: Any?): java.math.BigDecimal = when (v) {
+        null -> java.math.BigDecimal.ZERO
+        is Number -> runCatching { java.math.BigDecimal(v.toString()) }.getOrDefault(java.math.BigDecimal.ZERO)
+        is String -> runCatching { java.math.BigDecimal(v.trim()) }.getOrDefault(java.math.BigDecimal.ZERO)
+        else -> java.math.BigDecimal.ZERO
     }
 
     /**

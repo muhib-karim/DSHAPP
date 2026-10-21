@@ -84,6 +84,8 @@ import kotlin.math.roundToInt
  * | `statusAutoHideMs` | int | 状态横条**内容无变化**多久后自动消失，0 = 不自动消失 |
  * | `edgeSnap` | bool | 是否启用「拖出屏幕即贴边折叠」 |
  * | `throwEnabled` | bool | 是否启用「甩出去会飞、会弹、落地会挤压」的抛掷物理 |
+ * | `imeFlingEnabled` | bool | 是否启用「键盘弹出时球从下方飞上去」（拿不到 shell 身份时自动降级为几何避让） |
+ * | `shakeEnabled` | bool | 是否启用「快速晃动手机 ⇒ 球被甩飞」 |
  *
  * ## 三条设计约束
  *
@@ -189,6 +191,56 @@ data class BubbleAppearance(
      * 之前的行为。默认**开**：那是"宠物"手感的核心，也是 dsh-pet 的默认。
      */
     val throwEnabled: Boolean = true,
+    /**
+     * 是否启用**键盘顶飞**：系统键盘弹出时，球从屏幕下方「嗖」地飞上去。
+     *
+     * ## 为什么需要这个
+     *
+     * 悬浮窗拿不到 IME insets，键盘弹起时球**不会被系统顶开**，停在屏幕下方的球
+     * 会被键盘整块盖住 —— 用户既看不见它、也点不到它。真机反馈原话：
+     * 「有时候宠物在屏幕比较偏下的地方，然后用户点开键盘弹出的时候就会被遮挡」。
+     *
+     * ## 触发源（为什么不是零成本）
+     *
+     * 唯一可靠的键盘状态来源是 `dumpsys input_method` 的 `mInputShown`，它需要
+     * **uid 2000 / Shizuku** 才能读（[AppShellExecutor.needsShellUid] 已含 `dumpsys`）。
+     * 单次耗时 95–150 ms，所以**不能高频轮询**：只在球停稳、且屏幕上确实有键盘
+     * 风险时才查，间隔 [IME_POLL_INTERVAL_MS]。
+     *
+     * ⚠️ 拿不到 shell 身份时**自动降级**为纯几何避让（见 [imeFallbackSafeZone]）：
+     *   球停稳后若落在下方危险区就直接弹开，不依赖任何权限。这样没有 adb 授权的
+     *   用户也不会被键盘盖住，只是少了「键盘一弹就飞」的戏剧感。
+     */
+    val imeFlingEnabled: Boolean = true,
+    /**
+     * 是否启用**晃动甩飞**：快速晃动手机时，球像被手甩出去一样飞、弹、滚停。
+     *
+     * ## 为什么不需要权限
+     *
+     * `TYPE_ACCELEROMETER` 是普通传感器，装了就可用，不像相机/定位要运行时授权。
+     *
+     * ## 与 [throwEnabled] 的关系
+     *
+     * [throwEnabled] 管的是「**手甩球**松手后飞不飞」；本字段管的是「**晃手机**能不能
+     * 让球飞」。两个独立：想要「只能手甩、晃手机没反应」就关掉这个。
+     *
+     * ⚠️ 阈值必须压在「明显是故意甩」之上 —— 走路、放桌上、打字都有读数。纯看代码
+     *   定不了，见 [SHAKE_THRESHOLD] 的注释。
+     */
+    val shakeEnabled: Boolean = true,
+    /**
+     * **余额徽标**：贴在球旁边常驻显示的一个小标签。
+     *
+     * ## 为什么要做成一个独立的可配置对象
+     *
+     * 需求是「AI 自己决定显示在哪、以什么形式显示」，所以**不能**把位置/配色
+     * 写死在某处常量里 —— 那样 AI 只能开关，不能设计。整个 [BalanceBadge]
+     * 一次性下发、一次性落盘，AI 改任何一项都不影响别的。
+     *
+     * ⚠️ 与 `bg`/`border` 这类**颜色字段为空 = 跟随主题**不同，徽标里的颜色
+     *   留空同样表示「跟随主题」—— 但要**逐个**判断，不做整体推断。
+     */
+    val balanceBadge: BalanceBadge = BalanceBadge(),
     /**
      * **具名动作池**：一次配一组动作，让宠物自己抽着播。
      *
@@ -638,6 +690,15 @@ data class BubbleAppearance(
                 statusAutoHideMs = clampInt(o, "statusAutoHideMs", base.statusAutoHideMs, 0, 60_000),
                 edgeSnap = if (o.has("edgeSnap")) o.optBoolean("edgeSnap", base.edgeSnap) else base.edgeSnap,
                 throwEnabled = if (o.has("throwEnabled")) o.optBoolean("throwEnabled", base.throwEnabled) else base.throwEnabled,
+                imeFlingEnabled = if (o.has("imeFlingEnabled")) o.optBoolean("imeFlingEnabled", base.imeFlingEnabled) else base.imeFlingEnabled,
+                shakeEnabled = if (o.has("shakeEnabled")) o.optBoolean("shakeEnabled", base.shakeEnabled) else base.shakeEnabled,
+                // 余额徽标整包下发：`balanceBadge` 缺席时**保持原值**（不能重置成默认，
+                // 否则 AI 每改一次别的字段就会把用户精心调好的徽标打回原形）。
+                balanceBadge = if (o.has("balanceBadge")) {
+                    BalanceBadge.merge(o.optJSONObject("balanceBadge"), base.balanceBadge)
+                } else {
+                    base.balanceBadge
+                },
                 // ⚠️ 池与文案都**允许传空对象/空数组来清空**（与 `actionMap` 同规矩）：
                 //   一刀切地"空即保持原值"会让 AI 没法撤掉配错的池。
                 pools = if (o.has("pools")) poolsOf(o) else base.pools,
@@ -652,6 +713,25 @@ data class BubbleAppearance(
                 statusImages = if (o.has("statusImages")) statusImagesOf(o) else base.statusImages,
                 moveParams = if (o.has("moveParams")) moveParamsOf(o) else base.moveParams,
             )
+
+            // ── 「键盘顶飞」的能力闸门 ──────────────────────────────────────
+            //
+            // 它需要读 `dumpsys input_method` 的 `mInputShown`，而那条命令要求
+            // `android.permission.DUMP` —— **普通应用 uid 拿不到**，必须有 Shizuku
+            // 授权或 root。没有特权时这个开关就算开着也不可能工作。
+            //
+            // 所以这里**强制关掉**，而不是留一个"开着但静默无效"的开关：后者会让
+            // 用户以为功能坏了、反复来报 bug。设置页会用同一判据把开关置灰并说明
+            // 原因（见 ShellPrivilege）。
+            //
+            // ⚠️ 是「读的时候纠正」，**不写回磁盘**：用户哪天接入了特权，重启 App
+            //   后原来的 true 会自动恢复生效，不需要再手动开一次。
+            if (merged.imeFlingEnabled && context != null &&
+                !ShellPrivilege.isAvailable(context)
+            ) {
+                ShellPrivilege.logDenied("键盘顶飞", ShellPrivilege.status(context))
+                merged = merged.copy(imeFlingEnabled = false)
+            }
 
             // ── 轮播帧 / 动作帧集 ──
             //
@@ -1453,6 +1533,36 @@ data class BubbleAppearance(
                 put("statusAutoHideMs", appearance.statusAutoHideMs)
                 put("edgeSnap", appearance.edgeSnap)
                 put("throwEnabled", appearance.throwEnabled)
+                put("imeFlingEnabled", appearance.imeFlingEnabled)
+                put("shakeEnabled", appearance.shakeEnabled)
+                // 余额徽标整包落盘。**逐字段写而不是塞一个嵌套 JSON 字符串**：
+                // 读回时 `BalanceBadge.merge` 要按字段判"缺省即保持"，嵌套字符串
+                // 会让"某个字段没写"与"某个字段是空串"彻底分不开。
+                put(
+                    "balanceBadge",
+                    JSONObject().apply {
+                        val bb = appearance.balanceBadge
+                        put("enabled", bb.enabled)
+                        put("anchor", bb.anchor)
+                        put("gapDp", bb.gapDp)
+                        put("bg", bb.bg)
+                        put("fg", bb.fg)
+                        put("border", bb.border)
+                        put("borderWidthDp", bb.borderWidthDp)
+                        put("radiusDp", bb.radiusDp)
+                        put("fontSizeSp", bb.fontSizeSp)
+                        put("paddingHDp", bb.paddingHDp)
+                        put("paddingVDp", bb.paddingVDp)
+                        put("maxWidthDp", bb.maxWidthDp)
+                        put("template", bb.template)
+                        put("showCostFlash", bb.showCostFlash)
+                        put("hideWhenIdle", bb.hideWhenIdle)
+                        put("refreshOnTurnEnd", bb.refreshOnTurnEnd)
+                        put("refreshEverySec", bb.refreshEverySec)
+                        put("refreshOnTap", bb.refreshOnTap)
+                        put("tapRefreshMinIntervalSec", bb.tapRefreshMinIntervalSec)
+                    },
+                )
                 // ⚠️ 池、权重、状态文案都必须落盘，否则重启后宠物只剩默认动作 ——
                 //   而磁盘上那几十段素材还在，表现为"重开 App 宠物就不动了"。
                 //   空对象/空数组也要写：它们正是"清空"这个状态本身。

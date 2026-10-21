@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 26
+        versionCode = 27
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -124,7 +124,26 @@ android {
         //         整轮失败（`unknown prompt variable "{{cwd}}" ... registered
         //         variables: provider, model`）。上一轮只删了锚点没删正文。
         //      ③ 内置预设源码换成 npm 上已发布的 dsh-preset-razor@1.0.3。
-        versionName = "0.3.0"
+        // ⚠️ 27（本次）**换 versionName：0.3.0 → 0.3.1**。
+        //      ① **修余额功能整条链路**：`getBalance` 的参数结构原来自己编的
+        //         （`clientVersion/locale/utcOffsetSec`），网关直接拒
+        //         `wire field "client" failed boundary validation`，余额永远拉不到。
+        //         改成官方的 `{version, locale, timezoneOffsetSeconds}`。
+        //      ② **球不在时缓存余额快照**：原来球隐藏期间拿到的余额被直接丢弃，
+        //         而余额恰好是在 App 前台（球隐藏）时刷新的 ⇒ 回桌面永远没徽标。
+        //      ③ **点球刷新的限流跟随配置**：页面里写死 20 秒，设置里是 10 秒，
+        //         导致连点毫无反应。
+        //      ④ **球的默认底色改成全透明**：原来是纯白，头像外面那圈永远是
+        //         一块白底，与设置页显示的「透明」不一致。
+        //      ⑤ 余额徽标底色默认也改成透明（原来是主题白底黑字）。
+        //      ⑥ 设置页「显示内容」改成可视化编辑器：成品预览 + 可删胶囊 +
+        //         已用词置灰 + 恢复默认，不再把 `{balance}` 这种占位符摊给用户。
+        //      ⑦ 晃动手感重做成**惯性撞边**：手机快速移动时，球被对应那侧的
+        //         边框撞飞（原来只是"晃过阈值给一次速度"）。
+        //      ⑧ 删掉顶栏与小分节里重复的「拖拽抛掷 / 晃动甩飞 / 键盘顶飞」开关 ——
+        //         上面那份只存盘不推活球，表现是"开关状态不马上刷新"。
+        //      ⑨ 面板底色「自动」= 透明（同时抑制描边、给文字加阴影）。
+        versionName = "0.3.1"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {

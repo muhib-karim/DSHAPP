@@ -1627,9 +1627,20 @@ class MainActivity : AppCompatActivity() {
          * 也可能开了开关但授权被系统撤销了。分开报，设置页才能给出正确的下一步。
          */
         override fun bubbleState(): String = try {
+            // ⚠️ 这几个字段是「悬浮气泡」设置页的**开关状态**，页面渲染时直接读这里。
+            //   两个新开关都带能力判据：`imeFlingAvailable` 为 false 时页面必须把
+            //   「键盘顶飞」置灰并显示 `imeFlingReason`，而不是让用户打开一个注定
+            //   不生效的开关（读 `dumpsys input_method` 需要 DUMP 权限，普通应用没有）。
+            val ap = BubbleAppearance.load(this@MainActivity)
+            val priv = ShellPrivilege.status(this@MainActivity)
             JSONObject()
                 .put("enabled", FloatingBubble.isEnabled(this@MainActivity))
                 .put("granted", FloatingBubble.canDrawOverlays(this@MainActivity))
+                .put("throwEnabled", ap.throwEnabled)
+                .put("imeFlingEnabled", ap.imeFlingEnabled)
+                .put("imeFlingAvailable", priv.available)
+                .put("imeFlingReason", priv.reason ?: JSONObject.NULL)
+                .put("shakeEnabled", ap.shakeEnabled)
                 .toString()
         } catch (t: Throwable) {
             Log.w(DshApplication.TAG, "读取气泡状态失败: ${t.message}")
@@ -1641,6 +1652,171 @@ class MainActivity : AppCompatActivity() {
             Log.i(DshApplication.TAG, "设置页切换悬浮气泡: $enabled")
             FloatingBubble.setEnabled(this@MainActivity, enabled)
             if (!enabled) FloatingBubble.hideNow()
+        }
+
+        /**
+         * 设置「键盘顶飞」。
+         *
+         * ⚠️ 无特权通道时**拒绝并回退**：`BubbleAppearance.merge()` 里有同一道闸门，
+         *   就算这里写进了 true，下次 `load()` 也会被强制纠正回 false —— 与其让它
+         *   「看起来打开了但其实没生效」，不如当场拒绝并记日志。设置页本就会用
+         *   `imeFlingAvailable` 把开关置灰，正常路径下走不到这里。
+         */
+        override fun bubbleSetImeFling(enabled: Boolean) {
+            val priv = ShellPrivilege.status(this@MainActivity)
+            if (enabled && !priv.available) {
+                ShellPrivilege.logDenied("键盘顶飞", priv)
+                Log.i(DshApplication.TAG, "拒绝打开键盘顶飞：${priv.reason}")
+                return
+            }
+            Log.i(DshApplication.TAG, "设置页切换键盘顶飞: $enabled")
+            val cur = BubbleAppearance.load(this@MainActivity)
+            BubbleAppearance.save(this@MainActivity, cur.copy(imeFlingEnabled = enabled))
+            // 立即生效（同 [bubbleSetThrow]：只 save 不会让活的球重新读配置）。
+            runCatching { FloatingBubble.applyAppearance(FloatingBubble.currentAppearanceJson()) }
+                .onFailure { Log.w(DshApplication.TAG, "键盘顶飞即时生效失败: ${it.message}") }
+        }
+
+        /**
+         * 设置「晃动甩飞」。加速度计零权限，直接写盘即可。
+         *
+         * ⚠️ 同样要 apply 到活的球 —— 见 [bubbleSetThrow] 的说明。
+         */
+        override fun bubbleSetShake(enabled: Boolean) {
+            Log.i(DshApplication.TAG, "设置页切换晃动甩飞: $enabled")
+            val cur = BubbleAppearance.load(this@MainActivity)
+            BubbleAppearance.save(this@MainActivity, cur.copy(shakeEnabled = enabled))
+            runCatching { FloatingBubble.applyAppearance(FloatingBubble.currentAppearanceJson()) }
+                .onFailure { Log.w(DshApplication.TAG, "晃动甩飞即时生效失败: ${it.message}") }
+        }
+
+        /**
+         * 徽标刷新配置下发。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程上，只读 SharedPreferences，不碰 View。
+         */
+        override fun bubbleBadgeConfig(): String {
+            return try {
+                val b = BubbleAppearance.load(this@MainActivity).balanceBadge
+                JSONObject().apply {
+                    put("refreshEverySec", b.refreshEverySec)
+                    put("refreshOnTurnEnd", b.refreshOnTurnEnd)
+                    put("refreshOnTap", b.refreshOnTap)
+                    put("tapRefreshMinIntervalSec", b.tapRefreshMinIntervalSec)
+                }.toString()
+            } catch (t: Throwable) {
+                Log.w(DshApplication.TAG, "读徽标刷新配置失败: ${t.message}")
+                // 兜底给"只按轮末刷新"：最省接口、且一定有数据更新。
+                // `tapRefreshMinIntervalSec` 用 3 而不是 20：读不到配置时应该尽量
+                // 让功能可用，而不是把用户挡在门外（见页面侧那段注释）。
+                """{"refreshEverySec":0,"refreshOnTurnEnd":true,"refreshOnTap":false,"tapRefreshMinIntervalSec":3}"""
+            }
+        }
+
+        /**
+         * 点球刷新计数（见 `PageBridge.bubbleTapRefreshSeq` 的说明）。
+         */
+        override fun bubbleTapRefreshSeq(): Int = tapRefreshSeq
+
+        /**
+         * 把页面侧的诊断文字写进 `app.log`。
+         *
+         * ## 为什么需要
+         *
+         * 余额不出数的时候，页面的 `console.log` **不进 `app.log`**（它走 WebView
+         * 控制台），于是"到底有没有拿到 `remote.account`""接口返回了什么"这些
+         * 关键事实在真机上完全看不见，只能靠猜。
+         *
+         * 有了这个通道，页面侧把一次探测结果拼成一句话发过来，就能在
+         * `logs/app.log` 里按 `[DSH]` 标签直接读。
+         *
+         * ⚠️ 只用于诊断，**不要**在正常路径里频繁调用（会污染日志）。
+         */
+        override fun pageDiag(text: String) {
+            Log.i(DshApplication.TAG, "页面诊断: $text")
+        }
+
+        /**
+         * 写系统剪贴板（供页面侧「复制登录链接」用）。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程上。`ClipboardManager` 是系统服务，
+         *   从任意线程调用都安全（内部自己切 binder），不需要 `runOnUiThread`。
+         *
+         * ⚠️ 失败**不能抛**：抛出去会让 JS 侧收到异常而不是 `false`，
+         *   官方那段 `try/catch` 会走到意料之外的路径。
+         */
+        override fun writeClipboard(text: String): Boolean {
+            if (text.isEmpty()) return false
+            return try {
+                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("DSH", text))
+                Log.i(DshApplication.TAG, "已复制到剪贴板: ${text.length} 字符")
+                true
+            } catch (t: Throwable) {
+                Log.w(DshApplication.TAG, "写剪贴板失败: ${t.message}")
+                false
+            }
+        }
+
+        /**
+         * 设置「拖拽抛掷」（手甩球）。纯本地物理，无权限要求。
+         *
+         * ⚠️⚠️ **必须走 `FloatingBubble.applyAppearance`，不能只 save。**
+         *   早先这里只 `BubbleAppearance.save(...)` 就返回了 —— 配置确实落盘，
+         *   但**正在运行的悬浮球不读这份新配置**，于是用户看到的是
+         *   「开了没反应，要等下次改别的参数把整份配置重新 apply 才生效」。
+         *
+         *   而下方「动作与交互」折叠卡片里那个同名开关走的是 `bubbleApply`，
+         *   一按就生效 —— 同一个功能两个入口、两种行为，这才是用户报的那个 bug。
+         *
+         *   现在两个入口统一：都先 save，再 apply 到活的球上。
+         */
+        override fun bubbleSetThrow(enabled: Boolean) {
+            Log.i(DshApplication.TAG, "设置页切换拖拽抛掷: $enabled")
+            val cur = BubbleAppearance.load(this@MainActivity)
+            BubbleAppearance.save(this@MainActivity, cur.copy(throwEnabled = enabled))
+            // 立即生效：把含新 `throwEnabled` 的整份配置推给活的球。
+            runCatching { FloatingBubble.applyAppearance(FloatingBubble.currentAppearanceJson()) }
+                .onFailure { Log.w(DshApplication.TAG, "拖拽抛掷即时生效失败: ${it.message}") }
+        }
+
+        /**
+         * 页面侧拉到的余额 → 原生徽标。
+         *
+         * ⚠️ 运行在 WebView 的 JS 线程上，**不能碰 View**：
+         *   `applyBalanceToActive` 内部自己 `main.post`，这里只做解析。
+         *
+         * ⚠️ 解析失败**不能抛**（会打断 JS 桥调用，页面侧看到异常）。
+         *   失败按空快照处理，徽标隐藏即可。
+         */
+        override fun bubbleReportBalance(json: String) {
+            val snap = try {
+                val o = JSONObject(json)
+                BalanceSnapshot.fromWallets(
+                    rechargeJson = o.optJSONArray("wallets"),
+                    bonusJson = o.optJSONArray("bonusWallets"),
+                    costLast = runCatching {
+                        java.math.BigDecimal(o.opt("costLast")?.toString() ?: "0")
+                    }.getOrDefault(java.math.BigDecimal.ZERO),
+                    previous = null,
+                ).copy(
+                    costSession = runCatching {
+                        java.math.BigDecimal(o.opt("costSession")?.toString() ?: "0")
+                    }.getOrDefault(java.math.BigDecimal.ZERO),
+                    error = o.optString("error", ""),
+                )
+            } catch (t: Throwable) {
+                Log.w(DshApplication.TAG, "解析余额载荷失败: ${t.message}")
+                BalanceSnapshot(error = "载荷解析失败")
+            }
+            val ok = FloatingBubble.applyBalanceToActive(snap)
+            Log.i(
+                DshApplication.TAG,
+                "页面上报余额: 钱包=${snap.wallets.size} 赠送=${snap.bonusWallets.size} " +
+                    "合计=${snap.total().toPlainString()} 本次=${snap.costLast.toPlainString()} " +
+                    "已送达=$ok",
+            )
         }
 
         /**
@@ -3505,6 +3681,28 @@ class MainActivity : AppCompatActivity() {
     internal companion object {
         /** 键盘高度缓存的 SharedPreferences 文件名。 */
         const val IME_PREFS = "dsh_ime"
+
+        /**
+         * 点球刷新计数（页面侧 `bubbleTapRefreshSeq()` 读它）。
+         *
+         * ⚠️ 放在 `companion object` 而不是 [StatusBridge] 里：球（`FloatingBubble`）
+         *   和桥（`StatusBridge`）是**两个不相干的对象**，球拿不到桥的实例引用
+         *   （桥是 `private inner class`）。用静态计数是两者唯一能共享的位置。
+         *
+         * ⚠️ `@Volatile` 保证可见性：写发生在主线程（球的触摸回调），
+         *   读发生在 WebView 的 JS 线程。不加锁 —— 这只决定"什么时候刷新"，
+         *   读到旧值顶多晚一轮刷新，不会出错。
+         */
+        @Volatile
+        @JvmStatic
+        var tapRefreshSeq: Int = 0
+            private set
+
+        /** 点了一下球。由 `FloatingBubble` 的触摸回调调。 */
+        @JvmStatic
+        fun bumpTapSeq() {
+            tapRefreshSeq += 1
+        }
 
         /**
          * Shizuku 授权请求码。

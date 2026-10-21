@@ -151,6 +151,35 @@ class FloatingBubble(private val context: Context) {
         /** 底部留白（dp）：避开手势条 / 导航栏。 */
         private const val BOTTOM_MARGIN_DP = 48
 
+        /**
+         * 键盘「危险区」占屏幕高度的比例。
+         *
+         * 球底边越过 `屏高 × (1 - 本值)` 就算会被键盘盖住。0.42 与
+         * [keyboardHeightPx] 的 40% 估值同量级，留一点余量。
+         */
+        private const val IME_RISK_RATIO = 0.42f
+
+        /**
+         * 键盘顶飞的向上初速度（px/s，正数）。
+         *
+         * ## 这个值怎么定的
+         *
+         * 用户反馈「起飞的速度不够快，都没冲出键盘区域」。最初写 2100，按
+         * `h = v²/(2g)`、`g = GRAVITY*密度 = 1400` 算：`2100²/2800 ≈ 1575 px`，
+         * 而本机要逃的高度约 `2016 - 1329 ≈ 690 px` —— 理论上是够的。
+         *
+         * 但**主观速度**取决于前 100 ms 的位移量，而抛物线在起点附近爬升最快、
+         * 随后迅速变慢；2100 在头 100 ms 只挪约 200 px，肉眼看就是「慢慢升」。
+         * 提到 [IME_FLING_SPEED] 后头 100 ms 约 290 px，且顶点更高，才有「嗖」
+         * 那一下。
+         *
+         * ⚠️ 上限受 [BubblePhysics.MAX_THROW_SPEED]（3600）约束，超过会被截断。
+         */
+        private const val IME_FLING_SPEED = 3300f
+
+        /** 键盘顶飞时横向随机分量的幅度（px/s）。避免每次都笔直上冲显得死板。 */
+        private const val SHAKE_RANDOM_VX = 260
+
         /** 判定"点击"而非"拖动"的位移阈值（dp）。与系统 ViewConfiguration 同量级。 */
         private const val TAP_SLOP_DP = 6
 
@@ -291,7 +320,13 @@ class FloatingBubble(private val context: Context) {
                 // 半路残留的实例（addView 失败、或转屏把 Activity 拆了）先收干净，
                 // 否则旧 window 会一直挂在 WindowManager 上，用户看得见却点不动。
                 instance?.hide()
-                instance = FloatingBubble(ctx).also { it.show() }
+                instance = FloatingBubble(ctx).also {
+                    it.show()
+                    // 球起来的这一刻，把 App 在前台期间攒下的余额快照贴上去。
+                    // 没有这一步，徽标要等下一次页面刷新（点球/定时/轮末）才出现，
+                    // 而用户回桌面后通常**什么都不会做**，就一直看不到余额。
+                    lastBalanceSnapshot?.let { snap -> it.applyBalanceSnapshot(snap) }
+                }
             }
         }
 
@@ -426,6 +461,41 @@ class FloatingBubble(private val context: Context) {
          * @param action 该状态下要播的动作名；**null = 别动临时钦定的动作**，
          *   空串 = 清掉钦定（回到 `actionMap` 自动映射）。
          */
+        /**
+         * 余额信箱 → 活动实例。由 [BubbleCommandBridge.pollBalance] 调。
+         *
+         * @param snap 新快照。
+         * @return 是否有活动实例接收（false 表示球没显示，这次数据先存着）。
+         *
+         * ## 为什么必须缓存，不能丢
+         *
+         * 原来这里球没显示就**直接丢弃**，理由是"余额是现在还剩多少，等球再次
+         * 显示时该重新拉"。听起来合理，实际把主路径整个堵死了：
+         *
+         * - 余额的刷新发生在**页面活着的时候**，而页面活着 = App 在前台 = **球是隐藏的**
+         *   （[onAppForeground] 会把 `instance` 置空）；
+         * - 用户一按 Home 回桌面，球出现，但此刻没有任何东西会再推一次余额。
+         *
+         * 于是真机上的固定现象就是：日志明明写着「余额刷新成功: 1 个钱包」，
+         * 但球旁边**永远没有徽标**。用户原话：「我点这个球，还是没有看到余额」。
+         *
+         * 所以改成：球不在就先**存一份最新的**，等球起来（[onAppBackground] 之后
+         * 建窗）再贴上去。数据旧一点也远好过没有 —— 而且要的是"一回到桌面就能看见"。
+         */
+        fun applyBalanceToActive(snap: BalanceSnapshot): Boolean {
+            lastBalanceSnapshot = snap
+            val cur = instance ?: return false
+            main.post { cur.applyBalanceSnapshot(snap) }
+            return true
+        }
+
+        /**
+         * 最近一次拿到的余额快照（球不在时先存着）。
+         *
+         * 球建窗时用它先把徽标画出来，随后页面侧的定时/点击刷新会覆盖成更新的值。
+         */
+        private var lastBalanceSnapshot: BalanceSnapshot? = null
+
         fun applyRunStateToActive(runState: String, action: String?): Boolean {
             val cur = instance ?: return false
             main.post {
@@ -497,6 +567,47 @@ class FloatingBubble(private val context: Context) {
                     for (n in BubbleVideos.actionNames(ctx)) put(n)
                 })
                 put("throwEnabled", a.throwEnabled)
+                // ⚠️ 这三个是「动作手感」的开关，之前**漏了**，导致
+                //   `bubbleAppearance()` 读回里没有它们 —— 前端 `ap.shakeEnabled`
+                //   永远是 undefined ⇒ 设置页的「晃动甩飞」开关一直显示成关，
+                //   点一下反而把它真正关掉（读回 undefined → !undefined === true
+                //   只在一边成立，视觉与实际彻底错位）。
+                //   **凡是 merge() 认的布尔开关，这里必须都读回一份。**
+                put("shakeEnabled", a.shakeEnabled)
+                put("imeFlingEnabled", a.imeFlingEnabled)
+                // 余额徽标的配置 + 当前实际余额，**一起读回**。
+                //
+                // ⚠️ 配置与实际值必须同时给：AI 只看到配置就不知道"现在到底显示
+                //   什么"，只看到数值又没法据此调整模板/位置。两者都要。
+                put(
+                    "balanceBadge",
+                    JSONObject().apply {
+                        val b = a.balanceBadge
+                        put("enabled", b.enabled)
+                        put("anchor", b.anchor)
+                        put("gapDp", b.gapDp)
+                        put("bg", b.bg)
+                        put("fg", b.fg)
+                        put("border", b.border)
+                        put("borderWidthDp", b.borderWidthDp)
+                        put("radiusDp", b.radiusDp)
+                        put("fontSizeSp", b.fontSizeSp)
+                        put("paddingHDp", b.paddingHDp)
+                        put("paddingVDp", b.paddingVDp)
+                        put("maxWidthDp", b.maxWidthDp)
+                        put("template", b.template)
+                        put("showCostFlash", b.showCostFlash)
+                        put("hideWhenIdle", b.hideWhenIdle)
+                        put("refreshOnTurnEnd", b.refreshOnTurnEnd)
+                        put("refreshEverySec", b.refreshEverySec)
+                        put("refreshOnTap", b.refreshOnTap)
+                        put("tapRefreshMinIntervalSec", b.tapRefreshMinIntervalSec)
+                    },
+                )
+                // 余额实际值（内存态）。没拉过时 `ready=false`，AI 据此知道要先拉。
+                put("balance", instance?.balanceSnapshotJson()?.let {
+                    runCatching { JSONObject(it) }.getOrNull()
+                } ?: JSONObject().put("ready", false))
                 // 池、权重、状态文案、走动 —— 与 `actions` 同理：AI 据此知道
                 // "现在配了哪些池"，不用自己维护一份清单。
                 put(
@@ -635,8 +746,22 @@ class FloatingBubble(private val context: Context) {
         /** 主线程 Handler，所有对 View / window 的操作都走它。 */
         private val main = Handler(Looper.getMainLooper())
 
-        /** 球的默认底色（与 `bubble_circle_bg.xml` 一致）。 */
-        const val DEFAULT_BALL_BG = 0xFFFFFFFF.toInt()
+        /**
+         * 球的默认底色。
+         *
+         * ## 为什么是**全透明**而不是白色
+         *
+         * 用户反复提（原话：「为什么设置是透明 实际是白色，说了多少次了」、
+         * 「我说的是我们悬浮球那个头像的背景，那个圆圈」）。
+         *
+         * 原来这里是 `0xFFFFFFFF`（纯白），于是不管设置页怎么显示「透明」，
+         * 头像外面那圈永远是**一块白底**，压在桌面上像个白色圆贴纸。
+         *
+         * 现在改成全透明：球只显示头像本身，和桌面贴在一起。
+         * 需要可见轮廓时由 [DEFAULT_BORDER] 那圈淡描边承担 —— 那本来就是
+         * 描边的职责，不该靠一块不透明底把整个圆涂满。
+         */
+        const val DEFAULT_BALL_BG = 0x00000000
 
         /** 默认描边（8% 黑，与 XML 里的 `#14000000` 一致）。 */
         const val DEFAULT_BORDER = 0x14000000
@@ -649,8 +774,30 @@ class FloatingBubble(private val context: Context) {
          */
         const val ELEVATION_DP = 8f
 
-        /** 默认面板底色。 */
-        const val DEFAULT_PANEL_BG = 0xFFFFFFFF.toInt()
+        /**
+         * 默认面板底色（= 配置里 `panelBg` 为空、「自动」时用它）。
+         *
+         * ## 为什么是**完全透明**而不是某种白色
+         *
+         * 用户的诉求原话：「我就是要你选择自动的时候，它就变成透明啊。因为不然的话，
+         * 你那个色板里面也没有透明这个选项，那用户怎么办？」
+         *
+         * 这句把约束说全了：`<input type="color">` **只能选不透明色**，页面上
+         * 根本给不出「透明」这个选项。所以「自动」是用户表达"我不要自己上色"的
+         * **唯一入口**，它必须承担"透明"这个语义 —— 否则用户永远做不出透明面板。
+         *
+         * 顺带解决观感不一致：设置页把「自动」画成一个**棋盘格**（透明的通用符号），
+         * 而面板此前是死白，用户看到的符号与实际效果对不上。
+         *
+         * ⚠️ 完全透明时**必须同时去掉描边和投影**，否则会看到"一圈没有底色的边框
+         *   浮在屏幕上"，比白板更难看。见 [panelBackground] 与 `applyPanelChrome`。
+         *
+         * ⚠️ 文字色不能跟着透明：没有底色的面板上，文字必须有足够对比度
+         *   （[DEFAULT_TEXT] 是深灰，在浅色背景上可读；`panelBg` 透明时底下是
+         *   用户的壁纸，深浅不定 —— 所以透明模式下要给文字加一层浅色阴影，
+         *   见 [applyPanelColors]）。
+         */
+        const val DEFAULT_PANEL_BG = 0x00000000
 
         /** 默认正文色。 */
         const val DEFAULT_TEXT = 0xFF1A1D21.toInt()
@@ -920,6 +1067,37 @@ class FloatingBubble(private val context: Context) {
     /** 上一帧的时间戳（ns），用来算 dt。 */
     private var throwLastFrameNs = 0L
 
+    // ── 晃动甩飞 ──────────────────────────────────────────────────────
+
+    /**
+     * 加速度计监听：快速晃手机 ⇒ 球被甩飞。
+     *
+     * 用 lazy 是因为它依赖 `context`，而 `context` 在构造函数里就有；放在这里只是
+     * 为了跟其它子系统保持同一排版。真正 `start()` 在 [show] 里。
+     */
+    private val shakeDetector by lazy { ShakeDetector(context) }
+
+    // ── 键盘顶飞 ──────────────────────────────────────────────────────
+
+    /**
+     * 键盘探针。**惰性构造**，且 [ImeProbe.start] 只在「球停稳且位于危险区」时调用。
+     *
+     * ⚠️ 单次 `dumpsys input_method` 95–150 ms，绝不能常驻轮询 —— 见 [ImeProbe] 的说明。
+     */
+    private val imeProbe by lazy {
+        ImeProbe(context) { cmd ->
+            // ⚠️ **必须走 Shizuku 的 uid 2000**。`dumpsys input_method` 要求
+            //   `android.permission.DUMP`，普通 app uid 直接被拒：
+            //   `Permission Denial: can't dump InputMethodManagerService ... uid=10347`。
+            //   这里曾经写成 `ProcessBuilder("/system/bin/sh", "-c", cmd)` —— 那是在
+            //   **app uid** 下跑的，必然读不到，表现为「Shizuku 已授权但功能仍不可用」。
+            runCatching { ShizukuShell.exec(cmd) }.getOrNull()
+        }
+    }
+
+    /** 键盘探针是否已挂上回调（避免重复设置）。 */
+    private var imeProbeWired = false
+
     /** 落地挤压动画（X / Y 各一个，必须同步）。 */
     private var squashAnim: android.animation.ValueAnimator? = null
 
@@ -965,6 +1143,32 @@ class FloatingBubble(private val context: Context) {
 
     /** 「点 + 文字」那一行。只有配图没文案时整行收起（否则留一条空白）。 */
     private var statusTextRow: View? = null
+
+    // ══════════════════════════════════════════════════════════════════
+    // 余额徽标（独立 window，与球平级）
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // ⚠️ 与状态气泡是**两个完全不同的东西**，不要合并：
+    //   状态气泡是「AI 正在干什么」（转瞬即逝、走 notify/state 通道），
+    //   余额徽标是「还剩多少钱」（常驻、由 BalanceBadge 配置、跟着球走）。
+    //   合并会让"刷新余额"把正在显示的状态消息冲掉。
+
+    /** 徽标窗口里的 View。null = 没创建（未启用或球没显示）。 */
+    private var balanceRoot: BalanceBadgeView? = null
+
+    /** 上一次渲染的文字，用于判重与"花费跳一下"。 */
+    private var balanceLastText = ""
+
+    /** 上一次渲染时的花费值，用于判断"要不要跳一下"。 */
+    private var balanceLastCost: java.math.BigDecimal = java.math.BigDecimal.ZERO
+
+    /**
+     * 当前余额快照。**只存内存**（理由见 [BalanceSnapshot] 的头注释）。
+     *
+     * 初始为 null：这表示"还没拉取过"，徽标会保持隐藏 —— 而不是显示一个
+     * 编造的 `¥0.00`。用假数据填充比不显示更糟，用户会以为真的没钱了。
+     */
+    private var balanceCurrent: BalanceSnapshot? = null
 
     /** 状态横条自动消失的计时器。 */
     private val statusHandler = Handler(Looper.getMainLooper())
@@ -1111,6 +1315,12 @@ class FloatingBubble(private val context: Context) {
             statusImagePath = BubbleAppearance.statusImageFor(appearance, runState) ?: ""
             scheduleChain(CHAIN_INTERVAL_MS)
             scheduleMove()
+            // 晃动甩飞：加速度计是普通传感器，零权限，装上就能用。
+            startShakeDetection()
+            // 键盘顶飞：只有拿到特权通道才起探针（否则 BubbleAppearance 已把它置 false）。
+            startImeWatching()
+            // 余额徽标：球显示出来之后才有"旁边"可言。
+            renderBalanceBadge()
         } catch (t: Throwable) {
             // 最常见的是没权限（BadTokenException）。不致命，只是没气泡。
             Log.w(TAG, "添加气泡失败: ${t.message}")
@@ -1132,6 +1342,11 @@ class FloatingBubble(private val context: Context) {
         videoLayer = null
         // 飞行中的球也要停下：视图都要移除了，继续 postOnAnimation 会碰到 null root。
         stopThrow()
+        // 传感器与探针同理：视图都要移除了，继续监听只是白耗电。
+        stopShakeDetection()
+        stopImeWatching()
+        // 徽标是独立窗口，球没了它必须一起消失，否则会孤立地挂在屏幕上。
+        removeBalanceBadge()
         squashAnim?.cancel()
         squashAnim = null
         spinning = false
@@ -2328,8 +2543,15 @@ class FloatingBubble(private val context: Context) {
     private fun panelBackground(): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
         cornerRadius = dp(20).toFloat()
-        setColor(colorOr(appearance.panelBg, DEFAULT_PANEL_BG))
-        setStroke(dp(1), DEFAULT_BORDER)
+        val bgColor = colorOr(appearance.panelBg, DEFAULT_PANEL_BG)
+        setColor(bgColor)
+        // ⚠️ 底色全透明时**不能描边**：没有底色的情况下，那圈 1dp 灰线会孤零零
+        //   浮在屏幕上，看起来像"一个空框"，比不做还难看。判断看 alpha。
+        if (android.graphics.Color.alpha(bgColor) == 0) {
+            setStroke(0, android.graphics.Color.TRANSPARENT)
+        } else {
+            setStroke(dp(1), DEFAULT_BORDER)
+        }
     }
 
     /**
@@ -2342,8 +2564,21 @@ class FloatingBubble(private val context: Context) {
     private fun applyPanelColors() {
         val text = colorOr(appearance.panelText, DEFAULT_TEXT)
         val accent = colorOr(appearance.panelAccent, DEFAULT_ACCENT)
-        panelAction?.setTextColor(text)
-        panelTitle?.setTextColor(text)
+        // ⚠️ 面板**底色全透明**时，文字直接压在用户的壁纸/桌面内容上，深浅完全不可控。
+        //   给文字加一层浅色描边（白晕），保证深色文字在深壁纸上也读得出来；
+        //   有底色时清掉阴影，避免正常面板上出现一圈脏边。
+        val translucentPanel = android.graphics.Color.alpha(
+            colorOr(appearance.panelBg, DEFAULT_PANEL_BG),
+        ) == 0
+        val glow = if (translucentPanel) 0xCCFFFFFF.toInt() else 0
+        panelAction?.let {
+            it.setTextColor(text)
+            it.setShadowLayer(if (translucentPanel) 3f else 0f, 0f, 0f, glow)
+        }
+        panelTitle?.let {
+            it.setTextColor(text)
+            it.setShadowLayer(if (translucentPanel) 3f else 0f, 0f, 0f, glow)
+        }
         panelInput?.setTextColor(text)
         panelSend?.let { s ->
             s.background = GradientDrawable().apply {
@@ -2598,6 +2833,150 @@ class FloatingBubble(private val context: Context) {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // 余额徽标
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 刷新余额数据。由插件经 [BalanceCommandBridge] 或本类自己的定时器调。
+     *
+     * @param snap 新快照；`null` 表示只重绘当前数据（配置改了就靠这个重排）。
+     */
+    fun applyBalanceSnapshot(snap: BalanceSnapshot?) {
+        if (snap != null) {
+            val oldCost = balanceLastCost
+            balanceCurrent = snap
+            balanceLastCost = snap.costLast
+            if (snap.costLast.compareTo(oldCost) != 0 && appearance.balanceBadge.showCostFlash) {
+                balanceRoot?.flash()
+            }
+        }
+        renderBalanceBadge()
+    }
+
+    /**
+     * 给用户一个"点到了"的即时反馈（点在球上时调）。
+     *
+     * ## 为什么需要
+     *
+     * 用户开了「点球刷新」后点球，反馈原话是「我点球，他也没有什么信息弹出来」。
+     * 根因是：余额**没变**的时候，整个流程走完界面**一动不动** —— 用户完全无从
+     * 判断是自己没点到、还是刷新了但数字没变、还是功能坏了。
+     *
+     * 所以这里不等数据，先让徽标脉冲一下：哪怕余额一分没变，用户也能看到
+     * "这一下被接收了"。真实的数字更新随后由 [applyBalanceSnapshot] 接上。
+     *
+     * ⚠️ 徽标没显示（未启用/未登录）时**什么都不做**，不能因为没徽标就去弹窗 ——
+     *   那会变成一个用户没要求的提示框。
+     */
+    fun pulseBalanceBadge() {
+        balanceRoot?.flash()
+    }
+
+    /** 取当前快照（README/工具读回用）。 */
+    fun balanceSnapshotJson(): String = (balanceCurrent ?: BalanceSnapshot()).toJson().toString()
+
+    /**
+     * 创建/更新/销毁徽标窗口。
+     *
+     * 三种状态要分清（漏一种就会出现"关了还看得见"或"开了看不见"）：
+     *
+     * | 条件 | 动作 |
+     * |---|---|
+     * | 未启用 / 无数据 / 文字为空 | 移除窗口 |
+     * | 已启用且有数据、窗口不存在 | 创建 |
+     * | 已启用且有数据、窗口已存在 | 只重排 + 换文字 |
+     */
+    private fun renderBalanceBadge() {
+        val badge = appearance.balanceBadge
+        val v = root ?: run {
+            removeBalanceBadge()
+            return
+        }
+        val text = balanceCurrent?.render(badge.template) ?: ""
+
+        // 未启用、或（要求空闲隐藏 且 这次没有花费）→ 移除。
+        val idleHidden = badge.hideWhenIdle &&
+            (balanceCurrent?.costLast?.compareTo(java.math.BigDecimal.ZERO) ?: 0) <= 0
+
+        if (!badge.enabled || text.isEmpty() || idleHidden || !attached) {
+            removeBalanceBadge()
+            return
+        }
+
+        var view = balanceRoot
+        if (view == null) {
+            view = BalanceBadgeView(context)
+            val p = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType(),
+                // ⚠️ 必须 NOT_TOUCHABLE：徽标只是展示，任何触摸都该穿透到球或下层应用。
+                //   不加的话它会吃掉球边缘那片区域的拖拽。
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+            }
+            val added = runCatching { wm.addView(view, p) }.isSuccess
+            if (!added) {
+                Log.w(TAG, "余额徽标窗口添加失败（已忽略）")
+                return
+            }
+            balanceRoot = view
+        }
+
+        view.render(badge, text)
+        balanceLastText = text
+        positionBalanceBadge()
+    }
+
+    /**
+     * 把徽标摆到球旁边。
+     *
+     * ⚠️ 尺寸可能还没量出来（刚 addView 那一帧宽高是 0）。这时**先按 wrap_content
+     *   让它自己量**，用 `post` 在下一帧重排一次 —— 否则第一帧会算成左上角，
+     *   表现为"徽标闪一下才到正确位置"。
+     */
+    private fun positionBalanceBadge() {
+        val v = balanceRoot ?: return
+        val p = v.layoutParams as? WindowManager.LayoutParams ?: return
+        val badge = appearance.balanceBadge
+        val dm = context.resources.displayMetrics
+
+        val bw = v.width
+        val bh = v.height
+        if (bw <= 0 || bh <= 0) {
+            v.post { positionBalanceBadge() }
+            return
+        }
+
+        val (x, y) = v.applyAnchor(
+            badge = badge,
+            bubbleX = curX,
+            bubbleY = curY,
+            bubbleW = circleWidth(),
+            bubbleH = circleHeight(),
+            badgeW = bw,
+            badgeH = bh,
+            screenW = dm.widthPixels,
+            screenH = dm.heightPixels,
+        )
+        p.x = x
+        p.y = y
+        runCatching { wm.updateViewLayout(v, p) }
+    }
+
+    /** 移除徽标窗口（幂等）。 */
+    private fun removeBalanceBadge() {
+        val v = balanceRoot ?: return
+        balanceRoot = null
+        balanceLastText = ""
+        runCatching { wm.removeView(v) }
+    }
+
     /** 球的当前宽度（量过就用实测值，否则退回配置里的尺寸）。 */
     private fun circleWidth(): Int = root?.width?.takeIf { !expanded && !edgeCollapsed && it > 0 }
         ?: boxW()
@@ -2770,13 +3149,43 @@ class FloatingBubble(private val context: Context) {
                     }
                     if (!wasDrag) {
                         if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                            // 单击 = 请求刷新余额（若用户在徽标设置里开了「点击刷新」）。
+                            //
+                            // ⚠️ **无条件自增**，不在这里判断开关：开关是**页面侧**的事
+                            //   （它自己决定要不要轮询这个计数）。原生这边只负责"记下
+                            //   用户点了球"，判断留给知道配置的那一侧 —— 否则同一个开关
+                            //   要在两处各读一遍 SharedPreferences，还容易漂。
+                            // ⚠️ 双击也是两次 ACTION_UP，因此会自增两次。这是**有意的**：
+                            //   页面侧有 `tapRefreshMinIntervalSec` 兜底，连点不会打穿接口，
+                            //   而"双击刷新"这个用户诉求只需要"两次点击都能触发刷新"。
+                            runCatching { MainActivity.bumpTapSeq() }
                             // ⚠️ 配了 `click` 池 → 单击是"逗宠物"；长按才展开。
                             //   没配 → 单击照旧展开（老行为，零影响）。
                             val hasClickPool = !appearance.pools[BubbleAppearance.POOL_CLICK].isNullOrEmpty()
+                            // ⚠️⚠️ **开了「点球刷新」时，单击只刷新余额，不展开面板。**
+                            //
+                            // 真机反馈原话：「我开了之后，我点球，它还是展开我们的那个对话小窗」。
+                            // 根因就是这里：`bumpTapSeq()` 只是"记了一笔点击"，但紧接着
+                            // `onTap()` 照样把面板拉出来了 —— 用户的注意力全在面板上，
+                            // 完全看不出余额刚刷新过，等于这个开关白开。
+                            //
+                            // 语义上也不该并存：用户特意打开「点球刷新」，表达的就是
+                            // "点球这个手势归刷新用"。展开面板仍有**长按**这个入口
+                            // （见下面的 `LONG_PRESS_MS` 分支），不会失去能力。
+                            val tapRefreshOnly = appearance.balanceBadge.refreshOnTap
                             if (hasClickPool && heldMs < LONG_PRESS_MS) {
                                 playClickPose()
                             } else if (!hasClickPool) {
-                                onTap()
+                                if (tapRefreshOnly && heldMs < LONG_PRESS_MS) {
+                                    // 只刷新：`bumpTapSeq` 已经在上面记了这一笔，
+                                    // 页面侧轮询到就会重新拉余额并回推徽标。
+                                    Log.i(DshApplication.TAG, "单击球 = 刷新余额（不展开面板）")
+                                    // 先给一个"点到了"的可见反馈，不等数据回来。
+                                    pulseBalanceBadge()
+                                    playClickPose()
+                                } else {
+                                    onTap()
+                                }
                             }
                         }
                     } else {
@@ -2855,6 +3264,8 @@ class FloatingBubble(private val context: Context) {
         }
         // 位置落盘：下次启动回到用户放的地方（`snapToEdge` 里也做这件事）。
         persistPosition()
+        // 用户可能把它拖到了下方危险区 —— 那里才需要探键盘。
+        startImeWatching()
     }
 
     /** 把当前位置写进配置（用户拖到哪，下次启动就回到哪）。 */
@@ -2875,8 +3286,16 @@ class FloatingBubble(private val context: Context) {
      * ⚠️ 与 [snapToEdge] 同理，动画的是 `layoutParams.x/y`（`moveTo`），
      *   不是 View 的 `translationX/Y` —— 悬浮窗的位置由 WindowManager 决定，
      *   两者会打架（表现为"飞一下又闪回原位"）。
+     *
+     * @param floorYOverride 本次飞行的**地面高度**（窗口左上角 y 的上界）。
+     *   `null` = 用默认值（屏高 - 球高 - 底部留白 - imeHeightPx）。
+     *
+     *   ⚠️ 键盘顶飞必须传「键盘危险线」，否则球飞上去之后会**原路掉回来** ——
+     *   抛掷是纯抛物线，上升和下落对称，落点就是出发点。真机反馈原话：
+     *   「它冲上去之后，它后面会重新掉到键盘区域」。把地面抬到危险线上方，
+     *   球就只会在这个新地面上弹几下、停在可见区，再也回不到键盘底下。
      */
-    private fun startThrow(vx: Float, vy: Float) {
+    private fun startThrow(vx: Float, vy: Float, floorYOverride: Float? = null) {
         val v = root ?: return
         stopThrow()
 
@@ -2895,8 +3314,9 @@ class FloatingBubble(private val context: Context) {
                 val h = v.height.takeIf { it > 0 } ?: boxH()
                 val dm = context.resources.displayMetrics
                 val minY = dp(TOP_MARGIN_DP).toFloat()
-                val maxY = (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx)
-                    .coerceAtLeast(minY.toInt()).toFloat()
+                val maxY = (floorYOverride
+                    ?: (dm.heightPixels - h - dp(BOTTOM_MARGIN_DP) - imeHeightPx).toFloat())
+                    .coerceAtLeast(minY)
 
                 val step = physics.step(
                     st, dt,
@@ -2924,6 +3344,8 @@ class FloatingBubble(private val context: Context) {
                     //   「它不像电脑一样可以放在手机屏幕上的任何一个位置」）。
                     //   `edgeSnap` 打开时才回到老行为。
                     if (appearance.edgeSnap) snapToEdge() else persistPosition()
+                    // 落点可能进了下方危险区（也可能离开了）—— 重新评估要不要探键盘。
+                    startImeWatching()
                     return
                 }
                 v.postOnAnimation(this)
@@ -2938,6 +3360,123 @@ class FloatingBubble(private val context: Context) {
         throwRunnable?.let { root?.removeCallbacks(it) }
         throwRunnable = null
         throwState = null
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 晃动甩飞
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 起晃动检测。**加速度计是普通传感器，零权限**，所以这里不需要任何授权判断 ——
+     * 与键盘顶飞完全不同（那个必须有特权通道）。
+     */
+    private fun startShakeDetection() {
+        if (!appearance.shakeEnabled) {
+            Log.i(TAG, "晃动甩飞已关闭（appearance.shakeEnabled=false）")
+            return
+        }
+        if (!shakeDetector.isAvailable()) {
+            Log.w(TAG, "本机没有加速度计，晃动甩飞不可用")
+            return
+        }
+        shakeDetector.onShake = { vx, vy ->
+            // 只在**收起态**甩。展开态时面板是个大窗口，把它甩飞既没有视觉意义，
+            // 也会让正在打字的人莫名其妙。
+            if (attached && !expanded) {
+                startThrow(vx, vy)
+            }
+        }
+        shakeDetector.start()
+    }
+
+    private fun stopShakeDetection() {
+        shakeDetector.stop()
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // 键盘顶飞
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 起键盘探针。
+     *
+     * ⚠️ 前提是 `appearance.imeFlingEnabled` —— 而它已经在
+     * `BubbleAppearance.merge()` 里被特权闸门强制置 false 过（没有 Shizuku/root
+     * 时读不到 `dumpsys input_method`，开着也不可能工作）。
+     *
+     * ## 只在「有遮挡风险」时才探
+     *
+     * `dumpsys` 单次 95–150 ms，2 秒一轮也占 5%–7% CPU。球停在上半屏时键盘根本
+     * 盖不到它，那时探测纯属白烧电 —— 所以这里先算位置，**不在危险区就直接不启动**。
+     * 球被拖到下方 / 抛掷落在下方时会重新调本方法（见 [persistPosition] 与
+     * `startThrow` 的停稳分支）。
+     */
+    private fun startImeWatching() {
+        if (!appearance.imeFlingEnabled) {
+            Log.i(TAG, "键盘顶飞未启用（无特权通道或用户关闭）")
+            return
+        }
+        if (!imeProbeWired) {
+            imeProbeWired = true
+            imeProbe.onShown = { onImeShown() }
+        }
+        if (!inImeRiskZone()) {
+            // 球在安全区：没必要探，停掉省电。
+            imeProbe.stop()
+            return
+        }
+        // 立刻探一拍：球可能已经在下方停着、而键盘早就弹着了。
+        // ⚠️ 这条日志是**唯一的「探针真的在跑」证据**。正常轮询不打印任何东西，
+        //   出问题时光看日志会以为功能没启动 —— 排查先看这一行在不在。
+        Log.i(TAG, "键盘探针启动（球在危险区 y=$curY，间隔 ${ImeProbe.POLL_INTERVAL_MS}ms）")
+        imeProbe.start(immediate = true)
+    }
+
+    /** 球当前是否落在「键盘会盖住」的下方危险区。 */
+    private fun inImeRiskZone(): Boolean {
+        val dm = context.resources.displayMetrics
+        val h = root?.height?.takeIf { it > 0 } ?: boxH()
+        val riskTop = (dm.heightPixels * (1f - IME_RISK_RATIO)).roundToInt()
+        return curY + h > riskTop
+    }
+
+    private fun stopImeWatching() {
+        imeProbe.stop()
+    }
+
+    /**
+     * 键盘**刚从无到有**了。
+     *
+     * 只在「球收起且落在键盘会盖住的下方区域」时才飞 —— 球在上半屏时飞它一下
+     * 反而是干扰。
+     */
+    private fun onImeShown() {
+        if (!attached || expanded) return
+        if (!appearance.imeFlingEnabled) return
+
+        val dm = context.resources.displayMetrics
+        val h = root?.height?.takeIf { it > 0 } ?: boxH()
+        // 键盘大约占屏幕下方 [IME_RISK_RATIO]；球底边越过这条线就算会被盖住。
+        val riskTop = (dm.heightPixels * (1f - IME_RISK_RATIO)).roundToInt()
+        if (curY + h <= riskTop) {
+            // 球在安全区，不用动。
+            return
+        }
+
+        // ── 落点：把「地面」抬到安全线上方 ─────────────────────────────
+        //
+        // ⚠️ 这是**关键**。不传的话，球飞上去会原路掉回来（抛物线对称），
+        //   用户看到的是「弹一下又躲回键盘底下」，等于没修。真机反馈三条里的
+        //   第 3 条就是这个。
+        //
+        // 取 `riskTop - h`：球**底边**停在安全线上（而不是球顶），这样整个球
+        // 都在键盘上方，视觉上才是"逃出去了"。
+        val floorY = (riskTop - h).toFloat().coerceAtLeast(dp(TOP_MARGIN_DP).toFloat())
+
+        // 往上甩：横向给一点随机，避免每次都笔直上冲显得死板。
+        val vx = (-1..1).random() * SHAKE_RANDOM_VX
+        Log.i(TAG, "键盘弹出且球在下方（y=$curY, 危险线=$riskTop, 落点上限=${floorY.roundToInt()}），顶飞")
+        startThrow(vx.toFloat(), -IME_FLING_SPEED, floorYOverride = floorY)
     }
 
     /**
@@ -2996,6 +3535,9 @@ class FloatingBubble(private val context: Context) {
         runCatching { wm.updateViewLayout(v, p) }
         // 状态标签跟着球走 —— 漏了这行的话，拖动时球跑了、标签留在原地。
         positionStatusBubble()
+        // 余额徽标同理。⚠️ 这里是**所有位置变化的唯一入口**（拖动、飞行、走动、
+        // 吸附动画都最终走 moveTo），所以只挂这一处就能让徽标全程跟住。
+        positionBalanceBadge()
     }
 
     /** 夹进可见区域（考虑状态栏与底部手势条）。 */

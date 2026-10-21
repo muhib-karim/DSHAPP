@@ -165,9 +165,6 @@ class GeckoWebHost(
                 action?.invoke()
             }
 
-            /** 关窗请求：本 App 单页，直接忽略（不要让内核把会话关掉）。 */
-            override fun onCloseRequest(session: GeckoSession) = Unit
-
             /**
              * 内容进程**崩溃**了（与 WebView 的 `onRenderProcessGone(didCrash=true)` 对应）。
              *
@@ -332,6 +329,48 @@ class GeckoWebHost(
          * 是 app 私有目录，Gecko 内容进程读得到（同 uid）。
          */
         session.promptDelegate = object : GeckoSession.PromptDelegate {
+            /**
+             * `window.open` 请求新窗口。
+             *
+             * ⚠️ **GeckoView 走的是 `PromptDelegate.onPopupPrompt`，不是
+             *   `ContentDelegate.onCreateWindow`**（后者在 GeckoView 里根本不存在，
+             *   写上去编译期就报 `overrides nothing`）。而且契约与 WebView 差别很大：
+             *   它的 `PopupPrompt.confirm(...)` **只接受 `AllowOrDeny`**，
+             *   `GeckoSession.TargetWindow` 是个**注解**（不是 WebView 那种能把新
+             *   WebView 塞进去的 `WebViewTransport`）—— 也就是说宿主**无法**在这里
+             *   提供自己的会话，放行后由 GeckoView 自己建，而它建出来的窗口没有
+             *   任何容器承载（本 App 只有一个 `GeckoView`）。
+             *
+             * 因此这里的策略是：**把授权页交给系统浏览器**，然后 `deny`。
+             *
+             * - `deny` 让 GeckoView 别建那个没人承载的窗口（否则是白窗口/泄漏）；
+             * - `prompt.targetUri` 里有目标地址，交给系统浏览器打开，用户照样能完成
+             *   登录 —— 这是 GeckoView 上唯一能真正跑通的路。
+             *
+             * ⚠️ 不实现本方法的症状与 system 版一致：默认 deny 且**不做任何跳转**，
+             *   于是页面 `window.open` 拿到 null，官方登录流程里
+             *   `popup.location.replace(...)` 作用在 null 上静默失败 ——
+             *   用户看到「点登录什么都没发生」。
+             */
+            override fun onPopupPrompt(
+                session: GeckoSession,
+                prompt: GeckoSession.PromptDelegate.PopupPrompt,
+            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                val uri = prompt.targetUri
+                // 本地引擎自己的弹窗按内核语义处理（可能只是 SPA 内部的空 shell）。
+                if (uri.isNullOrEmpty()) {
+                    Log.i(DshApplication.TAG, "window.open 无目标地址，交内核处理")
+                    return GeckoResult.fromValue(prompt.confirm(AllowOrDeny.ALLOW))
+                }
+                if (uri.startsWith(LOCAL_ENGINE_PREFIX)) {
+                    Log.i(DshApplication.TAG, "window.open 指向本地引擎，交内核处理: ${uri.take(80)}")
+                    return GeckoResult.fromValue(prompt.confirm(AllowOrDeny.ALLOW))
+                }
+                Log.i(DshApplication.TAG, "window.open 转系统浏览器（Gecko）: ${uri.take(120)}")
+                callbacks.onExternalUrl(uri)
+                return GeckoResult.fromValue(prompt.dismiss())
+            }
+
             override fun onFilePrompt(
                 session: GeckoSession,
                 prompt: GeckoSession.PromptDelegate.FilePrompt,
@@ -635,6 +674,20 @@ class GeckoWebHost(
                     "switchToTcpMode" -> b.switchToTcpMode()
                     "bubbleSetEnabled" -> b.bubbleSetEnabled(args.optBoolean(0))
                     "bubbleRequestOverlay" -> b.bubbleRequestOverlay()
+                    // 甩动手感三开关（见「悬浮气泡」设置页）。
+                    "bubbleSetThrow" -> b.bubbleSetThrow(args.optBoolean(0))
+                    "bubbleSetShake" -> b.bubbleSetShake(args.optBoolean(0))
+                    "bubbleSetImeFling" -> b.bubbleSetImeFling(args.optBoolean(0))
+                    // 余额快照：页面侧拉取、原生渲染（见 PageBridge.bubbleReportBalance）。
+                    // ⚠️ 参数是 JSON 字符串，用 optString 而不是 optBoolean。
+                    "bubbleReportBalance" -> b.bubbleReportBalance(args.optString(0, ""))
+                    // 徽标刷新配置 + 点球计数（见 PageBridge.bubbleBadgeConfig /
+                    // bubbleTapRefreshSeq）。⚠️ 与 system 版逐条对齐。
+                    "bubbleBadgeConfig" -> b.bubbleBadgeConfig()
+                    "bubbleTapRefreshSeq" -> b.bubbleTapRefreshSeq()
+                    // 剪贴板（登录页「复制登录链接」）。⚠️ 与 system 版逐条对齐。
+                    "writeClipboard" -> b.writeClipboard(args.optString(0, ""))
+                    "pageDiag" -> b.pageDiag(args.optString(0, ""))
                     "rootRecheck" -> b.rootRecheck()
                     // Shizuku（uid 2000 的第二条来源，见 ShizukuChannel）。
                     // ⚠️ 与 system 版白名单必须逐条对齐，理由见下面那段的说明。

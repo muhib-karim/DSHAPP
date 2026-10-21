@@ -66,11 +66,103 @@ interface PageBridge {
     /** 设置页「切到固定端口」：把 adbd 切到 `adb tcpip 5555`（阻塞，需后台线程）。 */
     fun switchToTcpMode()
 
-    /** 读悬浮气泡状态。返回 JSON：`{"enabled":bool,"granted":bool}`。 */
+    /** 读悬浮气泡状态。返回 JSON：`{"enabled":bool,"granted":bool, …物理开关…}`。 */
     fun bubbleState(): String
 
     /** 开关悬浮气泡。关掉时立刻收起已显示的窗口。 */
     fun bubbleSetEnabled(enabled: Boolean)
+
+    /**
+     * 设置「键盘顶飞」开关。
+     *
+     * ⚠️ 没有特权通道时会被**拒绝**（判据见 `ShellPrivilege`）：这条路径读的是
+     *   `dumpsys input_method`，普通应用 uid 拿不到 `DUMP` 权限。与其让用户打开一个
+     *   静默无效的开关，不如拒绝并保持原值 —— 设置页用 `imeFlingAvailable` 先置灰。
+     */
+    fun bubbleSetImeFling(enabled: Boolean)
+
+    /** 设置「晃动甩飞」开关。加速度计是普通传感器，无需任何权限，直接生效。 */
+    fun bubbleSetShake(enabled: Boolean)
+
+    /**
+     * 上报余额快照（页面侧拉取 → 原生显示）。
+     *
+     * ## 为什么余额要从页面侧拉
+     *
+     * 引擎插件层**拿不到** `ctx.remote`（实测：`inject` 了会 `pending` 等一个
+     * 永远不来的服务，不 `inject` 读取直接抛 `cannot get property "remote"`，
+     * 且同层的 `tools`/`agents`/`sessions` 全都是不可达）。而页面侧插件
+     * 用 `ctx.inject(["remote"], scope => …)` 是**可以的**（官方
+     * `dsh-client-ui-settings-account` 就靠这条路显示余额）。
+     *
+     * 所以分工是：**页面取数 → 本桥回传 → 原生渲染**。原生不碰网络，
+     * 页面不碰 View，各做各擅长的事。
+     *
+     * @param json 载荷，结构见 `dsh-android-balance` 的 `flush()`：
+     *   `{ wallets:[{currency,balance}], bonusWallets:[…], costLast, costSession, error }`。
+     *   传 `{}` 或空串表示"清空"（徽标随即隐藏）。
+     * @return 是否被接受（球未显示时为 false，属正常）。
+     */
+    fun bubbleReportBalance(json: String)
+
+    /**
+     * 读徽标的刷新配置（页面侧据此决定定时/轮末/点击是否刷新）。
+     *
+     * @return JSON 字符串 `{refreshEverySec, refreshOnTurnEnd, refreshOnTap, tapRefreshMinIntervalSec}`。
+     *   永不返回 null —— 页面侧把它当"永远成功"来用，省掉一次判空。
+     */
+    fun bubbleBadgeConfig(): String
+
+    /**
+     * 点球刷新计数。页面侧每 300ms 读一次，发现涨了就拉一次余额。
+     *
+     * ## 为什么用"计数 + 轮询"而不是原生反向调 JS
+     *
+     * 原生没有可靠的方式在自己的进程里主动执行页面里的 JS 函数
+     * （`evaluateJavascript` 必须回到 WebView 线程、且页面可能正在导航）。
+     * 读一个数字天然幂等、可重入、页面刷新后自动归零 —— 比反向调用稳得多，
+     * 代价只是每 300ms 读一次 int（可忽略）。
+     *
+     * @return 单调递增的计数（进程重启归零）。
+     */
+    fun bubbleTapRefreshSeq(): Int
+
+    /**
+     * 把文本写进系统剪贴板，供页面侧的「复制登录链接」使用。
+     *
+     * ## 为什么必须由原生写
+     *
+     * 官方「登录」对话框的「复制登录链接」调的是
+     * `navigator.clipboard.writeText(...)`。**真机实测必然失败**：
+     * `NotAllowedError: Write permission denied.`
+     *
+     * 原因是 WebView 的剪贴板写权限由**原生侧的 `WebChromeClient.onPermissionRequest`**
+     * 授予，本 App 没有实现它，因此内核一律拒绝 —— 页面侧看到的是
+     * `navigator.clipboard` **存在、`isSecureContext` 也是 true**（因为
+     * `http://127.0.0.1` 属于潜在可信来源），**但一调用就抛**。
+     * 这种"API 在但用不了"的形态最容易误判成前端 bug。
+     *
+     * ⚠️ 本方法只做写入，**不读剪贴板**。读会牵出"应用能偷看剪贴板"的隐私面，
+     *   而需求只有复制。
+     *
+     * @param text 要写入的文本。
+     * @return 是否写入成功（失败时页面侧可回退提示）。
+     */
+    fun writeClipboard(text: String): Boolean
+
+    /**
+     * 页面诊断：把一句话写进 `app.log`。
+     *
+     * 页面的 `console.log` 只到 WebView 控制台，真机上读不到；排查"余额拿不到"
+     * 这类问题必须先知道 `remote.account` 到底有没有、接口返回了什么。
+     * 走这个通道就能在 `logs/app.log` 里按 `DSH` 标签直接读到。
+     *
+     * ⚠️ 诊断专用，正常路径不要调。
+     */
+    fun pageDiag(text: String)
+
+    /** 设置「拖拽抛掷」开关（手甩球松手后飞不飞）。纯本地物理，无权限要求。 */
+    fun bubbleSetThrow(enabled: Boolean)
 
     /** 拉起系统的「显示在其他应用上层」授权页。 */
     fun bubbleRequestOverlay()
