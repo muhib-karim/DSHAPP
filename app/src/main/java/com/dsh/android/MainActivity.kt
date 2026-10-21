@@ -1860,12 +1860,12 @@ class MainActivity : AppCompatActivity() {
 
         override fun keyboardAvoidState(): String = KeyboardAvoid.stateJson(this@MainActivity)
 
-        override fun keyboardAvoidSetEnabled(enabled: Boolean) {
+        override fun keyboardAvoidSetEnabled(enabled: Boolean): Boolean {
             Log.i(DshApplication.TAG, "设置页切换键盘避让: $enabled")
             // ⚠️ 这里**不**弹关联权限的提示：键盘避让有自己那张卡片（开关 + 去开启权限），
             //   在"开气泡"这个动作上顺手弹一个无障碍对话框，用户会不知道自己在确认什么。
             // 没有可用检测来源时原生会拒绝打开（返回 false），设置页据 stateJson 置灰。
-            KeyboardAvoid.setEnabled(this@MainActivity, enabled)
+            return KeyboardAvoid.setEnabled(this@MainActivity, enabled)
         }
 
         override fun keyboardAvoidRequestPermission() {

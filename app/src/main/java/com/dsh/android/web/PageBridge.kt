@@ -178,8 +178,14 @@ interface PageBridge {
      */
     fun keyboardAvoidState(): String
 
-    /** 开关「键盘避让」。关掉后悬浮球不再避让键盘（仍保留手动拖动）。 */
-    fun keyboardAvoidSetEnabled(enabled: Boolean)
+    /**
+     * 开关「键盘避让」。关掉后悬浮球不再避让键盘（仍保留手动拖动）。
+     *
+     * @return true = 已写入；false = 被拒绝（无障碍与特权通道都不可用）。
+     *   ⚠️ 必须回传结果：页面据此把开关弹回去。否则用户点了开关、原生静默拒绝、
+     *   页面却已经把开关画成"开"，两边状态就不一致了。
+     */
+    fun keyboardAvoidSetEnabled(enabled: Boolean): Boolean
 
     /** 拉起系统的无障碍设置页 —— 用户在那里打开「DSH 键盘哨兵」。 */
     fun keyboardAvoidRequestPermission()

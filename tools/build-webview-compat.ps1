@@ -1,4 +1,4 @@
-# 生成 WebView 兼容资产（webview-compat.zip）
+﻿# 生成 WebView 兼容资产（webview-compat.zip）
 #
 # ── 为什么需要它 ──────────────────────────────────────────────────────
 #

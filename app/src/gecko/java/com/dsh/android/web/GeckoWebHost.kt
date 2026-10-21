@@ -678,6 +678,15 @@ class GeckoWebHost(
                     "bubbleSetThrow" -> b.bubbleSetThrow(args.optBoolean(0))
                     "bubbleSetShake" -> b.bubbleSetShake(args.optBoolean(0))
                     "bubbleSetImeFling" -> b.bubbleSetImeFling(args.optBoolean(0))
+                    // 键盘避让（见「悬浮气泡 → 键盘避让」卡片）。
+                    // ⚠️ PR #3 漏了这份白名单，症状是「开了无障碍，开关还是打不开」：
+                    //   页面侧 `window.DSHAndroid.keyboardAvoidState` 是 undefined，
+                    //   前端走进 noBridge 分支把开关置灰，原生日志却一切正常。
+                    //   `keyboardAvoidState` 走快照同步读（见 pushSnapshot），
+                    //   这里只处理写入与跳转。
+                    "keyboardAvoidSetEnabled" -> b.keyboardAvoidSetEnabled(args.optBoolean(0))
+                    "keyboardAvoidRequestPermission" -> b.keyboardAvoidRequestPermission()
+                    "keyboardAvoidState" -> pushSnapshot()
                     // 余额快照：页面侧拉取、原生渲染（见 PageBridge.bubbleReportBalance）。
                     // ⚠️ 参数是 JSON 字符串，用 optString 而不是 optBoolean。
                     "bubbleReportBalance" -> b.bubbleReportBalance(args.optString(0, ""))
@@ -783,6 +792,11 @@ class GeckoWebHost(
             //   （用户在 Shizuku 自己的确认界面上点「允许」），页面轮询时读的
             //   就是这个缓存 —— 不推的话用户授权完，设置页永远停在「未授权」。
             .put("shizuku", callbacks.bridge.shizukuState())
+            // 键盘避让状态（JSON 文本）。同样是页面侧**同步**读取
+            // （`bridge.keyboardAvoidState()`），只能经快照缓存。
+            // ⚠️ 必须进快照：无障碍授权是在**另一个 Activity** 里给的，用户授权完
+            //   回到设置页，页面拿到的若还是旧缓存，就会一直显示「还差一步：去开权限」。
+            .put("keyboardAvoid", callbacks.bridge.keyboardAvoidState())
         postToExtension(msg)
     }
 

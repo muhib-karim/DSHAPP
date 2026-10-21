@@ -608,6 +608,22 @@ private class SystemPageBridge(private val impl: PageBridge) {
     @android.webkit.JavascriptInterface
     fun bubbleSetImeFling(enabled: Boolean) = impl.bubbleSetImeFling(enabled)
 
+    // ── 键盘避让（见「悬浮气泡 → 键盘避让」卡片）──────────────────────────
+    // ⚠️ 这三个方法 PR #3 只加进了 `PageBridge` 接口与 `MainActivity` 实现，
+    //   **漏了这份白名单** —— 症状正是「开了无障碍，开关还是打不开」：
+    //   页面侧 `window.DSHAndroid.keyboardAvoidState` 是 undefined，前端据此
+    //   走进 `noBridge` 分支，开关被置灰，而原生日志一切正常（静默失败）。
+    //   这份白名单是**手工维护**的，往 `PageBridge` 加方法必须同步加到这里。
+    @android.webkit.JavascriptInterface
+    fun keyboardAvoidState(): String = impl.keyboardAvoidState()
+
+    /** 返回 Boolean 让页面知道有没有被拒（无检测来源时原生拒绝打开）。 */
+    @android.webkit.JavascriptInterface
+    fun keyboardAvoidSetEnabled(enabled: Boolean): Boolean = impl.keyboardAvoidSetEnabled(enabled)
+
+    @android.webkit.JavascriptInterface
+    fun keyboardAvoidRequestPermission() = impl.keyboardAvoidRequestPermission()
+
     @android.webkit.JavascriptInterface
     fun bubbleReportBalance(json: String) = impl.bubbleReportBalance(json)
 
