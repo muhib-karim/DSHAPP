@@ -45,6 +45,13 @@ jobs:
           disk-size: 8000M
           ram-size: 4096M
           disable-animations: true
+          # The app picks its Termux bootstrap from Build.SUPPORTED_ABIS[0] and ships arm64 only; list arm64 first so the
+          # x86_64 image (which runs arm64 code through its ndk_translation layer) presents itself as an arm64 device.
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+            -prop ro.product.cpu.abilist=arm64-v8a,x86_64,x86,armeabi-v7a,armeabi
+            -prop ro.product.cpu.abilist64=arm64-v8a,x86_64
+            -prop ro.product.cpu.abi=arm64-v8a
           script: python3 -I tools/ci/emulator-smoke.py "$(ls dist/DSH*-mk.apk)" com.mkdsh.droid emulator-screenshots
       - name: Upload screenshots, UI dumps and logcat
         if: always()

@@ -44,6 +44,33 @@ def dump(tag):
         return None
 
 
+# System dialogs that cover the app on a slow CI emulator: a launcher ANR ("Wait") and the app's own request to run in
+# the background ("Allow", which the app needs to keep its engine alive).
+DISMISS = re.compile(r"^(Wait|Allow|允许|始终允许|OK|确定)$")
+COVER = re.compile(r"(isn't responding|无响应|run in background|后台运行)", re.I)
+
+
+def dismiss(root):
+    texts = " | ".join(label(n) for n in nodes(root))
+    if not COVER.search(texts):
+        return False
+    for n in nodes(root):
+        if DISMISS.match((n.get("text") or "").strip()):
+            print("dismissing system dialog:", texts[:160], flush=True)
+            return tap(n)
+    return False
+
+
+def screen(tag):
+    """A dump with system dialogs out of the way."""
+    for _ in range(4):
+        root = dump(tag)
+        if not dismiss(root):
+            return root
+        time.sleep(2)
+    return dump(tag)
+
+
 def nodes(root):
     return [] if root is None else list(root.iter("node"))
 
@@ -62,18 +89,19 @@ def tap(n):
 
 
 def main():
+    print("abilist:", adb("shell", "getprop", "ro.product.cpu.abilist").strip(), flush=True)
     adb("install", "-r", "-g", APK, check=True, timeout=600)
     adb("shell", "pm", "grant", PKG, "android.permission.POST_NOTIFICATIONS")
     adb("logcat", "-c")
     adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1", check=True)
     time.sleep(25)
+    screen("first")
     shot("01-first-screen")
-    dump("first")
 
     chat = False
     deadline = time.time() + 12 * 60
     while time.time() < deadline:
-        root = dump("wait")
+        root = screen("wait")
         texts = " | ".join(label(n) for n in nodes(root))
         if any(n.get("class") == "android.widget.EditText" for n in nodes(root)) or CHAT_HINT.search(texts):
             chat = True
@@ -83,8 +111,8 @@ def main():
             break
         time.sleep(10)
     time.sleep(5)
+    root = screen("chat")
     shot("02-chat")
-    root = dump("chat")
 
     settings = False
     target = next((n for n in nodes(root) if SETTINGS.search((n.get("text") or "").strip()) or SETTINGS.search((n.get("content-desc") or "").strip())), None)
@@ -95,11 +123,11 @@ def main():
         if top_left:
             tap(top_left[0])
             time.sleep(3)
-            root = dump("sidebar")
+            root = screen("sidebar")
             target = next((n for n in nodes(root) if SETTINGS.search((n.get("text") or "").strip()) or SETTINGS.search((n.get("content-desc") or "").strip())), None)
     if target is not None and tap(target):
         time.sleep(4)
-        root = dump("settings")
+        root = screen("settings")
         settings = SETTINGS_OPEN.search(" | ".join(label(n) for n in nodes(root))) is not None
     shot("03-settings")
     with open(os.path.join(OUT, "logcat.txt"), "w", encoding="utf-8") as fh:
