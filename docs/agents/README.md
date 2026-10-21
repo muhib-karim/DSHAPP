@@ -8,6 +8,7 @@
 |---|---|---|
 | [constraints.md](constraints.md) | 两条硬约束 | 包名 15 字符、targetSdk ≤ 28。改错不报错但真机必炸 |
 | [build-and-ship.md](build-and-ship.md) | 构建、发行与发布 | gradle 任务、签名、夸克网盘上传与版本整理 |
+| [server-build-env.md](server-build-env.md) | 服务器构建环境 | 八壹云部署、GRADLE_USER_HOME / DSH_HOME 两处必须存在的绝对路径、一键发布脚本 |
 | [platform-android.md](platform-android.md) | android 平台适配总览 | 为什么 Node 在 Android 上是 android 而不是 linux |
 | [link-compat.md](link-compat.md) | ③ SELinux 不给 link 权限 | LD_PRELOAD 转译层：为什么必须转译、转译语义、降级路径 |
 | [directory-picker.md](directory-picker.md) | ③.5 目录选择器只在**一棵**树里走 | HOME 下的入口链接接上手机存储 |
