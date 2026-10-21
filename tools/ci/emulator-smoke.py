@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""CI (fork): emulator smoke test of the release APK. Install, launch, screenshot the first screen, then the app's own
+native screens; a PNG of each plus the UI dumps and logcat land in <out>.
+
+The CI emulator is x86_64 (arm64 code runs through translation). The app ships an arm64 Termux bootstrap only and picks
+it from Build.SUPPORTED_ABIS[0], so on this image its engine cannot boot ("Termux 环境未就绪"). The DSH chat and
+settings web UI therefore needs a real arm64 device (FORK_NOTES.md). When the engine does come up (an arm64 runner), the
+test goes on to the chat and settings screens as before; otherwise it checks the native boot-status screen (safe mode,
+view log) and the native log viewer.
+
+usage: emulator-smoke.py <apk> <package> <out dir>
+Runs inside reactivecircus/android-emulator-runner (an x86_64 image that translates arm64 apps).
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+APK, PKG, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
+os.makedirs(OUT, exist_ok=True)
+CHAT_HINT = re.compile(r"(输入|消息|Message|Ask|问点什么|发送|Send|新建会话|New session|New chat)", re.I)
+SETTINGS = re.compile(r"^(设置|Settings)$", re.I)
+SETTINGS_OPEN = re.compile(r"(通用|General|模型|Models|插件|Plugins|外观|Appearance)", re.I)
+VIEW_LOG = re.compile(r"^(查看日志|View log|View logs)$", re.I)
+ENGINE_FAIL = re.compile(r"(启动失败|failed to start|CANNOT LINK|救援模式|Rescue)", re.I)
+
+
+def adb(*args, check=False, timeout=120):
+    r = subprocess.run(["adb", *args], capture_output=True, timeout=timeout)
+    if check and r.returncode != 0:
+        sys.exit(f"adb {' '.join(args)} failed: {r.stderr.decode(errors='replace')}")
+    return r.stdout.decode(errors="replace")
+
+
+def shot(name):
+    with open(os.path.join(OUT, name + ".png"), "wb") as fh:
+        fh.write(subprocess.run(["adb", "exec-out", "screencap", "-p"], capture_output=True, timeout=60).stdout)
+    print("screenshot", name, flush=True)
+
+
+def dump(tag):
+    adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
+    xml = adb("shell", "cat", "/sdcard/ui.xml")
+    with open(os.path.join(OUT, f"ui-{tag}.xml"), "w", encoding="utf-8") as fh:
+        fh.write(xml)
+    try:
+        return ET.fromstring(xml[xml.index("<?xml"):] if "<?xml" in xml else xml)
+    except (ET.ParseError, ValueError):
+        return None
+
+
+# System dialogs that cover the app on a slow CI emulator: a launcher ANR ("Wait") and the app's own request to run in
+# the background ("Allow", which the app needs to keep its engine alive).
+DISMISS = re.compile(r"^(Wait|Allow|允许|始终允许|OK|确定)$")
+COVER = re.compile(r"(isn't responding|无响应|run in background|后台运行)", re.I)
+
+
+def dismiss(root):
+    texts = " | ".join(label(n) for n in nodes(root))
+    if not COVER.search(texts):
+        return False
+    for n in nodes(root):
+        if DISMISS.match((n.get("text") or "").strip()):
+            print("dismissing system dialog:", texts[:160], flush=True)
+            return tap(n)
+    return False
+
+
+def screen(tag):
+    """A dump with system dialogs out of the way."""
+    for _ in range(4):
+        root = dump(tag)
+        if not dismiss(root):
+            return root
+        time.sleep(2)
+    return dump(tag)
+
+
+def nodes(root):
+    return [] if root is None else list(root.iter("node"))
+
+
+def label(n):
+    return (n.get("text") or "") + " " + (n.get("content-desc") or "")
+
+
+def tap(n):
+    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds", ""))
+    if not m:
+        return False
+    x1, y1, x2, y2 = map(int, m.groups())
+    adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
+    return True
+
+
+def main():
+    print("abilist:", adb("shell", "getprop", "ro.product.cpu.abilist").strip(), flush=True)
+    adb("install", "-r", "-g", APK, check=True, timeout=600)
+    adb("shell", "pm", "grant", PKG, "android.permission.POST_NOTIFICATIONS")
+    adb("logcat", "-c")
+    adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1", check=True)
+    time.sleep(25)
+    screen("first")
+    shot("01-first-screen")
+
+    chat = False
+    boot_status = False
+    deadline = time.time() + 6 * 60
+    while time.time() < deadline:
+        root = screen("wait")
+        texts = " | ".join(label(n) for n in nodes(root))
+        if any(n.get("class") == "android.widget.EditText" for n in nodes(root)) or CHAT_HINT.search(texts):
+            chat = True
+            break
+        if ENGINE_FAIL.search(texts) or VIEW_LOG.search(texts):
+            print("engine status on screen:", texts[:300], flush=True)
+            boot_status = True
+            break
+        time.sleep(10)
+    time.sleep(5)
+    root = screen("status")
+    if chat:
+        shot("02-chat")
+        target = find(root, SETTINGS)
+        if target is None:
+            corner = [n for n in nodes(root) if n.get("clickable") == "true" and re.match(r"\[(\d+),(\d+)\]", n.get("bounds", ""))]
+            corner.sort(key=lambda n: tuple(int(v) for v in re.match(r"\[(\d+),(\d+)\]", n.get("bounds")).groups())[::-1])
+            if corner:
+                tap(corner[0])
+                time.sleep(3)
+                target = find(screen("sidebar"), SETTINGS)
+        ok = target is not None and tap(target)
+        time.sleep(4)
+        ok = ok and SETTINGS_OPEN.search(" | ".join(label(n) for n in nodes(screen("settings")))) is not None
+        shot("03-settings")
+        result = f"engine up: chat screen and settings screen opened: {ok}"
+    else:
+        shot("02-boot-status")
+        button = find(root, VIEW_LOG)
+        ok = boot_status and button is not None and tap(button)
+        time.sleep(4)
+        screen("log")
+        resumed = adb("shell", "dumpsys", "activity", "activities")
+        ok = ok and "LogViewerActivity" in next((l for l in resumed.splitlines() if "mResumedActivity" in l or "topResumedActivity" in l), "")
+        shot("03-log-viewer")
+        result = ("engine not up on this x86_64 emulator (arm64-only Termux bootstrap); native boot-status screen shown and "
+                  f"log viewer opened: {ok}")
+    with open(os.path.join(OUT, "logcat.txt"), "w", encoding="utf-8") as fh:
+        fh.write(adb("logcat", "-d", "-v", "time", timeout=120))
+    with open(os.path.join(OUT, "RESULT.txt"), "w", encoding="utf-8") as fh:
+        fh.write(result + "\n")
+    print(result, flush=True)
+    if not ok:
+        sys.exit(1)
+
+
+def find(root, pattern):
+    return next((n for n in nodes(root) if pattern.search((n.get("text") or "").strip()) or pattern.search((n.get("content-desc") or "").strip())), None)
+
+
+if __name__ == "__main__":
+    main()

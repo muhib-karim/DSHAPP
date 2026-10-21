@@ -24,7 +24,9 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.dsh.android"
+        // Fork (muhib-karim/DSHAPP): own 15-character id so it installs next to upstream DSHAPP and other
+        // com.dsh.android builds. Still exactly 15 characters (see the comment above); the ELF prefix is derived from it.
+        applicationId = "com.mkdsh.droid"
         minSdk = 26
         // 🔴 必须是 28，不能升到 29+。Android 10（API 29）起，targetSdk ≥ 29 的
         // 应用不允许 execve() 自身私有目录里的文件（W^X 限制，SELinux
@@ -32,7 +34,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 29
+        versionCode = 30
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -176,7 +178,8 @@ android {
         //         `build-webview-compat.ps1 -CompatVersion` 33 → 34。
         //         两个都是**字符串相等**判据，不 bump 会命中「戳一致 ⇒ 整棵树跳过」，
         //         设备上静默跑回旧 UI（本项目已踩过 20 次以上）。
-        versionName = "0.3.3"
+        // 0.3.4 = upstream 0.3.3 (versionCode 29) as published by the muhib-karim fork; no feature changes.
+        versionName = "0.3.4"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
@@ -212,7 +215,7 @@ android {
         }
         create("gecko") {
             dimension = "webengine"
-            applicationId = "com.dsh.webview"
+            applicationId = "com.mkdsh.gecko" // fork id, 15 characters (upstream: com.dsh.webview)
             // 两个包会同时存在于设备上（applicationId 不同 ⇒ 可共存），
             // 版本号带后缀才能在系统「应用信息」里分辨出装的是哪一个。
             versionNameSuffix = "-gecko"

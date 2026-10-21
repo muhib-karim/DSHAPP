@@ -1,5 +1,19 @@
 # DSH for Android
 
+> **本仓库是 [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP)（MIT）的分支（fork）**，由
+> [muhib-karim](https://github.com/muhib-karim) 维护，**原样发布**：界面与功能不变，全部归功于上游作者。
+> 本分支只做了：
+> - **包名**：`com.mkdsh.droid`（system 版）/ `com.mkdsh.gecko`（gecko 版），仍为 15 字符（见「两条硬约束」），
+>   以便与上游 DSHAPP 及其它 `com.dsh.android` 应用同装一台机器。应用名不变（仍为「DSH」）。
+> - **版本**：0.3.4（versionCode 30），即上游 0.3.3（29）之后的下一个号。
+> - **CI 构建**：`.github/workflows/release-apk.yml` 在 GitHub Actions 上构建签名的发行版 APK 并上传
+>   APK + SHA256SUMS；打 `v*` 标签时自动建 Release。构建资产来源见 `tools/ci/assemble-assets.py`
+>   （不变的二进制资产取自上游 v0.3.0 发行版 APK 并按 sha256 固定，插件 zip 由本仓库源码打包，
+>   JNI 辅助程序由 NDK 编译，`webview-compat.zip` 由上游脚本重建）。
+> - **不含内置号池**：上游 APK 里的 `keyinject.bin`（上游自己的 API 账号）不会打进本分支的包，请使用你自己的 API Key。
+> - **模拟器冒烟测试**：`.github/workflows/emulator-smoke.yml`（首屏、对话页、设置页截图，见 `docs/screenshots/`）。
+> - 第三方组件与许可证：[THIRD-PARTY.md](THIRD-PARTY.md)。上游 LICENSE 原样保留。
+
 **在 Android 手机上跑一个完整的 AI 编码 Agent。**
 
 [English](README.en.md) · [文档](docs/agents/README.md) · [参与贡献](CONTRIBUTING.md)

@@ -1,0 +1,142 @@
+name: Release APK
+
+# Fork (muhib-karim/DSHAPP): builds signed release APKs of both flavors (system WebView, built-in GeckoView) from this
+# repository plus the build assets upstream keeps out of git (tools/ci/assemble-assets.py says where each comes from).
+# Uploads the APKs, SHA256SUMS.txt and ASSETS.json. A v* tag runs release.yml, which calls this and publishes a Release.
+# Signing: the DSHAPP_KEYSTORE_* repository secrets when they are set (a stable identity, required for tags);
+# otherwise a throwaway key made for this run (installs, but cannot update an install signed by another run).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_APK_URL: https://github.com/pht88888888/DSHAPP/releases/download/v0.3.0/DSH0.3.0.apk
+  UPSTREAM_APK_SHA256: 5ac0299c350c92cf47ba7f3925cc0bd69e292e0d7695012c602ef5a1dee61682
+
+jobs:
+  webview-compat:
+    # Upstream's own tools/build-webview-compat.ps1 (PowerShell, Windows paths), run unchanged.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Take engine.bin from the pinned upstream APK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:UPSTREAM_APK_URL -OutFile "$env:RUNNER_TEMP\upstream.apk"
+          $hash = (Get-FileHash "$env:RUNNER_TEMP\upstream.apk" -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:UPSTREAM_APK_SHA256) { throw "upstream APK sha256 $hash" }
+          python -I -c "import zipfile,sys; open(sys.argv[2],'wb').write(zipfile.ZipFile(sys.argv[1]).read('assets/engine.bin'))" "$env:RUNNER_TEMP\upstream.apk" "$env:RUNNER_TEMP\engine.bin"
+      - name: Pre-install esbuild and acorn where the scripts look for them (their own installs use a local proxy)
+        shell: pwsh
+        run: |
+          npm install esbuild@0.25.0 --prefix "$env:TEMP\dsh-esbuild-tool" --no-audit --no-fund --loglevel=error
+          npm install acorn@8 --prefix "$env:TEMP\dsh-syntax-check" --no-audit --no-fund --loglevel=error
+      - name: Build webview-compat.zip (tools/build-webview-compat.ps1)
+        shell: pwsh
+        run: ./tools/build-webview-compat.ps1 -EngineBin "$env:RUNNER_TEMP\engine.bin" -OutZip "$env:RUNNER_TEMP\webview-compat.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: webview-compat
+          path: ${{ runner.temp }}/webview-compat.zip
+          if-no-files-found: error
+          retention-days: 3
+
+  build:
+    needs: webview-compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.name.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@99b8673ff64fbf99d8d325f52d9a5bdedb8483e9 # v4.2.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: webview-compat
+          path: ${{ runner.temp }}/compat
+      - name: Fetch the pinned upstream APK (source of the unchanged binary assets)
+        run: |
+          curl --fail --silent --show-error --location --retry 3 -o "$RUNNER_TEMP/upstream.apk" "$UPSTREAM_APK_URL"
+          echo "$UPSTREAM_APK_SHA256  $RUNNER_TEMP/upstream.apk" | sha256sum --check
+      - name: Compile the JNI helpers (NDK)
+        run: bash tools/ci/build-native.sh "$RUNNER_TEMP/native"
+      - name: Assemble app/src/main/assets
+        run: |
+          python3 -I tools/ci/assemble-assets.py --apk "$RUNNER_TEMP/upstream.apk" --native "$RUNNER_TEMP/native" \
+            --compat "$RUNNER_TEMP/compat/webview-compat.zip" --out app/src/main/assets --manifest "$RUNNER_TEMP/ASSETS.json"
+      - name: Signing key (repository secrets, else a throwaway key for this run)
+        env:
+          KS_B64: ${{ secrets.DSHAPP_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.DSHAPP_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.DSHAPP_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.DSHAPP_KEY_PASSWORD }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          umask 077
+          ks="$RUNNER_TEMP/release.jks"
+          if [[ -n "$KS_B64" && -n "$KS_PASS" && -n "$KS_ALIAS" && -n "$KEY_PASS" ]]; then
+            printf '%s' "$KS_B64" | base64 --decode > "$ks"
+            echo "SIGNING=repository key" >> "$GITHUB_ENV"
+          else
+            if [[ "$IS_TAG" == "true" ]]; then
+              echo "::error::A tagged release needs the DSHAPP_KEYSTORE_* secrets (a stable signing identity)."
+              exit 1
+            fi
+            KS_PASS="$(openssl rand -hex 24)"; KEY_PASS="$KS_PASS"; KS_ALIAS=ci
+            keytool -genkeypair -keystore "$ks" -storetype PKCS12 -storepass "$KS_PASS" -keypass "$KEY_PASS" -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 30 -dname "CN=DSHAPP fork CI throwaway" > /dev/null
+            echo "SIGNING=throwaway key (this run only)" >> "$GITHUB_ENV"
+          fi
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$ks" "$KS_PASS" "$KS_ALIAS" "$KEY_PASS" > keystore.properties
+      - name: Build both flavors (release)
+        run: |
+          # gradle.properties routes Gradle through upstream's local proxy (127.0.0.1:7897); a runner connects directly.
+          sed -i '/^systemProp\.https\?\.proxy\(Host\|Port\)=/d' gradle.properties
+          bash ./gradlew --no-daemon :app:assembleSystemRelease :app:assembleGeckoRelease
+      - name: Name, verify and checksum the APKs
+        id: name
+        run: |
+          version="$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts | head -1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          cp app/build/outputs/apk/system/release/app-system-release.apk "dist/DSH${version}-mk.apk"
+          cp app/build/outputs/apk/gecko/release/app-gecko-release.apk "dist/DSH${version}-mk-gecko.apk"
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          aapt="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/aapt2"
+          for apk in dist/*.apk; do
+            "$apksigner" verify "$apk"
+            "$aapt" dump badging "$apk" | grep -E "^package:|targetSdkVersion|native-code" | tee -a dist/BADGING.txt
+          done
+          grep -q "name='com.mkdsh.droid'" dist/BADGING.txt && grep -q "name='com.mkdsh.gecko'" dist/BADGING.txt
+          cp "$RUNNER_TEMP/ASSETS.json" dist/ASSETS.json
+          echo "$SIGNING" > dist/SIGNING.txt
+          (cd dist && sha256sum ./*.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          ls -la dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dshapp-release-apks
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+      - name: Remove the signing material
+        if: always()
+        run: rm -f keystore.properties "$RUNNER_TEMP/release.jks"
+
