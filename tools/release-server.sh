@@ -12,12 +12,20 @@
 #   · keystore.properties + dsh-release.jks（release 签名）
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
-source /etc/profile.d/dsh-build.sh
 
-PROJ=/mnt/data/dshapp
-QUARK=/opt/quarkclouddrive
-TMP=/mnt/data/release-tmp
-cd "$PROJ" || exit 1
+# 服务器环境变量（JDK / SDK / GRADLE_USER_HOME / DSH_HOME）。本机跑则无需此文件。
+[ -f /etc/profile.d/dsh-build.sh ] && source /etc/profile.d/dsh-build.sh
+
+# 项目根 = 本脚本所在目录的上一级。**不要写死绝对路径** ——
+# 曾经写成 /mnt/data/dshapp，目录一挪脚本就静默失效（cd 失败才发现）。
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJ=$(cd "$SCRIPT_DIR/.." && pwd)
+
+QUARK=${QUARK_DIR:-/opt/quarkclouddrive}
+TMP=${RELEASE_TMP:-/mnt/data/DSHAPP/release-tmp}
+mkdir -p "$TMP"
+cd "$PROJ" || { echo "❌ 进不去项目根：$PROJ"; exit 1; }
+echo "▶ 项目根：$PROJ"
 
 # ── 0. 版本号：优先取参数，否则读 build.gradle.kts ──────────────────────────
 if [ -n "${1:-}" ]; then
