@@ -99,7 +99,7 @@ $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17.0.19.10-hotspot"
 
 ```powershell
 $bash = "C:\Program Files\Git\bin\bash.exe"
-$skill = "/c/Users/XIAOPAN/.claude/skills/quarkclouddrive"
+$skill = "/c/Users/你的用户名/.claude/skills/quarkclouddrive"
 
 # 1) 先查目标目录的 FID（⚠️ 每次都要现查，见下）
 & $bash -lc "cd $skill && node scripts/quark-drive.cjs search --keyword 'DSH APP' --search-type dir 2>&1"
@@ -108,7 +108,7 @@ $skill = "/c/Users/XIAOPAN/.claude/skills/quarkclouddrive"
 Copy-Item app\build\outputs\apk\release\app-release.apk "$env:TEMP\DSH0.1.0-pool.apk" -Force
 
 # 3) 上传（--parent-fid 填上一步查到的 FID）
-& $bash -lc "cd $skill && node scripts/quark-drive.cjs upload '/c/Users/XIAOPAN/AppData/Local/Temp/DSH0.1.0-pool.apk' --parent-fid '<FID>' 2>&1" |
+& $bash -lc "cd $skill && node scripts/quark-drive.cjs upload '/c/Users/你的用户名/AppData/Local/Temp/DSH0.1.0-pool.apk' --parent-fid '<FID>' 2>&1" |
   Select-Object -Last 4
 ```
 

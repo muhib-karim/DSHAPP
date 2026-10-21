@@ -43,7 +43,7 @@
 Invoke-WebRequest https://nodejs.org/dist/v26.4.0/node-v26.4.0-headers.tar.gz `
   -OutFile hdr.tgz -Proxy "http://127.0.0.1:7897"
 tar -xzf hdr.tgz
-$cxx = "C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang++.cmd"
+$cxx = "C:\Users\你的用户名\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang++.cmd"
 & $cxx -shared -fPIC -O2 -std=c++17 -static-libstdc++ `
   -I node-v26.4.0/include/node `
   -I <engine>\node_modules\node-addon-api `

@@ -40,7 +40,7 @@ $headerPath = Join-Path $jniDir 'keyinject-keys.h'
 $sourcePath = Join-Path $jniDir 'keyinject.c'
 $assetPath = Join-Path $repoRoot 'app/src/main/assets/keyinject.bin'
 
-$ndkClang = 'C:\Users\XIAOPAN\AppData\Local\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd'
+$ndkClang = "$env:LOCALAPPDATA\Android\Sdk\ndk\27.0.12077973\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd"
 
 # ── 1. 读密钥清单 ────────────────────────────────────────────────────────
 

@@ -12,7 +12,7 @@
 
 ### 1.1 现场
 
-服务器 `39.98.163.161:56789` 上的诊断包，设备 Xiaomi 24122RKC7C / Android 16 (API 36)，
+服务器 `39.98.163.161:56789` 上的诊断包，设备 某小米机型 / Android 16 (API 36)，
 版本 `0.2.9-tooliso (18) system`（**本方案写作时的最新发布版**）：
 
 | 包 | 时间 | 版本 | 结果 |
@@ -866,7 +866,7 @@ if (!existsSync(join(dir, "package.json"))) {
 **服务器访问**：
 
 ```
-ssh -i C:\Users\XIAOPAN\.ssh\id_ed25519_logsrv -p 56789 \
+ssh -i C:\Users\你的用户名\.ssh\id_ed25519_logsrv -p 56789 \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@39.98.163.161
 ```
 

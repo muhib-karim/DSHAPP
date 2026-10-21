@@ -3997,7 +3997,7 @@ class FloatingBubble(private val context: Context) {
      *
      * ⚠️ **这里每一个 `?` 都不是多余的，去掉任意一个都会崩主线程。**
      *
-     * 真机现场（`20261014-083111-uncaught-exception.txt`，Xiaomi 24122RKC7C /
+     * 真机现场（`20261014-083111-uncaught-exception.txt`，某小米机型 /
      * Android 16，`thread: main`）：
      *
      * ```

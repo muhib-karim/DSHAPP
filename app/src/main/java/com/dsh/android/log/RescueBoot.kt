@@ -23,7 +23,7 @@ import java.io.File
  *
  * ## 这个文件解决的是什么
  *
- * 真机事实（2026-10-14，Xiaomi 24122RKC7C / Android 16 / v18）：用户装了 40 个第三方
+ * 真机事实（2026-10-14，某小米机型 / Android 16 / v18）：用户装了 40 个第三方
  * 插件，其中一个重复注册了 `mcpManager/list` 这个 endpoint，把冲突灌进**核心插件**
  * `typert-loader`，于是引擎 `startup failed: 1 required plugin did not activate`
  * 直接退出 —— **App 完全打不开，同一个 bootId 内连续 8 次**。

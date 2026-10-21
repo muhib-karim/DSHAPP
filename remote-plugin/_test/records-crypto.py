@@ -5,7 +5,7 @@
 跑法（Windows 本机，**不联网**、**不碰线上**）：
 
     cd remote-plugin\\pair-server
-    & "C:\\Users\\XIAOPAN\\AppData\\Local\\Python\\PythonCore-3.14-64\\python.exe" ..\\_test\\records-crypto.py
+    & "C:\\Users\\你的用户名\\AppData\\Local\\Python\\PythonCore-3.14-64\\python.exe" ..\\_test\\records-crypto.py
 
 它把 `PAIR_STATE_DIR` 指到临时目录、把 Cloudflare 三件套留空，
 然后 `import pair_server`。三层断言：
@@ -75,7 +75,7 @@ def main():
                 "accessToken": access,
                 "tunnelToken": tunnel,
                 "clientSecret": secret,
-                "deviceLabel": "XIAOPAN",
+                "deviceLabel": "你的用户名",
                 "createdAt": 1700000000,
             }
         }
@@ -107,7 +107,7 @@ def main():
         check("load 回 accessToken 一致", got.get("accessToken") == access)
         check("load 回 tunnelToken 一致", got.get("tunnelToken") == tunnel)
         check("load 回 clientSecret 一致", got.get("clientSecret") == secret)
-        check("load 回非敏感字段一致", got.get("deviceLabel") == "XIAOPAN")
+        check("load 回非敏感字段一致", got.get("deviceLabel") == "你的用户名")
 
         # 幂等：加密过的值再 seal 一次不能被套两层（否则 load 出来是内层密文）。
         once = srv._seal(access)
