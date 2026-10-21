@@ -1,0 +1,39 @@
+name: Release
+
+# Fork (muhib-karim/DSHAPP): on a v* tag, build the signed APKs (release-apk.yml, which requires the DSHAPP_KEYSTORE_*
+# secrets for tags) and publish them with SHA256SUMS.txt and ASSETS.json as a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/release-apk.yml
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dshapp-release-apks
+          path: dist
+      - name: Verify checksums
+        run: cd dist && sha256sum --check SHA256SUMS.txt
+      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
+            dist/ASSETS.json
+          body: |
+            DSH for Android, fork of [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP) (MIT), version ${{ needs.build.outputs.version }}.
+            `DSH${{ needs.build.outputs.version }}-mk.apk` (system WebView, `com.mkdsh.droid`) and `DSH${{ needs.build.outputs.version }}-mk-gecko.apk`
+            (built-in GeckoView, `com.mkdsh.gecko`). arm64-v8a only, targetSdk 28 (sideload). Checksums in SHA256SUMS.txt;
+            where every build asset came from in ASSETS.json. No built-in API account pool: bring your own key.

@@ -2,13 +2,12 @@ name: Release APK
 
 # Fork (muhib-karim/DSHAPP): builds signed release APKs of both flavors (system WebView, built-in GeckoView) from this
 # repository plus the build assets upstream keeps out of git (tools/ci/assemble-assets.py says where each comes from).
-# Uploads the APKs, SHA256SUMS.txt and ASSETS.json; on a v* tag also publishes a GitHub Release with them.
+# Uploads the APKs, SHA256SUMS.txt and ASSETS.json. A v* tag runs release.yml, which calls this and publishes a Release.
 # Signing: the DSHAPP_KEYSTORE_* repository secrets when they are set (a stable identity, required for tags);
 # otherwise a throwaway key made for this run (installs, but cannot update an install signed by another run).
 on:
   push:
     branches: [main, 'release/**']
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -138,27 +137,3 @@ jobs:
         if: always()
         run: rm -f keystore.properties "$RUNNER_TEMP/release.jks"
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: dshapp-release-apks
-          path: dist
-      - name: Verify checksums
-        run: cd dist && sha256sum --check SHA256SUMS.txt
-      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
-        with:
-          files: |
-            dist/*.apk
-            dist/SHA256SUMS.txt
-            dist/ASSETS.json
-          body: |
-            DSH for Android, fork of [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP) (MIT), version ${{ needs.build.outputs.version }}.
-            `DSH${{ needs.build.outputs.version }}-mk.apk` (system WebView, `com.mkdsh.droid`) and `DSH${{ needs.build.outputs.version }}-mk-gecko.apk`
-            (built-in GeckoView, `com.mkdsh.gecko`). arm64-v8a only, targetSdk 28 (sideload). Checksums in SHA256SUMS.txt;
-            where every build asset came from in ASSETS.json. No built-in API account pool: bring your own key.
