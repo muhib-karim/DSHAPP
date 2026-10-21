@@ -3054,6 +3054,88 @@ class EngineManager private constructor(private val context: Context) {
      * 的一部分，用户删掉它就等于弄丢了号池，所以每次启动都要确保它在。但**只补缺**
      * （见 [mergeKeyPoolProvider]），已有 `agnes:` 时一个字节都不动。
      */
+    /**
+     * 删掉 `$DSH_HOME/.credentials.yaml` 里那条**老用户手填的**内置号池密钥。
+     *
+     * ## 症状
+     *
+     * 升级后界面显示「API 密钥无效」，而 API 地址已经是网关地址。设置页里密钥
+     * 输入框提示「留空使用已保存凭据」，**看不到**「已检测到环境变量」。
+     *
+     * ## 根因
+     *
+     * `dsh-credentials-local` 的 `describe()` 优先级是：
+     *
+     * ```
+     * values（.credentials.yaml）→ inherited（父进程环境变量）→ dotenv 兜底
+     * ```
+     *
+     * 老版本要求用户在设置页里手填 Agnes 真密钥，那份值被写进 `.credentials.yaml`。
+     * 新版本改用环境变量 `AGNES_CREDENTIAL`（值是网关令牌），但**文件层优先**，
+     * 于是 `Authorization` 头带的仍是用户当年手填的**旧真密钥** ——
+     * 打到现在指向的网关地址上，网关不认识它，回 401 ⇒ 界面「API 密钥无效」。
+     *
+     * 这正是「留空使用已保存凭据」与「已检测到环境变量」互斥的原因：
+     * 前者说明 `source === "file"`，后者说明 `source === "env"`。老用户是前者。
+     *
+     * ## 为什么可以安全删除
+     *
+     * `AGNES_CREDENTIAL` 是**内置号池专用的引用名**（见 [KEY_ENV]），
+     * 用户自己的第三方 provider 用各自的引用名，不受影响。
+     * 而且网关令牌永远由 [start] 注入成环境变量 —— 文件里那条只会造成遮蔽。
+     *
+     * ⚠️ **只删这一条**。整份文档原样保留（注释、其它条目、格式都不动）：
+     * 用户可能同时配了别的 provider，粗暴重写等于毁他数据。
+     *
+     * ⚠️ 只认「值不是网关令牌」的条目。若用户手动填的就是网关令牌，留着无害。
+     */
+    private fun dropStaleBuiltinCredential() {
+        val file = File(dshHome, ".credentials.yaml")
+        if (!file.isFile) return
+        val text = try {
+            file.readText()
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取 .credentials.yaml 失败: ${t.message}")
+            return
+        }
+
+        // 找 `AGNES_CREDENTIAL:` 那一行（顶层键，允许引号/注释/空行）。
+        // 只处理顶层缩进为 0 的行，避免误伤嵌套结构。
+        val lines = text.lines().toMutableList()
+        val idx = lines.indexOfFirst { line ->
+            val t = line.trimStart()
+            line.indexOfFirst { it != ' ' } == 0 &&
+                t.startsWith("$KEY_ENV:") &&
+                !t.startsWith("#")
+        }
+        if (idx < 0) return
+
+        val raw = lines[idx].substringAfter("$KEY_ENV:").trim()
+        // 去掉行尾注释与引号，取出真正的值
+        val value = raw
+            .substringBefore(" #")
+            .trim()
+            .trim('\'', '"')
+        if (value.isEmpty()) return
+        if (value == KEY_PLACEHOLDER) return   // 已经是网关令牌，无需处理
+
+        // 还有别的条目就只删这一行，否则整个文件只剩这一条 ⇒ 删文件更干净
+        val remaining = lines.filterIndexed { i, line ->
+            i != idx && !(line.isBlank() || line.trimStart().startsWith("#"))
+        }
+        try {
+            if (remaining.isEmpty()) {
+                if (file.delete()) Log.i(TAG, "已删除只含旧号池密钥的 .credentials.yaml")
+            } else {
+                val body = lines.filterIndexed { i, _ -> i != idx }.joinToString("\n")
+                file.writeText(body.trimEnd('\n') + "\n")
+                Log.i(TAG, "已从 .credentials.yaml 移除旧的 $KEY_ENV 条目")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "清理 .credentials.yaml 失败: ${t.message}")
+        }
+    }
+
     private fun ensureKeyPoolProvider(profile: String = PROFILE_NAME): Boolean {
         // 老版本把内置号池写成 --patch overlay（keyinject.patch.yml）。那个写法会
         // 在最顶层整块替换 `llm-pi-ai` 那行，把用户自己的 provider 一起盖掉 ——
@@ -3341,7 +3423,47 @@ class EngineManager private constructor(private val context: Context) {
             line.isNotBlank() && line.indexOfFirst { it != ' ' } == child + 6 &&
                 (trimmed == "retryPolicy:" || trimmed.startsWith("retryPolicy: "))
         }
-        if (hasRetryPolicy) return unchangedOrHealed()
+        // ── baseURL 迁移：老安装必须改到网关地址 ──────────────────────────
+        //
+        // ⚠️ 与上面 `retryPolicy` 完全同一类 bug，只是这次漏的是 baseURL。
+        //
+        //   号池从「客户端 TLS 注入 + 直连上游」改成「服务端网关」后，
+        //   `agnes:` 块里的 `baseURL` 必须从 `api.agnes-ai.cn` /
+        //   `apihub.agnes-ai.cn` 换成 [KEY_BASE_URL]。
+        //
+        //   但 `mergeKeyPoolProvider` 的既定语义是「已有 agnes: 就一个字节都不动」，
+        //   于是**所有老安装升级后仍然指向旧域名**：注入库已经删了，占位符不再被
+        //   替换成真密钥，请求带着 `sk-agnes-…` 令牌直连 Agnes 上游 ⇒ 上游回 401
+        //   ⇒ 客户端显示「API 密钥无效」。全新安装反而是对的，典型的
+        //   「新装测不出、老用户全炸」。
+        //
+        //   纠偏范围**严格限定在 baseURL 这一个键**，且**只认已知的旧值**：
+        //   - 命中旧直连域名 ⇒ 改成网关地址（这是本次迁移的唯一目的）
+        //   - 已是网关地址   ⇒ 不动
+        //   - 其它任意值     ⇒ 不动（用户自己填的第三方地址，绝不可覆盖）
+        var baseUrlFixed = false
+        val baseUrlIndent = child + 6
+        for (i in agnesIndex + 1 until agnesEnd) {
+            val line = lines[i]
+            if (line.isBlank()) continue
+            if (line.indexOfFirst { it != ' ' } != baseUrlIndent) continue
+            val trimmed = line.trim()
+            if (!trimmed.startsWith("baseURL:")) continue
+            val value = trimmed.removePrefix("baseURL:").trim().trim('\'', '"')
+            if (value in LEGACY_KEY_BASE_URLS) {
+                lines[i] = " ".repeat(baseUrlIndent) + "baseURL: '$KEY_BASE_URL'"
+                dirty = true
+                baseUrlFixed = true
+                Log.i(TAG, "内置号池 baseURL 迁移: $value -> $KEY_BASE_URL")
+            }
+            break
+        }
+        // ⚠️ 不能在这里 `return`：baseURL 改了之后，retryPolicy 可能**同样缺失**
+        //    （老安装两样都缺）。早退会让「换号重试」这个修复对老用户失效，
+        //    与上面 retryPolicy 注释里踩过的坑完全一样。继续往下走。
+        if (hasRetryPolicy) {
+            return if (baseUrlFixed) lines.joinToString("\n") else unchangedOrHealed()
+        }
 
         insert(agnesIndex + 1, keyPoolRetryPolicyYaml(child + 6))
         return lines.joinToString("\n")
@@ -6783,6 +6905,10 @@ class EngineManager private constructor(private val context: Context) {
         // command-line overlay` —— 用户表现为「一添加第三方 API 就报错」。
         // 所以改为把内置号池**补进 profile 的用户配置层**（见 [ensureKeyPoolProvider]）。
         ensureKeyPoolProvider()
+        // 老用户在 GUI 里手填过真密钥 ⇒ `.credentials.yaml` 里有一条
+        // `AGNES_CREDENTIAL`，它的优先级**高于**环境变量，会把网关令牌顶掉。
+        // 号池改成服务端网关后这条残留必须清掉，详见 [dropStaleBuiltinCredential]。
+        dropStaleBuiltinCredential()
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
@@ -8476,6 +8602,26 @@ class EngineManager private constructor(private val context: Context) {
          * ⚠️ **不要删除这个常量**，也不要把它当成有效配置使用。
          */
         private const val LEGACY_KEY_PLACEHOLDER = "sk-ANON00000000000000000000000000000000000000000000"
+
+        /**
+         * **旧版**直连上游的 baseURL，仅用于**识别并迁移**老安装的 `agnes:` 配置块。
+         *
+         * 号池改为服务端网关后，`baseURL` 必须是 [KEY_BASE_URL]。但
+         * [mergeKeyPoolProvider] 的语义是「已有 agnes: 就一个字节都不动」，
+         * 老安装升级后仍指向这两个域名 ⇒ 带着网关令牌直连上游 ⇒ 上游 401 ⇒
+         * 界面显示「API 密钥无效」。
+         *
+         * [mergeKeyPoolProvider] 命中这里列出的值时改写成网关地址；
+         * **其它任何值都不碰**（用户自填的第三方地址绝不可覆盖）。
+         *
+         * ⚠️ 不要把它们当成有效配置使用。
+         */
+        private val LEGACY_KEY_BASE_URLS = setOf(
+            "https://api.agnes-ai.cn/v1",
+            "https://apihub.agnes-ai.cn/v1",
+            "https://api.agnes-ai.cn",
+            "https://apihub.agnes-ai.cn",
+        )
 
         /**
          * 内置号池的 provider 路由名。
