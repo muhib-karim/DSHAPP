@@ -1273,6 +1273,67 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 放宽「发图格式白名单」—— 原版只认 4 个精确的 MIME 字符串。
+     *
+     * **症状**：新会话里粘贴/选择图片，直接弹「仅支持 PNG、JPG、WebP、GIF 格式的图片」，
+     * 图根本没进输入框。而同一张图在已有会话里能发。
+     *
+     * **根因**：`dsh-client-ui-conversation` 的 `isImageMediaType()` 是**精确字符串比较**：
+     *
+     * ```js
+     * return value === "image/png" || value === "image/jpeg"
+     *     || value === "image/webp" || value === "image/gif";
+     * ```
+     *
+     * 于是下面这些**明明能显示的图片**全被判成非法：
+     *
+     * | 场景 | `file.type` | 结果 |
+     * |---|---|---|
+     * | 后缀是 `.jpg`（部分系统/相册） | `image/jpg` | ❌ 被拒（不是 `jpeg`） |
+     * | iPhone 拍照 | `image/heic` / `image/heif` | ❌ 被拒 |
+     * | 部分安卓相册 | `image/bmp` / `image/avif` | ❌ 被拒 |
+     * | 从剪贴板粘贴 | 可能是空串 | ❌ 被拒 |
+     *
+     * 触发点还叠了 `continuable`（新开会话）这个条件，所以表现成
+     * 「新会话一粘图就报错，老会话没事」。
+     *
+     * **做法**：把精确比较换成前缀 + 别名判断 —— 只要 `image/` 开头就放行，
+     * 再补上 `image/jpg` 这个常见别名。
+     *
+     * ⚠️ **只放宽「能不能选」，不放宽「能不能解码」**：真正的解码在下游
+     * （`dsh-attachment-local` 用 sharp），不支持的格式那里会给出明确错误，
+     * 比在入口处一刀切拦住友好得多 —— 用户至少能看到「这张图解码失败」，
+     * 而不是莫名其妙的格式白名单。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败）。
+     */
+    private fun patchImageMediaType() {
+        val entry = File(
+            engineDir,
+            "node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        )
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到会话 UI 入口，跳过发图格式补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(IMG_TYPE_ANCHOR)) {
+                return
+            }
+            if (!source.contains(IMG_TYPE_GUARD)) {
+                Log.w(TAG, "发图格式判断结构与预期不符，跳过补丁")
+                return
+            }
+            entry.writeText(source.replace(IMG_TYPE_GUARD, IMG_TYPE_ANCHOR))
+            Log.i(TAG, "已放宽发图格式白名单: dsh-client-ui-conversation")
+        } catch (t: Throwable) {
+            Log.w(TAG, "放宽发图格式白名单失败: ${t.message}")
+        }
+    }
+
+    /**
      * 从引擎打印的 URL 里取出端口号，取不到给空串。
      *
      * ⚠️ **不能写成 `url.substringAfter(":").substringBefore("/")`**（踩过，真机全中）：
@@ -6816,6 +6877,8 @@ class EngineManager private constructor(private val context: Context) {
         patchTerminalShell()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
+        // 发图格式白名单只认 4 个精确 MIME → image/jpg、heic、剪贴板粘贴全被误拒
+        patchImageMediaType()
         // ⚠️ 用户自己做的插件在运行期抛出未捕获异常时，installFailLoud 会 proc.exit(1)
         //   把整个引擎杀掉 → 反复重启 → App 再也打不开（三级降级阶梯对此无效，
         //   因为这条路径下 RescueBoot.recordFailure 一次都不会被调用）。见其 KDoc。
@@ -8072,6 +8135,30 @@ class EngineManager private constructor(private val context: Context) {
                 "\t\tif (err && (err.code === \"EACCES\" || err.code === \"EPERM\")) return;\n" +
                 "\t\tthrow err;\n" +
                 "\t}"
+
+        /**
+         * 发图格式白名单的原版判断（精确比较 4 个 MIME）。
+         *
+         * ⚠️ 缩进是**三个制表符**，与官方发布件逐字一致；引擎升级后若不再匹配，
+         * 补丁会跳过并在日志里提示，不会让启动失败。见 [patchImageMediaType]。
+         */
+        private const val IMG_TYPE_GUARD =
+            "\t\t\treturn value === \"image/png\" || value === \"image/jpeg\" || " +
+                "value === \"image/webp\" || value === \"image/gif\";"
+
+        /**
+         * 放宽后的判断：任何 `image/` 前缀 + `image/jpg` 别名都放行。
+         *
+         * 解码能力交给下游 sharp 判断 —— 它会给明确错误，
+         * 比在入口处一刀切拦住友好（见 [patchImageMediaType] 的表格）。
+         */
+        private const val IMG_TYPE_ANCHOR =
+            "\t\t\tif (typeof value !== \"string\") return false;\n" +
+                "\t\t\t/* DSH Android: 放宽到任何 image/ 前缀。原版只认 4 个精确值，\n" +
+                "\t\t\t   而 image/jpg、image/heic、image/avif、image/bmp 以及剪贴板粘贴\n" +
+                "\t\t\t   的空 type 都会被误拒，用户看到的是「仅支持 PNG、JPG、WebP、GIF」。\n" +
+                "\t\t\t   真正的解码能力由下游 sharp 判断，那里报错更准确。 */\n" +
+                "\t\t\treturn value.startsWith(\"image/\");"
 
         /**
          * 凭据文件名（`dsh-credentials-local` 的 `CREDENTIALS_FILENAME`，写死，

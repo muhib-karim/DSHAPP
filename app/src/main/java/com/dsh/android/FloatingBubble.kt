@@ -1100,6 +1100,9 @@ class FloatingBubble(private val context: Context) {
     /** 正在跑的呼吸动画（X / Y 各一个，必须同步）。 */
     private var pulseAnimator: ObjectAnimator? = null
     private var pulseAnimatorY: ObjectAnimator? = null
+    /** 视频层的呼吸动画（X/Y 各一个，与图片层同频同相）。 */
+    private var pulseVideoX: ObjectAnimator? = null
+    private var pulseVideoY: ObjectAnimator? = null
 
     /** 当前呼吸动画的基准缩放，用来判断"配置真的变了没"。 */
     private var pulseBase = 0f
@@ -1332,6 +1335,7 @@ class FloatingBubble(private val context: Context) {
 
         // 功能开关关掉时只记状态、不做动作：地面也不该被键盘抬高（见 maxWindowY）。
         if (!keyboardAvoidEnabled) return
+        // 贴边态不参与键盘避让：它贴的是屏幕左右边缘，不是底部，键盘盖不到它。
         if (expanded || edgeCollapsed || dragging) return
         if (visible) {
             // ⚠️ 飞行中不再重复给初速：键盘弹出的那段动画里 `top` 会变几次，
@@ -1682,8 +1686,33 @@ class FloatingBubble(private val context: Context) {
      * ⚠️ 全程 try/catch：气泡是锦上添花，一份写错的配置不能让它消失。
      */
     fun applyAppearance(next: BubbleAppearance) {
+        val prev = appearance
         appearance = next
         try {
+            // ⚠️ **插件改了面板尺寸就清掉用户的手动拖动记录。**
+            //
+            //   原逻辑里 `panelWidth` / `panelHeight` 的取值是：
+            //     prefs 里有拖动记录 ⇒ 用记录值（插件配置被永久忽略）
+            //   于是用户只要拖过一次缩放手柄，之后再怎么调设置页的
+            //   「面板宽度 / 面板高度」都**完全没反应** —— 真机反馈为
+            //   「面板尺寸调节无效」，而且看起来像滑杆坏了。
+            //
+            //   修法：插件下发的配置里尺寸**变了**，就当成"这次以插件为准"，
+            //   清掉拖动记录。没变则不动（保留用户的微调）。
+            val sizeChanged = next.panelWidth != prev.panelWidth ||
+                next.panelHeight != prev.panelHeight
+            if (sizeChanged) {
+                prefs.edit()
+                    .remove(KEY_PANEL_W)
+                    .remove(KEY_TRANSCRIPT_H)
+                    .apply()
+                Log.i(
+                    TAG,
+                    "面板尺寸改为插件配置: width=${next.panelWidth} height=${next.panelHeight}" +
+                        "（已清除手动拖动记录）",
+                )
+            }
+
             applyAppearanceToViews()
             // ⚠️ **按新尺寸夹，不能读 `root.width`。** 这里刚改完 layoutParams，
             //   布局还没重测，`root.width` 仍是**旧**尺寸（可能是贴边态的 6dp，
@@ -2120,6 +2149,13 @@ class FloatingBubble(private val context: Context) {
         // ⚠️ 用 [facingScaleX] 而不是直接读 `avatarScale`：转身（`flipOnTurn`）就是
         //   靠这里的水平镜像表达的，直接赋值会把朝向抹掉 —— 表现为"转身只生效一瞬"。
         iv.scaleY = appearance.avatarScale
+        // ⚠️ **视频层也必须一起缩放。**
+        //
+        //   原实现只给 `avatarView`（图片层）设了 `scaleY`，视频层 `videoHost`
+        //   完全没设。而桌宠最主流的用法就是视频素材 —— 于是调设置页的
+        //   「头像缩放」时，图片素材的球会变大变小，**视频素材的宠物纹丝不动**。
+        //   真机反馈为「宠物比例调整后不会自动变化」，看起来像滑杆坏了。
+        (videoHost as? View)?.scaleY = appearance.avatarScale
         // 水平镜像（转身）交给 [applyFacing] 统一刷。
         //
         // ⚠️ 不能只在"朝向变化的那一刻"刷一次：内容层会因换动作/换状态被反复重建，
@@ -2719,6 +2755,22 @@ class FloatingBubble(private val context: Context) {
     private fun applyMotion() {
         val iv = avatarView ?: return
 
+        // ⚠️ **视频层要跟着一起做动效。**
+        //
+        //   原实现只对 `avatarView`（图片层）设 spin/pulse，视频层 `videoHost`
+        //   完全不动。而桌宠的主流素材是视频 —— 于是「旋转」「呼吸」这两个
+        //   开关对视频宠物**完全无效**，且两个内容层互斥显示时观感不一致
+        //   （图片球会呼吸，切成视频后突然静止）。
+        //
+        //   这里只同步**静态部分**（基础缩放与旋转角）；呼吸是 `ObjectAnimator`，
+        //   动画器要各自建一个（见下面 pulse 分支里的 `pulseVideoX/Y`）。
+        (videoHost as? View)?.let { vh ->
+            vh.scaleY = appearance.avatarScale
+            vh.scaleX = if (appearance.flipOnTurn && facingRight) -appearance.avatarScale
+                        else appearance.avatarScale
+            vh.rotation = if (appearance.spin != 0) vh.rotation else 0f
+        }
+
         // ── 旋转 ──────────────────────────────────────────────────────
         if (appearance.spin != 0) {
             // 每 360° 的时长 = 360 / 每秒角度。负角度即逆时针。
@@ -2777,14 +2829,37 @@ class FloatingBubble(private val context: Context) {
                     interpolator = AccelerateDecelerateInterpolator()
                     start()
                 }
+                // 视频层用同一组参数再建一对，保证两个内容层呼吸节奏一致
+                (videoHost as? View)?.let { vh ->
+                    pulseVideoX?.cancel()
+                    pulseVideoY?.cancel()
+                    pulseVideoX = ObjectAnimator.ofFloat(vh, View.SCALE_X, sx, sx * 1.12f).apply {
+                        this.duration = 700
+                        repeatCount = ObjectAnimator.INFINITE
+                        repeatMode = ObjectAnimator.REVERSE
+                        interpolator = AccelerateDecelerateInterpolator()
+                        start()
+                    }
+                    pulseVideoY = ObjectAnimator.ofFloat(vh, View.SCALE_Y, base, base * 1.12f).apply {
+                        this.duration = 700
+                        repeatCount = ObjectAnimator.INFINITE
+                        repeatMode = ObjectAnimator.REVERSE
+                        interpolator = AccelerateDecelerateInterpolator()
+                        start()
+                    }
+                }
                 pulseBase = sx
                 pulsing = true
             }
         } else if (pulsing) {
             pulseAnimator?.cancel()
             pulseAnimatorY?.cancel()
+            pulseVideoX?.cancel()
+            pulseVideoY?.cancel()
             pulseAnimator = null
             pulseAnimatorY = null
+            pulseVideoX = null
+            pulseVideoY = null
             pulseBase = 0f
             pulsing = false
             // ⚠️ 用 [facingScaleX] 而不是 `avatarScale`：这里在"关掉呼吸"时把缩放
@@ -2792,6 +2867,10 @@ class FloatingBubble(private val context: Context) {
             //   宠物突然转回正面"。
             iv.scaleX = facingScaleX()
             iv.scaleY = appearance.avatarScale
+            (videoHost as? View)?.let { vh ->
+                vh.scaleX = facingScaleX()
+                vh.scaleY = appearance.avatarScale
+            }
         }
     }
 
@@ -3701,6 +3780,19 @@ class FloatingBubble(private val context: Context) {
         val tick = object : Runnable {
             override fun run() {
                 val st = throwState ?: return
+                // ⚠️ **贴边态绝不能继续跑物理。**
+                //
+                //   贴边时窗口尺寸从「球」变成了「一条探头」，而物理循环用的是
+                //   `v.width/v.height`（此刻已是贴边条的尺寸）。继续下落会有两个后果：
+                //   ① 一条探头贴片受重力往下滑，最后停在屏幕底部；
+                //   ② 地面判据按贴边条高度算，看起来就是"吸附的图片掉下来了"。
+                //
+                //   真机反馈原话：「宠物在吸附状态时会由于重力感应掉下来，
+                //   并且是以吸附的图片形式掉下来」。所以贴边时直接终止抛掷。
+                if (edgeCollapsed) {
+                    stopThrow()
+                    return
+                }
                 val now = System.nanoTime()
                 val dt = ((now - throwLastFrameNs) / 1_000_000_000f).coerceIn(0f, 0.05f)
                 throwLastFrameNs = now
@@ -3787,7 +3879,9 @@ class FloatingBubble(private val context: Context) {
         shakeDetector.onShake = { vx, vy ->
             // 只在**收起态**甩。展开态时面板是个大窗口，把它甩飞既没有视觉意义，
             // 也会让正在打字的人莫名其妙。
-            if (attached && !expanded) {
+            // ⚠️ 贴边态也不能甩：那时候窗口是一条探头，甩飞会变成
+            //   「一张贴边图飞出去」，与抛掷同样的毛病。
+            if (attached && !expanded && !edgeCollapsed) {
                 startThrow(vx, vy)
             }
         }
@@ -4038,6 +4132,11 @@ class FloatingBubble(private val context: Context) {
         edgeSide = side
         expanded = false
         edgeCollapsed = true
+        // ⚠️ 进贴边态必须**立刻掐掉正在跑的抛掷**。
+        //   只靠物理 tick 里那个 `if (edgeCollapsed) return` 还不够：
+        //   tick 是 `postOnAnimation` 排的，可能还有一帧在队列里，那一帧会用
+        //   贴边条的尺寸算一次位置，把刚摆好的贴边位置冲掉。
+        stopThrow()
         hideStatusBubble()
         applyFocusFlags(focusable = false)
         panelInput?.let {
