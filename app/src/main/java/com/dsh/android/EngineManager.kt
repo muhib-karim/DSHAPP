@@ -8297,7 +8297,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val PRESET_SKILLS_ASSET = "preset-skills.zip"
 
         /** 内容版本戳：改了 `preset-skills.zip` 里任何东西都必须改这里。 */
-        private const val PRESET_SKILLS_VERSION = "1.0.0-1"
+        private const val PRESET_SKILLS_VERSION = "1.0.0-2"
         private const val PRESET_SKILLS_STAMP = ".preset_skills_version"
 
         /**
