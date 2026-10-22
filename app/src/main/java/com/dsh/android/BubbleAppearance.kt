@@ -55,7 +55,7 @@ import kotlin.math.roundToInt
  * | `shape` | string | `circle` / `square` / `rounded` / **`path`**（用 `shapePath`） |
  * | `shapePath` | string | SVG path 的 `d`，如 `M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z` |
  * | `shapeViewBox` | string | `shapePath` 的坐标系，默认 `0 0 100 100` |
- * | `size` | int(dp) | 球的**边长**，24~160。方形画布时它是宽，也是高 |
+ * | `size` | int(dp) | 球的**边长**，24~320。方形画布时它是宽，也是高 |
  * | `boxWidth` | int(dp) | **画布宽**，0 = 跟随 `size`（正方形）。16~400 |
  * | `boxHeight` | int(dp) | **画布高**，0 = 跟随 `size`（正方形）。16~400 |
  * | `showDot` | bool | 是否显示右下角状态点。默认 **false**（不显示） |
@@ -600,6 +600,18 @@ data class BubbleAppearance(
          */
         const val DEFAULT_EDGE_WIDTH = 28
 
+        /**
+         * 球边长（`size`）的上限，dp。
+         *
+         * 曾是 160。桌宠素材（dsh-app-pet 的 640×360 webm）里人物只占画面宽度的
+         * ~33%，要让它看起来有正常大小就得把画布开得很大 —— 160 不够用。
+         * 320 在 3x 屏上是 960px，已经接近半屏宽，再大就会挡操作。
+         *
+         * ⚠️ 画布（`boxWidth`/`boxHeight`）的上限本来就是 400，比这里宽，
+         *   所以不需要同步改。
+         */
+        const val MAX_SIZE_DP = 320
+
         /** 贴边态宽度下限 / 上限，dp。下限保证"能点到"，上限防止挡住半个屏幕。 */
         const val MIN_EDGE_WIDTH = 6
         const val MAX_EDGE_WIDTH = 120
@@ -733,7 +745,7 @@ data class BubbleAppearance(
                 ),
                 shapePath = textOf(o, "shapePath", base.shapePath, MAX_SHAPE_PATH_CHARS),
                 shapeViewBox = textOf(o, "shapeViewBox", base.shapeViewBox, 64),
-                size = clampInt(o, "size", base.size, 24, 160),
+                size = clampInt(o, "size", base.size, 24, MAX_SIZE_DP),
                 // ⚠️ `0` 是**合法取值**（= 自动），所以这里不能再套 `clampInt(o,…,
                 //   24, 160)` —— 那会把 0 夹成 24，配置里写 `boxWidth:0` 反而变成长方形。
                 //   单独用一个 `autoOrInt` 把「0 或 16~400」放行。

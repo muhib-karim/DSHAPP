@@ -1776,9 +1776,30 @@ class FloatingBubble(private val context: Context) {
                 lp.height = edgeH
                 e.layoutParams = lp
             }
-            e.background = edgeBackground()
-            e.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
+            // ⚠️ 显示图片时**不能有背景与投影**。
+            //
+            //   `bubble_edge_bg` 是「白色圆角矩形 + 1dp 灰描边」，原本是纯色薄片
+            //   的底；`elevation = 8dp` 又给整个 FrameLayout 加了一层投影。
+            //   图片叠在这两者之上时，人物周围会套一个带阴影的圆角框 ——
+            //   真机反馈为「碰撞箱边缘有暗影」，看起来像图片被裁进了一个框里。
+            //
+            //   所以：有图 ⇒ 背景置空、投影归零；无图（`edgeImage == "none"`）
+            //   ⇒ 恢复成原来的纯色薄片。
+            if (usesEdgeImage()) {
+                e.background = null
+                e.elevation = 0f
+            } else {
+                e.background = edgeBackground()
+                e.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
+                e.elevation = dp(8).toFloat()
+            }
         }
+        // ⚠️ 贴边态的状态点**跟着 `showDot` 走**，与球上那个点同一套开关。
+        //
+        //   原实现让它无条件可见，而它 `layout_gravity="center"` 正好压在探头
+        //   人物的脸上 —— 真机反馈「那个圆圈挡到角色了」。
+        //   显示图片时尤其碍眼：图片本身已经表达了形象，再叠一个灰点没有信息量。
+        edgeDot?.visibility = if (appearance.showDot) View.VISIBLE else View.GONE
         applyEdgeImage()
 
         // ── 整体不透明度（与两个分层透明度相乘）─────────────────────────
@@ -4482,7 +4503,10 @@ class FloatingBubble(private val context: Context) {
         try {
             paintDot(dotView, status.running)
             paintDot(panelDot, status.running, small = true)
-            paintDot(edgeDot, status.running, small = true)
+            // ⚠️ 贴边态的状态点**默认不显示**（见 [applyEdgeImage] 里的可见性）。
+            //   它居中压在探头人物脸上，真机反馈「挡到角色了」。
+            //   只有在用户显式 `showDot: true` 时才画。
+            if (appearance.showDot) paintDot(edgeDot, status.running, small = true)
             refreshStatusBubble(status)
 
             // 「停止」只在 AI 真在跑时出现。常驻的话用户会去点它 ——

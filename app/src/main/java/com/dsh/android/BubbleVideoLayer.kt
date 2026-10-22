@@ -289,6 +289,35 @@ class BubbleVideoLayer(
   var curAction = '';
   var raf = 0;
 
+  // ── 双缓冲：两个 video 元素轮流当"当前"与"下一段" ──────────────────────
+  //
+  // ⚠️ **这是修「切动画会闪一下」的关键。**
+  //
+  //   原实现只有一个 video：'video.src = src; video.load(); video.play()'。
+  //   'load()' 会**立刻丢弃当前解码缓冲**，而新视频要等 'readyState >= 2'
+  //   才有可画的帧；这期间 draw() 里那个 'readyState >= 2' 判断为假，
+  //   canvas 被 clearRect 清空后什么都没画 ⇒ 至少闪一帧（网络/解码慢时更久）。
+  //
+  //   改成两个元素后，切换流程是：
+  //     ① 让"待命"的那个去 load + 预解码（此时**旧的那个仍在画**）
+  //     ② 等它 readyState >= 3（HAVE_FUTURE_DATA，已有一帧可画）
+  //     ③ 原子地把 'active' 指针切过去，再从这一帧开始画
+  //   全程屏幕上一直有画面，没有空窗。
+  var A = makeVideo();
+  var B = makeVideo();
+  var active = A;          // 正在画的那个
+  var standby = B;         // 正在预加载的那个
+  var pendingSpec = null;  // 预加载完成后要接管的 {action, src, loop}
+
+  function makeVideo(){
+    var v = document.createElement('video');
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.setAttribute('webkit-playsinline', '');
+    return v;
+  }
+
   function syncSize(){
     var r = cv.getBoundingClientRect();
     var dpr = window.devicePixelRatio || 1;
@@ -300,41 +329,114 @@ class BubbleVideoLayer(
   function draw(){
     syncSize();
     var W = cv.width, H = cv.height;
-    ctx.clearRect(0, 0, W, H);
-    if (video.readyState >= 2 && video.videoWidth > 0) {
-      var vw = video.videoWidth, vh = video.videoHeight;
+    // ⚠️ **不能每帧都 clearRect**。
+    //
+    //   原实现无条件清空再画，于是任何一帧"暂时没有可画内容"都会露出空白。
+    //   现在只在**确实画了新内容**时才清空并重绘；没有新内容就保留上一帧，
+    //   屏幕上是"静止"而不是"闪一下"。
+    var v = active;
+    if (v.readyState >= 2 && v.videoWidth > 0) {
+      var vw = v.videoWidth, vh = v.videoHeight;
       var s = Math.min(W / vw, H / vh);
       var dw = vw * s, dh = vh * s;
-      ctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      ctx.clearRect(0, 0, W, H);
+      ctx.drawImage(v, (W - dw) / 2, (H - dh) / 2, dw, dh);
     }
+    // readyState < 2 时**保留上一帧**（不清屏）—— 这正是消除闪烁的关键。
     raf = requestAnimationFrame(draw);
   }
 
-  video.addEventListener('ended', function(){
-    if (video.loop) return;
-    try { BubbleNative.onEnded(curAction); } catch (e) {}
-  });
-  video.addEventListener('error', function(){
-    var m = video.error ? ('code ' + video.error.code) : 'unknown';
-    try { BubbleNative.onError(curAction, m); } catch (e) {}
-  });
+  function wire(el){
+    el.addEventListener('ended', function(){
+      if (el.loop) return;
+      // 只有**当前正在画的那个**播完才算数：待命元素是预加载用的，
+      // 它"播完"没有任何语义（而且它多半是 paused）。
+      if (el !== active) return;
+      try { BubbleNative.onEnded(curAction); } catch (e) {}
+    });
+    el.addEventListener('error', function(){
+      if (el !== active && el !== standby) return;
+      var m = el.error ? ('code ' + el.error.code) : 'unknown';
+      try { BubbleNative.onError(curAction, m); } catch (e) {}
+    });
+  }
+  wire(A); wire(B);
+
+  /**
+   * 把 standby 换上来的那一刻。
+   *
+   * 前提：standby 已经 readyState >= 3（有可画帧）。此时：
+   * ① 旧 active 暂停（省解码）；
+   * ② active/standby 互换；
+   * ③ 新 active 开始播 —— **屏幕上从头到尾都有画面**。
+   */
+  function promote(){
+    if (!pendingSpec) return;
+    var spec = pendingSpec;
+    pendingSpec = null;
+
+    var old = active;
+    active = standby;
+    standby = old;
+    curAction = spec.action;
+    active.loop = !!spec.loop;
+
+    var p = active.play();
+    if (p && p.catch) { p.catch(function(e){
+      try { BubbleNative.onError(spec.action, String(e)); } catch (x) {}
+    }); }
+    try { standby.pause(); } catch (e) {}
+  }
+
+  /**
+   * 让 standby 预加载一段素材。
+   *
+   * ⚠️ **'load()' 之后不能马上 'play()' 就完事**：新源在 readyState 到达 3
+   *   之前没有可画帧。所以这里挂一次性监听，等到位了再 [promote]。
+   *   超时兜底 600ms：万一 'canplay' 没来（部分内核在 paused 状态下不触发），
+   *   也强行切过去 —— 宁可切到一个空帧，也不要宠物永远停在旧动作上。
+   */
+  function preload(spec){
+    pendingSpec = spec;
+    standby.loop = !!spec.loop;
+    standby.src = spec.src;
+    standby.load();
+    // paused 元素也要尝试 play()，否则某些内核不预解码
+    var p0 = standby.play();
+    if (p0 && p0.catch) { p0.catch(function(){}); }
+
+    var done = false;
+    function ready(){
+      if (done) return;
+      done = true;
+      standby.removeEventListener('canplay', ready);
+      standby.removeEventListener('loadeddata', ready);
+      promote();
+    }
+    standby.addEventListener('canplay', ready);
+    standby.addEventListener('loadeddata', ready);
+    setTimeout(function(){
+      if (done) return;
+      if (standby.readyState >= 2) { ready(); }
+      else {
+        // 实在等不到：先把旧的继续留着，避免空屏；600ms 后再试一次。
+        done = true;
+        setTimeout(function(){ if (pendingSpec) { pendingSpec = spec; preload(spec); } }, 600);
+      }
+    }, 600);
+  }
 
   window.__pet = {
     play: function(action, src, loop){
-      curAction = action;
-      video.loop = !!loop;
-      video.src = src;
-      video.load();
-      var p = video.play();
-      if (p && p.catch) { p.catch(function(e){
-        try { BubbleNative.onError(action, String(e)); } catch (x) {}
-      }); }
+      // 同一个动作重复下发：什么都不做（避免无谓地重载、白闪）。
+      if (action === curAction && !pendingSpec) return 'ok';
+      preload({ action: action, src: src, loop: !!loop });
       return 'ok';
     },
-    pause: function(){ try { video.pause(); } catch (e) {} return 'ok'; },
-    resume: function(){ var p = video.play(); if (p && p.catch) { p.catch(function(){}); } return 'ok'; },
+    pause: function(){ try { active.pause(); } catch (e) {} return 'ok'; },
+    resume: function(){ var p = active.play(); if (p && p.catch) { p.catch(function(){}); } return 'ok'; },
     current: function(){ return curAction; },
-    ready: function(){ return video.readyState; }
+    ready: function(){ return active.readyState; }
   };
 
   raf = requestAnimationFrame(draw);

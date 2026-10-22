@@ -189,7 +189,7 @@ Shape layer:
 - \`shape\`: "circle" | "square" | "rounded" | "path"
 - \`shapePath\`: an SVG path \`d\` string — used when \`shape\` is "path", and this is how you give the ball ANY outline (star, heart, hexagon, speech bubble, logo). Coordinates are in \`shapeViewBox\` units, not dp, so the same path scales to any \`size\`. Example five-pointed star, viewBox "0 0 100 100": \`M50 3 L61 38 L98 38 L68 60 L79 95 L50 73 L21 95 L32 60 L2 38 L39 38 Z\`. Max 4000 characters. Invalid paths fall back to a circle.
 - \`shapeViewBox\`: "minX minY width height", default "0 0 100 100".
-- \`size\`: ball diameter in dp, 24–160. When the canvas is auto-sized, this is its LONG edge.
+- \`size\`: ball diameter in dp, 24–320. When the canvas is auto-sized, this is its LONG edge.
 - \`boxWidth\` / \`boxHeight\`: the canvas (background box / window) size in dp, 16–400. \`0\` (the default) means AUTO: the canvas fits the current subject material — its long edge becomes \`size\` and the short edge follows the material's aspect ratio. So a square avatar/video gives the classic square ball, and a wide sprite sheet gives a wide box. Give only ONE of the two and the other still follows the material. Empty space around the subject is transparent (use \`bgOpacity:0\` to drop the visible background box entirely).
 - \`showDot\`: boolean, default **false**. The small status dot in the bottom-right corner; it overlaps the pet artwork, so it is off unless you want it.
 - \`cornerRadius\`: dp, 0–80 (only meaningful for "rounded")
@@ -931,7 +931,7 @@ function bubbleTool(home) {
 				shape: { type: 'string', enum: ['circle', 'square', 'rounded', 'path'] },
 				shapePath: { type: 'string', description: 'SVG path "d" for shape:"path" — any outline you like, in shapeViewBox units. Max 4000 chars.' },
 				shapeViewBox: { type: 'string', description: '"minX minY width height" for shapePath, default "0 0 100 100".' },
-				size: { type: 'number', description: 'Ball diameter in dp, 24–160. When the canvas is auto-sized, this is its LONG edge.' },
+				size: { type: 'number', description: 'Ball diameter in dp, 24–320. When the canvas is auto-sized, this is its LONG edge.' },
 				boxWidth: { type: 'number', description: 'Canvas width in dp, 16–400. 0 (default) = auto: fit to the current subject material, long edge = size. Give only one of boxWidth/boxHeight and the other still follows the material.' },
 				boxHeight: { type: 'number', description: 'Canvas height in dp, 16–400. 0 (default) = auto. See boxWidth.' },
 				showDot: { type: 'boolean', description: 'Show the small status dot at the bottom-right. Default false (hidden) — it sits on top of the pet artwork.' },
