@@ -102,11 +102,30 @@
     -->
     <FrameLayout
         android:id="@+id/bubbleEdge"
-        android:layout_width="6dp"
+        android:layout_width="28dp"
         android:layout_height="44dp"
         android:background="@drawable/bubble_edge_bg"
         android:elevation="8dp"
         android:visibility="gone">
+
+        <!--
+          贴边态的图片层（默认是「探头」形象，见 drawable-*/bubble_edge_default.png）。
+
+          ⚠️ 必须 `fitCenter` 而不是 `fitXY`：探头形象是竖长条，而可见框的
+             长宽比由用户/插件配的 edgeWidth × edgeHeight 决定，拉伸会把人物压扁。
+             留白处是透明的，看起来就是"从边里探出头"。
+
+          ⚠️ 用 `adjustViewBounds` + 不设固定尺寸不够：这里必须**严格填满**
+             父容器（`match_parent`），因为父容器尺寸就是"可点击区域"——
+             图片比框小的话，用户点到透明留白处仍应能唤出球。
+        -->
+        <ImageView
+            android:id="@+id/edgeImage"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter"
+            android:contentDescription="@null"
+            android:importantForAccessibility="no" />
 
         <View
             android:id="@+id/edgeDot"

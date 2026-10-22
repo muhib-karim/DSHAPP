@@ -26,6 +26,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
+import java.io.File
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -482,6 +483,16 @@ class FloatingBubble(private val context: Context) {
                     next.copy(avatar = BubbleAppearance.load(ctx).avatar)
                 }
             }
+            // 贴边图与头像**完全同构**：base64 落盘，内存里换成文件标记。
+            // ⚠️ 不换标记的话，`usesEdgeImage()` 会认成"未知来源 ⇒ 用内置图"，
+            //   表现为「AI 换了贴边图但没反应」，要等重启 `load()` 才生效。
+            if (merged.edgeImage.startsWith("data:image/")) {
+                merged = if (BubbleAppearance.writeEdgeImage(ctx, merged.edgeImage) != null) {
+                    merged.copy(edgeImage = BubbleAppearance.EDGE_IMAGE_FILE)
+                } else {
+                    next.copy(edgeImage = BubbleAppearance.load(ctx).edgeImage)
+                }
+            }
             // 状态配图同理，只是它是一张二维表：逐档逐张过一遍 [BubbleStatusImages.ensure]。
             //
             // ⚠️ **`ensure` 而不是 `write`**：表里可能混着两种东西 —— 这次新传的
@@ -925,6 +936,18 @@ class FloatingBubble(private val context: Context) {
 
     /** 贴边态薄片与它上面的小点。 */
     private var edgeView: View? = null
+
+    /**
+     * 贴边态的图片层。
+     *
+     * ⚠️ 与 [edgeView] 分开持有：贴边态现在**可配图片**（默认是探头形象），
+     *   而 `edgeView` 的背景是纯色薄片（`edgeImage == "none"` 时才用它）。
+     *   两者叠在同一个 FrameLayout 里，靠 visibility 切换。
+     */
+    private var edgeImageView: ImageView? = null
+
+    /** [applyEdgeImage] 的去重指纹（来源 + 尺寸）。没变就不重设图片。 */
+    private var edgeImageKey: String = ""
     private var edgeDot: View? = null
 
     /**
@@ -1523,6 +1546,7 @@ class FloatingBubble(private val context: Context) {
         panelSend = view.findViewById(R.id.panelSend)
         edgeView = view.findViewById(R.id.bubbleEdge)
         edgeDot = view.findViewById(R.id.edgeDot)
+        edgeImageView = view.findViewById(R.id.edgeImage)
 
         paintDot(dotView, running = false)
         paintDot(panelDot, running = false, small = true)
@@ -1739,16 +1763,23 @@ class FloatingBubble(private val context: Context) {
         // ── 内容层：内置头像 / 自定义图片 / 动作帧集 / 精灵图 ───────────
         applyActionLayer(boxReq())
 
-        // ── 贴边薄片：高度跟随球，宽度固定 ─────────────────────────────
+        // ── 贴边薄片：尺寸与图片都由外观决定 ───────────────────────────
+        //
+        // ⚠️ 原实现宽度写死 `EDGE_WIDTH_DP = 6`，真机反馈「太小了，点不到」——
+        //   6dp × 44dp 在 3x 屏上只有 18×132 像素。现在宽度走 `edgeWidth`
+        //   （默认 28dp），并且可以显示图片。
         edgeView?.let { e ->
+            val edgeW = dp(edgeWidthDp())
+            val edgeH = if (appearance.edgeHeight > 0) dp(appearance.edgeHeight) else boxH
             (e.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.width = dp(EDGE_WIDTH_DP)
-                lp.height = boxH
+                lp.width = edgeW
+                lp.height = edgeH
                 e.layoutParams = lp
             }
             e.background = edgeBackground()
             e.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
         }
+        applyEdgeImage()
 
         // ── 整体不透明度（与两个分层透明度相乘）─────────────────────────
         root?.alpha = appearance.opacity.coerceIn(0.05f, 1f)
@@ -2791,6 +2822,75 @@ class FloatingBubble(private val context: Context) {
     }
 
     /** 贴边薄片的底：窄圆角条，颜色跟随球的底色。 */
+    /**
+     * 贴边态当前应使用的宽度（dp）。
+     *
+     * 显示图片时用配置值；`edgeImage == "none"`（纯色薄片）时退回老的
+     * [EDGE_WIDTH_DP]，因为那是"一条缝"的语义，与"能点到的探头"不是一回事。
+     */
+    private fun edgeWidthDp(): Int = if (usesEdgeImage()) {
+        appearance.edgeWidth.coerceIn(
+            BubbleAppearance.MIN_EDGE_WIDTH,
+            BubbleAppearance.MAX_EDGE_WIDTH,
+        )
+    } else {
+        EDGE_WIDTH_DP
+    }
+
+    /** 贴边态当前是否要显示图片（而非纯色薄片）。 */
+    private fun usesEdgeImage(): Boolean = when (appearance.edgeImage) {
+        BubbleAppearance.EDGE_IMAGE_NONE -> false
+        BubbleAppearance.EDGE_IMAGE_FILE -> File(
+            context.filesDir,
+            BubbleAppearance.EDGE_IMAGE_FILE,
+        ).let { it.isFile && it.length() > 0L }
+        else -> true   // "default" 或 data URI
+    }
+
+    /**
+     * 把贴边图铺到 [edgeImageView] 上。
+     *
+     * 三种来源：内置 drawable（默认）、落盘的自定义图、内联 data URI。
+     * 纯色薄片模式下清空图片并让 `edgeView` 的背景露出来。
+     *
+     * ⚠️ 每帧都调用 `setImageBitmap` 会很浪费（`applyAppearanceToViews` 在状态
+     *   刷新时也会跑），所以**按来源指纹去重**：指纹没变就直接返回。
+     */
+    private fun applyEdgeImage() {
+        val iv = edgeImageView ?: return
+        val src = appearance.edgeImage
+        val fingerprint = "$src|${edgeWidthDp()}|${appearance.edgeHeight}"
+        if (fingerprint == edgeImageKey && iv.drawable != null) {
+            iv.alpha = appearance.edgeOpacity.coerceIn(0f, 1f)
+            return
+        }
+        edgeImageKey = fingerprint
+
+        if (!usesEdgeImage()) {
+            iv.setImageDrawable(null)
+            iv.visibility = View.GONE
+            return
+        }
+        iv.visibility = View.VISIBLE
+        iv.alpha = appearance.edgeOpacity.coerceIn(0f, 1f)
+
+        // ⚠️ 只认落盘文件与内置两种来源。内联 data URI **在 merge 阶段就已经被
+        //   [BubbleAppearance.writeEdgeImage] 换成文件标记了**（见那里的注释），
+        //   所以这里不需要再解码 —— 与 [appearance.avatar] 的处理完全一致。
+        //   万一真拿到 data URI（解析场景没落盘），退回内置图即可，不影响可用性。
+        if (src == BubbleAppearance.EDGE_IMAGE_FILE) {
+            val bmp = BubbleAppearance.readEdgeImage(context, dp(edgeWidthDp()))
+            if (bmp != null) {
+                iv.setImageBitmap(bmp)
+            } else {
+                // 文件没了（用户清数据）⇒ 退回内置，不留空白
+                iv.setImageResource(R.drawable.bubble_edge_default)
+            }
+        } else {
+            iv.setImageResource(R.drawable.bubble_edge_default)
+        }
+    }
+
     private fun edgeBackground(): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
         cornerRadius = dp(3).toFloat()
@@ -3895,7 +3995,7 @@ class FloatingBubble(private val context: Context) {
      * 后者是原有的吸附行为，球仍然完整可见。
      *
      * ⚠️ 位置必须**贴住屏幕边**（x = 0 或 screenW - edgeW），不能沿用球的坐标：
-     *   薄片只有 6dp 宽，沿用球的 x 会让它浮在半空中。
+     *   贴边态比球窄，沿用球的 x 会让它浮在半空中。
      */
     private fun enterEdge(side: Int) {
         val dm = context.resources.displayMetrics
@@ -3912,19 +4012,28 @@ class FloatingBubble(private val context: Context) {
         circleView?.visibility = View.GONE
         edgeView?.visibility = View.VISIBLE
 
-        val edgeW = dp(EDGE_WIDTH_DP)
+        val edgeW = dp(edgeWidthDp())
+        val edgeH = if (appearance.edgeHeight > 0) dp(appearance.edgeHeight) else boxH()
         val x = if (side < 0) 0 else (dm.widthPixels - edgeW)
-        val (nx, ny) = clampInto(x, curY, edgeW, boxH())
+        // 竖直位置：`edgeAnchor` 给了固定值就用它（探头每次都在同一高度），
+        // 否则沿用球被拖出去时的 y —— 用户把球拖到哪，它就贴在哪。
+        val y = if (appearance.edgeAnchor >= 0f) {
+            val usable = (dm.heightPixels - edgeH).coerceAtLeast(0)
+            (usable * appearance.edgeAnchor.coerceIn(0f, 1f)).roundToInt()
+        } else {
+            curY
+        }
+        val (nx, ny) = clampInto(x, y, edgeW, edgeH)
         moveTo(nx, ny)
         prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
-        Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny")
+        Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny w=${edgeWidthDp()}dp h=${edgeH}px")
     }
 
     /**
      * 退出贴边态，弹回完整球。
      *
-     * ⚠️ 位置按 [edgeSide] 算，不是按薄片当前坐标 —— 薄片只有 6dp，它贴左边时
-     *   中心在屏幕最左，直接用它的 x 会让球有一半在屏幕外。
+     * ⚠️ 位置按 [edgeSide] 算，不是按贴边态当前坐标 —— 贴边态贴左边时它的中心
+     *   就在屏幕最左，直接用它的 x 会让球有一半在屏幕外。
      */
     private fun exitEdge() {
         if (!edgeCollapsed) return
