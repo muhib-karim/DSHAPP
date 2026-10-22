@@ -7289,7 +7289,7 @@ window.__ModuleLoader__.load({
 				React.createElement("div", { style: S.ctlRow, key: "size" },
 					React.createElement("span", { style: S.ctlLabel }, t("fSize")),
 					React.createElement("input", {
-						type: "range", min: 24, max: 160, step: 2,
+						type: "range", min: 24, max: 320, step: 2,
 						key: "size:" + ap.size,
 						defaultValue: ap.size, style: S.slider,
 						"aria-label": t("fSize"),

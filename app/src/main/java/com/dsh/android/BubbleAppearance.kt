@@ -711,12 +711,49 @@ data class BubbleAppearance(
             val rawH = if (appearance.boxHeight > 0) appearance.boxHeight else 0
             // 两个都没配 → 完全走自动。
             if (rawW == 0 && rawH == 0) return auto
-            // 只配了一个 → 另一个沿用**自动**那一轴（而不是 size），于是
-            // 「只改宽」不用把高也写一遍，且高会跟着素材比例走。
-            val w = if (rawW > 0) rawW else (auto.first / dm.density).roundToInt()
-            val h = if (rawH > 0) rawH else (auto.second / dm.density).roundToInt()
-            return (w * dm.density).roundToInt().coerceAtLeast(1) to
-                (h * dm.density).roundToInt().coerceAtLeast(1)
+
+            // ⚠️ **`boxWidth`/`boxHeight` 是「相对 `size` 的比例基准」，不是绝对值。**
+            //
+            //   原实现直接用它们当最终 dp，于是只要两个都配了，`size` 就被彻底
+            //   架空 —— 真机反馈「调节直径没反应」。桌宠预设正是这种情形
+            //   （`size:160, boxWidth:160, boxHeight:142`）。
+            //
+            //   现在的语义：
+            //     `size` = 画布的**长边**，`boxWidth`/`boxHeight` 只表达**长宽比**。
+            //   于是拖直径滑块能整体缩放，而画布形状保持不变。
+            //
+            //   举例（长宽比 160:142）：
+            //     size=160 → 160 x 142
+            //     size=320 → 320 x 284
+            //   这正是用户对「直径」的直觉。
+            //
+            //   ⚠️ 素材本身是正方形（没配 boxWidth/boxHeight）时仍走 [autoBox]，
+            //     行为与以前完全一致，不影响存量配置。
+            val longDp = appearance.size
+            val boxLong = maxOf(rawW, rawH)
+            if (boxLong <= 0) return auto
+
+            // 按「配的那个当长边」求比例，缺的那一轴由比例推出。
+            val wDp: Int
+            val hDp: Int
+            if (rawW > 0 && rawH > 0) {
+                // 两个都给：等比缩放到长边 = size。
+                val k = longDp.toFloat() / boxLong
+                wDp = (rawW * k).roundToInt()
+                hDp = (rawH * k).roundToInt()
+            } else if (rawW > 0) {
+                // 只给宽：宽就是 size，高按素材比例。
+                val ratio = if (auto.first > 0) auto.second.toFloat() / auto.first else 1f
+                wDp = longDp
+                hDp = (wDp * ratio).roundToInt()
+            } else {
+                // 只给高：高就是 size，宽按素材比例。
+                val ratio = if (auto.second > 0) auto.first.toFloat() / auto.second else 1f
+                hDp = longDp
+                wDp = (hDp * ratio).roundToInt()
+            }
+            return (wDp * dm.density).roundToInt().coerceAtLeast(1) to
+                (hDp * dm.density).roundToInt().coerceAtLeast(1)
         }
 
         /** 整个配置对象的 key。 */
