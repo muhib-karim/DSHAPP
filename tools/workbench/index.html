@@ -132,15 +132,31 @@
     <div class="step-h">
       <div class="step-n">1</div>
       <div class="step-t">导入素材</div>
-      <div class="step-d">PNG 序列 / GIF / 单张图</div>
+      <div class="step-d">视频 / GIF / 图片，都行</div>
     </div>
     <div class="step-b">
       <div class="drop" id="drop">
-        <div class="big">把图片拖进来，或点击选择</div>
+        <div class="big">把视频拖进来，或点击选择</div>
         <div class="sm">
-          多张 PNG 请一起选中（按文件名数字顺序排列）· GIF 会自动拆成帧
+          支持 mp4 / mov / webm / gif / png 序列 ——
+          <b>有背景也行，会自动抠掉</b>
         </div>
-        <input type="file" id="file" multiple accept="image/*" hidden>
+        <input type="file" id="file" multiple accept="video/*,image/*" hidden>
+      </div>
+
+      <div class="row mt">
+        <div class="field" style="min-width:200px">
+          <label style="display:flex;gap:7px;align-items:center;color:var(--text);font-size:13px">
+            <input type="checkbox" id="autoBg" checked style="width:auto">
+            自动抠掉纯色背景
+          </label>
+        </div>
+        <div class="field" style="min-width:200px">
+          <label style="display:flex;gap:7px;align-items:center;color:var(--text);font-size:13px">
+            <input type="checkbox" id="autoCrop" checked style="width:auto">
+            自动裁掉透明空白
+          </label>
+        </div>
       </div>
       <div class="msg" id="msg1"></div>
       <div class="preview" id="pv1" style="display:none">
@@ -407,14 +423,21 @@ const MiniZip = (() => {
   async function handleFiles(files) {
     if (!files || files.length === 0) return;
     hideMsg($('msg1'));
+    $('pv1').style.display = 'none';
+    $('stats1').style.display = 'none';
 
-    const r = await PetEngine.importFiles(files);
+    // 视频导入可能较慢（逐帧 seek），先给个反馈
+    const isVideo = Array.from(files).some(f => /^video\//.test(f.type));
+    if (isVideo) showMsg($('msg1'), 'ok', '正在读视频并逐帧提取…');
+
+    const r = await PetEngine.importFiles(files, {
+      autoBg: $('autoBg').checked,
+    });
     if (!r.ok) {
       showMsg($('msg1'), 'bad', r.message);
       return;
     }
 
-    // 计算并集包围盒
     const box = PetEngine.computeBBox(8);
     const info = PetEngine.info();
 
@@ -433,11 +456,21 @@ const MiniZip = (() => {
     c2.width = bw; c2.height = bh;
     PetEngine.drawFrame(c2.getContext('2d'), 0, { crop: true, outW: bw, outH: bh });
 
+    const bgLabel = info.bgRemoved
+      ? `已抠掉 rgb(${info.detectedBg.join(',')})`
+      : (info.sourceKind === 'video' ? '无需抠图' : '背景已透明');
+
     $('stats1').innerHTML = `
+      <div class="stat"><span class="k">来源</span><span class="v">${
+        { video: '视频', gif: 'GIF', images: '图片' }[info.sourceKind] || '—'
+      }</span></div>
       <div class="stat"><span class="k">帧数</span><span class="v">${info.frameCount}</span></div>
       <div class="stat"><span class="k">原始</span><span class="v">${info.width}×${info.height}</span></div>
       <div class="stat"><span class="k">裁剪后</span><span class="v">${bw}×${bh}</span></div>
       <div class="stat"><span class="k">空白减少</span><span class="v">${(100 - bw * bh / (info.width * info.height) * 100).toFixed(0)}%</span></div>
+      <div class="stat"><span class="k">背景</span><span class="v" style="color:${
+        info.bgRemoved ? 'var(--ok)' : 'var(--dim)'
+      }">${bgLabel}</span></div>
     `;
 
     // 输出宽度默认值：跟随裁剪后宽度（上限 640）
@@ -453,7 +486,10 @@ const MiniZip = (() => {
     if (info.warnings.length) {
       showMsg($('msg1'), 'warn', info.warnings.join('；'));
     } else {
-      showMsg($('msg1'), 'ok', r.message);
+      const extra = info.bgRemoved
+        ? `，已自动抠掉 rgb(${info.detectedBg.join(',')}) 背景`
+        : '';
+      showMsg($('msg1'), 'ok', r.message + extra);
     }
 
     $('btnExport').disabled = false;
