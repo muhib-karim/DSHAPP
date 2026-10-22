@@ -2880,9 +2880,18 @@ class FloatingBubble(private val context: Context) {
     private fun applyEdgeImage() {
         val iv = edgeImageView ?: return
         val src = appearance.edgeImage
-        val fingerprint = "$src|${edgeWidthDp()}|${appearance.edgeHeight}"
+        // ⚠️ **指纹里必须带 `edgeSide`。**
+        //
+        //   内置探头形象是「从右边探出头」画的（人物靠右、留白在左）。贴到
+        //   屏幕左边时必须水平镜像，否则人物背对屏幕边缘 —— 真机反馈为
+        //   「只能适配右边，贴左边很怪异」。
+        //
+        //   不把方向放进指纹的话，从右边换到左边时指纹没变，会直接 return，
+        //   镜像永远不会重算。
+        val fingerprint = "$src|${edgeWidthDp()}|${appearance.edgeHeight}|$edgeSide"
         if (fingerprint == edgeImageKey && iv.drawable != null) {
             iv.alpha = appearance.edgeOpacity.coerceIn(0f, 1f)
+            iv.scaleX = if (edgeSide < 0) -1f else 1f
             return
         }
         edgeImageKey = fingerprint
@@ -2910,6 +2919,12 @@ class FloatingBubble(private val context: Context) {
         } else {
             iv.setImageResource(R.drawable.bubble_edge_default)
         }
+        // 镜像：贴左边时水平翻转，让「探头」朝向屏幕内侧。
+        //
+        // ⚠️ 用 `scaleX = -1` 而不是把 bitmap 翻转一份：后者每次切边都要重新
+        //   解码一张图（`edgeWidthDp()` 变了还要重采样），而 scaleX 是渲染层
+        //   的一次变换，零分配。`pivotX` 默认是 view 中心，镜像后位置不变。
+        iv.scaleX = if (edgeSide < 0) -1f else 1f
     }
 
     private fun edgeBackground(): GradientDrawable = GradientDrawable().apply {
@@ -4046,6 +4061,13 @@ class FloatingBubble(private val context: Context) {
         }
         val (nx, ny) = clampInto(x, y, edgeW, edgeH)
         moveTo(nx, ny)
+        // ⚠️ **必须重新应用一次贴边图。**
+        //
+        //   [applyEdgeImage] 只在 `applyAppearanceToViews` 里被调用，而进贴边态
+        //   不走那条路。从右边换到左边时方向变了，不重算就会沿用上一次的镜像
+        //   （表现为「贴哪边都朝同一个方向」）。
+        //   指纹里带了 `edgeSide`，所以这里重复调用是廉价的：方向没变直接 return。
+        applyEdgeImage()
         prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
         Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny w=${edgeWidthDp()}dp h=${edgeH}px")
     }
