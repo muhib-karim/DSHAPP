@@ -106,6 +106,9 @@ def tap(n):
 
 def main():
     print("abilist:", adb("shell", "getprop", "ro.product.cpu.abilist").strip(), flush=True)
+    # The CI emulator is slow enough that the background Pixel Launcher keeps hitting ANR; its dialog takes input
+    # focus and swallows typed text (run 39958069915). Background ANRs need no dialog here.
+    adb("shell", "settings", "put", "global", "anr_show_background", "0")
     adb("install", "-r", "-g", APK, check=True, timeout=600)
     adb("shell", "pm", "grant", PKG, "android.permission.POST_NOTIFICATIONS")
     adb("logcat", "-c")
@@ -196,6 +199,7 @@ def sign_in_screens():
         tap(field)
         wait_for_ime()
         for attempt in range(3):
+            ensure_app_focus()
             adb("shell", "input", "text", KEY)
             time.sleep(2)
             root = back_to_app(screen("api-key-typed"))
@@ -244,6 +248,19 @@ def wait_for_ime(timeout=12):
             return True
         time.sleep(1)
     print("keyboard not reported as shown; typing anyway", flush=True)
+    return False
+
+
+def ensure_app_focus(timeout=20):
+    """Until the app's window has input focus (a system dialog in front takes the typed keys)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        focus = [l for l in adb("shell", "dumpsys", "window").splitlines() if "mCurrentFocus" in l]
+        if focus and PKG in focus[0]:
+            return True
+        print("input focus:", (focus[0].strip() if focus else "?")[:160], flush=True)
+        screen("focus")   # dismisses ANR / background-run dialogs
+        time.sleep(2)
     return False
 
 
