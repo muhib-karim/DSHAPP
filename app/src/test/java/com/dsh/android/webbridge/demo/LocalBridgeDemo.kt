@@ -5,10 +5,14 @@ import com.dsh.android.webbridge.WebChat
 import com.dsh.android.webbridge.WebDelta
 import java.io.File
 
-/** Not a test: a local harness (uncommitted) that serves the real bridge with a scripted web chat. */
+/**
+ * Not a test: serves the real [BridgeServer] on 127.0.0.1:3397 (secret `demo-secret-0123456789`) with a scripted web
+ * chat, so a desktop dsh can be pointed at it (`llm-pi-ai` route `deepseek-web`) to check that dsh accepts the bridge's
+ * streaming, reasoning_content and tool_calls. Run with the unit-test classpath; argument: a file to append prompts to.
+ */
 object LocalBridgeDemo {
     @JvmStatic fun main(args: Array<String>) {
-        val log = File(args.getOrElse(0) { "/tmp/bridge-prompts.log" })
+        val log = File(requireNotNull(args.firstOrNull()) { "usage: LocalBridgeDemo <prompt log file>" })
         val chat = object : WebChat {
             override fun complete(prompt: String, thinking: Boolean, search: Boolean, cancelled: () -> Boolean, onDelta: (WebDelta) -> Unit) {
                 log.appendText("=== PROMPT (${prompt.length} chars) thinking=$thinking\n$prompt\n")
