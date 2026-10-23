@@ -1,6 +1,9 @@
 package com.dsh.android
 
 import android.content.Context
+import com.dsh.android.account.AccountConfig
+import com.dsh.android.account.AccountStore
+import com.dsh.android.account.DshCredentials
 import com.dsh.android.log.DshLog as Log
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
@@ -44,6 +47,9 @@ import java.util.concurrent.TimeUnit
  * 而 `$PREFIX/bin/node` 正落在私有目录里。详见 app/build.gradle.kts 的注释。
  */
 class EngineManager private constructor(private val context: Context) {
+    /** v1.3.0: starts the web-account bridge if needed and returns its port (null: not running). Set by WebAccount. */
+    @Volatile var webBridgePort: (() -> Int?)? = null
+
 
     sealed interface State {
         data object Idle : State
@@ -3355,6 +3361,32 @@ class EngineManager private constructor(private val context: Context) {
      * 判据与 [ensureKeyPoolProvider] 一致：**只补缺，不覆盖**。行已存在就一个字节
      * 都不动 —— 那意味着用户在设置页里选过模型，属于用户意图。
      */
+    /**
+     * v1.3.0: writes what the first screen's sign-in means into the profile patch (see [AccountConfig]); for the web
+     * account also the bridge secret into `.credentials.yaml`. Runs before every launch: the bridge port is per process.
+     */
+    private fun ensureAccountConfig(profile: String, hasKeyPool: Boolean) {
+        val store = AccountStore(context)
+        val mode = store.mode
+        val port = if (mode == AccountConfig.Mode.WEB) webBridgePort?.invoke() else null
+        try {
+            if (port != null) DshCredentials.write(dshHome, mapOf(DshCredentials.WEB_BRIDGE_KEY to store.bridgeSecret()))
+            else if (DshCredentials.read(dshHome, DshCredentials.WEB_BRIDGE_KEY) != null) {
+                DshCredentials.write(dshHome, mapOf(DshCredentials.WEB_BRIDGE_KEY to null))
+            }
+            val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
+            val existing = if (patch.isFile) patch.readText() else ""
+            val updated = AccountConfig.render(existing, mode, port, hasKeyPool)
+            if (updated != existing) {
+                patch.parentFile?.mkdirs()
+                patch.writeText(updated)
+                Log.i(TAG, "account config ($profile): mode=$mode bridge=${port != null}")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "account config ($profile) failed: ${t.message}")
+        }
+    }
+
     private fun ensureDefaultModel(profile: String = PROFILE_NAME) {
         val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
@@ -6783,6 +6815,8 @@ class EngineManager private constructor(private val context: Context) {
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
+        // v1.3.0: the sign-in chosen on the first screen (API key / web account / none) → provider + default model.
+        ensureAccountConfig(PROFILE_NAME, keyInject != null)
 
         // ⚠️ **救援 profile 也必须拿到同一套用户层配置**，否则救援界面是残废的：
         //   没有默认模型 ⇒ AI 一开口就路由失败；没有号池 ⇒ 用户得自己配 key；
@@ -6800,6 +6834,7 @@ class EngineManager private constructor(private val context: Context) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
             ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
+            ensureAccountConfig(RESCUE_PROFILE_NAME, keyInject != null)
         }
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
