@@ -190,28 +190,32 @@ def sign_in_screens():
     field = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
     key_ok = False
     if field is not None:
-        typed = False
+        # Run 39953357675 typed before the keyboard was up (nothing arrived); run 39955835370 re-tapped the field's old
+        # bounds after the keyboard had moved the layout and hit "Get a key", which opened Chrome. So: tap once, wait for
+        # the keyboard, type, and re-tap only with bounds from a fresh dump while the app is in front.
+        tap(field)
+        wait_for_ime()
         for attempt in range(3):
-            tap(field)
-            time.sleep(2 + attempt)   # the keyboard has to be up before "input text" reaches the field
             adb("shell", "input", "text", KEY)
-            time.sleep(1)
-            root = screen("api-key-typed")
-            field = key_field(root) or field
-            typed = KEY in (field.get("text") or "")
+            time.sleep(2)
+            root = back_to_app(screen("api-key-typed"))
+            field = key_field(root)
+            typed = field is not None and (field.get("text") or "").strip() not in ("", "DeepSeek API key")
             print("key typed:", typed, flush=True)
-            if typed:
+            if typed or field is None:
                 break
+            tap(field)
+            wait_for_ime()
         adb("shell", "input", "keyevent", "66")   # IME "Done" submits
         deadline = time.time() + 75   # DNS failure plus the check's 15 s connect and read timeouts on a slow emulator
         tapped_continue = False
         while time.time() < deadline and not key_ok:
             time.sleep(3)
-            root = screen("api-key-error")
+            root = back_to_app(screen("api-key-error"))
             key_ok = find(root, KEY_ERROR) is not None
             button = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnKeyContinue")), None)
             if not key_ok and not tapped_continue and button is not None and time.time() > deadline - 65:
-                tap(button)   # the IME action did not submit: press Continue
+                tap(button)   # the IME action did not submit: press Continue (fresh bounds, app in front)
                 tapped_continue = True
         shot("03-api-key-error")
     print("API-key screen error shown:", key_ok, flush=True)
@@ -228,6 +232,32 @@ def sign_in_screens():
         time.sleep(2)
         root = screen("first-again")
     return first_ok, key_ok
+
+
+def wait_for_ime(timeout=12):
+    """Until the soft keyboard is shown (input text sent earlier is lost)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        dump = adb("shell", "dumpsys", "input_method")
+        if any(flag in dump for flag in ("mInputShown=true", "mIsInputViewShown=true", "isInputViewShown=true")):
+            time.sleep(1)
+            return True
+        time.sleep(1)
+    print("keyboard not reported as shown; typing anyway", flush=True)
+    return False
+
+
+def back_to_app(root):
+    """If something else came to the front (a browser, a system screen), press Back until the app is there again."""
+    for _ in range(3):
+        packages = {n.get("package") for n in nodes(root)}
+        if PKG in packages or not packages:
+            return root
+        print("not in the app (", ", ".join(sorted(p for p in packages if p)), "); Back", flush=True)
+        adb("shell", "input", "keyevent", "4")
+        time.sleep(2)
+        root = screen("back-to-app")
+    return root
 
 
 def key_field(root):
