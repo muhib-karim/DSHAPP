@@ -181,7 +181,7 @@ android {
         // 0.3.4 = upstream 0.3.3 (versionCode 29) as published by the muhib-karim fork; no feature changes.
         // 1.3.0 (versionCode 31), fork: two sign-ins (DeepSeek web account through a local bridge, or an API key),
         //      opaque UI without wallpapers, Settings > Plugins with a live "/" palette, in-app harness and app updates.
-        //      Stamps bumped with it: MOBILE_UI_VERSION 1.0.0-102, compat 36, preset skills 1.0.0-2, gecko bridge 1.0.15.
+        //      Stamps bumped with it: MOBILE_UI_VERSION 1.0.0-103, compat 37, preset skills 1.0.0-2, gecko bridge 1.0.15.
         versionName = "1.3.0"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构

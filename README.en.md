@@ -47,9 +47,10 @@ menu right away, without a restart.
 
 **Updates in the app.** **Settings > About & updates** (and a daily check on launch) offers a one-tap update of the
 DSH harness from npm, installed with the bundled pnpm. The previous harness is kept, and if the new one does not
-start, the app switches back by itself. The app itself updates from this repository's GitHub releases (checksum
-verified, and the archive's package name and signing certificate are checked against the installed app before the
-installer opens, so a wrong download is refused and can be retried).
+start, the app switches back by itself. Once a new harness has started, **Restore previous version** in the same
+section goes back to the one before it (after a confirmation and a restart). The app itself updates from this
+repository's GitHub releases (checksum verified, and the archive's package name and signing certificate are checked
+against the installed app before the installer opens, so a wrong download is refused and can be retried).
 
 | Plugins | Account | About & updates |
 |---|---|---|

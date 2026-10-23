@@ -13,7 +13,7 @@
 | Opaque UI | `mobile-ui-plugin/dsh-android-mobile/lib/client.js` (`CLEAN_CSS`, `mpApplyOpaqueTokens`, `mpHideWallpaperLayers`), `MainActivity.cutoutTopPx` / `observeFullscreenBottomInset` | `tools/tests/mobile-clean.test.mjs`, `mobile-clean.browser.mjs`, fixture `tools/tests/fixtures/dsh-test-glass-theme` |
 | Settings > Account / Plugins / About & updates | `client.js` (`mpAccountSection`, `mpPluginsSection`, `mpAboutSection`); native side `AppState.kt` through `PageBridge.appState()` / `appAction(name, arg)` | `tools/tests/plugin-list.test.mjs` |
 | Live "/" palette | `mobile-ui-plugin/dsh-android-mobile/lib/skill-refresh.js` (re-emits `plugin-manager/changed`) | `tools/tests/skill-refresh.test.mjs` |
-| Updates | `update/Versions.kt`, `EngineSlots.kt`, `HarnessUpdater.kt`, `AppUpdater.kt`, `UpdateCenter.kt`; `EngineManager` hooks `rollBackPendingHarness` / `pendingHarnessReady` / `activateHarnessUpdate` / `runWithEngineEnv` | `VersionsTest`, `EngineSlotsTest`, `HarnessUpdaterTest`, `AppUpdaterTest`, `HarnessActivationTest`, `EngineLifecycleTest`, `UpdateActionsTest` |
+| Updates | `update/Versions.kt`, `EngineSlots.kt`, `HarnessUpdater.kt`, `AppUpdater.kt`, `UpdateCenter.kt`; `EngineManager` hooks `rollBackPendingHarness` / `pendingHarnessReady` / `activateHarnessUpdate` / `activatePreviousHarness` / `runWithEngineEnv` | `VersionsTest`, `EngineSlotsTest`, `HarnessUpdaterTest`, `AppUpdaterTest`, `HarnessActivationTest`, `EngineLifecycleTest`, `UpdateActionsTest` |
 
 ## Rules that are easy to break
 
@@ -31,6 +31,9 @@
    Ready; a start failure while pending rolls back **before** `RescueBoot.recordFailure` (so the rescue ladder does not
    count it) and the version goes to `engine.bad`. Slot transactions recover before extraction; lifecycle serialization
    keeps extraction/startup and stop/promote/recovery from overlapping, and candidate processes are reaped before file moves.
+   A manual **Restore previous version** (About & updates) goes through the same `slots.rollback()` and is refused while
+   `engine.next` exists, a harness is pending or a journal is present, so it cannot race an install or a recovery; the
+   rejected version is marked bad exactly like an automatic rollback.
 7. **Changing `client.js` or `skill-refresh.js` → bump `MOBILE_UI_VERSION` and `-CompatVersion`** (see
    [asset-stamps.md](asset-stamps.md)); CI packs the zip from source.
 

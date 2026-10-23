@@ -329,6 +329,9 @@ interface PageBridge {
      */
     fun appState(): String
 
-    /** v1.3.0 settings actions: `accountSwitch`, `accountSignOut`, `engineRestart`, `updateCheck`, `updateHarness`, `updateApp`. */
+    /**
+     * v1.3.0 settings actions: `accountSwitch`, `accountSignOut`, `engineRestart`, `updateCheck`, `updateHarness`,
+     * `updateApp`, `harnessRollback` (arg = the previous version shown in About).
+     */
     fun appAction(name: String, arg: String)
 }

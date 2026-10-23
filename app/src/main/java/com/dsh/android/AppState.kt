@@ -44,10 +44,31 @@ object AppState {
             "updateCheck" -> UpdateCenter.check(activity)
             "updateHarness" -> UpdateCenter.updateHarness(activity)
             "updateApp" -> UpdateCenter.updateApp(activity)
+            "harnessRollback" -> restorePreviousHarness(activity, arg)
             // Settings > Plugins: a plugin change that dsh can only apply on restart.
             "engineRestart" -> Thread({ EngineManager.get(activity).requestRestart("plugins changed") }, "engine-restart").start()
             else -> DshLog.w(DshApplication.TAG, "unknown settings action: $name")
         }
+    }
+
+    /**
+     * Settings > About & updates: swap `engine.prev` back in on a worker thread. The page can only name a version
+     * (`0.2.1-rc.2`); [EngineManager.activatePreviousHarness] re-checks it against the slot and refuses while an update
+     * is pending or installing. Only the validated version is logged.
+     */
+    private fun restorePreviousHarness(activity: Activity, arg: String) {
+        val expected = arg.trim()
+        if (!expected.matches(Regex("[0-9A-Za-z][0-9A-Za-z._+-]{0,63}"))) {
+            DshLog.w(DshApplication.TAG, "harness restore: invalid version")
+            return
+        }
+        val app = activity.applicationContext
+        Thread({
+            val restored = runCatching { EngineManager.get(app).activatePreviousHarness(expected) }
+                .onFailure { DshLog.w(DshApplication.TAG, "harness restore $expected failed: ${it.message}") }
+                .getOrDefault(false)
+            DshLog.i(DshApplication.TAG, if (restored) "harness restored to $expected" else "harness restore $expected not applied")
+        }, "harness-restore").start()
     }
 
     /**

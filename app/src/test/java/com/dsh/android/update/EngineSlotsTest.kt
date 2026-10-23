@@ -165,6 +165,58 @@ class EngineSlotsTest {
         assertEquals("0.2.3", slots.pending())
     }
 
+    @Test fun previousVersionIsOfferedOnlyAfterTheCandidateBooted() {
+        val slots = EngineSlots(tmp.root)
+        harness(slots.engine, "0.2.2")
+        harness(slots.next, "0.2.3")
+        assertTrue(slots.promote())
+        assertNull("an unbooted candidate owns the rollback window", slots.previousVersion())
+        assertNull(slots.rollbackCandidate())
+        slots.confirm()
+        assertEquals("0.2.2", slots.previousVersion())
+        assertEquals(slots.prev, slots.rollbackCandidate())
+    }
+
+    @Test fun rollbackCandidateNeverRacesAnInstallOrARecovery() {
+        val slots = EngineSlots(tmp.root)
+        harness(slots.engine, "0.2.2")
+        harness(slots.next, "0.2.3")
+        slots.promote()
+        slots.confirm()
+        harness(slots.next, "0.2.4")
+        assertNull("a queued candidate blocks the offer", slots.previousVersion())
+        slots.next.deleteRecursively()
+        assertEquals("0.2.2", slots.previousVersion())
+        transaction("promote", "0.2.4", "0.2.3")
+        assertNull("an interrupted rename is recovered by its owner first", slots.previousVersion())
+    }
+
+    @Test fun incompleteOrUnknownPreviousHarnessIsNotOffered() {
+        val slots = EngineSlots(tmp.root)
+        harness(slots.engine, "0.2.2")
+        assertNull("no engine.prev yet", slots.previousVersion())
+        harness(slots.prev, "0.2.1")
+        File(slots.prev, "node_modules/@deepseek-ai/dsh/lib/bin.js").delete()
+        assertNull("engine.prev without the entry point is unusable", slots.previousVersion())
+        harness(slots.prev, "0.2.1")
+        File(slots.prev, "node_modules/@deepseek-ai/dsh/package.json").writeText("not json")
+        assertNull("engine.prev without a readable version is not a candidate", slots.previousVersion())
+    }
+
+    @Test fun rollbackCandidateReportsTheVersionTheRollbackWouldRestore() {
+        val slots = EngineSlots(tmp.root)
+        harness(slots.engine, "0.2.2")
+        harness(slots.next, "0.2.3")
+        slots.promote()
+        slots.confirm()
+        val offered = slots.previousVersion()
+        assertEquals("0.2.2", offered)
+        assertEquals(offered, slots.versionIn(slots.rollbackCandidate()!!))
+        assertTrue(slots.rollback())
+        assertEquals("0.2.2", slots.installedVersion())
+        assertNull(slots.previousVersion())
+    }
+
     private fun transaction(operation: String, version: String, previous: String) {
         File(tmp.root, "engine.transaction").writeText(
             """{"operation":"$operation","version":"$version","previous":"$previous"}"""

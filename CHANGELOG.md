@@ -39,8 +39,9 @@ updatable in the app.
   marketplace, turn bundles on or off, remove user plugins (dsh's own plugin manager).
 - **Live "/" palette**: skills added on disk or by a plugin install show up without a restart.
 - **In-app updates** (Settings > About & updates, and a daily check on launch): the DSH harness from npm with the bundled
-  pnpm, keeping the previous harness and rolling back automatically if the new one does not start; the APK from this
-  fork's GitHub releases, SHA-256 checked, installed through a FileProvider. Before the installer opens, the APK must
+  pnpm, keeping the previous harness and rolling back automatically if the new one does not start; once a new harness
+  has started, Settings also offers a manual **Restore previous version**, so a working but unwanted update can be undone
+  without waiting for a failed boot. The APK from this fork's GitHub releases, SHA-256 checked, installed through a FileProvider. Before the installer opens, the APK must
   also carry this app's package name and be signed by its certificate; a wrong-flavor or wrong-signer download is
   deleted and reported with a retryable message instead of failing late in the installer.
 - JVM and node unit tests (credentials writer, profile patch, key check, PoW solver, SSE parser, bridge mapping and

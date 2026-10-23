@@ -33,4 +33,16 @@ class UpdateActionsTest {
         assertFalse(UpdateActions.harness(true, "error", blocked = true).canUpdate)
         assertFalse(UpdateActions.harness(false, "error", blocked = false).canUpdate)
     }
+
+    @Test fun manualRollbackNeedsAPreviousHarnessAndAnIdleUpdater() {
+        for (status in listOf("idle", "error", "installed", "failed")) {
+            assertTrue(status, UpdateActions.rollback(hasPrevious = true, status = status))
+        }
+        assertFalse(UpdateActions.rollback(hasPrevious = false, status = "idle"))
+    }
+
+    @Test fun manualRollbackIsNotOfferedWhileAnUpdateRuns() {
+        assertFalse(UpdateActions.rollback(hasPrevious = true, status = "downloading"))
+        assertFalse(UpdateActions.rollback(hasPrevious = true, status = "installing"))
+    }
 }

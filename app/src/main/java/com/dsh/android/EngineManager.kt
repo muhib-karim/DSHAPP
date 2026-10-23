@@ -8,6 +8,8 @@ import com.dsh.android.update.EngineSlots
 import com.dsh.android.update.EngineLifecycle
 import com.dsh.android.update.HarnessActivation
 import com.dsh.android.update.HarnessUpdater
+import com.dsh.android.update.UpdateActions
+import com.dsh.android.update.UpdateCenter
 import com.dsh.android.log.DshLog as Log
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
@@ -7753,6 +7755,43 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * v1.3.0: restore `engine.prev` by hand from Settings > About & updates, for a harness that booted but misbehaves.
+     *
+     * Same gate and recovery as [activateHarnessUpdate]. Refuses while an install ([EngineSlots.next]) or a promoted
+     * but unbooted harness ([EngineSlots.pending]) owns the rollback window, and refuses when [expected] is not the
+     * version actually sitting in `engine.prev`, so a stale card cannot swap in an unexpected tree.
+     */
+    fun activatePreviousHarness(expected: String): Boolean = runBlocking {
+        lifecycle.exclusive {
+            val slots = EngineSlots(context.filesDir)
+            val candidate = slots.rollbackCandidate()
+            if (candidate == null || slots.versionIn(candidate) != expected ||
+                !UpdateActions.rollback(hasPrevious = true, status = UpdateCenter.harnessWorkerStatus)
+            ) {
+                return@exclusive false
+            }
+            try {
+                stop()
+                val restored = slots.rollback()
+                requestRestart(if (restored) "harness restored to $expected" else "harness restore aborted")
+                if (restored) EventLog.record("harness.restored", mapOf("version" to expected))
+                restored
+            } catch (failure: Exception) {
+                // Even a partially failed stop or rename must recover under the same gate.
+                runCatching {
+                    stop()
+                    slots.recoverInterrupted()
+                    requestRestart("harness restore recovery")
+                }.onFailure { recovery ->
+                    failure.addSuppressed(recovery)
+                    Log.w(TAG, "harness restore recovery failed; slots preserved: ${recovery.message}")
+                }
+                throw failure
+            }
+        }
+    }
+
+    /**
      * v1.3.0 harness updater: runs [cmd] in [dir] with exactly the environment of the last real engine launch (PREFIX,
      * PATH, LD_PRELOAD link compat, certificates). Returns the exit code, or -1 when the engine has not been launched in
      * this process (no environment to copy) or [timeoutMs] passed.
@@ -9203,7 +9242,7 @@ class EngineManager private constructor(private val context: Context) {
           *      （99 → 100 / 33 → 34），否则会回退，设备上静默跑回没有这张卡的旧 UI。
           *      ⚠️ 两个戳都 bump（本常量 99 → 100，-CompatVersion 33 → 34）。
           */
-        private const val MOBILE_UI_VERSION = "1.0.0-102"
+        private const val MOBILE_UI_VERSION = "1.0.0-103"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

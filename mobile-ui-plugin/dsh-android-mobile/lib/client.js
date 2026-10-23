@@ -9694,6 +9694,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			unknown: "Not checked yet",
 			noBridge: "Updates are available in the Android app.",
 			releases: "Release notes",
+			restore: "Restore previous version ({version})",
+			confirmRestore: "Go back to @deepseek-ai/dsh {version}? The engine will restart.",
 		};
 		const MP_ABOUT_ZH = {
 			nav: "关于与更新",
@@ -9719,6 +9721,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			unknown: "尚未检查",
 			noBridge: "更新功能仅在 Android App 中可用。",
 			releases: "更新说明",
+			restore: "恢复上一个版本（{version}）",
+			confirmRestore: "回到 @deepseek-ai/dsh {version}？引擎会重新启动。",
 		};
 
 		function mpAboutSection(props) {
@@ -9737,6 +9741,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			const card = (key, title, u, action) => {
 				u = u || {};
 				const tn = tone(u);
+				const canRestore = key === "harness" && u.canRollback === true && !!u.previous;
 				return h("div", { style: S.card, "data-mp-update": key, "data-mp-update-status": u.status || "unknown" },
 					h("div", { style: S.cardHead },
 						h("h3", { style: S.cardTitle }, title),
@@ -9747,6 +9752,12 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 					u.message ? h("p", { style: { ...S.note, margin: 0 } }, u.message) : null,
 					u.canUpdate || u.canInstall ? h("div", { style: S.actions },
 						h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } }, t(u.canInstall ? "install" : "update") + " → " + u.latest)) : null,
+					canRestore ? h("div", { style: S.actions },
+						h("button", { style: S.btn, "data-mp-update-action": "harnessRollback", onClick: () => {
+							if (!window.confirm(t("confirmRestore").replace("{version}", String(u.previous)))) return;
+							mpAppAction("harnessRollback", u.previous);
+							refresh();
+						} }, t("restore").replace("{version}", String(u.previous)))) : null,
 				);
 			};
 			const last = update.lastCheck ? new Date(update.lastCheck).toLocaleString() : t("never");

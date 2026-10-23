@@ -48,13 +48,20 @@ object UpdateCenter {
     private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private fun slots(c: Context) = EngineSlots(c.applicationContext.filesDir)
 
+    /** Raw harness worker state, shared with [com.dsh.android.EngineManager] so a manual restore never interrupts an install. */
+    val harnessWorkerStatus: String get() = harnessStatus
+
     fun json(context: Context): JSONObject {
         val p = prefs(context)
-        val current = slots(context).installedVersion()
+        val slots = slots(context)
+        val current = slots.installedVersion()
+        val previous = slots.previousVersion()
         val latest = p.getString("harnessLatest", null)
-        val offer = HarnessUpdater(slots(context)).offer(current, latest)
+        val offer = HarnessUpdater(slots).offer(current, latest)
         val harnessActions = UpdateActions.harness(offer != null, harnessStatus, harnessBlocked() != null)
         val harness = JSONObject().put("current", current ?: JSONObject.NULL).put("latest", latest ?: JSONObject.NULL)
+            .put("previous", previous ?: JSONObject.NULL)
+            .put("canRollback", UpdateActions.rollback(previous != null && previous != current, harnessStatus))
             .put("status", when {
                 harnessStatus != "idle" -> harnessStatus
                 harnessBlocked() != null && offer != null -> "blocked"

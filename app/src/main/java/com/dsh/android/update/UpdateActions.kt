@@ -10,5 +10,13 @@ data class UpdateActions(val canUpdate: Boolean, val canInstall: Boolean = false
             val available = hasOffer && status != "downloading"
             return UpdateActions(available && !hasVerifiedApk, available && hasVerifiedApk)
         }
+
+        /**
+         * A manual restore of [EngineSlots.prev] is offered only when a complete candidate exists and the harness
+         * updater is neither installing nor downloading. The UI and [com.dsh.android.EngineManager] share this check
+         * so a tap on a stale card cannot interrupt an update that started in between.
+         */
+        fun rollback(hasPrevious: Boolean, status: String) =
+            hasPrevious && status != "installing" && status != "downloading"
     }
 }

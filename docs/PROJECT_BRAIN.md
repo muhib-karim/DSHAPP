@@ -11,12 +11,15 @@ green and no merge, tag or release.
   polish, release notes, plugin search, About tools, cancelable downloads, then docs/screenshots and full gates.
 - P3 item 1 done: downloaded APKs are checked for package name and signing certificate before the installer;
   `ApkIdentity` has 10 JVM tests. Both debug APKs built and both flavor suites passed; Gradle stopped.
+- P3 item 2 done: About & updates offers **Restore previous version** once a promoted harness has booted; it reuses
+  `slots.rollback()`, is refused while an install/pending/journal is active, and marks the rejected version bad.
+  Native eligibility plus client button and Node/JVM tests; mobile-ui stamp `1.0.0-103`, compat `37`.
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. Implement P3 item 2 (manual harness rollback) with its tests and version-stamp/zip checks.
+1. Implement P3 item 3 (web-session expiry handling) with its tests.
 2. After all items, refresh CHANGELOG/README/PROJECT_BRAIN and the affected screenshots, then run the full matrix.
 
 
@@ -42,3 +45,4 @@ green and no merge, tag or release.
 - 2026-10-23 14:02Z Codex/gpt-6-astra: local full gates and live frontend checks passed; committing delivery record before security checks, push and exact-head CI watch.
 - 2026-10-23 14:27Z dsh/DeepSeek V4.1 Flash: P3 plan `51bff9c` committed after baseline both-flavor build/tests; next: implement plan items.
 - 2026-10-23 14:36Z dsh/DeepSeek V4.1 Flash: P3 item 1 (APK identity) implemented and tested; both-flavor gate green; next: item 2.
+- 2026-10-23 14:43Z dsh/DeepSeek V4.1 Flash: P3 item 2 (manual harness restore) implemented; targeted JVM and Node tests green; next: both-flavor gate, commit, item 3.

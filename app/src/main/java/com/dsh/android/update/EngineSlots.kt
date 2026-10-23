@@ -61,6 +61,21 @@ class EngineSlots(
     /** Version promoted but not yet seen booting, or null. */
     fun pending(): String? = runCatching { pendingFile.readText().trim().ifEmpty { null } }.getOrNull()
 
+    /**
+     * The complete previous harness that [rollback] would restore, or null.
+     *
+     * Read-only: an install ([next]) or a promoted harness that has not booted yet ([pending]) owns the rollback
+     * window, so Settings must not offer the old version until that update settles. A transaction in progress also
+     * blocks the offer: the engine that owns it recovers the interrupted rename first.
+     */
+    fun rollbackCandidate(): File? = synchronized(lock) {
+        if (pending() != null || next.exists() || transactionFile.exists()) return@synchronized null
+        prev.takeIf { isComplete(it) && versionIn(it) != null }
+    }
+
+    /** Version in [prev] when it can still be restored by hand, or null. */
+    fun previousVersion(): String? = rollbackCandidate()?.let { versionIn(it) }
+
     /** The promoted harness booted: it is the harness now ([prev] stays for a manual rollback until the next update). */
     fun confirm() = synchronized(lock) {
         if (pendingFile.exists() && !pendingFile.delete()) throw IOException("Could not confirm the harness")
