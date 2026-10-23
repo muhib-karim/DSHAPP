@@ -32,7 +32,6 @@ ENGINE_FAIL = re.compile(r"(启动失败|failed to start|CANNOT LINK|救援模�
 GOOGLE = re.compile(r"^Continue with Google$", re.I)
 API_KEY = re.compile(r"^Use API key$", re.I)
 LATER = re.compile(r"^Set up later$", re.I)
-BACK = re.compile(r"^Back$", re.I)
 KEY_ERROR = re.compile(r"(rejected this key|Could not reach api\.deepseek\.com|DeepSeek answered HTTP|no balance|rate limiting)", re.I)
 
 
@@ -119,7 +118,10 @@ def main():
     while time.time() < deadline:
         root = screen("wait")
         texts = " | ".join(label(n) for n in nodes(root))
-        if any(n.get("class") == "android.widget.EditText" for n in nodes(root)) or CHAT_HINT.search(texts):
+        if on_sign_in(root):
+            print("still on the sign-in screen; Back", flush=True)
+            adb("shell", "input", "keyevent", "4")
+        elif any(n.get("class") == "android.widget.EditText" for n in nodes(root)) or CHAT_HINT.search(texts):
             chat = True
             break
         if ENGINE_FAIL.search(texts) or VIEW_LOG.search(texts):
@@ -200,16 +202,28 @@ def sign_in_screens():
         time.sleep(1)
         shot("03-api-key-error")
     print("API-key screen error shown:", key_ok, flush=True)
+    # Leave the key panel with the system Back key (its own Back button can be below the fold); a first Back may only
+    # close the keyboard, so repeat until the first screen's "Set up later" is on screen.
     root = screen("api-key-done")
-    if find(root, BACK) is not None:
-        tap(find(root, BACK))
+    for _ in range(4):
+        later = find(root, LATER)
+        if later is not None and not on_sign_in_key_panel(root):
+            tap(later)
+            time.sleep(3)
+            break
+        adb("shell", "input", "keyevent", "4")
         time.sleep(2)
         root = screen("first-again")
-    later = find(root, LATER)
-    if later is not None:
-        tap(later)
-        time.sleep(3)
     return first_ok, key_ok
+
+
+def on_sign_in_key_panel(root):
+    return any((n.get("resource-id") or "").endswith(":id/keyInput") for n in nodes(root))
+
+
+def on_sign_in(root):
+    """The app's own first screen (its key field is not the chat composer)."""
+    return any((n.get("resource-id") or "").endswith((":id/keyInput", ":id/btnGoogle", ":id/btnApiKey")) for n in nodes(root))
 
 
 def find(root, pattern):
