@@ -41,6 +41,7 @@ test('isWallpaperLayer: full-screen decorative layers yes, real UI no', () => {
   assert.equal(isWallpaperLayer({ ...base, position: 'static' }, vp), false, 'in-flow content');
   assert.equal(isWallpaperLayer({ ...base, tag: 'div', pointerEvents: 'auto', textLength: 40, interactive: 3 }, vp), false, 'a dialog');
   assert.equal(isWallpaperLayer({ ...base, uiRoot: true }, vp), false, 'dsh roots are never hidden');
+  assert.equal(isWallpaperLayer({ ...base, tag: 'div', pointerEvents: 'none' }, vp), false, 'an empty toast/portal container is not a wallpaper');
 });
 
 test('clean CSS: every backdrop-filter is none, no blur, opaque menu and header', () => {

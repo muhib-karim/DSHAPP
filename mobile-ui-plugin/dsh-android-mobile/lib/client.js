@@ -1398,21 +1398,25 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			const area = viewport.width * viewport.height;
 			if (!(area > 0) || (info.rect.width * info.rect.height) / area < 0.9) return false;
 			if (info.textLength > 0 || info.interactive > 0) return false;
+			// Media or a background image only: an empty full-screen container (toast or popover portal) is real UI.
 			const media = info.tag === "canvas" || info.tag === "video" || info.tag === "img";
-			return media || info.pointerEvents === "none" || (info.backgroundImage && info.backgroundImage !== "none");
+			return media || !!(info.backgroundImage && info.backgroundImage !== "none");
 		}
 
 		function injectCleanStyles() {
-			// Re-appended when another stylesheet lands after it, so it stays last in <head>.
-			let tag = document.querySelector("style[data-plugin-css='dsh-android-mobile/clean.css']");
-			if (tag && tag === document.head.lastElementChild) return;
-			if (!tag) {
-				tag = document.createElement("style");
-				tag.dataset.plugin = "dsh-android-mobile";
-				tag.dataset.pluginCss = "dsh-android-mobile/clean.css";
-				tag.textContent = CLEAN_CSS;
-			}
+			// Injected once; html[data-mobile] selectors with !important outrank a theme's own !important rules.
+			if (document.querySelector("style[data-plugin-css='dsh-android-mobile/clean.css']")) return;
+			const tag = document.createElement("style");
+			tag.dataset.plugin = "dsh-android-mobile";
+			tag.dataset.pluginCss = "dsh-android-mobile/clean.css";
+			tag.textContent = CLEAN_CSS;
 			document.head.appendChild(tag);
+		}
+
+		/** True when every node a mutation batch added or removed is the opaque guard's own probe. */
+		function mpOnlyProbeMutations(records) {
+			return records.length > 0 && records.every((r) => r.type === "childList"
+				&& [...r.addedNodes, ...r.removedNodes].every((n) => n.dataset && n.dataset.mpProbe !== undefined));
 		}
 
 		/** Resolve a custom property to the colour the browser computes for it (handles var() and color-mix()). */
@@ -1429,6 +1433,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			for (const token of SURFACE_TOKENS) body.style.removeProperty(token);
 			body.style.removeProperty("--mp-solid-base");
 			const probe = document.createElement("div");
+			probe.dataset.mpProbe = "";   // setupCleanSurfaces ignores its own probe (otherwise it re-runs forever)
 			probe.style.cssText = "position:absolute;width:0;height:0;visibility:hidden;pointer-events:none";
 			body.appendChild(probe);
 			try {
@@ -1457,7 +1462,11 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			const root = document.getElementById("root");
 			if (root) candidates.push(...root.children);
 			for (const el of candidates) {
-				if (el.hasAttribute("data-mp-wallpaper-hidden")) continue;
+				if (el.hasAttribute("data-mp-wallpaper-hidden")) {
+					// Something put real content into it after all: show it again.
+					if ((el.textContent || "").trim() || el.querySelector("button,input,textarea,a[href],[role]")) el.removeAttribute("data-mp-wallpaper-hidden");
+					continue;
+				}
 				const tag = el.tagName.toLowerCase();
 				if (tag === "script" || tag === "style" || tag === "link") continue;
 				const cs = getComputedStyle(el);
@@ -1485,6 +1494,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			let timer = 0;
 			const run = () => {
 				timer = 0;
+				window.__mpCleanRuns = (window.__mpCleanRuns || 0) + 1;
 				injectCleanStyles();
 				mpApplyOpaqueTokens();
 				mpHideWallpaperLayers();
@@ -1493,7 +1503,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			run();
 			const headObserver = new MutationObserver(schedule);
 			headObserver.observe(document.head, { childList: true });
-			const bodyObserver = new MutationObserver(schedule);
+			const bodyObserver = new MutationObserver((records) => { if (!mpOnlyProbeMutations(records)) schedule(); });
 			bodyObserver.observe(document.body, { childList: true, attributes: true,
 				attributeFilter: ["data-ds-dark-theme", "data-dsh-theme", "class"] });
 			const rootObserver = new MutationObserver(schedule);
