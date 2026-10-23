@@ -53,4 +53,57 @@ class AccountChangesTest {
         assertThrows(java.io.IOException::class.java) { attempt.commit { throw java.io.IOException("disk full") } }
         assertFalse(attempt.commit { fail("failed attempt must be retried through validation") })
     }
+
+    @Test fun failedCredentialRemovalPreservesAccountAndBridge() {
+        val home = tmp.newFolder()
+        DshCredentials.write(home, mapOf(DshCredentials.DEEPSEEK_API_KEY to "previous-key"))
+        var mode = AccountConfig.Mode.API_KEY
+        var token: String? = "previous-session"
+        var stopped = false
+        var success = false
+        assertThrows(java.io.IOException::class.java) {
+            success = changes.begin().signOut(
+                clearCredentials = { throw java.io.IOException("disk full") },
+                forgetAccount = { mode = AccountConfig.Mode.NONE; token = null },
+                stopBridge = { stopped = true },
+            )
+        }
+        assertEquals(AccountConfig.Mode.API_KEY, mode)
+        assertEquals("previous-session", token)
+        assertEquals("previous-key", DshCredentials.read(home, DshCredentials.DEEPSEEK_API_KEY))
+        assertFalse(stopped)
+        assertFalse(success)
+    }
+
+    @Test fun successfulSignOutRemovesBothKeysBeforeForgettingAccount() {
+        val home = tmp.newFolder()
+        DshCredentials.write(home, mapOf(DshCredentials.DEEPSEEK_API_KEY to "api", DshCredentials.WEB_BRIDGE_KEY to "bridge"))
+        val order = mutableListOf<String>()
+        assertTrue(changes.begin().signOut(
+            clearCredentials = {
+                DshCredentials.write(home, mapOf(DshCredentials.DEEPSEEK_API_KEY to null, DshCredentials.WEB_BRIDGE_KEY to null))
+                order += "credentials"
+            },
+            forgetAccount = {
+                assertNull(DshCredentials.read(home, DshCredentials.DEEPSEEK_API_KEY))
+                assertNull(DshCredentials.read(home, DshCredentials.WEB_BRIDGE_KEY))
+                order += "account"
+            },
+            stopBridge = { order += "bridge" },
+        ))
+        assertEquals(listOf("credentials", "account", "bridge"), order)
+    }
+
+    @Test fun supersededSignOutCannotEraseANewAccount() {
+        val signOut = changes.begin()
+        val login = changes.begin()
+        assertTrue(login.commit {})
+        assertFalse(signOut.isLatest)
+        assertTrue(login.isLatest)
+        assertFalse(signOut.signOut(
+            clearCredentials = { fail("superseded") },
+            forgetAccount = { fail("superseded") },
+            stopBridge = { fail("superseded") },
+        ))
+    }
 }

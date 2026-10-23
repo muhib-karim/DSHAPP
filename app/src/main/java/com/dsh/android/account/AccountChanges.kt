@@ -10,6 +10,7 @@ class AccountChanges {
     inner class Attempt internal constructor(private val owner: Long) {
         private var consumed = false
         val isCurrent: Boolean get() = synchronized(this@AccountChanges) { !consumed && generation == owner }
+        val isLatest: Boolean get() = synchronized(this@AccountChanges) { generation == owner }
 
         fun cancel() = synchronized(this@AccountChanges) { consumed = true }
 
@@ -19,6 +20,13 @@ class AccountChanges {
             consumed = true
             action()
             true
+        }
+
+        /** Sign-out must remove persisted keys before publishing an anonymous account. */
+        fun signOut(clearCredentials: () -> Unit, forgetAccount: () -> Unit, stopBridge: () -> Unit): Boolean = commit {
+            clearCredentials()
+            forgetAccount()
+            stopBridge()
         }
     }
 
