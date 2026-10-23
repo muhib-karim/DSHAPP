@@ -24,7 +24,14 @@ object WebAccount {
             return null
         }
         server?.takeIf { it.running }?.let { return it.port }
-        val created = BridgeServer(store.bridgeSecret(), { client(app) }) { DshLog.i(TAG, it) }
+        val created = BridgeServer(
+            secret = store.bridgeSecret(),
+            chat = { client(app) },
+            onSessionExpired = {
+                if (!store.webExpired) DshLog.i(TAG, "web session expired; Settings > Account asks to sign in again")
+                store.markWebExpired()
+            },
+        ) { DshLog.i(TAG, it) }
         return try {
             created.start()
             server = created

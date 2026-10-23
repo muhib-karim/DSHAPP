@@ -120,6 +120,10 @@ action. Record the expiry when the bridge sees it and show a clear sign-in-again
 - Manual: invalidate the web token on a test account, send one message, open Settings > Account, confirm the warning
   and that “Sign in again” opens the web sign-in. The warning disappears after a successful sign-in.
 
+**Deviation:** the expired card promotes its one existing action to **Sign in again** instead of adding a second
+button next to **Switch account**; both call `accountSwitch`, so two identical buttons would be noise. **Sign out**
+stays. `PRESET_SKILLS_VERSION` is unchanged because only `mobile-ui.zip` changed.
+
 ## 4. Replace the API key without signing out, and show a masked hint
 
 An API-key user who rotates a key must currently choose “Switch account” and re-enter the whole flow. Add a direct

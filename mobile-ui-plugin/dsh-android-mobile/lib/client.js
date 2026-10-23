@@ -9366,6 +9366,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			switch: "Switch account",
 			signOut: "Sign out",
 			signIn: "Sign in",
+			reauth: "Sign in again",
+			webExpired: "This web session has expired. Sign in again to keep using your DeepSeek web account.",
 			confirmSignOut: "Sign out of DeepSeek on this phone? The API key or web session is removed.",
 			webNote: "Web account replies come from chat.deepseek.com through a local bridge on this phone. Tools work through a text protocol; images are not sent.",
 			keyNote: "The key is stored only in DSH's own credentials file (owner-only) and used by the official DeepSeek provider.",
@@ -9382,6 +9384,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			switch: "切换账号",
 			signOut: "退出登录",
 			signIn: "登录",
+			reauth: "重新登录",
+			webExpired: "网页会话已过期。重新登录后即可继续使用 DeepSeek 网页账号。",
 			confirmSignOut: "确定在这台手机上退出 DeepSeek？API 密钥或网页会话会被删除。",
 			webNote: "网页账号的回复经本机的本地桥来自 chat.deepseek.com。工具通过文本协议调用；不发送图片。",
 			keyNote: "密钥只保存在 DSH 自己的凭据文件里（仅本人可读），由官方 DeepSeek 供应商使用。",
@@ -9400,7 +9404,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			const account = state.account || {};
 			const mode = account.mode || "none";
 			const label = mode === "web" ? t("modeWeb") : (mode === "api_key" ? t("modeKey") : t("modeNone"));
-			const tone = mode === "none" ? MP_PRIV_TONE.warn : MP_PRIV_TONE.on;
+			const webExpired = mode === "web" && account.webExpired === true;
+			const tone = mode === "none" || webExpired ? MP_PRIV_TONE.warn : MP_PRIV_TONE.on;
 			const signOut = () => { if (window.confirm(t("confirmSignOut"))) mpAppAction("accountSignOut"); };
 			return h("div", { style: S.section },
 				h("h2", { style: S.heading }, t("title")),
@@ -9411,8 +9416,9 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 						h("span", { style: { ...S.badge, color: tone.color, background: tone.bg } }, label),
 					),
 					mode === "web" && account.label ? h("p", { style: S.summary }, account.label) : null,
+					webExpired ? h("p", { style: { ...S.note, color: MP_PRIV_TONE.warn.color, background: MP_PRIV_TONE.warn.bg, borderRadius: "8px", padding: "8px 10px" }, "data-mp-account-expired": "1" }, t("webExpired")) : null,
 					h("div", { style: S.actions },
-						h("button", { style: S.btnPrimary, onClick: () => mpAppAction("accountSwitch") }, mode === "none" ? t("signIn") : t("switch")),
+						h("button", { style: S.btnPrimary, onClick: () => mpAppAction("accountSwitch") }, webExpired ? t("reauth") : (mode === "none" ? t("signIn") : t("switch"))),
 						mode !== "none" ? h("button", { style: S.btn, onClick: signOut }, t("signOut")) : null,
 					),
 					mode === "web" ? h("p", { style: S.note }, t("webNote")) : null,

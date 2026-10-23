@@ -11,6 +11,7 @@ import java.net.InetAddress
 import java.net.URL
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class BridgeServerTest {
     private val secret = "a".repeat(64)
@@ -25,8 +26,13 @@ class BridgeServerTest {
         }
     }
     private lateinit var server: BridgeServer
+    private val expiredNotifications = AtomicInteger()
 
-    @Before fun start() { server = BridgeServer(secret, { fake }); server.start() }
+    @Before fun start() {
+        expiredNotifications.set(0)
+        server = BridgeServer(secret, { fake }, onSessionExpired = { expiredNotifications.incrementAndGet() })
+        server.start()
+    }
     @After fun stop() = server.stop()
 
     private fun call(path: String, body: String? = null, auth: String? = "Bearer $secret"): Pair<Int, String> {
@@ -96,6 +102,26 @@ class BridgeServerTest {
         val (code, body) = call("/v1/chat/completions", chat)
         assertEquals(401, code)
         assertTrue(body.contains("sign in again"))
+    }
+
+    @Test fun eachExpiryCodeNotifiesTheAccountExactlyOncePerRequest() {
+        for (code in listOf(40001, 40003)) {
+            val before = expiredNotifications.get()
+            reply = { _, _, _ -> throw WebServiceError(code, "expired") }
+            assertEquals(401, call("/v1/chat/completions", chat).first)
+            assertEquals("code $code", before + 1, expiredNotifications.get())
+        }
+    }
+
+    @Test fun otherUpstreamFailuresDoNotMarkTheSessionExpired() {
+        reply = { _, _, _ -> throw WebServiceError(500, "boom") }
+        assertEquals(502, call("/v1/chat/completions", chat).first)
+        assertEquals(0, expiredNotifications.get())
+    }
+
+    @Test fun aWrongBearerDoesNotMarkTheSessionExpired() {
+        assertEquals(401, call("/v1/models", auth = "Bearer nope").first)
+        assertEquals(0, expiredNotifications.get())
     }
 
     @Test fun oversizedBodyIs413() {

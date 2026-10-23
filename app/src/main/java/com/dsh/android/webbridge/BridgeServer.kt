@@ -25,6 +25,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class BridgeServer(
     private val secret: String,
     private val chat: () -> WebChat,
+    /** Called once per rejected request when chat.deepseek.com says the saved web token is no longer valid. */
+    private val onSessionExpired: () -> Unit = {},
     private val log: (String) -> Unit = {},
 ) {
     private var socket: ServerSocket? = null
@@ -164,7 +166,10 @@ class BridgeServer(
             if (!finished && !cancelled.get()) throw WebServiceError(-1, "DeepSeek reply ended before completion")
         } catch (e: WebServiceError) {
             val (status, message) = when {
-                DeepSeekWebClient.isExpired(e) -> 401 to "DeepSeek web session expired: sign in again (Settings > Account)."
+                DeepSeekWebClient.isExpired(e) -> {
+                    runCatching { onSessionExpired() }
+                    401 to "DeepSeek web session expired: sign in again (Settings > Account)."
+                }
                 e.code == 429 -> 429 to "DeepSeek web is rate limiting this account; wait a moment."
                 e.code in 40300..40399 -> 502 to "DeepSeek rejected the proof of work; update the app."
                 else -> 502 to "DeepSeek web error ${e.code}."

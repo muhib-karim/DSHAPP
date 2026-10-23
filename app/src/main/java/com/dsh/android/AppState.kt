@@ -25,7 +25,10 @@ object AppState {
     fun json(activity: Activity): String {
         val store = AccountStore(activity)
         val account = JSONObject().put("mode", store.mode.name.lowercase())
-        if (store.mode == AccountConfig.Mode.WEB) account.put("label", store.webLabel ?: "DeepSeek account")
+        if (store.mode == AccountConfig.Mode.WEB) {
+            account.put("label", store.webLabel ?: "DeepSeek account")
+            account.put("webExpired", store.webExpired)
+        }
         val version = JSONObject()
             .put("app", BuildConfig.VERSION_NAME)
             .put("code", BuildConfig.VERSION_CODE)

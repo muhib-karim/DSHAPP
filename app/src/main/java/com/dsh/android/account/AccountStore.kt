@@ -1,6 +1,7 @@
 package com.dsh.android.account
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -17,8 +18,8 @@ import javax.crypto.spec.GCMParameterSpec
  * The web user token and the bridge secret are encrypted with an AES-GCM key that lives in the Android Keystore (never
  * leaves it). The API key itself is not stored here: it lives only in dsh's own `.credentials.yaml` (mode 600).
  */
-class AccountStore(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+class AccountStore internal constructor(private val prefs: SharedPreferences) {
+    constructor(context: Context) : this(context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
 
     var mode: AccountConfig.Mode
         get() = runCatching { AccountConfig.Mode.valueOf(prefs.getString(KEY_MODE, null) ?: "") }.getOrDefault(AccountConfig.Mode.NONE)
@@ -36,10 +37,24 @@ class AccountStore(context: Context) {
 
     fun webToken(): String? = decrypt(prefs.getString(KEY_WEB_TOKEN, null))
 
-    fun saveWebToken(token: String) { prefs.edit().putString(KEY_WEB_TOKEN, encrypt(token)).apply() }
+    /**
+     * True when chat.deepseek.com last rejected the saved web token. Settings > Account then asks to sign in again
+     * instead of pretending the account still works. Any successful sign-in or sign-out clears it.
+     */
+    var webExpired: Boolean
+        get() = prefs.getBoolean(KEY_WEB_EXPIRED, false)
+        private set(value) { prefs.edit().putBoolean(KEY_WEB_EXPIRED, value).apply() }
+
+    fun markWebExpired() { webExpired = true }
+
+    fun clearWebExpired() { webExpired = false }
+
+    fun saveWebToken(token: String) {
+        prefs.edit().putString(KEY_WEB_TOKEN, encrypt(token)).remove(KEY_WEB_EXPIRED).apply()
+    }
 
     /** Drops the web session only (switching to an API key). */
-    fun signOutWeb() { prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).apply() }
+    fun signOutWeb() { prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).remove(KEY_WEB_EXPIRED).apply() }
 
     /** When the browser route was started (the `mkdsh://session` link is accepted for 30 minutes after it). */
     var browserSignInStartedAt: Long?
@@ -48,8 +63,8 @@ class AccountStore(context: Context) {
 
     /** Forget the account: back to the first screen on the next launch. */
     fun signOut() {
-        prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).remove(KEY_LATER).remove(KEY_BROWSER_STARTED)
-            .putString(KEY_MODE, AccountConfig.Mode.NONE.name).apply()
+        prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).remove(KEY_WEB_EXPIRED).remove(KEY_LATER)
+            .remove(KEY_BROWSER_STARTED).putString(KEY_MODE, AccountConfig.Mode.NONE.name).apply()
     }
 
     /** Per-install secret the local bridge requires as its bearer token (64 hex chars, created once). */
@@ -98,6 +113,7 @@ class AccountStore(context: Context) {
         const val KEY_LATER = "set_up_later"
         const val KEY_WEB_TOKEN = "web_token"
         const val KEY_WEB_LABEL = "web_label"
+        const val KEY_WEB_EXPIRED = "web_expired"
         const val KEY_BRIDGE_SECRET = "bridge_secret"
         const val KEY_BROWSER_STARTED = "browser_started"
         const val KEY_ALIAS = "dsh_account_v1"

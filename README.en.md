@@ -31,7 +31,8 @@ key** (a key from platform.deepseek.com, checked once and saved only in DSH's ow
   browsers; when it does, *Use your browser* signs in at chat.deepseek.com in your browser and brings the session
   back. Replies then come from your web account through a small local bridge on the phone (127.0.0.1, random port,
   protected by a per-install secret). DSH's tools work through a text protocol; images are not sent.
-- **Settings > Account**: see how you are signed in, switch account or sign out.
+- **Settings > Account**: see how you are signed in, switch account or sign out. If chat.deepseek.com rejects the
+  saved web session, the card says so and offers **Sign in again**, instead of only failing when a message is sent.
 
 **A cleaner, opaque interface.** No wallpaper or animated background, no glass: sheets, the "+" and "/" menus,
 dialogs, the header and previews are all solid, in light and dark. This holds for any theme, including themes the AI

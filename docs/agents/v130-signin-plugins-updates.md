@@ -8,10 +8,10 @@
 |---|---|---|
 | First screen ("Continue with Google" / "Use API key") | `account/SignInActivity.kt`, `res/layout/activity_sign_in.xml`; started by `MainActivity.onCreate` while `AccountStore.needsFirstScreen()` | emulator smoke (`tools/ci/emulator-smoke.py`) |
 | Key store and config | `account/DshCredentials.kt` (`$DSH_HOME/.credentials.yaml`, 600, records kept), `account/ProfilePatch.kt` + `account/AccountConfig.kt` (`profiles/<p>/cordis.patch.yml`), applied by `EngineManager.ensureAccountConfig` before every launch | `DshCredentialsTest`, `ProfilePatchTest`, `AccountConfigTest`, `ApiKeyCheckTest` |
-| Web account | `webbridge/DeepSeekLoginActivity.kt` (WebView + browser hand-off `mkdsh://session`), `WebToken.kt`, `DeepSeekWebClient.kt`, `DeepSeekHashV1.kt`, `PowChallenge.kt`, `WebSseParser.kt` | `WebTokenTest`, `DeepSeekHashV1Test`, `PowChallengeTest`, `WebSseParserTest` |
+| Web account | `webbridge/DeepSeekLoginActivity.kt` (WebView + browser hand-off `mkdsh://session`), `WebToken.kt`, `DeepSeekWebClient.kt`, `DeepSeekHashV1.kt`, `PowChallenge.kt`, `WebSseParser.kt`; expiry flag in `account/AccountStore.kt` | `WebTokenTest`, `DeepSeekHashV1Test`, `PowChallengeTest`, `WebSseParserTest`, `AccountStoreTest` |
 | Local OpenAI-compatible bridge | `webbridge/BridgeServer.kt`, `OpenAiMapping.kt`, `WebAccount.kt` (route `deepseek-web`, `apiKeyEnv DEEPSEEK_WEB_BRIDGE_KEY`) | `BridgeServerTest`, `OpenAiMappingTest`; `demo/LocalBridgeDemo.kt` for a desktop dsh |
 | Opaque UI | `mobile-ui-plugin/dsh-android-mobile/lib/client.js` (`CLEAN_CSS`, `mpApplyOpaqueTokens`, `mpHideWallpaperLayers`), `MainActivity.cutoutTopPx` / `observeFullscreenBottomInset` | `tools/tests/mobile-clean.test.mjs`, `mobile-clean.browser.mjs`, fixture `tools/tests/fixtures/dsh-test-glass-theme` |
-| Settings > Account / Plugins / About & updates | `client.js` (`mpAccountSection`, `mpPluginsSection`, `mpAboutSection`); native side `AppState.kt` through `PageBridge.appState()` / `appAction(name, arg)` | `tools/tests/plugin-list.test.mjs` |
+| Settings > Account / Plugins / About & updates | `client.js` (`mpAccountSection`, `mpPluginsSection`, `mpAboutSection`); native side `AppState.kt` through `PageBridge.appState()` / `appAction(name, arg)` | `tools/tests/plugin-list.test.mjs`, `tools/tests/account-expiry.test.mjs` |
 | Live "/" palette | `mobile-ui-plugin/dsh-android-mobile/lib/skill-refresh.js` (re-emits `plugin-manager/changed`) | `tools/tests/skill-refresh.test.mjs` |
 | Updates | `update/Versions.kt`, `EngineSlots.kt`, `HarnessUpdater.kt`, `AppUpdater.kt`, `UpdateCenter.kt`; `EngineManager` hooks `rollBackPendingHarness` / `pendingHarnessReady` / `activateHarnessUpdate` / `activatePreviousHarness` / `runWithEngineEnv` | `VersionsTest`, `EngineSlotsTest`, `HarnessUpdaterTest`, `AppUpdaterTest`, `HarnessActivationTest`, `EngineLifecycleTest`, `UpdateActionsTest` |
 
@@ -36,6 +36,11 @@
    rejected version is marked bad exactly like an automatic rollback.
 7. **Changing `client.js` or `skill-refresh.js` → bump `MOBILE_UI_VERSION` and `-CompatVersion`** (see
    [asset-stamps.md](asset-stamps.md)); CI packs the zip from source.
+8. **A 401/403 (or 40001–40003) from chat.deepseek.com marks the web session expired exactly once.**
+   `BridgeServer`'s `onSessionExpired` sets `AccountStore.webExpired`; `AppState` exposes it only in `web` mode, and the
+   Account card offers **Sign in again** through the existing `accountSwitch` action. Saving a new token, signing out of
+   the web account, switching to an API key and a full sign-out all clear the flag. Wrong bearer tokens and other
+   upstream errors must not set it.
 
 ## Tests
 
