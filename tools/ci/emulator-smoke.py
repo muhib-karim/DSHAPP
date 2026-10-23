@@ -64,12 +64,21 @@ def dump(tag):
 # the background ("Allow", which the app needs to keep its engine alive).
 DISMISS = re.compile(r"^(Wait|Allow|允许|始终允许|OK|确定)$")
 COVER = re.compile(r"(isn't responding|无响应|run in background|后台运行)", re.I)
+CLOSE = re.compile(r"^(Close app|关闭应用)$")
+LAUNCHER_ANR = re.compile(r"(Launcher|启动器).{0,20}(isn't responding|无响应)", re.I)
+LAUNCHERS = ("com.google.android.apps.nexuslauncher", "com.android.launcher3")
 
 
 def dismiss(root):
     texts = " | ".join(label(n) for n in nodes(root))
     if not COVER.search(texts):
         return False
+    # A hung launcher is closed (waiting keeps it holding input focus); anything else gets Wait / Allow.
+    preferred = CLOSE if LAUNCHER_ANR.search(texts) else DISMISS
+    for n in nodes(root):
+        if preferred.match((n.get("text") or "").strip()):
+            print("dismissing system dialog:", texts[:160], flush=True)
+            return tap(n)
     for n in nodes(root):
         if DISMISS.match((n.get("text") or "").strip()):
             print("dismissing system dialog:", texts[:160], flush=True)
@@ -109,6 +118,11 @@ def main():
     # The CI emulator is slow enough that the background Pixel Launcher keeps hitting ANR; its dialog takes input
     # focus and swallows typed text (run 39958069915). Background ANRs need no dialog here.
     adb("shell", "settings", "put", "global", "anr_show_background", "0")
+    # Run 39960054520: the hung Pixel Launcher kept input focus (mCurrentFocus) over the app for the whole run, so typed
+    # text never arrived. The test launches the app explicitly and needs no home screen: disable and stop the launcher.
+    for launcher in LAUNCHERS:
+        adb("shell", "pm", "disable-user", "--user", "0", launcher)
+        adb("shell", "am", "force-stop", launcher)
     adb("install", "-r", "-g", APK, check=True, timeout=600)
     adb("shell", "pm", "grant", PKG, "android.permission.POST_NOTIFICATIONS")
     adb("logcat", "-c")
