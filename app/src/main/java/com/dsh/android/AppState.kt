@@ -39,6 +39,8 @@ object AppState {
                 signOut(activity)
                 activity.startActivity(Intent(activity, SignInActivity::class.java))
             }
+            // Settings > Plugins: a plugin change that dsh can only apply on restart.
+            "engineRestart" -> EngineManager.get(activity).requestRestart("plugins changed")
             else -> DshLog.w(DshApplication.TAG, "unknown settings action: $name")
         }
     }

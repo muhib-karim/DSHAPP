@@ -1421,6 +1421,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			return getComputedStyle(probe).backgroundColor;
 		}
 
+		let mpOpaqueLogged = "";
+
 		function mpApplyOpaqueTokens() {
 			const body = document.body;
 			if (!body || !mpIsMobile()) return;
@@ -1440,7 +1442,9 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 						: flattenColor(mpResolveToken(probe, token), base);
 					if (solid) { body.style.setProperty(token, solid, "important"); changed++; }
 				}
-				if (changed) console.info("[dsh-android-mobile] opaque guard: flattened " + changed + " translucent surface token(s)");
+				const summary = changed + ":" + base;
+				if (changed && summary !== mpOpaqueLogged) console.info("[dsh-android-mobile] opaque guard: flattened " + changed + " translucent surface token(s)");
+				mpOpaqueLogged = summary;
 			} finally {
 				probe.remove();
 			}
@@ -2352,21 +2356,23 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			// 顶部返回条：只有圆形返回按钮 + 标题，不再放 ✕
 			const backBar = document.createElement("div");
 			backBar.className = "mp-back-bar";
-			backBar.innerHTML = '<button type="button" class="mp-back-circle" aria-label="返回">‹</button>'
-				+ '<span class="mp-title">设置</span>';
+			// v1.3.0: label follows the UI language (was always Chinese).
+			const mpZh = /^zh/i.test(document.documentElement.lang || navigator.language || "");
+			backBar.innerHTML = '<button type="button" class="mp-back-circle" aria-label="' + (mpZh ? "返回" : "Back") + '">‹</button>'
+				+ '<span class="mp-title">' + (mpZh ? "设置" : "Settings") + '</span>';
 			Object.assign(backBar.style, {
 				display: "flex", flex: "0 0 auto", alignItems: "center", gap: "4px",
 				minHeight: "56px", padding: "8px 12px", boxSizing: "border-box",
-				borderBottom: "none", background: "transparent", position: "relative",
+				borderBottom: "none", background: "var(--mp-solid-base, var(--dsw-alias-bg-base))", position: "relative",
 			});
 			// 回退 CSS 规则：用 !important 压内联 padding，让出状态栏
-			const sysTop = getComputedStyle(document.documentElement).getPropertyValue("--dsh-android-system-top").trim() || "0px";
-			backBar.style.setProperty("padding-top", sysTop, "important");
+			// v1.3.0: the variable itself (not a one-time read), so a later inset push from the app still applies.
+			backBar.style.setProperty("padding-top", "var(--dsh-android-system-top, 0px)", "important");
 			const backBtn = backBar.querySelector(".mp-back-circle");
 			Object.assign(backBtn.style, {
-				width: "36px", height: "36px", borderRadius: "50%", background: "var(--dsw-alias-interactive-bg-hover, #f0f0f0)",
+				width: "36px", height: "36px", borderRadius: "50%", background: "var(--dsw-alias-interactive-bg-hover-solid, #f0f0f0)",
 				border: "none", cursor: "pointer", display: "inline-flex", alignItems: "center",
-				justifyContent: "center", fontSize: "20px", color: "#222", flex: "0 0 auto",
+				justifyContent: "center", fontSize: "20px", color: "var(--dsw-alias-label-primary, #222)", flex: "0 0 auto",
 			});
 			const titleSpan = backBar.querySelector(".mp-title");
 			Object.assign(titleSpan.style, {
@@ -9256,7 +9262,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			}
 			if (!mpPrivReact) return;
 			try {
-				ctx.inject(["slots", "locale"], (scope) => {
+				ctx.inject(["slots", "locale"].concat(spec.inject || []), (scope) => {
 					const t = scope.locale.bind(spec.ns);
 					scope.effect(() => scope.locale.register(spec.ns, { zh: spec.zh, en: spec.en }), "dsh-android-mobile: " + spec.id);
 					scope.slots.inject("settings.section", () => scope.slots.register({
@@ -9265,7 +9271,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 						order: spec.order,
 						label: () => t("nav"),
 						locale: spec.ns,
-					}, spec.component));
+					}, (slotProps) => spec.component(slotProps, scope)));
 				});
 			} catch (e) {
 				console.warn("[dsh-android-mobile] settings section " + spec.id + " failed:", e && (e.stack || e.message || e));
@@ -9379,6 +9385,250 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 					mode === "web" ? h("p", { style: S.note }, t("webNote")) : null,
 					mode === "api_key" ? h("p", { style: S.note }, t("keyNote")) : null,
 				),
+			);
+		}
+
+		// ── v1.3.0 settings: Plugins (built-in and user plugins side by side) ──────────────────────────
+
+		/** The app's own plugins, mounted with --patch outside pnpm: always on, managed by the app (rescue mode). */
+		const APP_PLUGINS = [
+			{ name: "dsh-android-mobile", label: "Mobile UI", description: "Phone layout, opaque surfaces, these settings." },
+			{ name: "dsh-android-market", label: "Plugin marketplace", description: "Browse and install plugins from npm." },
+			{ name: "dsh-agnes-multimodal", label: "Image and video generation", description: "generate_image and generate_video tools." },
+			{ name: "dsh-android-shell", label: "Shell (uid 2000)", description: "Privileged shell over ADB or Shizuku." },
+			{ name: "dsh-android-root", label: "Root shell", description: "Only on rooted phones." },
+			{ name: "dsh-android-uiagent", label: "Screen control", description: "The ui tool: see and tap the screen." },
+			{ name: "dsh-android-bubble", label: "Floating bubble", description: "The bubble tool." },
+			{ name: "dsh-android-pet", label: "Desktop pet", description: "The pet tool." },
+			{ name: "dsh-android-statusbar", label: "Status bar", description: "System bar colours and fullscreen." },
+			{ name: "dsh-android-logs", label: "Logs", description: "The logs tool for diagnosing the app." },
+		];
+
+		/** Bundles the app installs into the profile itself (link: dependencies): part of the app, but switchable. */
+		const APP_BUNDLES = new Set(["dsh-core-memory", "dsh-preset-razor"]);
+
+		function mpBundleLabel(b) {
+			const meta = b.meta || {};
+			const pick = (v) => (typeof v === "string" ? v : (v && typeof v === "object" ? (v.en || v.zh || Object.values(v)[0]) : ""));
+			return pick(meta.title) || pick(meta.displayName) || pick(meta.name) || b.name;
+		}
+
+		function mpBundleDescription(b) {
+			const meta = b.meta || {};
+			const d = typeof meta.description === "string" ? meta.description
+				: (meta.description && (meta.description.en || meta.description.zh)) || b.description || "";
+			return String(d).split("\n")[0].trim();
+		}
+
+		/**
+		 * Rows for Settings > Plugins from pluginManager.listBundles() plus the app's own plugins.
+		 * kind: "user" (installed by the person: switch + remove), "app" (shipped by this app), "builtin" (DSH's own).
+		 * DSH catalog entries that are neither installed nor optional are left out (the marketplace lists those).
+		 */
+		function buildPluginRows(bundles, appPlugins) {
+			const rows = [];
+			for (const b of bundles || []) {
+				if (!b || !b.name) continue;
+				const app = APP_BUNDLES.has(b.name);
+				// The profile's own base bundles (@deepseek-ai/dsh-base, dsh-web-app, …) are not flagged official.
+				const kind = app ? "app" : (b.official || String(b.name).startsWith("@deepseek-ai/") ? "builtin" : "user");
+				if (kind === "builtin" && !b.installed && !b.optional) continue;
+				rows.push({
+					name: b.name,
+					label: mpBundleLabel(b),
+					description: mpBundleDescription(b),
+					version: b.version || "",
+					kind,
+					enabled: !!b.enabled,
+					toggleable: !!(b.installed || b.optional),
+					removable: kind === "user" && b.removable !== false,
+					error: b.error ? String(b.error.message || b.error.code || b.error) : "",
+				});
+			}
+			for (const p of appPlugins || []) {
+				if (rows.some((r) => r.name === p.name)) continue;
+				rows.push({ name: p.name, label: p.label, description: p.description || "", version: "", kind: "app",
+					enabled: true, toggleable: false, removable: false, error: "" });
+			}
+			const order = { user: 0, app: 1, builtin: 2 };
+			rows.sort((a, b) => (order[a.kind] - order[b.kind]) || a.label.localeCompare(b.label, "en", { sensitivity: "base" })
+				|| a.name.localeCompare(b.name));
+			return rows;
+		}
+
+		/** Why [spec] cannot be installed from the Plugins section (npm names only), or null. */
+		function pluginSpecProblem(spec) {
+			const s = String(spec == null ? "" : spec).trim();
+			if (!s) return "Enter an npm package name.";
+			if (!/^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*(@[A-Za-z0-9.^~<>=*|+ -]+)?$/.test(s) || /\s/.test(s)) {
+				return "Use an npm package name, like dsh-plugin-name or @scope/name.";
+			}
+			return null;
+		}
+
+		const MP_PLUGINS_NS = "dsh-android-mobile.plugins";
+		const MP_PLUGINS_EN = {
+			nav: "Plugins",
+			title: "Plugins",
+			intro: "In DSH everything is a plugin: skills, tools, themes. Install from npm or the marketplace, switch them on or off, and remove the ones you installed. New skills show up in the / menu right away.",
+			installLabel: "Install from npm",
+			installPlaceholder: "package name, e.g. dsh-plugin-name",
+			install: "Install",
+			installing: "Installing…",
+			market: "Browse marketplace",
+			groupUser: "Installed by you",
+			groupApp: "Built into the app",
+			groupBuiltin: "Built into DSH",
+			none: "No plugins installed yet.",
+			on: "On",
+			off: "Off",
+			enable: "Turn on",
+			disable: "Turn off",
+			remove: "Remove",
+			confirmRemove: "Remove {name}?",
+			working: "Working…",
+			done: "Done.",
+			restartNeeded: "Restart the engine to finish.",
+			restart: "Restart engine",
+			unavailable: "The plugin manager is not available right now.",
+			refresh: "Refresh",
+			marketMissing: "Open Settings > Marketplace.",
+		};
+		const MP_PLUGINS_ZH = {
+			nav: "插件",
+			title: "插件",
+			intro: "DSH 里一切皆插件：技能、工具、主题。可从 npm 或插件市场安装，开关插件，移除自己装的插件。新技能会立刻出现在 / 菜单里。",
+			installLabel: "从 npm 安装",
+			installPlaceholder: "包名，例如 dsh-plugin-name",
+			install: "安装",
+			installing: "安装中…",
+			market: "浏览插件市场",
+			groupUser: "我安装的",
+			groupApp: "App 内置",
+			groupBuiltin: "DSH 内置",
+			none: "还没有安装插件。",
+			on: "已开启",
+			off: "已关闭",
+			enable: "开启",
+			disable: "关闭",
+			remove: "移除",
+			confirmRemove: "移除 {name}？",
+			working: "处理中…",
+			done: "完成。",
+			restartNeeded: "需要重启引擎才能生效。",
+			restart: "重启引擎",
+			unavailable: "插件管理器暂时不可用。",
+			refresh: "刷新",
+			marketMissing: "请打开 设置 > 插件市场。",
+		};
+
+		function mpOpenMarketSection(t) {
+			const labels = /^(Marketplace|插件市场)$/;
+			const target = [...document.querySelectorAll('[role="dialog"] button, [role="dialog"] [role="tab"], [role="dialog"] a, [role="dialog"] li')]
+				.find((el) => labels.test((el.textContent || "").trim()));
+			if (target) target.click(); else window.alert(t("marketMissing"));
+		}
+
+		function mpPluginsSection(props, scope) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const h = React.createElement;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_PLUGINS_EN[key] ?? key;
+			const [list, setList] = React.useState({ phase: "loading", rows: [] });
+			const [spec, setSpec] = React.useState("");
+			const [op, setOp] = React.useState(null);
+			const manager = scope && scope.remote && scope.remote.pluginManager;
+
+			const load = React.useCallback(() => {
+				if (!manager || typeof manager.listBundles !== "function") { setList({ phase: "unavailable", rows: buildPluginRows([], APP_PLUGINS) }); return; }
+				manager.listBundles().then((result) => {
+					if (!result || !result.ok) { setList({ phase: "unavailable", rows: buildPluginRows([], APP_PLUGINS) }); return; }
+					setList({ phase: "ready", rows: buildPluginRows(result.value || [], APP_PLUGINS) });
+				}).catch(() => setList({ phase: "unavailable", rows: buildPluginRows([], APP_PLUGINS) }));
+			}, [manager]);
+			React.useEffect(load, [load]);
+
+			const run = (name, promise) => {
+				setOp({ name, phase: "working" });
+				promise.then((result) => {
+					const value = (result && result.value) || {};
+					if (!result || !result.ok || value.application === "failed" || value.error) {
+						const err = (result && result.error) || value.error || {};
+						setOp({ name, phase: "error", message: String(err.message || err.code || err.reason || "failed") });
+					} else {
+						setOp({ name, phase: value.application === "restart-required" ? "restart" : "done" });
+					}
+					load();
+				}).catch((e) => { setOp({ name, phase: "error", message: String((e && e.message) || e) }); load(); });
+			};
+			const install = () => {
+				const problem = pluginSpecProblem(spec);
+				if (problem) { setOp({ name: spec, phase: "error", message: problem }); return; }
+				if (!manager || typeof manager.installBundle !== "function") { setOp({ name: spec, phase: "error", message: t("unavailable") }); return; }
+				run(spec.trim(), manager.installBundle(spec.trim(), { enabled: true }));
+				setSpec("");
+			};
+			const toggle = (row) => manager && run(row.name, manager.setBundleEnabled(row.name, !row.enabled));
+			const remove = (row) => {
+				if (!manager || !window.confirm(t("confirmRemove").replace("{name}", row.label))) return;
+				run(row.name, manager.removeBundle(row.name));
+			};
+
+			const busy = op && op.phase === "working";
+			const status = op ? h("div", { style: S.next, "data-mp-plugin-status": op.phase },
+				h("span", { style: S.nextText },
+					op.phase === "working" ? t("working") : op.phase === "error" ? op.message
+						: op.phase === "restart" ? t("restartNeeded") : t("done")),
+				op.phase === "restart" ? h("button", { style: S.btnPrimary, onClick: () => mpAppAction("engineRestart") }, t("restart")) : null,
+			) : null;
+
+			const row = (r) => h("div", { key: r.name, style: { ...S.card, gap: "6px" }, "data-mp-plugin": r.name, "data-mp-plugin-kind": r.kind },
+				h("div", { style: S.cardHead },
+					h("h3", { style: { ...S.cardTitle, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, r.label),
+					h("span", { style: { ...S.badge, color: (r.enabled ? MP_PRIV_TONE.on : MP_PRIV_TONE.warn).color,
+						background: (r.enabled ? MP_PRIV_TONE.on : MP_PRIV_TONE.warn).bg } }, r.enabled ? t("on") : t("off")),
+				),
+				r.description ? h("p", { style: { ...S.note, margin: 0 } }, r.description) : null,
+				h("p", { style: { ...S.note, margin: 0, fontFamily: "ui-monospace, monospace", wordBreak: "break-all" } }, r.name + (r.version ? " · " + r.version : "")),
+				r.error ? h("p", { style: { ...S.error, margin: 0 } }, r.error) : null,
+				(r.toggleable || r.removable) ? h("div", { style: S.actions },
+					r.toggleable ? h("button", { style: S.btn, disabled: busy, onClick: () => toggle(r) }, r.enabled ? t("disable") : t("enable")) : null,
+					r.removable ? h("button", { style: S.btnQuiet, disabled: busy, onClick: () => remove(r) }, t("remove")) : null,
+				) : null,
+			);
+			const group = (kind, title) => {
+				const rows = list.rows.filter((r) => r.kind === kind);
+				if (!rows.length && kind !== "user") return null;
+				return h("div", { style: S.stack, key: kind },
+					h("h3", { style: { ...S.cardTitle, marginTop: "8px" } }, title),
+					rows.length ? rows.map(row) : h("p", { style: S.note }, t("none")),
+				);
+			};
+
+			return h("div", { style: S.section },
+				h("h2", { style: S.heading }, t("title")),
+				h("p", { style: S.intro }, t("intro")),
+				h("div", { style: S.card },
+					h("h3", { style: S.cardTitle }, t("installLabel")),
+					h("input", {
+						type: "text", value: spec, placeholder: t("installPlaceholder"), autoCapitalize: "none", autoCorrect: "off", spellCheck: false,
+						onChange: (e) => setSpec(e.target.value),
+						onKeyDown: (e) => { if (e.key === "Enter") install(); },
+						style: { font: "inherit", fontSize: "14px", padding: "8px 10px", borderRadius: "8px", color: "inherit",
+							border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)", background: "var(--dsw-alias-bg-layer-1, #fff)" },
+						"data-mp-plugin-spec": "",
+					}),
+					h("div", { style: S.actions },
+						h("button", { style: S.btnPrimary, disabled: busy, onClick: install }, busy ? t("installing") : t("install")),
+						h("button", { style: S.btn, onClick: () => mpOpenMarketSection(t) }, t("market")),
+						h("button", { style: S.btnQuiet, onClick: load }, t("refresh")),
+					),
+				),
+				status,
+				list.phase === "unavailable" ? h("p", { style: S.note }, t("unavailable")) : null,
+				group("user", t("groupUser")),
+				group("app", t("groupApp")),
+				group("builtin", t("groupBuiltin")),
 			);
 		}
 
@@ -9853,6 +10103,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			mpRegisterBubbleSection(ctx);
 			mpRegisterLogsSection(ctx);
 			mpRegisterV13Section(ctx, { id: "dsh-android-account", order: 3, ns: MP_ACCOUNT_NS, zh: MP_ACCOUNT_ZH, en: MP_ACCOUNT_EN, component: mpAccountSection });
+			mpRegisterV13Section(ctx, { id: "dsh-android-plugins", order: 4, ns: MP_PLUGINS_NS, zh: MP_PLUGINS_ZH, en: MP_PLUGINS_EN,
+				component: mpPluginsSection, inject: ["remote", "remote.pluginManager"] });
 			mpRegisterContactSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */
@@ -9932,6 +10184,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 		}
 
 		exports.apply = apply;
+		Object.assign(exports.__test, { buildPluginRows, pluginSpecProblem, APP_PLUGINS });
 		/**
 		 * 本插件依赖的 cordis 服务。
 		 *
