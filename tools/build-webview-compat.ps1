@@ -175,7 +175,7 @@ param(
     #      ⚠️ PR #3 原作把本戳写成 24、把 `MOBILE_UI_VERSION` 写成 1.0.0-68，
     #      那是基于旧的 22/1.0.0-66 算的。合并时**必须取本地已推进的值再 +1**
     #      （33 → 34 / 1.0.0-99 → -100），否则会回退，设备上静默跑回旧 UI。
-    [string]$CompatVersion = "39",
+    [string]$CompatVersion = "40",
 
     [string]$EngineBin,
     [string]$OutZip

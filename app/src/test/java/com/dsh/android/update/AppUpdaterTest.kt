@@ -26,6 +26,8 @@ class AppUpdaterTest {
         assertEquals("DSH1.3.1-mk.apk", system.apkName)
         assertEquals("https://github.com/x/DSH-mk.apk", system.apkUrl)
         assertEquals("https://github.com/x/SHA256SUMS.txt", system.sumsUrl)
+        assertEquals("https://github.com/muhib-karim/DSHAPP/releases/tag/v1.3.1", system.page)
+        assertEquals("Notes", system.notes)
         assertEquals("DSH1.3.1-mk-gecko.apk", AppUpdater.parseRelease(release("v1.3.1"), gecko = true)!!.apkName)
     }
 
@@ -34,6 +36,53 @@ class AppUpdaterTest {
         assertNull(AppUpdater.parseRelease(release("v1.4.0", pre = true), gecko = false))
         assertNull(AppUpdater.parseRelease("{\"message\":\"Not Found\"}", gecko = false))
         assertNull(AppUpdater.parseRelease("{\"tag_name\":\"v1.4.0\",\"assets\":[]}", gecko = false))
+    }
+
+    @Test fun releaseNotesAreCleanedPlainText() {
+        assertEquals("Title\n\nBody", AppUpdater.displayNotes("  Title\r\n\r\n\r\n\tBody\u0000\r\n"))
+        assertEquals("one line", AppUpdater.displayNotes("one line\n\n\n"))
+        assertEquals("", AppUpdater.displayNotes(""))
+        assertEquals("", AppUpdater.displayNotes(" \r\n\t\u0000 "))
+        assertEquals("", AppUpdater.parseRelease(release("v1.3.1").replace("\"body\":\"Notes\",", ""), false)!!.notes)
+    }
+
+    @Test fun longReleaseNotesAreCappedWithAnEllipsis() {
+        val shown = AppUpdater.displayNotes("x".repeat(10_000))
+        assertEquals(AppUpdater.MAX_NOTES_CHARS, shown.length)
+        assertTrue(shown.endsWith("\u2026"))
+        assertEquals("x".repeat(AppUpdater.MAX_NOTES_CHARS - 1), shown.dropLast(1))
+    }
+
+    @Test fun releaseNotesNeverSplitASurrogatePair() {
+        val source = "a" + "\uD83D\uDE00".repeat(3_000)
+        val shown = AppUpdater.displayNotes(source)
+        assertTrue(shown.length <= AppUpdater.MAX_NOTES_CHARS)
+        assertTrue(shown.endsWith("\u2026"))
+        val kept = shown.dropLast(1)
+        assertFalse(Character.isHighSurrogate(kept.last()))
+        assertEquals(source.take(kept.length), kept)
+    }
+
+    @Test fun onlyThisForksHttpsReleasePagesAreTrusted() {
+        listOf(
+            "https://github.com/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://github.com/muhib-karim/DSHAPP/releases/latest",
+            "https://github.com:443/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://GITHUB.com/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+        ).forEach { assertTrue(it, AppUpdater.isTrustedReleasePage(it)) }
+        listOf(
+            "http://github.com/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://evil.example/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://github.com.evil.example/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://user@github.com/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://github.com:8443/muhib-karim/DSHAPP/releases/tag/v1.3.1",
+            "https://github.com/muhib-karim/DSHAPP/releases/../../evil",
+            "https://github.com/muhib-karim/DSHAPP/releases/%2e%2e/evil",
+            "https://github.com/other/DSHAPP/releases/tag/v1.3.1",
+            "https://github.com/muhib-karim/DSHAPP/issues",
+            "javascript:alert(1)",
+            "",
+        ).forEach { assertFalse(it, AppUpdater.isTrustedReleasePage(it)) }
     }
 
     @Test fun onlyNewerReleasesAreUpdates() {

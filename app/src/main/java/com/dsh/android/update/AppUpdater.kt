@@ -2,11 +2,17 @@ package com.dsh.android.update
 
 import org.json.JSONObject
 import java.io.File
+import java.net.URI
 import java.security.MessageDigest
 
 /** App updates from this fork's GitHub releases (pure parts: parsing and checks; download and install in UpdateCenter). */
 object AppUpdater {
     const val RELEASES_URL = "https://api.github.com/repos/muhib-karim/DSHAPP/releases/latest"
+
+    /** A release body is shown as at most this many characters; longer notes end with an ellipsis. */
+    const val MAX_NOTES_CHARS = 4_000
+
+    private const val RELEASE_PAGE_PREFIX = "/muhib-karim/DSHAPP/releases/"
 
     data class Release(val version: String, val apkName: String, val apkUrl: String, val apkSize: Long,
                        val sumsUrl: String?, val page: String, val notes: String)
@@ -52,6 +58,47 @@ object AppUpdater {
     }.getOrNull()
 
     fun isUpdate(release: Release, currentVersionName: String) = Versions.isNewer(release.version, currentVersionName)
+
+    /**
+     * Release notes as safe plain text for the About card.
+     *
+     * GitHub bodies are Markdown, but the card never interprets them: normalise line endings, drop control
+     * characters, keep at most one blank line between paragraphs, trim and cap the result. The cap leaves the
+     * ellipsis inside [MAX_NOTES_CHARS] and never splits a surrogate pair.
+     */
+    fun displayNotes(notes: String): String {
+        val normalised = notes.replace("\r\n", "\n").replace('\r', '\n')
+        val cleaned = buildString(normalised.length) {
+            var afterBlankLine = false
+            for (raw in normalised.split('\n')) {
+                val line = raw.filterNot { it.isISOControl() }.trimEnd()
+                if (line.isBlank()) {
+                    // At most one blank line, and none at the start or end.
+                    if (isEmpty() || afterBlankLine) continue
+                    afterBlankLine = true
+                } else {
+                    afterBlankLine = false
+                }
+                if (isNotEmpty()) append('\n')
+                append(line)
+            }
+        }.trim()
+        if (cleaned.length <= MAX_NOTES_CHARS) return cleaned
+        var cut = MAX_NOTES_CHARS - 1
+        if (cut > 0 && Character.isHighSurrogate(cleaned[cut - 1])) cut--
+        return cleaned.substring(0, cut).trimEnd() + "\u2026"
+    }
+
+    /** True only for this fork's HTTPS release pages, with no credentials, port trick or path traversal. */
+    fun isTrustedReleasePage(url: String): Boolean = runCatching {
+        val uri = URI(url.trim())
+        val path = uri.normalize().path ?: return false
+        uri.scheme.equals("https", ignoreCase = true) &&
+            uri.host.equals("github.com", ignoreCase = true) &&
+            uri.userInfo == null && (uri.port == -1 || uri.port == 443) &&
+            path.startsWith(RELEASE_PAGE_PREFIX) &&
+            !path.contains("..") && !path.contains('%') && !path.contains('\\')
+    }.getOrDefault(false)
 
     /** The lowercase sha256 of [apkName] in a `sha256sum` listing, or null. */
     fun sha256For(sums: String, apkName: String): String? = sums.lineSequence().mapNotNull { line ->

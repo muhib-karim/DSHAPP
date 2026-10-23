@@ -58,6 +58,8 @@ start, the app switches back by itself. Once a new harness has started, **Restor
 section goes back to the one before it (after a confirmation and a restart). The app itself updates from this
 repository's GitHub releases (checksum verified, and the archive's package name and signing certificate are checked
 against the installed app before the installer opens, so a wrong download is refused and can be retried).
+The release notes expand as plain text in the card (long notes are truncated), and **Release page** opens this
+repository's GitHub release — the page cannot supply a different URL.
 
 | Plugins | Account | About & updates |
 |---|---|---|

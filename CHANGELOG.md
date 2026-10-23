@@ -52,6 +52,10 @@ updatable in the app.
   without waiting for a failed boot. The APK from this fork's GitHub releases, SHA-256 checked, installed through a FileProvider. Before the installer opens, the APK must
   also carry this app's package name and be signed by its certificate; a wrong-flavor or wrong-signer download is
   deleted and reported with a retryable message instead of failing late in the installer.
+- **Release notes in About & updates**: the checked app release's notes open in a collapsible block as plain text
+  (line breaks and lists readable, control characters and excess blank lines removed, long notes capped at 4,000
+  characters with a visible ellipsis). A **Release page** button opens the release on github.com; the page cannot pass
+  a URL, and native code accepts only `https://github.com/muhib-karim/DSHAPP/releases/…`.
 - JVM and node unit tests (credentials writer, profile patch, key check, PoW solver, SSE parser, bridge mapping and
   server, version compare, update slots, plugin list, skill refresh, opaque surfaces); CI runs them before the build.
   The emulator smoke test now covers the first screen and the API-key screen.

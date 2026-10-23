@@ -76,7 +76,10 @@ object UpdateCenter {
             appLatest != null && Versions.isNewer(appLatest, BuildConfig.VERSION_NAME), appStatus,
             release?.let { downloadedApk?.isFor(it) } == true,
         )
+        val appNotes = release?.notes?.let(AppUpdater::displayNotes).orEmpty()
+        val appPage = release?.page?.takeIf(AppUpdater::isTrustedReleasePage)
         val app = JSONObject().put("current", BuildConfig.VERSION_NAME).put("latest", appLatest ?: JSONObject.NULL)
+            .put("notes", appNotes).put("page", appPage ?: JSONObject.NULL)
             .put("status", when {
                 appStatus != "idle" -> appStatus
                 appLatest != null && Versions.isNewer(appLatest, BuildConfig.VERSION_NAME) -> "available"
@@ -88,6 +91,9 @@ object UpdateCenter {
         return JSONObject().put("harness", harness).put("app", app)
             .put("checking", checking).put("lastCheck", p.getLong("lastCheck", 0L))
     }
+
+    /** The checked app release's page, but only when it is this fork's HTTPS GitHub release URL. */
+    fun releasePage(): String? = release?.page?.takeIf(AppUpdater::isTrustedReleasePage)
 
     /** Why the harness cannot be updated on this phone, or null. */
     private fun harnessBlocked(): String? =

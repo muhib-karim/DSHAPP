@@ -9707,6 +9707,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			unknown: "Not checked yet",
 			noBridge: "Updates are available in the Android app.",
 			releases: "Release notes",
+			releasePage: "Release page",
 			restore: "Restore previous version ({version})",
 			confirmRestore: "Go back to @deepseek-ai/dsh {version}? The engine will restart.",
 		};
@@ -9734,6 +9735,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			unknown: "尚未检查",
 			noBridge: "更新功能仅在 Android App 中可用。",
 			releases: "更新说明",
+			releasePage: "发布页",
 			restore: "恢复上一个版本（{version}）",
 			confirmRestore: "回到 @deepseek-ai/dsh {version}？引擎会重新启动。",
 		};
@@ -9763,8 +9765,17 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 					h("div", { style: S.row }, h("span", { style: S.rowLabel }, t("current")), h("span", { style: S.rowValue }, u.current || "—")),
 					h("div", { style: S.row }, h("span", { style: S.rowLabel }, t("latest")), h("span", { style: S.rowValue }, u.latest || "—")),
 					u.message ? h("p", { style: { ...S.note, margin: 0 } }, u.message) : null,
+					key === "app" && typeof u.notes === "string" && u.notes ? h("details", { style: S.foldInline, "data-mp-update-notes": "" },
+						h("summary", { style: S.foldHead }, t("releases")),
+						h("pre", { style: { ...S.note, margin: "8px 0 0", maxHeight: "220px", overflowY: "auto",
+							whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit" } }, u.notes)) : null,
 					u.canUpdate || u.canInstall ? h("div", { style: S.actions },
 						h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } }, t(u.canInstall ? "install" : "update") + " → " + u.latest)) : null,
+					key === "app" && typeof u.page === "string" && u.page ? h("div", { style: S.actions },
+						h("button", { style: S.btn, "data-mp-update-action": "openReleasePage", onClick: () => {
+							mpAppAction("openReleasePage");
+							refresh();
+						} }, t("releasePage"))) : null,
 					canRestore ? h("div", { style: S.actions },
 						h("button", { style: S.btn, "data-mp-update-action": "harnessRollback", onClick: () => {
 							if (!window.confirm(t("confirmRestore").replace("{version}", String(u.previous)))) return;

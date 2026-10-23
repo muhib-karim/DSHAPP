@@ -88,3 +88,47 @@ for (const [description, harness] of [
     assert.equal(find(card, (node) => node.props['data-mp-update-action'] === 'harnessRollback'), undefined);
   });
 }
+
+test('app release notes render as plain text in a collapsed block', () => {
+  const notes = "## What's new\n\n- Faster start\n- <b>Safer</b> & quieter";
+  const page = 'https://github.com/muhib-karim/DSHAPP/releases/tag/v1.4.0';
+  const { tree } = render({ app: { current: '1.3.0', latest: '1.4.0', status: 'available', canUpdate: false,
+    canInstall: false, notes, page } });
+  const card = find(tree, (node) => node.props['data-mp-update'] === 'app');
+  const details = find(card, (node) => node.tag === 'details' && 'data-mp-update-notes' in node.props);
+  assert.ok(details, 'the notes block is present');
+  assert.equal(find(details, (node) => node.tag === 'summary').children.join(''), 'Release notes');
+  const pre = find(details, (node) => node.tag === 'pre');
+  assert.equal(pre.children.join(''), notes, 'Markdown is kept verbatim as text');
+  assert.equal(pre.props.style.whiteSpace, 'pre-wrap');
+  assert.equal(find(card, (node) => node.props.dangerouslySetInnerHTML !== undefined), undefined);
+});
+
+test('the app card offers the stored release page and passes no URL from the page', () => {
+  const page = 'https://github.com/muhib-karim/DSHAPP/releases/tag/v1.4.0';
+  const { tree, actions } = render({ app: { current: '1.3.0', latest: '1.4.0', status: 'available', canUpdate: false,
+    canInstall: false, notes: 'Notes', page } });
+  const card = find(tree, (node) => node.props['data-mp-update'] === 'app');
+  const button = find(card, (node) => node.props['data-mp-update-action'] === 'openReleasePage');
+  assert.ok(button, 'the release-page action is visible');
+  assert.equal(button.children.join(''), 'Release page');
+  button.props.onClick();
+  assert.deepEqual(actions, [['openReleasePage', '']], 'the native side looks the page up again');
+});
+
+test('notes and the release page stay hidden when the app update has none', () => {
+  const { tree } = render({ app: { current: '1.3.0', latest: '1.3.0', status: 'current', canUpdate: false,
+    canInstall: false, notes: '', page: null } });
+  const card = find(tree, (node) => node.props['data-mp-update'] === 'app');
+  assert.equal(find(card, (node) => node.tag === 'details'), undefined);
+  assert.equal(find(card, (node) => node.props['data-mp-update-action'] === 'openReleasePage'), undefined);
+});
+
+test('release notes belong to the app card, not the harness card', () => {
+  const page = 'https://github.com/muhib-karim/DSHAPP/releases/tag/v1.4.0';
+  const { tree } = render({ harness: { current: '0.2.3', status: 'current', canUpdate: false, notes: 'Engine notes',
+    page } });
+  const card = find(tree, (node) => node.props['data-mp-update'] === 'harness');
+  assert.equal(find(card, (node) => node.tag === 'details'), undefined);
+  assert.equal(find(card, (node) => node.props['data-mp-update-action'] === 'openReleasePage'), undefined);
+});

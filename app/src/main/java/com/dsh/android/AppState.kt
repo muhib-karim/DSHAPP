@@ -2,6 +2,7 @@ package com.dsh.android
 
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.webkit.CookieManager
 import android.webkit.WebStorage
 import androidx.appcompat.app.AlertDialog
@@ -11,6 +12,7 @@ import com.dsh.android.account.AccountStore
 import com.dsh.android.account.DshCredentials
 import com.dsh.android.account.SignInActivity
 import com.dsh.android.log.DshLog
+import com.dsh.android.update.AppUpdater
 import com.dsh.android.update.UpdateCenter
 import com.dsh.android.webbridge.DeepSeekWebClient
 import com.dsh.android.webbridge.WebAccount
@@ -49,11 +51,26 @@ object AppState {
             "updateCheck" -> UpdateCenter.check(activity)
             "updateHarness" -> UpdateCenter.updateHarness(activity)
             "updateApp" -> UpdateCenter.updateApp(activity)
+            "openReleasePage" -> openReleasePage(activity)
             "harnessRollback" -> restorePreviousHarness(activity, arg)
             // Settings > Plugins: a plugin change that dsh can only apply on restart.
             "engineRestart" -> Thread({ EngineManager.get(activity).requestRestart("plugins changed") }, "engine-restart").start()
             else -> DshLog.w(DshApplication.TAG, "unknown settings action: $name")
         }
+    }
+
+    /**
+     * Settings > About & updates: open the checked release's page. The page cannot supply a URL: [UpdateCenter]
+     * returns only the stored `html_url`, and [AppUpdater.isTrustedReleasePage] re-checks scheme, host and path.
+     */
+    private fun openReleasePage(activity: Activity) {
+        val page = UpdateCenter.releasePage()
+        if (page == null || !AppUpdater.isTrustedReleasePage(page)) {
+            DshLog.w(DshApplication.TAG, "release page: nothing trusted to open")
+            return
+        }
+        runCatching { activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(page))) }
+            .onFailure { DshLog.w(DshApplication.TAG, "release page: could not open (${it.javaClass.simpleName})") }
     }
 
     /**
