@@ -29,10 +29,10 @@ class DeepSeekWebClient(
 ) : WebChat {
 
     /** `GET users/current` → `biz_data` (email, mobile_number, need_birthday); throws when the token is not accepted. */
-    fun currentUser(): JSONObject = bizData(request("GET", "users/current", null))
+    fun currentUser(cancelled: () -> Boolean = { false }): JSONObject = bizData(request("GET", "users/current", null, cancelled))
 
-    fun createSession(): String {
-        val data = bizData(request("POST", "chat_session/create", JSONObject()))
+    fun createSession(cancelled: () -> Boolean = { false }): String {
+        val data = bizData(request("POST", "chat_session/create", JSONObject(), cancelled))
         return data.optString("id").ifEmpty { data.optJSONObject("chat_session")?.optString("id").orEmpty() }
             .ifEmpty { throw WebServiceError(-1, "DeepSeek did not return a chat id") }
     }
@@ -40,10 +40,12 @@ class DeepSeekWebClient(
     /** Creates and solves a challenge for [targetPath]; retries once if it expired while solving. */
     fun powHeader(targetPath: String = PowChallenge.COMPLETION_PATH, cancelled: () -> Boolean = { false }): String {
         repeat(2) {
-            val data = bizData(request("POST", "chat/create_pow_challenge", JSONObject().put("target_path", targetPath)))
+            val data = bizData(request("POST", "chat/create_pow_challenge", JSONObject().put("target_path", targetPath), cancelled))
             val challenge = data.optJSONObject("challenge")?.let(PowChallenge::fromJson)
                 ?: throw WebServiceError(-2, "DeepSeek changed its proof of work; update the app")
-            val answer = DeepSeekHashV1.answer(challenge) { if (cancelled()) throw IOException("cancelled") }
+            checkCancelled(cancelled)
+            if (System.currentTimeMillis() >= challenge.expireAt) return@repeat
+            val answer = DeepSeekHashV1.answer(challenge) { checkCancelled(cancelled) }
                 ?: throw WebServiceError(-2, "DeepSeek changed its proof of work; update the app")
             if (System.currentTimeMillis() < challenge.expireAt) return challenge.header(answer, targetPath)
         }
@@ -51,16 +53,20 @@ class DeepSeekWebClient(
     }
 
     override fun complete(prompt: String, thinking: Boolean, search: Boolean, cancelled: () -> Boolean, onDelta: (WebDelta) -> Unit) {
-        val session = createSession()
+        checkCancelled(cancelled)
+        val session = createSession(cancelled)
         val pow = powHeader(cancelled = cancelled)
         val body = JSONObject()
             .put("chat_session_id", session).put("parent_message_id", JSONObject.NULL).put("model_type", "default")
             .put("prompt", prompt).put("ref_file_ids", JSONArray()).put("thinking_enabled", thinking)
             .put("search_enabled", search).put("action", JSONObject.NULL).put("preempt", false)
+        checkCancelled(cancelled)
         val conn = open("POST", "chat/completion")
         conn.setRequestProperty("X-DS-PoW-Response", pow)
         conn.setRequestProperty("Accept", "text/event-stream")
+        val cancellation = ConnectionCancellation(conn, cancelled)
         try {
+            checkCancelled(cancelled)
             conn.doOutput = true
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val status = conn.responseCode
@@ -77,34 +83,38 @@ class DeepSeekWebClient(
                 var event: String? = null
                 val data = StringBuilder()
                 while (true) {
-                    if (cancelled()) return
+                    checkCancelled(cancelled)
                     val line = reader.readLine() ?: break
                     when {
                         line.isEmpty() -> {
-                            if (data.isNotEmpty()) parser.feed(event, data.toString()).forEach(onDelta)
+                            if (data.isNotEmpty() || event != null) parser.feed(event, data.toString()).forEach(onDelta)
                             event = null
                             data.setLength(0)
                             if (parser.finished) return
                         }
                         line.startsWith("event:") -> event = line.removePrefix("event:").trim()
                         line.startsWith("data:") -> {
-                            if (data.length > MAX_EVENT) throw IOException("event too large")
                             if (data.isNotEmpty()) data.append('\n')
                             data.append(line.removePrefix("data:").removePrefix(" "))
+                            if (data.length > MAX_EVENT) throw IOException("event too large")
                         }
                     }
                 }
-                if (data.isNotEmpty()) parser.feed(event, data.toString()).forEach(onDelta)
-                if (!parser.finished) onDelta(WebDelta.Finished)
+                if (data.isNotEmpty() || event != null) parser.feed(event, data.toString()).forEach(onDelta)
+                checkCancelled(cancelled)
+                if (!parser.finished) throw WebServiceError(-1, "DeepSeek stream ended before completion")
             }
         } finally {
-            conn.disconnect()
+            cancellation.close()
         }
     }
 
-    private fun request(method: String, path: String, body: JSONObject?): JSONObject {
+    private fun request(method: String, path: String, body: JSONObject?, cancelled: () -> Boolean = { false }): JSONObject {
+        checkCancelled(cancelled)
         val conn = open(method, path)
+        val cancellation = ConnectionCancellation(conn, cancelled)
         try {
+            checkCancelled(cancelled)
             if (body != null) {
                 conn.doOutput = true
                 conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
@@ -114,8 +124,30 @@ class DeepSeekWebClient(
             if (status !in 200..299) throw errorFor(status, text)
             return runCatching { JSONObject(text) }.getOrElse { throw WebServiceError(-1, "DeepSeek answered something unexpected") }
         } finally {
+            cancellation.close()
+        }
+    }
+
+    /** Closing a connection releases blocked connect/read calls; interruption alone does not do that on Android. */
+    private class ConnectionCancellation(private val conn: HttpURLConnection, cancelled: () -> Boolean) : java.io.Closeable {
+        private val done = java.util.concurrent.atomic.AtomicBoolean()
+        private val owner = Thread.currentThread()
+        private val watcher = Thread({
+            while (!done.get()) {
+                if (cancelled() || owner.isInterrupted) conn.disconnect()
+                try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+            }
+        }, "web-http-cancel").apply { isDaemon = true; start() }
+
+        override fun close() {
+            done.set(true)
+            watcher.interrupt()
             conn.disconnect()
         }
+    }
+
+    private fun checkCancelled(cancelled: () -> Boolean) {
+        if (cancelled() || Thread.currentThread().isInterrupted) throw IOException("cancelled")
     }
 
     private fun open(method: String, path: String): HttpURLConnection {

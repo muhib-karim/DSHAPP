@@ -23,6 +23,8 @@
     <string name="login_copy_bookmark">Copy bookmark</string>
     <string name="login_paste_hint">Paste session</string>
     <string name="login_bookmark_copied">Bookmark copied. Save it in your browser\'s bookmarks.</string>
+    <string name="login_switch_account">Choose another account on the page, or use your browser. Closing keeps your current DSH account.</string>
+    <string name="login_save_failed">Could not save the account. Try again.</string>
     <string name="login_checking">Signing in…</string>
     <string name="login_birthday">Finish your DeepSeek profile on the page first.</string>
     <string name="login_failed">That session was not accepted. Sign in again.</string>

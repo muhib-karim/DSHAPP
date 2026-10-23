@@ -22,10 +22,11 @@ import kotlin.concurrent.thread
 class SignInActivity : AppCompatActivity() {
     private lateinit var binding: ActivitySignInBinding
     private lateinit var store: AccountStore
+    private var attempt: AccountChanges.Attempt? = null
     @Volatile private var checking = false
 
     private val webLogin = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        if (result.resultCode == RESULT_OK) done(AccountConfig.Mode.WEB)
+        if (result.resultCode == RESULT_OK) { setResult(RESULT_OK); finish() }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,7 +36,10 @@ class SignInActivity : AppCompatActivity() {
         store = AccountStore(this)
         if (intent.getBooleanExtra(EXTRA_SWITCH, false)) binding.subtitle.setText(com.dsh.android.R.string.signin_switch_subtitle)
 
-        binding.btnGoogle.setOnClickListener { webLogin.launch(Intent(this, DeepSeekLoginActivity::class.java)) }
+        binding.btnGoogle.setOnClickListener {
+            cancelCheck()
+            webLogin.launch(Intent(this, DeepSeekLoginActivity::class.java).putExtra(EXTRA_SWITCH, intent.getBooleanExtra(EXTRA_SWITCH, false)))
+        }
         binding.btnApiKey.setOnClickListener { showKeyPanel(true) }
         binding.btnLater.setOnClickListener {
             store.setUpLater()
@@ -63,6 +67,7 @@ class SignInActivity : AppCompatActivity() {
     }
 
     private fun showKeyPanel(show: Boolean) {
+        if (!show) cancelCheck()
         binding.choicePanel.visibility = if (show) View.GONE else View.VISIBLE
         binding.keyPanel.visibility = if (show) View.VISIBLE else View.GONE
         binding.keyError.visibility = View.GONE
@@ -73,49 +78,62 @@ class SignInActivity : AppCompatActivity() {
         if (checking) return
         val key = binding.keyInput.text?.toString().orEmpty().trim()
         DshCredentials.problem(key)?.let { showError(it); return }
+        val pending = AccountChanges.shared.begin().also { attempt = it }
         checking = true
         binding.keyError.visibility = View.GONE
         binding.keyProgress.visibility = View.VISIBLE
         binding.btnKeyContinue.isEnabled = false
+        val app = applicationContext
         thread(name = "api-key-check") {
             val result = ApiKeyCheck.check(key)
-            val saved = if (result == KeyCheck.Ok) runCatching {
-                DshCredentials.write(EngineManager.get(this).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to key))
-            }.exceptionOrNull() else null
+            // Publication happens on the lifecycle thread: Back/destroy queued before this result always wins.
             runOnUiThread {
+                if (isFinishing || isDestroyed || attempt !== pending || !pending.isCurrent) return@runOnUiThread
                 checking = false
                 binding.keyProgress.visibility = View.GONE
                 binding.btnKeyContinue.isEnabled = true
+                if (result is KeyCheck.Failed) { pending.cancel(); showError(result.message); return@runOnUiThread }
+                val saved = runCatching {
+                    pending.commit {
+                        DshCredentials.write(EngineManager.get(app).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to key))
+                        store.signOutWeb()
+                        store.mode = AccountConfig.Mode.API_KEY
+                    }
+                }
                 when {
-                    isFinishing -> Unit
-                    result is KeyCheck.Failed -> showError(result.message)
-                    saved != null -> showError("Could not save the key: ${saved.message}")
-                    else -> done(AccountConfig.Mode.API_KEY)
+                    saved.isFailure -> showError("Could not save the key: ${saved.exceptionOrNull()?.message}")
+                    saved.getOrDefault(false) -> {
+                        DshLog.i("DSH", "signed in: mode=API_KEY")
+                        thread(name = "sign-in-apply") { restartEngine(app) }
+                        setResult(RESULT_OK)
+                        finish()
+                    }
                 }
             }
         }
     }
 
+    private fun cancelCheck() {
+        attempt?.cancel()
+        attempt = null
+        checking = false
+        binding.keyProgress.visibility = View.GONE
+        binding.btnKeyContinue.isEnabled = true
+    }
+
+    override fun finish() {
+        attempt?.cancel()
+        super.finish()
+    }
+
+    override fun onDestroy() {
+        attempt?.cancel()
+        super.onDestroy()
+    }
+
     private fun showError(message: String) {
         binding.keyError.text = message
         binding.keyError.visibility = View.VISIBLE
-    }
-
-    /** Remembers the mode; the engine is restarted so dsh reads the new provider and default model. */
-    private fun done(mode: AccountConfig.Mode) {
-        val previous = store.mode
-        if (mode == AccountConfig.Mode.API_KEY) store.signOutWeb()
-        store.mode = mode
-        DshLog.i("DSH", "signed in: mode=$mode (was $previous)")
-        val app = applicationContext
-        thread(name = "sign-in-apply") {
-            if (previous == AccountConfig.Mode.API_KEY && mode == AccountConfig.Mode.WEB) {
-                runCatching { DshCredentials.write(EngineManager.get(app).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to null)) }
-            }
-            restartEngine(app)
-        }
-        setResult(RESULT_OK)
-        finish()
     }
 
     companion object {

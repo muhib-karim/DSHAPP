@@ -38,6 +38,9 @@ object WebToken {
         return parse(decoded)
     }
 
+    fun captureCandidate(result: String?, previousToken: String?): String? =
+        fromJavascriptResult(result)?.takeUnless { it == previousToken }
+
     /** What a person pastes: the token, the page's stored JSON, or either with "Bearer " or quotes around it. */
     fun fromPaste(text: String?): String? {
         var raw = text?.trim() ?: return null

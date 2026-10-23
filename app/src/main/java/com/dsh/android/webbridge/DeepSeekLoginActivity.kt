@@ -21,7 +21,12 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.dsh.android.R
+import com.dsh.android.account.AccountChanges
+import com.dsh.android.account.AccountConfig
 import com.dsh.android.account.AccountStore
+import com.dsh.android.account.DshCredentials
+import com.dsh.android.account.SignInActivity
+import com.dsh.android.EngineManager
 import com.dsh.android.databinding.ActivityDeepseekLoginBinding
 import com.dsh.android.log.DshLog
 import org.json.JSONObject
@@ -44,10 +49,13 @@ class DeepSeekLoginActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     @Volatile private var verifying = false
     private var lastRejected: String? = null
+    private var attempt: AccountChanges.Attempt? = null
+    private var previousToken: String? = null
 
     private val poll = object : Runnable {
         override fun run() {
-            web?.evaluateJavascript(WebToken.CAPTURE_JS) { result -> WebToken.fromJavascriptResult(result)?.let(::verify) }
+            if (isFinishing || isDestroyed || attempt?.isCurrent != true) return
+            web?.evaluateJavascript(WebToken.CAPTURE_JS) { result -> WebToken.captureCandidate(result, previousToken)?.let(::verify) }
             handler.postDelayed(this, 1000)
         }
     }
@@ -57,6 +65,9 @@ class DeepSeekLoginActivity : AppCompatActivity() {
         binding = ActivityDeepseekLoginBinding.inflate(layoutInflater)
         setContentView(binding.root)
         store = AccountStore(this)
+        attempt = AccountChanges.shared.begin()
+        previousToken = store.webToken()
+        if (previousToken != null) status(getString(R.string.login_switch_account))
         binding.btnClose.setOnClickListener { finish() }
         binding.btnUseBrowser.setOnClickListener { showBrowserRoute() }
         binding.btnOpenBrowser.setOnClickListener { openBrowser() }
@@ -104,6 +115,14 @@ class DeepSeekLoginActivity : AppCompatActivity() {
         }
         CookieManager.getInstance().setAcceptCookie(true)
         view.webViewClient = object : WebViewClient() {
+            private var resetSession = previousToken != null
+            override fun onPageFinished(v: WebView, url: String?) {
+                if (resetSession && url != null && Uri.parse(url).host == "chat.deepseek.com") {
+                    resetSession = false
+                    // The encrypted account remains usable if this switch is canceled.
+                    v.evaluateJavascript("localStorage.removeItem('userToken'); location.replace('https://chat.deepseek.com/sign_in');", null)
+                }
+            }
             override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
                 val uri = request.url
                 return uri.scheme != "https"   // only https pages (DeepSeek, Google) load here
@@ -136,6 +155,7 @@ class DeepSeekLoginActivity : AppCompatActivity() {
     }
 
     private fun showBrowserRoute() {
+        handler.removeCallbacks(poll)
         binding.webFrame.visibility = View.GONE
         binding.browserBar.visibility = View.GONE
         binding.browserPanel.visibility = View.VISIBLE
@@ -147,26 +167,31 @@ class DeepSeekLoginActivity : AppCompatActivity() {
     }
 
     private fun verify(token: String, confirm: Boolean = false) {
-        if (verifying || token == lastRejected) return
+        val pending = attempt ?: return
+        if (isFinishing || isDestroyed || !pending.isCurrent || verifying || token == lastRejected) return
         verifying = true
         status(getString(R.string.login_checking))
         thread(name = "web-sign-in") {
             val cookies = runCatching { CookieManager.getInstance().getCookie(DeepSeekWebClient.ORIGIN) }.getOrNull().orEmpty()
-            val outcome: Result<JSONObject> = runCatching { DeepSeekWebClient(token = { token }, cookies = { cookies }).currentUser() }
+            val outcome: Result<JSONObject> = runCatching { DeepSeekWebClient(token = { token }, cookies = { cookies }).currentUser { !pending.isCurrent } }
             runOnUiThread {
                 verifying = false
-                if (isFinishing) return@runOnUiThread
+                if (isFinishing || isDestroyed || !pending.isCurrent) return@runOnUiThread
                 val user = outcome.getOrNull()
                 when {
                     user == null && outcome.exceptionOrNull() is IOException -> status(getString(R.string.login_offline))
                     user == null -> { lastRejected = token; status(getString(R.string.login_failed)) }
                     user.optBoolean("need_birthday", false) -> status(getString(R.string.login_birthday))
-                    confirm -> AlertDialog.Builder(this)
+                    confirm -> {
+                        verifying = true
+                        AlertDialog.Builder(this)
                         .setTitle(R.string.login_title)
                         .setMessage(getString(R.string.login_confirm_account, WebToken.label(user)))
                         .setPositiveButton(R.string.signin_key_continue) { _, _ -> accept(token, user) }
                         .setNegativeButton(R.string.login_close) { _, _ -> status(getString(R.string.login_failed)) }
+                        .setOnDismissListener { verifying = false }
                         .show()
+                    }
                     else -> accept(token, user)
                 }
             }
@@ -174,17 +199,37 @@ class DeepSeekLoginActivity : AppCompatActivity() {
     }
 
     private fun accept(token: String, user: JSONObject) {
-        store.saveWebToken(token)
-        store.webLabel = WebToken.label(user)
-        store.browserSignInStartedAt = null
-        DshLog.i("DSH", "DeepSeek web account signed in")
-        if (callingActivity == null) {
-            // Opened by the browser link rather than from the first screen: nobody waits for the result, so apply it here.
-            store.mode = com.dsh.android.account.AccountConfig.Mode.WEB
-            com.dsh.android.account.SignInActivity.restartEngine(applicationContext)
+        val pending = attempt ?: return
+        if (isFinishing || isDestroyed) return
+        val app = applicationContext
+        val saved = runCatching {
+            pending.commit {
+                // Clear only the app-owned API key, preserving all other DSH credentials and models.
+                if (store.mode == AccountConfig.Mode.API_KEY) {
+                    DshCredentials.write(EngineManager.get(app).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to null))
+                }
+                store.saveWebToken(token)
+                store.webLabel = WebToken.label(user)
+                store.browserSignInStartedAt = null
+                store.mode = AccountConfig.Mode.WEB
+            }
         }
-        setResult(RESULT_OK)
-        finish()
+        if (saved.isFailure) {
+            status(getString(R.string.login_save_failed))
+            attempt = AccountChanges.shared.begin()
+            return
+        }
+        if (saved.getOrDefault(false)) {
+            DshLog.i("DSH", "DeepSeek web account signed in")
+            thread(name = "web-sign-in-apply") { SignInActivity.restartEngine(app) }
+            setResult(RESULT_OK)
+            finish()
+        }
+    }
+
+    override fun finish() {
+        attempt?.cancel()
+        super.finish()
     }
 
     private fun status(text: String) {
@@ -193,6 +238,7 @@ class DeepSeekLoginActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        attempt?.cancel()
         handler.removeCallbacks(poll)
         web?.destroy()
         web = null

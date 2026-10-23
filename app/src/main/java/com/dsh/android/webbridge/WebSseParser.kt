@@ -33,9 +33,10 @@ class WebSseParser {
     fun feed(event: String?, data: String): List<WebDelta> {
         if (event in METADATA_EVENTS || finished) return emptyList()
         val trimmed = data.trim()
-        if (trimmed.isEmpty()) return emptyList()
+        if (event == "error") throw WebServiceError(-1, "DeepSeek stream reported an error")
+        if (trimmed.isEmpty()) return if (event == "finish" || event == "done") finish() else emptyList()
         if (trimmed == "[DONE]") return finish()
-        val json = try { JSONObject(trimmed) } catch (e: Exception) { return emptyList() }
+        val json = try { JSONObject(trimmed) } catch (e: Exception) { throw WebServiceError(-1, "Malformed DeepSeek stream event") }
         checkCode(json)
         val out = mutableListOf<WebDelta>()
         if (json.has("p") || json.has("o") || json.has("v")) {
@@ -78,7 +79,7 @@ class WebSseParser {
         when {
             path.isEmpty() -> (value as? JSONObject)?.optJSONObject("response")?.let { response(it, out) }
             path == "response" -> (value as? JSONObject)?.let { response(it, out) }
-            path == "response/status" -> if (value == "FINISHED") out += finish()
+            path == "response/status" -> status(value.toString(), out)
             path == "response/fragments" -> {
                 if (operation == "SET") fragments.clear()
                 (value as? JSONArray)?.let { list -> for (i in 0 until list.length()) list.optJSONObject(i)?.let { add(it, out) } }
@@ -92,7 +93,15 @@ class WebSseParser {
             fragments.clear()
             for (i in 0 until list.length()) list.optJSONObject(i)?.let { add(it, out) }
         }
-        if (value.optString("status") == "FINISHED") out += finish()
+        status(value.optString("status"), out)
+    }
+
+    private fun status(value: String, out: MutableList<WebDelta>) {
+        when (value.uppercase()) {
+            "FINISHED" -> out += finish()
+            "INCOMPLETE", "INTERRUPTED", "CONTENT_FILTER", "FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMEOUT" ->
+                throw WebServiceError(-1, "DeepSeek reply did not finish: $value")
+        }
     }
 
     private fun add(fragment: JSONObject, out: MutableList<WebDelta>) {

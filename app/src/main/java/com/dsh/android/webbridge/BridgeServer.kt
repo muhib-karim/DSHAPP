@@ -29,6 +29,7 @@ class BridgeServer(
 ) {
     private var socket: ServerSocket? = null
     private var pool: ExecutorService? = null
+    private val clients = java.util.concurrent.ConcurrentHashMap<Socket, AtomicBoolean>()
 
     val port: Int get() = socket?.localPort ?: 0
     val boundAddress: InetAddress? get() = socket?.inetAddress
@@ -46,7 +47,18 @@ class BridgeServer(
         executor.execute {
             while (!server.isClosed) {
                 val client = try { server.accept() } catch (e: IOException) { break }
-                executor.execute { handle(client) }
+                synchronized(this@BridgeServer) {
+                    if (server.isClosed) client.close()
+                    else {
+                        val cancelled = AtomicBoolean(false)
+                        clients[client] = cancelled
+                        executor.execute {
+                            try { handle(client, cancelled) }
+                            catch (_: IOException) { /* stop may close the socket before the handler starts */ }
+                            finally { clients.remove(client); runCatching { client.close() } }
+                        }
+                    }
+                }
             }
         }
         log("web bridge listening on 127.0.0.1:${server.localPort}")
@@ -56,6 +68,8 @@ class BridgeServer(
     @Synchronized
     fun stop() {
         runCatching { socket?.close() }
+        clients.forEach { (client, cancelled) -> cancelled.set(true); runCatching { client.close() } }
+        clients.clear()
         pool?.shutdownNow()
         socket = null
         pool = null
@@ -64,7 +78,7 @@ class BridgeServer(
     private class Request(val method: String, val path: String, val headers: Map<String, String>, val body: ByteArray)
     private class HttpError(val status: Int, message: String) : Exception(message)
 
-    private fun handle(client: Socket) {
+    private fun handle(client: Socket, cancelled: AtomicBoolean) {
         client.use { s ->
             s.soTimeout = 120_000
             val out = BufferedOutputStream(s.getOutputStream())
@@ -76,7 +90,7 @@ class BridgeServer(
                 val request = read(s.getInputStream())
                 when {
                     request.method == "GET" && request.path == "/v1/models" -> json(out, 200, OpenAiMapping.modelsJson())
-                    request.method == "POST" && request.path == "/v1/chat/completions" -> completion(out, request)
+                    request.method == "POST" && request.path == "/v1/chat/completions" -> completion(out, request, s, cancelled)
                     else -> throw HttpError(404, "no route ${request.method} ${request.path}")
                 }
             } catch (e: HttpError) {
@@ -96,7 +110,7 @@ class BridgeServer(
     /** At most [MAX_CONNECTIONS] requests at once; more get 503 instead of a thread each. */
     private val slots = java.util.concurrent.Semaphore(MAX_CONNECTIONS)
 
-    private fun completion(out: OutputStream, request: Request) {
+    private fun completion(out: OutputStream, request: Request, client: Socket, cancelled: AtomicBoolean) {
         val body = try { JSONObject(String(request.body, Charsets.UTF_8)) } catch (e: Exception) { throw HttpError(400, "body is not JSON") }
         val prompt = try { OpenAiMapping.toPrompt(body) } catch (e: IllegalArgumentException) { throw HttpError(400, e.message ?: "bad request") }
         val model = body.optString("model").ifEmpty { OpenAiMapping.MODEL_CHAT }
@@ -106,8 +120,15 @@ class BridgeServer(
         val promptTokens = OpenAiMapping.estimateTokens(prompt.prompt)
         val text = StringBuilder()
         val reasoning = StringBuilder()
-        val cancelled = AtomicBoolean(false)
         var headerSent = false
+        var finished = false
+        // The request body has been consumed. This connection accepts no next request, so EOF means cancellation,
+        // including while tool output is buffered and no downstream writes can detect a disconnect yet.
+        client.soTimeout = 0
+        Thread({
+            try { client.getInputStream().read() } catch (_: IOException) { }
+            finally { cancelled.set(true) }
+        }, "web-bridge-disconnect").apply { isDaemon = true; start() }
 
         fun sendChunk(delta: JSONObject, finish: String? = null, usage: JSONObject? = null) {
             if (!headerSent) {
@@ -115,6 +136,13 @@ class BridgeServer(
                 headerSent = true
             }
             out.write(("data: " + OpenAiMapping.chunkJson(id, model, created, delta, finish, usage) + "\n\n").toByteArray(Charsets.UTF_8))
+            out.flush()
+        }
+
+        fun fail(status: Int, message: String) {
+            if (cancelled.get()) return
+            if (!headerSent) throw HttpError(status, message)
+            out.write(("data: " + errorJson(status, message) + "\n\n").toByteArray(Charsets.UTF_8))
             out.flush()
         }
 
@@ -130,9 +158,10 @@ class BridgeServer(
                         // With tools the reply must be complete before <tool_call> blocks can be split out.
                         if (stream && !prompt.hasTools) try { sendChunk(JSONObject().put("content", delta.text)) } catch (e: IOException) { cancelled.set(true) }
                     }
-                    WebDelta.Finished -> Unit
+                    WebDelta.Finished -> finished = true
                 }
             }
+            if (!finished && !cancelled.get()) throw WebServiceError(-1, "DeepSeek reply ended before completion")
         } catch (e: WebServiceError) {
             val (status, message) = when {
                 DeepSeekWebClient.isExpired(e) -> 401 to "DeepSeek web session expired: sign in again (Settings > Account)."
@@ -140,11 +169,14 @@ class BridgeServer(
                 e.code in 40300..40399 -> 502 to "DeepSeek rejected the proof of work; update the app."
                 else -> 502 to "DeepSeek web error ${e.code}."
             }
-            if (headerSent) { cancelled.set(true); return }
-            throw HttpError(status, message)
+            fail(status, message)
+            return
         } catch (e: IOException) {
-            if (headerSent || cancelled.get()) return
-            throw HttpError(502, "Could not reach chat.deepseek.com.")
+            fail(502, "Could not reach chat.deepseek.com.")
+            return
+        } catch (e: Exception) {
+            fail(500, "Internal bridge error.")
+            return
         }
         if (cancelled.get()) return
 
@@ -208,7 +240,10 @@ class BridgeServer(
     }
 
     private fun error(out: OutputStream, status: Int, message: String) =
-        json(out, status, JSONObject().put("error", JSONObject().put("message", message).put("type", "deepseek_web_bridge").put("code", status)))
+        json(out, status, errorJson(status, message))
+
+    private fun errorJson(status: Int, message: String) =
+        JSONObject().put("error", JSONObject().put("message", message).put("type", "deepseek_web_bridge").put("code", status))
 
     private fun reason(status: Int) = when (status) {
         200 -> "OK"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 404 -> "Not Found"; 411 -> "Length Required"; 500 -> "Internal Server Error"; 503 -> "Service Unavailable"

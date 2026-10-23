@@ -9,6 +9,8 @@ import org.junit.Test
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class BridgeServerTest {
     private val secret = "a".repeat(64)
@@ -135,5 +137,53 @@ class BridgeServerTest {
 
     @Test fun unknownPathIs404() {
         assertEquals(404, call("/v1/embeddings", "{}").first)
+    }
+
+    @Test fun failureAfterStreamStartsSendsAnErrorInsteadOfSilentEof() {
+        reply = { _, _, on -> on(WebDelta.Text("partial")); throw WebServiceError(-1, "interrupted") }
+        val (_, body) = call("/v1/chat/completions", JSONObject(chat).put("stream", true).toString())
+        val events = body.split("\n\n").filter { it.startsWith("data: ") }.map { JSONObject(it.removePrefix("data: ")) }
+        assertTrue(body, events.last().has("error"))
+        assertTrue(body, !body.contains("[DONE]"))
+    }
+
+    @Test fun partialToolCallsAreNotPublishedWithoutFinished() {
+        reply = { _, _, on -> on(WebDelta.Text("<tool_call>{\"name\":\"read_file\",\"arguments\":{}}</tool_call>")) }
+        val request = JSONObject(chat).put("stream", true).put("tools", org.json.JSONArray("""[{"type":"function","function":{"name":"read_file"}}]"""))
+        val (code, body) = call("/v1/chat/completions", request.toString())
+        assertEquals(502, code)
+        assertTrue(!body.contains("\"tool_calls\""))
+    }
+
+    @Test fun stopCancelsAnActiveRequestAndClosesItsSocket() = cancellation(stopServer = true)
+
+    @Test fun disconnectCancelsBufferedToolGeneration() = cancellation(stopServer = false)
+
+    private fun cancellation(stopServer: Boolean) {
+        server.stop()
+        val entered = CountDownLatch(1)
+        val stopped = CountDownLatch(1)
+        val upstream = object : WebChat {
+            override fun complete(prompt: String, thinking: Boolean, search: Boolean, cancelled: () -> Boolean, onDelta: (WebDelta) -> Unit) {
+                entered.countDown()
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+                while (!cancelled() && System.nanoTime() < deadline) {
+                    // Blocking HTTP reads and the PoW solver do not treat executor interruption as cancellation.
+                    try { Thread.sleep(10) } catch (_: InterruptedException) { }
+                }
+                if (cancelled()) stopped.countDown()
+            }
+        }
+        server = BridgeServer(secret, { upstream })
+        server.start()
+        java.net.Socket("127.0.0.1", server.port).use { socket ->
+            socket.soTimeout = 1500
+            val body = JSONObject(chat).put("stream", true).put("tools", org.json.JSONArray("""[{"type":"function","function":{"name":"read_file"}}]""")).toString()
+            socket.getOutputStream().write(("POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer $secret\r\nContent-Length: ${body.toByteArray().size}\r\n\r\n$body").toByteArray())
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            if (stopServer) server.stop() else socket.close()
+            assertTrue("upstream work was not canceled", stopped.await(1, TimeUnit.SECONDS))
+            if (stopServer) assertEquals(-1, socket.getInputStream().read())
+        }
     }
 }

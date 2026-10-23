@@ -52,15 +52,18 @@ object OpenAiMapping {
         if (tools != null) system += toolProtocol(tools)
 
         if (system.isEmpty() && turns.size == 1 && turns[0].startsWith("[User]\n")) {
-            return WebPrompt(turns[0].removePrefix("[User]\n"), thinking, false, false)
+            val prompt = turns[0].removePrefix("[User]\n")
+            require(prompt.length <= MAX_PROMPT_CHARS) { "Prompt is too large; shorten the last message." }
+            return WebPrompt(prompt, thinking, false, false)
         }
         val head = if (system.isEmpty()) "" else "[System]\n" + system.joinToString("\n\n") + "\n\n"
         val tail = "\n\nReply as the assistant to the last message."
         val kept = ArrayDeque(turns)
         while (kept.size > 1 && head.length + kept.sumOf { it.length + 2 } + tail.length > MAX_PROMPT_CHARS) kept.removeFirst()
-        var body = kept.joinToString("\n\n")
-        val room = MAX_PROMPT_CHARS - head.length - tail.length
-        if (body.length > room && room > 0) body = body.takeLast(room)
+        val body = kept.joinToString("\n\n")
+        require(head.length + body.length + tail.length <= MAX_PROMPT_CHARS) {
+            "Prompt is too large; shorten the system instructions, tool definitions or last message."
+        }
         return WebPrompt(head + body + tail, thinking, false, tools != null)
     }
 

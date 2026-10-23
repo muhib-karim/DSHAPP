@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class OpenAiMappingTest {
@@ -118,5 +119,28 @@ class OpenAiMappingTest {
 
     @Test fun emptyMessagesAreRejected() {
         assertNull(runCatching { OpenAiMapping.toPrompt(JSONObject().put("messages", JSONArray())) }.getOrNull())
+    }
+
+    @Test fun oversizedSingleUserMessageIsRejectedWithoutTruncation() {
+        assertThrows(IllegalArgumentException::class.java) {
+            OpenAiMapping.toPrompt(request(msg("user", "x".repeat(120_001))))
+        }
+    }
+
+    @Test fun oversizedSystemAndToolDefinitionsAreRejected() {
+        assertThrows(IllegalArgumentException::class.java) {
+            OpenAiMapping.toPrompt(request(msg("system", "x".repeat(120_001)), msg("user", "LAST")))
+        }
+        val hugeTools = JSONArray(tools.toString())
+        hugeTools.getJSONObject(0).getJSONObject("function").getJSONObject("parameters").put("description", "x".repeat(120_001))
+        assertThrows(IllegalArgumentException::class.java) {
+            OpenAiMapping.toPrompt(request(msg("user", "LAST"), tools = hugeTools))
+        }
+    }
+
+    @Test fun lastTurnIsNeverSilentlyCutToFitSystemPrompt() {
+        assertThrows(IllegalArgumentException::class.java) {
+            OpenAiMapping.toPrompt(request(msg("system", "x".repeat(60_000)), msg("user", "y".repeat(60_000))))
+        }
     }
 }

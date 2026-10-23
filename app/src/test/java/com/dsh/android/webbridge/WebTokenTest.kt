@@ -51,4 +51,12 @@ class WebTokenTest {
         assertEquals("+86 1", WebToken.label(JSONObject().put("email", "").put("mobile_number", "+86 1")))
         assertEquals("DeepSeek account", WebToken.label(JSONObject()))
     }
+
+    @Test fun switchNeverAutomaticallyAcceptsThePreviousPageSession() {
+        val old = JSONObject.quote(token)
+        assertNull(WebToken.captureCandidate(old, token))
+        val next = "new-account-session-token"
+        assertEquals(next, WebToken.captureCandidate(JSONObject.quote(next), token))
+        assertEquals(token, WebToken.captureCandidate(old, null))
+    }
 }

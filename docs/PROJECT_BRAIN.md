@@ -13,11 +13,12 @@ on the final feature branch head. No merge, tag or release.
 - Baseline JVM build successful (97 existing tests); node watcher baseline has ENOSPC on shared host.
 - Mobile fixes verified: 34/34 Node tests, 5/5 Chromium tests; all 13 generated plugin zips byte-match source.
 - Actual upstream modal/header checked after animations: opaque colors, opacity 1, no backdrop filter.
-- Bridge RED run: 61 tests, 15 expected failures before fixes; native fixes remain in progress.
+- Account/bridge regressions green: 103 tests, zero failures; RED covered stream, cancellation and account-generation failures.
+- Mobile code/stamps committed as 499587a; updater tests and independent final review are in progress.
 - Server restart interrupted work; existing edits retained and subsystem workers resumed from their diffs.
 
 ## Next step
-1. Finish account/bridge and updater regression cycles, then inspect all subsystem diffs.
+1. Commit verified account/bridge fixes; finish updater tests and independent review.
 2. Run isolated browser checks and both flavor builds before delivery gates.
 
 
@@ -36,3 +37,4 @@ on the final feature branch head. No merge, tag or release.
 - 2026-10-23 13:52Z Codex/gpt-6-astra: baseline JVM build passed; smoke cancel/reopen/local-error checks added; next: regression fixes and browser verification.
 - 2026-10-23 13:54Z Codex/gpt-6-astra: recovered after server restart; retained plan, RED evidence and in-progress fixes; next: finish implementation and gates.
 - 2026-10-23 13:56Z Codex/gpt-6-astra: mobile regression suites green and plugin archives verified; next: native green runs, live palette check, commits and final gates.
+- 2026-10-23 13:57Z Codex/gpt-6-astra: account/bridge targeted suite passed 103 tests; next: commit native fixes, both-flavor gates and final review.

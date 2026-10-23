@@ -48,7 +48,7 @@ class AccountStore(context: Context) {
 
     /** Forget the account: back to the first screen on the next launch. */
     fun signOut() {
-        prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).remove(KEY_LATER)
+        prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).remove(KEY_LATER).remove(KEY_BROWSER_STARTED)
             .putString(KEY_MODE, AccountConfig.Mode.NONE.name).apply()
     }
 

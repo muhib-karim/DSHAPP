@@ -58,9 +58,28 @@ class WebSseParserTest {
         assertEquals(40003, e.code)
     }
 
-    @Test fun garbageAndDoneLines() {
+    @Test fun malformedEventsCannotBecomeSuccessfulReplies() {
+        assertThrows(WebServiceError::class.java) { WebSseParser().feed(null, "not json") }
+        assertThrows(WebServiceError::class.java) { WebSseParser().feed("error", """{"message":"interrupted"}""") }
+    }
+
+    @Test fun unsuccessfulTerminalStatusesFail() {
+        for (status in listOf("INCOMPLETE", "INTERRUPTED", "CONTENT_FILTER", "FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMEOUT")) {
+            assertThrows(status, WebServiceError::class.java) {
+                WebSseParser().feed(null, """{"p":"response/status","o":"SET","v":"$status"}""")
+            }
+            assertThrows(status, WebServiceError::class.java) {
+                WebSseParser().feed(null, """{"v":{"response":{"status":"$status","fragments":[]}}}""")
+            }
+        }
+    }
+
+    @Test fun emptyFinishEventIsTerminal() {
+        assertEquals(listOf(WebDelta.Finished), WebSseParser().feed("finish", ""))
+    }
+
+    @Test fun doneLinesFinishOnce() {
         val parser = WebSseParser()
-        assertTrue(parser.feed(null, "not json").isEmpty())
         assertEquals(listOf(WebDelta.Finished), parser.feed(null, "[DONE]"))
         assertTrue(parser.finished)
     }

@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.webkit.CookieManager
 import android.webkit.WebStorage
+import com.dsh.android.account.AccountChanges
 import com.dsh.android.account.AccountConfig
 import com.dsh.android.account.AccountStore
 import com.dsh.android.account.DshCredentials
@@ -54,7 +55,7 @@ object AppState {
      */
     fun signOut(activity: Activity, then: () -> Unit = {}) {
         val app = activity.applicationContext
-        AccountStore(app).signOut()
+        val signOut = AccountChanges.shared.begin()
         runCatching {
             val cookies = CookieManager.getInstance()
             val host = DeepSeekWebClient.ORIGIN.removePrefix("https://")
@@ -68,13 +69,18 @@ object AppState {
             WebStorage.getInstance().deleteOrigin(DeepSeekWebClient.ORIGIN)
         }
         Thread({
-            WebAccount.stop()
-            runCatching {
-                DshCredentials.write(EngineManager.get(app).dshHomeDir,
-                    mapOf(DshCredentials.DEEPSEEK_API_KEY to null, DshCredentials.WEB_BRIDGE_KEY to null))
-            }.onFailure { DshLog.w(DshApplication.TAG, "sign-out: credentials not cleared: ${it.message}") }
-            SignInActivity.restartEngine(app)
-            activity.runOnUiThread(then)
+            val applied = signOut.commit {
+                AccountStore(app).signOut()
+                WebAccount.stop()
+                runCatching {
+                    DshCredentials.write(EngineManager.get(app).dshHomeDir,
+                        mapOf(DshCredentials.DEEPSEEK_API_KEY to null, DshCredentials.WEB_BRIDGE_KEY to null))
+                }.onFailure { DshLog.w(DshApplication.TAG, "sign-out: credentials not cleared: ${it.message}") }
+            }
+            if (applied) {
+                SignInActivity.restartEngine(app)
+                activity.runOnUiThread(then)
+            }
         }, "sign-out").start()
     }
 
