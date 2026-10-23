@@ -20,6 +20,35 @@
 
 ---
 
+## [1.3.2-en] — 2026-10-23
+
+Fork release (muhib-karim/DSHAPP), `com.mkdsh.droid` / `com.mkdsh.gecko`, versionCode 37. Built on upstream **0.3.0**
+(tag `v0.3.0`); the loading screen, chat rendering, markdown, status line and engine bundle are those of 0.3.0.
+Installs as an update over the fork's 1.3.1-en (same package and signing key); it cannot update an upstream-signed 0.3.0.
+
+### Added
+- **English UI**: string resources default to English (the Chinese is kept in `values-zh`), and the text the app and
+  its bundled plugins show on screen is English. Logs, diagnostics and text sent to the model are unchanged.
+- **DeepSeek web login** (ported from the fork's 1.3.0): first screen with "Continue with Google" / "Use API key",
+  a local OpenAI-compatible bridge to chat.deepseek.com, Settings > Account (sign in again, switch, sign out) and a
+  long-press launcher shortcut "DeepSeek account".
+- **In-app bookmark guide** on the web-login screen: "Copy bookmarklet code" plus step-by-step instructions for
+  Android Chrome and desktop browsers, what "Open in DSH" and "Copy session instead" do, and a security note.
+
+### Fixed
+- Tool calls the web model writes in DeepSeek's DSML markup (`<｜DSML｜invoke …>`, fullwidth or ASCII bars, spaces,
+  `string="true|false"` parameters, several invokes) become real tool calls instead of raw text in the reply.
+- An "Open in DSH" link that did not follow a sign-in started in the app is no longer rejected silently: DSH shows the
+  account and asks "Use this DeepSeek session?" first.
+- First launch over 1.3.1-en data: the bundled engine is unpacked once more, 1.3.1's update slots and browser overlays
+  are removed, and preferences of an unexpected type are reset (sessions, credentials, workspace and the web sign-in
+  are kept).
+
+### Notes
+- 0.3.0 has no settings/chat export or import (only the diagnostic bundle in the log viewer and per-session export).
+
+---
+
 ## [0.3.0] — 2026-10-17
 
 ### 新增
