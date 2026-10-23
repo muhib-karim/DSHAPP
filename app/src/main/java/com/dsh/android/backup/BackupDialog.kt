@@ -345,6 +345,9 @@ object BackupDialog {
         else -> buildString {
             append("已恢复 ${r.entries} 个文件（${UserDataExporter.humanSize(r.bytes)}）")
             if (r.failed > 0) append("，${r.failed} 个失败")
+            // 跨 flavor 导入时改写了配置里的绝对路径 —— 明确告诉用户，
+            // 否则他不知道为什么能跨版本用
+            if (r.fixedPaths > 0) append("\n已自动修正 ${r.fixedPaths} 个配置文件的路径（跨版本兼容）")
             r.backupDir?.let { append("\n原有数据已备份到：${it.name}") }
             append("\n请重启 App 让引擎重新加载。")
         }
