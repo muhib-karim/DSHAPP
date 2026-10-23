@@ -20,6 +20,84 @@
 
 ---
 
+## [1.3.0] — 2026-10-23
+
+Fork release (muhib-karim/DSHAPP), versionCode 31, both flavors. Engine: `@deepseek-ai/dsh` 0.2.1-rc.2 (npm `latest`),
+updatable in the app.
+
+### Added
+
+- **First screen with two sign-ins**: "Continue with Google" (DeepSeek web account) and "Use API key".
+  - API key: checked with one `GET https://api.deepseek.com/models`, then written to dsh's own
+    `$DSH_HOME/.credentials.yaml` (mode 600, other refs and records kept); default model `deepseek-official/deepseek-flash`.
+  - The API-key panel has an explicit **Paste** button. The clipboard is read only when it is tapped; a trailing newline
+    from a copied key is dropped and a blank or non-text clip leaves the field untouched. The typed key, inline error and
+    focus survive rotation, while a check interrupted by rotation is canceled so the old screen cannot write the key.
+    Check, write and account-switch failures now show a heading and a reason instead of leaving the panel unchanged.
+  - Web account: chat.deepseek.com sign-in in an in-app WebView, or in the phone's browser with a bookmark/paste
+    hand-off when Google refuses the embedded WebView. The session token is encrypted with an Android Keystore key.
+    dsh reaches it through a local OpenAI-compatible bridge (127.0.0.1, random port, per-install bearer secret) that
+    solves DeepSeek's proof of work and maps tool calls through a text protocol.
+  - Settings > Account: switch account, sign out (token, cookies, page storage and keys removed). An API-key account
+    shows only the last four characters of the saved key and can **Replace API key** without signing out first; Back from
+    that screen keeps the old key and the account. When
+    chat.deepseek.com rejects the saved session, the card says the web session has expired and offers **Sign in again**,
+    so a stale session fails visibly instead of only in the chat.
+- **Settings > Plugins**: user plugins next to the app's and DSH's built-ins; install an npm name or open the
+  marketplace, turn bundles on or off, remove user plugins (dsh's own plugin manager).
+  - The list has a search box that filters by name, title or description as you type, case-insensitively, with a
+    clear button. Every group heading shows how many plugins it holds, and each row carries a **Yours / App / DSH**
+    scope badge so two plugins with similar names are easy to tell apart. A query with no hits shows a single
+    "No matching plugins." row instead of three empty groups.
+- **Live "/" palette**: skills added on disk or by a plugin install show up without a restart.
+- **In-app updates** (Settings > About & updates, and a daily check on launch): the DSH harness from npm with the bundled
+  pnpm, keeping the previous harness and rolling back automatically if the new one does not start; once a new harness
+  has started, Settings also offers a manual **Restore previous version**, so a working but unwanted update can be undone
+  without waiting for a failed boot. The APK from this fork's GitHub releases, SHA-256 checked, installed through a FileProvider. Before the installer opens, the APK must
+  also carry this app's package name and be signed by its certificate; a wrong-flavor or wrong-signer download is
+  deleted and reported with a retryable message instead of failing late in the installer.
+  While the APK is downloading, the card offers **Cancel download**: the request stops promptly (the active connection
+  is closed), progress resets, and a late completion from the abandoned attempt is never published. Cancelling also
+  clears stale files from the update cache, but never the verified APK the system installer may still be reading, so
+  the install already in progress is unaffected and the update can simply be started again.
+- **Release notes in About & updates**: the checked app release's notes open in a collapsible block as plain text
+  (line breaks and lists readable, control characters and excess blank lines removed, long notes capped at 4,000
+  characters with a visible ellipsis). A **Release page** button opens the release on github.com; the page cannot pass
+  a URL, and native code accepts only `https://github.com/muhib-karim/DSHAPP/releases/…`.
+- **Diagnostics in About & updates**: the card lists the app version and build, Android release, device, ABI and
+  WebView version. **Open logs** opens the app's own log viewer, and **Restart engine** asks once and then restarts the
+  engine; a restart while a start or restart is already running is ignored, so two engine pipelines never race for the
+  same port. The labels come only from build information — no account, serial, path or URL.
+- JVM and node unit tests (credentials writer, profile patch, key check, PoW solver, SSE parser, bridge mapping and
+  server, version compare, update slots, plugin list, skill refresh, opaque surfaces); CI runs them before the build.
+  The emulator smoke test now covers the first screen and the API-key screen.
+
+### Changed
+
+- **No wallpaper, no glass**: every theme's translucent surface colours are flattened to opaque, full-screen decorative
+  layers are hidden, `backdrop-filter` is off, the "+"/"/" menus are flat, the header is solid. The theme skill and the
+  status-bar tool no longer suggest wallpapers.
+- Fullscreen insets include the display cutout; keyboard and navigation bar no longer cover the composer in fullscreen.
+- Without the upstream key pool, the default model is no longer the unusable `agnes` route.
+- Settings back bar: opaque, readable chevron, follows the UI language.
+
+### Fixed (second review pass)
+
+- Canceled or superseded sign-in checks cannot overwrite the account; switching web accounts no longer immediately
+  accepts the old session. Signing out invalidates pending sign-ins and stops active bridge requests; failed credential removal preserves
+  the account and displays a retry message.
+- Interrupted or rejected web streams report failure instead of successful completion or partial tool calls;
+  prompt limits cover single messages, system instructions and tool definitions.
+- Harness activation recovers interrupted slot changes and rolls back failed validation, gateway startup or boot
+  timeout before normal rescue can alter user configuration; the failed process stops before restoring files.
+- Update and Install actions remain available after permission prompts, transient errors or a canceled installer.
+- Preserve custom theme colors and refresh them on same-scheme changes; remove root wallpapers and task-plan glass.
+- Respect upstream plugin ownership and read-only policy, including removable user-installed official packages;
+  live skill refresh survives unavailable watchers and folders created later.
+- Emulator smoke checks cancellation/reopening of API entry and deterministic empty-key validation.
+
+---
+
 ## [0.3.0] — 2026-10-17
 
 ### 新增

@@ -1,22 +1,93 @@
 # DSH for Android
 
 > **This repository is a fork of [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP) (MIT)**, maintained by
-> [muhib-karim](https://github.com/muhib-karim) and **shipped as-is**: the UI and features are upstream's, and all
-> credit goes to the upstream author. The fork only changes:
+> [muhib-karim](https://github.com/muhib-karim). The engine integration, plugins and most of the UI are upstream's, and
+> the credit for them goes to the upstream author. The fork changes:
 > - **Package names**: `com.mkdsh.droid` (system WebView build) and `com.mkdsh.gecko` (GeckoView build), still exactly
 >   15 characters (see "Two hard constraints"), so the fork installs next to upstream DSHAPP and other
 >   `com.dsh.android` apps. The app name is unchanged ("DSH").
-> - **Version**: 0.3.4 (versionCode 30), the next number after upstream's 0.3.3 (29).
+> - **Version**: 1.3.0 (versionCode 31). See [What's new in 1.3.0](#whats-new-in-130) and [CHANGELOG.md](CHANGELOG.md).
 > - **CI build**: `.github/workflows/release-apk.yml` builds signed release APKs on GitHub Actions and uploads the
 >   APKs plus SHA256SUMS; a `v*` tag publishes a GitHub Release. Where each build asset comes from is in
 >   `tools/ci/assemble-assets.py`. Unchanged binary assets are taken from upstream's v0.3.0 release APK, pinned by
 >   sha256. Plugin zips are packed from this repository's source. The JNI helpers are compiled with the NDK.
->   `webview-compat.zip` is rebuilt by upstream's own script.
-> - **No built-in account pool**: upstream's `keyinject.bin` (upstream's own API accounts) is not included; use your own
->   API key.
-> - **Emulator smoke test**: `.github/workflows/emulator-smoke.yml` (first screen, chat and settings screenshots, see
->   `docs/screenshots/`).
+>   `webview-compat.zip` is rebuilt by upstream's own script. Unit tests (JVM and node) run before the build.
+> - **No built-in account pool**: upstream's `keyinject.bin` (upstream's own API accounts) is not included. Sign in
+>   with a DeepSeek web account or your own API key.
+> - **Emulator smoke test**: `.github/workflows/emulator-smoke.yml` (first screen, API-key screen, boot status and log
+>   viewer on an x86_64 emulator; see [FORK_NOTES.md](FORK_NOTES.md)).
 > - Third-party components and licences: [THIRD-PARTY.md](THIRD-PARTY.md). Upstream's LICENSE is kept unchanged.
+
+## What's new in 1.3.0
+
+**Two ways to sign in.** The first screen offers **Continue with Google** (your DeepSeek web account) and **Use API
+key** (a key from platform.deepseek.com, checked once and saved only in DSH's own credentials file).
+
+| First screen | Use API key |
+|---|---|
+| <img src="docs/screenshots/v1.3.0/01-first-screen.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/02-api-key.jpg" width="240"> |
+
+- **Continue with Google** opens DeepSeek's own sign-in page in the app. Google refuses to sign in inside embedded
+  browsers; when it does, *Use your browser* signs in at chat.deepseek.com in your browser and brings the session
+  back. Replies then come from your web account through a small local bridge on the phone (127.0.0.1, random port,
+  protected by a per-install secret). DSH's tools work through a text protocol; images are not sent.
+- **Settings > Account**: see how you are signed in, switch account or sign out. With an API key, the card shows only
+  the last four characters of the saved key and offers **Replace API key**, so the key can rotate without signing out
+  first; Back from that screen keeps the old key and the account. If chat.deepseek.com rejects the saved web session,
+  the card says so and offers **Sign in again**, instead of only failing when a message is sent.
+- **Key entry**: the API-key panel has an explicit **Paste** button — the clipboard is read only when it is tapped, a
+  trailing newline from a copied key is dropped, and a blank clipboard leaves what you typed alone. Rotating the phone
+  keeps the text, the inline error and the focus; a check interrupted by rotation is canceled instead of being allowed
+  to write a key from the old screen. A failed check, write or account switch now says why.
+
+**A cleaner, opaque interface.** No wallpaper or animated background, no glass: sheets, the "+" and "/" menus,
+dialogs, the header and previews are all solid, in light and dark. This holds for any theme, including themes the AI
+made for you. The header clears the status bar, camera cutout and keyboard in fullscreen.
+
+| Before (a wallpaper theme) | 1.3.0 (same theme) | "/" menu before | "/" menu in 1.3.0 |
+|---|---|---|---|
+| <img src="docs/screenshots/v1.3.0/03-chat-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/04-chat-after.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/05-palette-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/06-palette-after.jpg" width="180"> |
+
+**Everything is a plugin.** **Settings > Plugins** lists the plugins you installed next to the app's and DSH's
+built-ins: install from npm or the marketplace, turn plugins on or off, remove yours. Search filters by name, title
+or description as you type, group headings carry counts, and a **Yours / App / DSH** badge on every row keeps
+same-named plugins apart. New skills appear in the "/" menu right away, without a restart.
+
+**Updates in the app.** **Settings > About & updates** (and a daily check on launch) offers a one-tap update of the
+DSH harness from npm, installed with the bundled pnpm. The previous harness is kept, and if the new one does not
+start, the app switches back by itself. Once a new harness has started, **Restore previous version** in the same
+section goes back to the one before it (after a confirmation and a restart). The app itself updates from this
+repository's GitHub releases (checksum verified, and the archive's package name and signing certificate are checked
+against the installed app before the installer opens, so a wrong download is refused and can be retried).
+The release notes expand as plain text in the card (long notes are truncated), and **Release page** opens this
+repository's GitHub release — the page cannot supply a different URL. While the APK is downloading, **Cancel
+download** closes the active connection, resets progress and discards the abandoned attempt's result, so no late
+error appears. Cancelling also clears stale update-cache files but keeps the verified APK an installer may still be
+reading, so an install already in progress is not interrupted and the download can be started again.
+
+The same card lists the app version and build, Android release, device, ABI and WebView version for bug reports.
+**Open logs** opens the app's own log viewer; **Restart engine** restarts after one confirmation, and a request made
+while the engine is already starting or restarting is ignored, so two engines never race for the same port. These
+labels come only from build information — no account, serial, file path or URL.
+
+| Plugins | Account | About & updates |
+|---|---|---|
+| <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |
+
+The first two screenshots are from the CI emulator (02 predates the **Paste** button; the current key panel has
+one). The others are DSH's real web UI with the app's mobile plugin rendered at phone size on a desktop; 08 and 09 were
+re-rendered from the current plugin, with a demo model reply and demo account and update values.
+
+The second review pass makes account switching and canceled sign-ins safe, rejects interrupted web replies,
+and keeps Update/Install available after permission prompts or failed downloads. Harness rollback preserves user
+configuration and recovers interrupted activation. Custom theme colors stay intact while surfaces remain opaque;
+user-installed official plugins remain removable, and skill refresh tolerates unavailable file watchers.
+
+The third pass adds package and signature checks before installing an APK, manual restore of the previous harness,
+a clear expired-web-session notice, a masked key hint with in-place replacement, the Paste button and rotation-safe
+input, plain-text release notes with a trusted release link, plugin search with group counts and scope badges,
+diagnostics with logs and engine restart, and cancellable APK downloads that clean stale cache files.
+Both flavors pass 200 JVM tests each; 66 Node and 5 Chromium checks pass, and both debug APKs build.
 
 **Run a full AI coding agent on your Android phone.**
 
@@ -69,8 +140,8 @@ Download an APK from [Releases](../../releases) and sideload it.
 
 | Package | applicationId | For |
 |---|---|---|
-| `DSH<version>.apk` | `com.dsh.android` | Most devices, smaller |
-| `DSH<version>-gecko.apk` | `com.dsh.webview` | Old devices / system WebView unavailable |
+| `DSH<version>-mk.apk` | `com.mkdsh.droid` | Most devices, smaller |
+| `DSH<version>-mk-gecko.apk` | `com.mkdsh.gecko` | Old devices / system WebView unavailable |
 
 The two packages have **different applicationIds and can coexist**, each with its own
 independent data directory.
@@ -220,6 +291,11 @@ docs/agents/                           developer docs (35 articles, look up as n
   web engine ship inside the package).
 - **Slow first launch** — the Termux environment and engine must be unpacked;
   roughly 10–60 seconds depending on the device.
+- **Web account (Continue with Google)** — it uses chat.deepseek.com's web API, which is not a public API and can
+  change; DSH's tools run through a text protocol, images are not sent. Google sign-in inside the app may be refused
+  by Google; the browser route is available as a fallback. Use an API key for the most reliable agent runs.
+- **Harness updates** need about 0.5 GB of free space while installing (the previous harness is kept for rollback);
+  on the system-WebView build the updated harness needs Android System WebView 94 or newer.
 
 Full list: [boundaries.md](docs/agents/boundaries.md).
 
@@ -239,6 +315,8 @@ This project stands on the shoulders of:
 - [Mozilla GeckoView](https://wiki.mozilla.org/Mobile/GeckoView) — bundled web engine
 - [ripgrep](https://github.com/BurntSushi/ripgrep) · [sharp](https://github.com/lovell/sharp)
   · [pnpm](https://github.com/pnpm/pnpm) · [Shizuku](https://github.com/RikkaApps/Shizuku)
+- [deepseek-android](https://github.com/muhib-karim/deepseek-android) (MIT) — the DeepSeek web client, proof-of-work
+  solver and credentials writer the 1.3.0 sign-in is ported from
 
 ## License
 

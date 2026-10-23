@@ -38,6 +38,7 @@ import { readFile, stat } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { createSkillRefresher } from './skill-refresh.js';
 
 export const name = 'dsh-android-mobile';
 
@@ -349,6 +350,20 @@ async function probe() {
  * @param {object} ctx - Cordis 上下文（已注入 `webServer`）。
  */
 export function apply(ctx) {
+	// v1.3.0: the "/" palette refetches skills when skill folders change or a plugin change settles (skill-refresh.js).
+	const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+	ctx.effect(() => {
+		const refresher = createSkillRefresher({
+			emit: (event, payload) => ctx.emit(event, payload),
+			on: (event, listener) => ctx.on(event, listener),
+			roots: [
+				{ path: path.join(home, 'skills'), recursive: true },
+				{ path: path.join(home, 'profiles', 'web', 'node_modules'), recursive: false },
+			],
+			log: (msg) => ctx.logger?.info?.(`[dsh-android-mobile] ${msg}`),
+		});
+		return () => refresher.dispose();
+	}, 'dsh-android-mobile: skill palette refresh');
 	ctx.effect(() => ctx.webServer.register({
 		kind: 'exact',
 		path: ROUTE,

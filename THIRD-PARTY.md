@@ -1,6 +1,6 @@
 # Third-party software
 
-This repository is a fork of **DSHAPP** and is shipped as-is.
+This repository is a fork of **DSHAPP** with the fork's own additions listed below.
 
 ## Upstream
 
@@ -8,9 +8,15 @@ This repository is a fork of **DSHAPP** and is shipped as-is.
 |---|---|---|
 | DSHAPP (DSH for Android) by pht88888888 | MIT (see [LICENSE](LICENSE), kept unchanged) | https://github.com/pht88888888/DSHAPP |
 
-All application code, plugins, documentation and design in this repository are upstream's. The fork's own additions
-are the CI files (`.github/workflows/release-apk.yml`, `.github/workflows/emulator-smoke.yml`, `tools/ci/`), the
-package-name and version change in `app/build.gradle.kts`, and these credit notes.
+Application code, plugins, documentation and design in this repository are upstream's, except the fork's own work:
+the CI files (`.github/workflows/release-apk.yml`, `.github/workflows/emulator-smoke.yml`, `tools/ci/`), the package
+name and version, and the 1.3.0 features: `app/src/main/java/com/dsh/android/{account,webbridge,update}/`,
+`AppState.kt`, the sign-in layouts, the v1.3.0 sections of `mobile-ui-plugin/dsh-android-mobile/lib/client.js`,
+`lib/skill-refresh.js`, `tools/tests/` and these credit notes.
+
+| Ported from | Licence | What |
+|---|---|---|
+| [muhib-karim/deepseek-android](https://github.com/muhib-karim/deepseek-android) (same owner) | MIT | `DeepSeekHashV1` (proof-of-work solver, ported verbatim with its test vectors), the DeepSeek web API endpoints, headers and stream format, the session-token capture and browser hand-off, and the dsh credentials writer |
 
 ## Bundled in the APK
 
@@ -32,6 +38,9 @@ publishes. Where the upstream repository names a component, its own wording is i
 | Mozilla GeckoView 140 (gecko build only) | Gradle dependency | MPL-2.0 | https://wiki.mozilla.org/Mobile/GeckoView |
 | Shizuku API | Gradle dependency | Apache-2.0 | https://github.com/RikkaApps/Shizuku-API |
 | AndroidX, Material Components, Kotlin, kotlinx.coroutines | Gradle dependencies | Apache-2.0 | https://developer.android.com/jetpack |
+
+Test-only dependencies (not in the APK): JUnit 4 (EPL-1.0), org.json (Public Domain / JSON licence), SnakeYAML
+(Apache-2.0). Local UI checks used Playwright (Apache-2.0) and Chromium outside the repository.
 
 GPL/LGPL components are unmodified upstream binaries. Their corresponding source is at the links above, at the
 versions in the APK.

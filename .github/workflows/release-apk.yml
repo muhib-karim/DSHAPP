@@ -7,7 +7,7 @@ name: Release APK
 # otherwise a throwaway key made for this run (installs, but cannot update an install signed by another run).
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -68,6 +68,29 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Unit tests (plugin JS on node:test, app JVM tests)
+        run: |
+          sed -i '/^systemProp\.https\?\.proxy\(Host\|Port\)=/d' gradle.properties
+          node --test tools/tests/*.test.mjs
+          bash ./gradlew --no-daemon testSystemDebugUnitTest
+      - name: Mobile UI browser regressions (real Chromium)
+        run: |
+          npm install --prefix "$RUNNER_TEMP/ui-check" playwright@1.48.2 --ignore-scripts --no-audit --no-fund
+          "$RUNNER_TEMP/ui-check/node_modules/.bin/playwright" install --with-deps chromium
+          PLAYWRIGHT_MODULE="$RUNNER_TEMP/ui-check/node_modules/playwright/index.mjs" node --test tools/tests/*.browser.mjs
+      - name: Smoke script syntax
+        run: python3 -m py_compile tools/ci/emulator-smoke.py
+      - name: Harness freshness (bundled engine vs npm latest)
+        run: |
+          bundled="$(grep -oP 'assetStamp = "\K[^"]+' app/src/main/java/com/dsh/android/MainActivity.kt | sed 's/-[0-9]*$//')"
+          latest="$(curl --fail --silent --show-error --retry 3 https://registry.npmjs.org/@deepseek-ai%2fdsh | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["dist-tags"]["latest"])')"
+          echo "bundled @deepseek-ai/dsh $bundled, npm latest $latest"
+          if [[ "$bundled" != "$latest" ]]; then
+            echo "::warning::npm latest @deepseek-ai/dsh is $latest, the APK bundles $bundled (installed apps update in-app)"
+          fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: webview-compat

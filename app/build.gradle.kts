@@ -34,7 +34,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 30
+        versionCode = 31
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -179,7 +179,10 @@ android {
         //         两个都是**字符串相等**判据，不 bump 会命中「戳一致 ⇒ 整棵树跳过」，
         //         设备上静默跑回旧 UI（本项目已踩过 20 次以上）。
         // 0.3.4 = upstream 0.3.3 (versionCode 29) as published by the muhib-karim fork; no feature changes.
-        versionName = "0.3.4"
+        // 1.3.0 (versionCode 31), fork: two sign-ins (DeepSeek web account through a local bridge, or an API key),
+        //      opaque UI without wallpapers, Settings > Plugins with a live "/" palette, in-app harness and app updates.
+        //      Stamps bumped with it: MOBILE_UI_VERSION 1.0.0-105, compat 39, preset skills 1.0.0-2, gecko bridge 1.0.15.
+        versionName = "1.3.0"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
@@ -297,6 +300,12 @@ android {
         jvmTarget = "17"
     }
 
+    testOptions {
+        // JVM unit tests (app/src/test) touch only plain Kotlin classes; android.jar stubs return defaults
+        // instead of throwing if one is reached by accident.
+        unitTests.isReturnDefaultValues = true
+    }
+
     buildFeatures {
         viewBinding = true
         // TermuxBootstrap.ELF_ROOT_REPLACEMENT 从 BuildConfig.APPLICATION_ID 派生 ——
@@ -353,4 +362,10 @@ dependencies {
     //   140 依赖 core 1.16.0（minAGP 8.6.0 / minCompileSdk 35，均满足），是能在
     //   当前工具链下直接构建的最高版本。要再往上就得先升 AGP，那是另一件事。
     "geckoImplementation"("org.mozilla.geckoview:geckoview-arm64-v8a:140.0.20250707120347")
+
+    // JVM unit tests. org.json: android.jar only has stubs of it. SnakeYAML: checks that the YAML the app writes
+    // into dsh's config parses (test only, not shipped).
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("org.yaml:snakeyaml:2.2")
 }

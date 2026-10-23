@@ -1,18 +1,76 @@
 # DSH for Android
 
 > **本仓库是 [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP)（MIT）的分支（fork）**，由
-> [muhib-karim](https://github.com/muhib-karim) 维护，**原样发布**：界面与功能不变，全部归功于上游作者。
-> 本分支只做了：
+> [muhib-karim](https://github.com/muhib-karim) 维护。引擎集成、插件与大部分界面来自上游，归功于上游作者。
+> 本分支的改动：
 > - **包名**：`com.mkdsh.droid`（system 版）/ `com.mkdsh.gecko`（gecko 版），仍为 15 字符（见「两条硬约束」），
 >   以便与上游 DSHAPP 及其它 `com.dsh.android` 应用同装一台机器。应用名不变（仍为「DSH」）。
-> - **版本**：0.3.4（versionCode 30），即上游 0.3.3（29）之后的下一个号。
+> - **版本**：1.3.0（versionCode 31）。见下方「1.3.0 新内容」与 [CHANGELOG.md](CHANGELOG.md)。
 > - **CI 构建**：`.github/workflows/release-apk.yml` 在 GitHub Actions 上构建签名的发行版 APK 并上传
 >   APK + SHA256SUMS；打 `v*` 标签时自动建 Release。构建资产来源见 `tools/ci/assemble-assets.py`
 >   （不变的二进制资产取自上游 v0.3.0 发行版 APK 并按 sha256 固定，插件 zip 由本仓库源码打包，
->   JNI 辅助程序由 NDK 编译，`webview-compat.zip` 由上游脚本重建）。
-> - **不含内置号池**：上游 APK 里的 `keyinject.bin`（上游自己的 API 账号）不会打进本分支的包，请使用你自己的 API Key。
-> - **模拟器冒烟测试**：`.github/workflows/emulator-smoke.yml`（首屏、对话页、设置页截图，见 `docs/screenshots/`）。
+>   JNI 辅助程序由 NDK 编译，`webview-compat.zip` 由上游脚本重建）。构建前先跑单元测试（JVM 与 node）。
+> - **不含内置号池**：上游 APK 里的 `keyinject.bin`（上游自己的 API 账号）不会打进本分支的包。请用 DeepSeek 网页账号或你自己的 API Key 登录。
+> - **模拟器冒烟测试**：`.github/workflows/emulator-smoke.yml`（x86_64 模拟器上的首屏、API Key 界面、启动状态与日志界面，见 [FORK_NOTES.md](FORK_NOTES.md)）。
 > - 第三方组件与许可证：[THIRD-PARTY.md](THIRD-PARTY.md)。上游 LICENSE 原样保留。
+
+## 1.3.0 新内容
+
+**两种登录方式。** 首屏提供 **Continue with Google**（DeepSeek 网页账号）与 **Use API key**（platform.deepseek.com
+的 API Key，校验一次后只保存在 DSH 自己的凭据文件里）。
+
+| 首屏 | API Key |
+|---|---|
+| <img src="docs/screenshots/v1.3.0/01-first-screen.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/02-api-key.jpg" width="240"> |
+
+- **Continue with Google** 在 App 内打开 DeepSeek 自己的登录页。Google 不允许在内嵌浏览器里登录；遇到这种情况，
+  点 *Use your browser* 在手机浏览器里登录 chat.deepseek.com，再把会话带回 App。之后的回复经手机上的本地桥
+  （127.0.0.1、随机端口、每台设备独立的密钥）来自你的网页账号。DSH 的工具通过文本协议调用；不发送图片。
+- **设置 > 账号**：查看当前登录方式、切换账号或退出登录。用 API Key 登录时只显示密钥末四位，并提供 **更换 API 密钥**：
+  不必退出再登录，换完返回即用新密钥；中途返回则保留原来的密钥。网页会话被 chat.deepseek.com 判定过期时，这里会明确
+  提示，并提供 **重新登录**，不必等到发消息失败才发现。
+- **首屏输入**：API Key 面板有单独的 **Paste** 按钮——只有点它才读取剪贴板，从终端复制时带上的末尾换行会被去掉，
+  空白剪贴板不会改动已输入的内容。旋转屏幕后输入框、错误提示和焦点都会保留；校验中旋转则会取消这次校验，避免旧页面
+  写入密钥。校验、写入或账号切换失败时，面板会说明原因。
+
+**更干净、不透明的界面。** 没有壁纸、动态背景和毛玻璃：底部弹层、「+」与「/」菜单、对话框、顶栏和预览全部为实色，
+浅色深色都一样。任何主题（包括 AI 帮你做的主题）都遵守这条规则。全面屏下顶栏会避开状态栏、挖孔和键盘。
+
+| 之前（壁纸主题） | 1.3.0（同一主题） | 之前的「/」菜单 | 1.3.0 的「/」菜单 |
+|---|---|---|---|
+| <img src="docs/screenshots/v1.3.0/03-chat-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/04-chat-after.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/05-palette-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/06-palette-after.jpg" width="180"> |
+
+**一切皆插件。** **设置 > 插件** 把你安装的插件与 App、DSH 的内置插件列在一起：从 npm 或插件市场安装、开关插件、
+移除你装的插件。搜索框按名称、标题或说明即时筛选，分组标题带数量，每行有「我装的 / App / DSH」来源徽章，
+同名插件一眼分清。新技能会立刻出现在「/」菜单里，无需重启。
+
+**App 内更新。** **设置 > 关于与更新**（以及每天一次的启动检查）可一键从 npm 更新 DSH 引擎，用内置的 pnpm 安装；
+旧版本会保留，新版本起不来时 App 自动切回。新引擎正常启动后，同一处还提供 **恢复上一个版本**：确认后重启引擎即可
+回到更新前的版本，不必等它启动失败。App 本身从本仓库的 GitHub Releases 更新（校验 SHA-256，并在安装前核对包名与签名，错的包会直接拒绝并可重试）。
+更新说明可在卡片里展开为纯文本阅读（过长会截断），**发布页**按钮只会打开本仓库的 GitHub Release，页面无法传入任意链接。
+APK 下载过程中可以点 **取消下载**：连接随即关闭、进度清零，已经放弃的那次下载不会再弹出迟到的错误；
+取消会清掉更新缓存里的残留文件，但不会删除已经校验通过、可能正被安装器读取的 APK，因此不会打断正在进行的安装。
+
+同一张卡片还列出 App 版本与 build、Android 版本、设备、ABI 和 WebView 版本，方便反馈问题时附上。
+**打开日志** 进入 App 自己的日志页；**重启引擎** 确认后重启，正在启动或重启时会被忽略，
+不会让两个引擎同时抢一个端口。这些标签只来自系统构建信息，不含账号、序列号、文件路径或链接。
+
+| 插件 | 账号 | 关于与更新 |
+|---|---|---|
+| <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |
+
+前两张截图来自 CI 模拟器（02 截于 **Paste** 按钮加入之前，当前构建的密钥面板上多一个 Paste 按钮）；
+其余为 DSH 真实的 Web 界面加本 App 的移动端插件，在电脑上按手机尺寸渲染，08 和 09 已按当前插件重拍，
+其中的模型回复、账号与版本信息为演示数据。
+
+第二轮审查补齐了账号切换与取消登录的保护，网页回复中断时明确报错；授予安装权限、下载失败或取消安装后仍可重试。
+引擎更新失败会保留用户配置并恢复旧版，更新切换中断也可恢复。主题原有配色得到保留，所有表面仍为实色；
+用户自行安装的官方插件可移除，文件监听不可用时技能列表仍会刷新。
+
+第三轮审查补上了安装 APK 前的包名与签名校验、手动恢复上一个引擎版本、网页会话过期的明确提示、
+密钥只显示末四位并可原地更换、Paste 按钮与旋转不丢输入、纯文本发布说明与受信任的发布页、
+插件搜索与分组计数及来源徽章、关于页的诊断信息/日志/引擎重启，以及可取消并清理残留的 APK 下载。
+两个 flavor 各 200 项 JVM 测试通过，66 项 Node 测试与 5 项 Chromium 检查通过，两个 debug APK 均构建成功。
 
 **在 Android 手机上跑一个完整的 AI 编码 Agent。**
 
@@ -59,8 +117,8 @@ APK
 
 | 包 | applicationId | 适用 |
 |---|---|---|
-| `DSH<版本>.apk` | `com.dsh.android` | 绝大多数设备，体积小 |
-| `DSH<版本>-gecko.apk` | `com.dsh.webview` | 老设备 / 系统 WebView 不可用时 |
+| `DSH<版本>-mk.apk` | `com.mkdsh.droid` | 绝大多数设备，体积小 |
+| `DSH<版本>-mk-gecko.apk` | `com.mkdsh.gecko` | 老设备 / 系统 WebView 不可用时 |
 
 两个包 **applicationId 不同，可以同时安装**，数据目录互相独立。
 
@@ -198,6 +256,10 @@ docs/agents/                           开发文档（35 篇，按需检索）
 - **APK 较大** —— system 版约 137 MB，gecko 版约 216 MB（引擎与内核随包分发）。
 - **首次启动较慢** —— 要解包 Termux 环境与引擎，视设备约 10–60 秒。
 
+- **网页账号（Continue with Google）**：走 chat.deepseek.com 的网页接口，它不是公开 API，可能变化；DSH 的工具通过文本协议
+  调用，不发送图片。App 内的 Google 登录可能被 Google 拒绝，也可尝试浏览器登录作为备选。要最稳定地跑 Agent，请用 API Key。
+- **引擎更新** 安装期间约需 0.5 GB 空闲空间（旧版本会保留用于回滚）；system 版更新后的引擎需要 Android System WebView 94 或更高。
+
 完整清单见 [boundaries.md](docs/agents/boundaries.md)。
 
 ## 参与贡献
@@ -215,6 +277,7 @@ docs/agents/                           开发文档（35 篇，按需检索）
 - [Mozilla GeckoView](https://wiki.mozilla.org/Mobile/GeckoView) —— 内置 Web 内核
 - [ripgrep](https://github.com/BurntSushi/ripgrep) · [sharp](https://github.com/lovell/sharp)
   · [pnpm](https://github.com/pnpm/pnpm) · [Shizuku](https://github.com/RikkaApps/Shizuku)
+- [deepseek-android](https://github.com/muhib-karim/deepseek-android)（MIT）—— 1.3.0 登录功能移植自它的 DeepSeek 网页客户端、工作量证明求解器与凭据写入器
 
 ## 许可证
 

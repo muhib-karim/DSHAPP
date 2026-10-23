@@ -6,6 +6,7 @@
 
 | 文件 | 主题 | 一句话 |
 |---|---|---|
+| [v130-signin-plugins-updates.md](v130-signin-plugins-updates.md) | 1.3.0 (fork) | Sign-in, web-account bridge, opaque UI, Settings > Plugins, live / palette, in-app updates |
 | [constraints.md](constraints.md) | 两条硬约束 | 包名 15 字符、targetSdk ≤ 28。改错不报错但真机必炸 |
 | [build-and-ship.md](build-and-ship.md) | 构建、发行与发布 | gradle 任务、签名、夸克网盘上传与版本整理 |
 | [platform-android.md](platform-android.md) | android 平台适配总览 | 为什么 Node 在 Android 上是 android 而不是 linux |

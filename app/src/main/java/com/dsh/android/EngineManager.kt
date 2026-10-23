@@ -1,6 +1,15 @@
 package com.dsh.android
 
 import android.content.Context
+import com.dsh.android.account.AccountConfig
+import com.dsh.android.account.AccountStore
+import com.dsh.android.account.DshCredentials
+import com.dsh.android.update.EngineSlots
+import com.dsh.android.update.EngineLifecycle
+import com.dsh.android.update.HarnessActivation
+import com.dsh.android.update.HarnessUpdater
+import com.dsh.android.update.UpdateActions
+import com.dsh.android.update.UpdateCenter
 import com.dsh.android.log.DshLog as Log
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
@@ -10,6 +19,8 @@ import com.dsh.android.log.RescueBoot
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -44,6 +55,9 @@ import java.util.concurrent.TimeUnit
  * 而 `$PREFIX/bin/node` 正落在私有目录里。详见 app/build.gradle.kts 的注释。
  */
 class EngineManager private constructor(private val context: Context) {
+    /** v1.3.0: starts the web-account bridge if needed and returns its port (null: not running). Set by WebAccount. */
+    @Volatile var webBridgePort: (() -> Int?)? = null
+
 
     sealed interface State {
         data object Idle : State
@@ -144,6 +158,7 @@ class EngineManager private constructor(private val context: Context) {
 
     private val _state = MutableStateFlow<State>(State.Idle)
     val state: StateFlow<State> = _state.asStateFlow()
+    private val lifecycle = EngineLifecycle()
 
     /**
      * 当前引擎进程。
@@ -155,6 +170,7 @@ class EngineManager private constructor(private val context: Context) {
      */
     @Volatile
     private var process: Process? = null
+    @Volatile private var preflightProcess: Process? = null
 
     /**
      * 是否是**我们自己**在停引擎（[stop]）。
@@ -278,12 +294,29 @@ class EngineManager private constructor(private val context: Context) {
      * @param versionStamp 资产版本标识；与已解包版本一致时直接跳过。
      */
     suspend fun ensureExtracted(versionStamp: String) = withContext(Dispatchers.IO) {
+        lifecycle.exclusive { ensureExtractedChecked(versionStamp) }
+    }
+
+    private suspend fun ensureExtractedChecked(versionStamp: String) = withContext(Dispatchers.IO) {
         lastAssetStamp = versionStamp
+        // Complete an interrupted slot swap before deciding whether the bundled assets need extracting.
+        EngineSlots(context.filesDir).recoverInterrupted()
+        // v1.3.0: a harness installed by the in-app updater (stamp `npm:<v>`) stays while it is newer than the bundled one.
+        val installedStamp = runCatching { stampFile.readText().trim() }.getOrNull()
+        if (HarnessUpdater.keepInstalled(installedStamp, versionStamp) && EngineSlots(context.filesDir).isComplete(engineDir)) {
+            Log.i(TAG, "keeping the updated harness ($installedStamp), bundled is $versionStamp")
+            return@withContext
+        }
         if (stampFile.isFile && stampFile.readText().trim() == versionStamp) {
             Log.i(TAG, "引擎资产已是最新（$versionStamp），跳过解包")
             return@withContext
         }
 
+        // v1.3.0: the bundled engine replaces whatever is there; an update that never booted is recorded as bad so it
+        // is not offered again (it would otherwise be "confirmed" when the bundled engine reaches Ready).
+        EngineSlots(context.filesDir).let { slots ->
+            slots.pending()?.let { v -> slots.markBad(v); slots.confirm(); Log.w(TAG, "harness $v replaced by the bundled engine before it booted") }
+        }
         _state.value = State.Extracting(0)
         // 先解到临时目录，成功后再原子替换，避免中途失败留下半成品
         val staging = File(context.filesDir, "engine.staging")
@@ -481,6 +514,7 @@ class EngineManager private constructor(private val context: Context) {
      *    新纳入的那部分**永远不生效**（静默，最难查的那种）。
      */
     private fun ensureWebViewCompat() {
+        webViewCompatApplied = false
         // 内置内核版整个跳过：这一整套的存在理由是「设备上的系统 WebView 太旧」，
         // 而内置内核的版本在编译期就定了（GeckoView 140），永远不可能过旧。
         // 跑了反而有害 —— 前端会被换成按 chrome73 降级、砍掉语法糖的版本。
@@ -492,6 +526,12 @@ class EngineManager private constructor(private val context: Context) {
         val dist = File(engineDir, "node_modules/@deepseek-ai/dsh-web-frontend/dist")
         if (!dist.isDirectory) {
             Log.w(TAG, "引擎尚未解包，跳过 WebView 降级资产")
+            return
+        }
+        // v1.3.0: the compat bundle is built for the bundled harness only; an updated harness keeps its own frontend
+        // (webViewCompatApplied stays false, so MainActivity applies the official bundle's WebView threshold).
+        if (runCatching { stampFile.readText() }.getOrDefault("").startsWith("npm:")) {
+            Log.i(TAG, "updated harness: WebView compat frontend not applied")
             return
         }
 
@@ -3355,6 +3395,32 @@ class EngineManager private constructor(private val context: Context) {
      * 判据与 [ensureKeyPoolProvider] 一致：**只补缺，不覆盖**。行已存在就一个字节
      * 都不动 —— 那意味着用户在设置页里选过模型，属于用户意图。
      */
+    /**
+     * v1.3.0: writes what the first screen's sign-in means into the profile patch (see [AccountConfig]); for the web
+     * account also the bridge secret into `.credentials.yaml`. Runs before every launch: the bridge port is per process.
+     */
+    private fun ensureAccountConfig(profile: String, hasKeyPool: Boolean) {
+        val store = AccountStore(context)
+        val mode = store.mode
+        val port = if (mode == AccountConfig.Mode.WEB) webBridgePort?.invoke() else null
+        try {
+            if (port != null) DshCredentials.write(dshHome, mapOf(DshCredentials.WEB_BRIDGE_KEY to store.bridgeSecret()))
+            else if (DshCredentials.read(dshHome, DshCredentials.WEB_BRIDGE_KEY) != null) {
+                DshCredentials.write(dshHome, mapOf(DshCredentials.WEB_BRIDGE_KEY to null))
+            }
+            val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
+            val existing = if (patch.isFile) patch.readText() else ""
+            val updated = AccountConfig.render(existing, mode, port, hasKeyPool)
+            if (updated != existing) {
+                patch.parentFile?.mkdirs()
+                patch.writeText(updated)
+                Log.i(TAG, "account config ($profile): mode=$mode bridge=${port != null}")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "account config ($profile) failed: ${t.message}")
+        }
+    }
+
     private fun ensureDefaultModel(profile: String = PROFILE_NAME) {
         val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
@@ -4771,13 +4837,24 @@ class EngineManager private constructor(private val context: Context) {
      */
     private suspend fun preflight(): PreflightResult {
         val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
+        val activation = HarnessActivation(EngineSlots(context.filesDir), ::stop)
         if (!profileDir.isDirectory) {
+            activation.validateConfiguration(null, hasRequiredEntries = false, hasSkippedBundles = false)
             // 还没有 profile：引擎首次启动会自己按模板初始化，没什么可体检的。
             // ⚠️ 这不是 Clean —— 一次 dump-config 都没跑过，运行期零验证。
             return PreflightResult.StaticOnly
         }
 
         val first = runDumpConfig()
+        if (EngineSlots(context.filesDir).pending() != null) {
+            // An incompatible candidate belongs to the updater. Never quarantine the user's known-working profile.
+            activation.validateConfiguration(
+                first?.exitCode,
+                hasRequiredEntries = first != null && missingRequiredEntries(first.stdout).isEmpty(),
+                hasSkippedBundles = first?.stderr?.lineSequence()?.any { it.contains("skipping profile bundle") } == true,
+            )
+            return PreflightResult.Clean
+        }
         if (first == null) {
             // 跑不起来（node 缺失等）：体检本身失效，放行让引擎报它自己的错。
             // ⚠️ 同样不是 Clean —— 见上面那条。
@@ -4879,6 +4956,8 @@ class EngineManager private constructor(private val context: Context) {
      * @return true = 本次确实自动进了安全模式（调用方应据此提示用户）。
      */
     internal fun shouldAutoEnterSafeMode(): Boolean {
+        // A failed updater rollback must not reuse stale rescue history to alter the user's profile.
+        if (EngineSlots(context.filesDir).pending() != null) return false
         val f = RescueBoot.lastFailure()
         val st = RescueBoot.tier()
         val streak = f?.consecutiveFailures ?: 0
@@ -4934,6 +5013,10 @@ class EngineManager private constructor(private val context: Context) {
      * @return true = 至少改动了一样（调用方据此提示用户）；false = 三样本来就都干净。
      */
     suspend fun enterSafeMode(): Boolean = withContext(Dispatchers.IO) {
+        lifecycle.exclusive { enterSafeModeChecked() }
+    }
+
+    private suspend fun enterSafeModeChecked(): Boolean = withContext(Dispatchers.IO) {
         stop()
 
         val profileDir = File(dshHome, "profiles/$PROFILE_NAME")
@@ -5218,7 +5301,8 @@ class EngineManager private constructor(private val context: Context) {
         )
         if (stampFile.isFile) stampFile.delete()
         return try {
-            ensureExtracted(stamp)
+            // Called only from preflight while start() already owns the lifecycle gate.
+            ensureExtractedChecked(stamp)
             val check = runDumpConfig()
             val stillMissing = check?.let { missingRequiredEntries(it.stdout) }.orEmpty()
             if (check != null && check.exitCode == 0 && stillMissing.isEmpty()) {
@@ -6401,6 +6485,7 @@ class EngineManager private constructor(private val context: Context) {
                 put("NODE_OPTIONS", "--max-old-space-size=1024")
             }
             val proc = pb.start()
+            preflightProcess = proc
             // ⚠️ 必须**并发**读走两个流：dump 的输出有 1500+ 行（真机实测），
             // 单线程先 readText() 一个流会让另一个流的 64KB 管道缓冲写满，
             // 引擎卡在 write 上永远不退出 —— 体检就成了新的挂死点。
@@ -6449,6 +6534,10 @@ class EngineManager private constructor(private val context: Context) {
         } catch (t: Throwable) {
             Log.w(TAG, "启动前体检执行失败，跳过: ${t.message}")
             null
+        } finally {
+            // Keep the reference if termination fails so updater rollback cannot move a live probe's files.
+            preflightProcess?.let { HarnessActivation.stopAndReap(it) }
+            preflightProcess = null
         }
     }
 
@@ -6565,6 +6654,18 @@ class EngineManager private constructor(private val context: Context) {
 
     /** 启动引擎，等待其打印带 token 的 URL。 */
     suspend fun start() = withContext(Dispatchers.IO) {
+        lifecycle.exclusive {
+            try {
+                startChecked()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                if (!rollBackPendingHarness(failure.message ?: failure.javaClass.simpleName)) throw failure
+            }
+        }
+    }
+
+    private suspend fun startChecked() = withContext(Dispatchers.IO) {
         if (process?.isAlive == true) {
             Log.i(TAG, "引擎已在运行")
             // ⚠️ **早返回也必须跑特权通道自愈。** 这一段原先直接 return，于是
@@ -6598,6 +6699,7 @@ class EngineManager private constructor(private val context: Context) {
         // ensureXxx 都是幂等的，重解包之后再跑一遍才是正确顺序。
         // 真机实测：正常态体检耗时 0.7~0.8 秒，对 7~10 秒的启动时间可忽略。
         if (!bootstrap.installNodeRuntime()) {
+            if (rollBackPendingHarness("Node runtime preparation failed")) return@withContext
             _state.value = State.Failed(
                 "Termux 环境未就绪，无法启动引擎。\n" +
                     "prefix=${bootstrap.prefixDir.absolutePath}\n" +
@@ -6608,6 +6710,7 @@ class EngineManager private constructor(private val context: Context) {
 
         val nodeBin = bootstrap.nodeBinary
         if (!nodeBin.isFile) {
+            if (rollBackPendingHarness("Node executable missing")) return@withContext
             _state.value = State.Failed("找不到 Node 可执行文件: ${nodeBin.absolutePath}")
             return@withContext
         }
@@ -6783,6 +6886,8 @@ class EngineManager private constructor(private val context: Context) {
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
+        // v1.3.0: the sign-in chosen on the first screen (API key / web account / none) → provider + default model.
+        ensureAccountConfig(PROFILE_NAME, keyInject != null)
 
         // ⚠️ **救援 profile 也必须拿到同一套用户层配置**，否则救援界面是残废的：
         //   没有默认模型 ⇒ AI 一开口就路由失败；没有号池 ⇒ 用户得自己配 key；
@@ -6800,6 +6905,7 @@ class EngineManager private constructor(private val context: Context) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
             ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
+            ensureAccountConfig(RESCUE_PROFILE_NAME, keyInject != null)
         }
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
@@ -6900,6 +7006,7 @@ class EngineManager private constructor(private val context: Context) {
 
         val binJs = File(engineDir, "node_modules/@deepseek-ai/dsh/lib/bin.js")
         if (!binJs.isFile) {
+            if (rollBackPendingHarness("entry missing")) return@withContext
             _state.value = State.Failed("找不到引擎入口: ${binJs.absolutePath}")
             return@withContext
         }
@@ -7065,7 +7172,8 @@ class EngineManager private constructor(private val context: Context) {
         //     而体检判的是核心 bundle 完不完整，判据没变、结论不会变。反过来，
         //     体检在发现核心损坏时会触发**整棵 engine/ 重解包**，那会把此刻已经
         //     就绪的 native addon 与补丁抹掉 —— 白跑一趟还引入新失败点。
-        maybeIsolateBadBundles()
+        // Pending candidates must prove themselves without changing the user's plugin selection.
+        if (EngineSlots(context.filesDir).pending() == null) maybeIsolateBadBundles()
 
         // ⚠️ L1 可能刚刚把层级降级成 RESCUE（二分没收敛时，见 [maybeIsolateBadBundles]
         //   末尾）。但 `targetProfile` 与 `cmd` 是在这**之前**算好的，本次发车仍会用
@@ -7107,6 +7215,7 @@ class EngineManager private constructor(private val context: Context) {
         val proc = try {
             pb.start()
         } catch (t: Throwable) {
+            if (rollBackPendingHarness("process launch failed: ${t.message}")) return@withContext
             _state.value = State.Failed("引擎进程启动失败: ${t.message}")
             return@withContext
         }
@@ -7222,6 +7331,8 @@ class EngineManager private constructor(private val context: Context) {
 
         val got = readyLatch.await(READY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         val url = readyUrl
+        // A concurrent explicit stop owns the state even if the old process already printed its URL.
+        if (userStopped || process !== proc) return@withContext
 
         if (got && url != null) {
             // ── 引擎**起来了**，但 gateway 可能已经废了（本 App 的第三种故障形态）──
@@ -7242,6 +7353,7 @@ class EngineManager private constructor(private val context: Context) {
             val gatewayTail = synchronized(logLines) { logLines.toList() }
             val gatewayCulprit = RescueBoot.parseGatewayFailure(gatewayTail)
             if (gatewayCulprit != null) {
+                if (pendingHarnessReady(gatewayHealthy = false)) return@withContext
                 Log.e(
                     TAG,
                     "引擎打印了 URL 但 typert gateway 整体下线（涉事=${gatewayCulprit.ifEmpty { "未解析到包名" }}）" +
@@ -7301,10 +7413,13 @@ class EngineManager private constructor(private val context: Context) {
                     ),
                 )
                 _state.value = State.Ready(url)
+                onEngineReady()
                 Log.i(TAG, "引擎就绪: $url")
                 return@withContext
             }
+            if (pendingHarnessReady(gatewayHealthy = true)) return@withContext
             _state.value = State.Ready(url)
+            onEngineReady()
             Log.i(TAG, "引擎就绪: $url")
             // ⚠️ 引擎**真的起来了** ⇒ 清掉上次的失败记录。
             //
@@ -7436,6 +7551,8 @@ class EngineManager private constructor(private val context: Context) {
             //   把记录提到广播之前即可根除：广播之后任何时刻读，记录都已就位。
             //   ⚠️ 别改成「广播后再补一次记录」—— 那会让同一场失败被记两次，
             //      计数翻倍，L1/L2/L3 全部提前触发（另一种失真）。
+            // v1.3.0: a just-updated harness that does not boot is swapped back before the rescue ladder counts it.
+            if (rollBackPendingHarness(reason)) return@withContext
             val tailList = synchronized(logLines) { logLines.toList() }
             RescueBoot.recordFailure(
                 bootId = BootState.bootId,
@@ -7536,15 +7653,14 @@ class EngineManager private constructor(private val context: Context) {
         // Shizuku 桥随引擎一起收：它的接受线程是 daemon、名字随进程释放，
         // 但显式关掉能让下一次 start() 重新绑定同一个名字而不撞车。
         ShizukuChannel.stop()
+        preflightProcess?.let { HarnessActivation.stopAndReap(it) }
+        preflightProcess = null
         process?.let { p ->
             Log.i(TAG, "停止引擎")
             // ⚠️ 必须在 destroy 之前置位：destroy 之后 stdout 线程会立刻读到 EOF
             //   并进 markEngineDeadIfCurrent，两者是并发的。
             userStopped = true
-            p.destroy()
-            if (!p.waitFor(3, TimeUnit.SECONDS)) {
-                p.destroyForcibly()
-            }
+            HarnessActivation.stopAndReap(p)
         }
         process = null
         // 引擎停了就别再占着 mDNS 监听（NsdManager 的 listener 注册是全局资源）
@@ -7553,6 +7669,150 @@ class EngineManager private constructor(private val context: Context) {
         WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
     }
+
+    /** v1.3.0: a restart asked for while a boot was in progress; done once that boot reaches Ready. */
+    @Volatile private var restartWhenReady: String? = null
+
+    /**
+     * v1.3.0: restart so dsh re-reads its account config (sign-in, sign-out). Ready → now; a boot in progress → once it
+     * reaches Ready (restarting mid-boot would start a second pipeline next to the running one); stopped or failed → the
+     * next start reads the new config anyway. Never blocks the caller (stop() waits for the process to exit).
+     */
+    fun restartForConfigChange(reason: String) {
+        when (_state.value) {
+            is State.Ready -> Thread({ requestRestart(reason) }, "engine-restart").start()
+            is State.Starting, is State.Extracting -> restartWhenReady = reason
+            else -> Unit
+        }
+    }
+
+    private fun onEngineReady() {
+        restartWhenReady?.let { reason ->
+            restartWhenReady = null
+            Thread({ requestRestart("$reason (after boot)") }, "engine-restart").start()
+        }
+    }
+
+    /** v1.3.0: the updated harness reached Ready once, so it is the harness now. */
+    private fun pendingHarnessReady(gatewayHealthy: Boolean): Boolean {
+        val slots = EngineSlots(context.filesDir)
+        val pending = slots.pending() ?: return false
+        val result = HarnessActivation(slots, ::stop).ready(gatewayHealthy, processAlive = process?.isAlive == true)
+        if (result != HarnessActivation.Result.CONFIRMED) {
+            return reportHarnessRecovery(pending, result, "candidate did not reach a healthy running state")
+        }
+        Log.i(TAG, "harness $pending booted; update confirmed")
+        EventLog.record("harness.update-confirmed", mapOf("version" to pending))
+        return false
+    }
+
+    /**
+     * v1.3.0: if the harness was just updated and has not booted yet, restore the previous one, never offer this
+     * version again, and restart (State.Dead → MainActivity restarts). Returns true when it rolled back.
+     */
+    private fun rollBackPendingHarness(reason: String): Boolean {
+        val slots = EngineSlots(context.filesDir)
+        val pending = slots.pending() ?: return false
+        return reportHarnessRecovery(pending, HarnessActivation(slots, ::stop).failed(), reason)
+    }
+
+    private fun reportHarnessRecovery(pending: String, result: HarnessActivation.Result, reason: String): Boolean {
+        if (result == HarnessActivation.Result.NOT_PENDING) return false
+        if (result != HarnessActivation.Result.ROLLED_BACK) {
+            Log.w(TAG, "harness $pending failed to boot and could not be rolled back ($reason)")
+            _state.value = State.Failed("Harness $pending failed; previous files were preserved. Restart the app to retry recovery.")
+            return true
+        }
+        Log.w(TAG, "harness $pending failed to boot ($reason); rolled back to ${EngineSlots(context.filesDir).installedVersion()}")
+        EventLog.record("harness.update-rolled-back", mapOf("version" to pending, "reason" to reason.take(200)))
+        _state.value = State.Dead("harness $pending did not start; previous version restored")
+        return true
+    }
+
+    /** Worker-thread entry: wait for any boot/extraction, then stop, swap and recover without another boot intervening. */
+    fun activateHarnessUpdate(version: String): Boolean = runBlocking {
+        lifecycle.exclusive {
+            val slots = EngineSlots(context.filesDir)
+            try {
+                stop()
+                val promoted = slots.promote()
+                if (!promoted) slots.recoverInterrupted()
+                requestRestart(if (promoted) "harness updated to $version" else "harness update aborted")
+                promoted
+            } catch (failure: Exception) {
+                // Even a partially failed stop or marker write must recover under the same gate.
+                runCatching {
+                    stop()
+                    slots.recoverInterrupted()
+                    requestRestart("harness update recovery")
+                }.onFailure { recovery ->
+                    failure.addSuppressed(recovery)
+                    Log.w(TAG, "harness recovery failed; slots preserved: ${recovery.message}")
+                }
+                throw failure
+            }
+        }
+    }
+
+    /**
+     * v1.3.0: restore `engine.prev` by hand from Settings > About & updates, for a harness that booted but misbehaves.
+     *
+     * Same gate and recovery as [activateHarnessUpdate]. Refuses while an install ([EngineSlots.next]) or a promoted
+     * but unbooted harness ([EngineSlots.pending]) owns the rollback window, and refuses when [expected] is not the
+     * version actually sitting in `engine.prev`, so a stale card cannot swap in an unexpected tree.
+     */
+    fun activatePreviousHarness(expected: String): Boolean = runBlocking {
+        lifecycle.exclusive {
+            val slots = EngineSlots(context.filesDir)
+            val candidate = slots.rollbackCandidate()
+            if (candidate == null || slots.versionIn(candidate) != expected ||
+                !UpdateActions.rollback(hasPrevious = true, status = UpdateCenter.harnessWorkerStatus)
+            ) {
+                return@exclusive false
+            }
+            try {
+                stop()
+                val restored = slots.rollback()
+                requestRestart(if (restored) "harness restored to $expected" else "harness restore aborted")
+                if (restored) EventLog.record("harness.restored", mapOf("version" to expected))
+                restored
+            } catch (failure: Exception) {
+                // Even a partially failed stop or rename must recover under the same gate.
+                runCatching {
+                    stop()
+                    slots.recoverInterrupted()
+                    requestRestart("harness restore recovery")
+                }.onFailure { recovery ->
+                    failure.addSuppressed(recovery)
+                    Log.w(TAG, "harness restore recovery failed; slots preserved: ${recovery.message}")
+                }
+                throw failure
+            }
+        }
+    }
+
+    /**
+     * v1.3.0 harness updater: runs [cmd] in [dir] with exactly the environment of the last real engine launch (PREFIX,
+     * PATH, LD_PRELOAD link compat, certificates). Returns the exit code, or -1 when the engine has not been launched in
+     * this process (no environment to copy) or [timeoutMs] passed.
+     */
+    fun runWithEngineEnv(cmd: List<String>, dir: File, timeoutMs: Long, onLine: (String) -> Unit): Int {
+        val env = activeEnv
+        if (env.isEmpty()) return -1
+        val pb = ProcessBuilder(cmd).directory(dir).redirectErrorStream(true)
+        pb.environment().apply { clear(); putAll(env) }
+        val proc = pb.start()
+        val reader = Thread {
+            runCatching { proc.inputStream.bufferedReader().forEachLine(onLine) }
+        }.apply { isDaemon = true; start() }
+        val done = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        if (!done) proc.destroyForcibly()
+        reader.join(2000)
+        return if (done) proc.exitValue() else -1
+    }
+
+    /** `$PREFIX` of the Termux environment the engine runs in (from the last launch), or null. */
+    val prefixPath: String? get() = activeEnv["PREFIX"]
 
     /**
      * 请求**界面**重启引擎（供救援信箱的 `switch-rescue` / `switch-back` 用）。
@@ -7616,6 +7876,8 @@ class EngineManager private constructor(private val context: Context) {
         if (userStopped) return
         if (process !== proc) return
         if (!wasReady) return
+        // Until confirmation, the boot pipeline owns failure/rollback. Do not start a second boot from stdout EOF.
+        if (EngineSlots(context.filesDir).pending() != null) return
         val code = runCatching { proc.exitValue() }.getOrNull()
         val detail = if (code != null) "退出码 $code" else "进程已退出"
         Log.w(TAG, "引擎在运行期退出（$detail），界面已失去后端")
@@ -8168,7 +8430,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val PRESET_SKILLS_ASSET = "preset-skills.zip"
 
         /** 内容版本戳：改了 `preset-skills.zip` 里任何东西都必须改这里。 */
-        private const val PRESET_SKILLS_VERSION = "1.0.0-1"
+        private const val PRESET_SKILLS_VERSION = "1.0.0-4"
         private const val PRESET_SKILLS_STAMP = ".preset_skills_version"
 
         /**
@@ -8979,8 +9241,16 @@ class EngineManager private constructor(private val context: Context) {
           *      那是基于旧的 66/22 算的。合并时**必须取本地已推进的值再 +1**
           *      （99 → 100 / 33 → 34），否则会回退，设备上静默跑回没有这张卡的旧 UI。
           *      ⚠️ 两个戳都 bump（本常量 99 → 100，-CompatVersion 33 → 34）。
+          * 1.0.0-108：设置 > 关于新增「诊断信息」卡片：App/Android/设备/ABI/WebView 只读标签，
+          *      外加「打开日志」与「重启引擎」两个动作（重启需确认；原生侧在启动或重启中会忽略）。
+          *      只改 `mobileui/lib/client.js`，降级产物随之变化。
+          *      ⚠️ 两个戳都 bump（本常量 107 → 108，-CompatVersion 41 → 42）。
+          * 1.0.0-109：设置 > 关于的 App 更新卡新增「取消下载」：下载中可随时取消，进度清零、
+          *      不会弹出迟到的错误；已下载校验通过的 APK 与安装器正在读的文件不会被清理。
+          *      只改 `mobileui/lib/client.js`，降级产物随之变化。
+          *      ⚠️ 两个戳都 bump（本常量 108 → 109，-CompatVersion 42 → 43）。
           */
-        private const val MOBILE_UI_VERSION = "1.0.0-100"
+        private const val MOBILE_UI_VERSION = "1.0.0-109"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

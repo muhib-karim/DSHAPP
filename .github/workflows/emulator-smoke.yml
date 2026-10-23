@@ -7,7 +7,7 @@ name: Emulator smoke
 # on a real arm64 device; tools/ci/emulator-smoke.py goes on to them when the engine does come up.
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -37,6 +37,42 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # The hosted runner has occasionally handed sdkmanager a truncated system-image archive
+      # ("Error on ZipFile unknown archive", run 39975831370), after which the emulator never boots.
+      # Install the image here with retries and clear the partial download before each attempt, so the
+      # emulator action finds it ready and does not download it again.
+      - name: Pre-install the emulator system image
+        env:
+          API_LEVEL: "34"
+          TARGET: google_apis
+          ARCH: x86_64
+        run: |
+          set -eu
+          image="system-images;android-${API_LEVEL};${TARGET};${ARCH}"
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          case "$sdk" in ""|"/") echo "::error::Refusing to use an empty or root SDK path."; exit 1;; esac
+          test -d "$sdk"
+          manager="$(command -v sdkmanager || true)"
+          if [ -z "$manager" ]; then
+            manager="$(find "$sdk/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1)"
+          fi
+          test -x "$manager"
+          yes | "$manager" --licenses >/dev/null 2>&1 || true
+          attempt=1
+          while [ "$attempt" -le 3 ]; do
+            if "$manager" --install "$image" >/tmp/sdkmanager.log 2>&1; then
+              echo "Installed $image (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::System image install failed (attempt $attempt); clearing partial files and retrying."
+            tail -n 20 /tmp/sdkmanager.log || true
+            rm -rf "$sdk/.temp" "$sdk/system-images/android-${API_LEVEL}/${TARGET}/${ARCH}"
+            if [ -n "${HOME:-}" ]; then rm -rf "$HOME/.android/cache"; fi
+            attempt=$((attempt + 1))
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not install $image after 3 attempts."
+          exit 1
       - name: Install, launch, screenshot first screen, chat and settings
         uses: reactivecircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed # v2.34.0
         with:

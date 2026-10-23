@@ -7,8 +7,8 @@
 
 | 改了什么 | 必须改 |
 |---|---|
-| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-100`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（现 `34`，见 ⑯） |
-| `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.13`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
+| `mobile-ui.zip` 内容 | `EngineManager.MOBILE_UI_VERSION`（现 `1.0.0-109`）**且**重跑 `tools/build-webview-compat.ps1` 时 bump `-CompatVersion`（现 `43`，见 ⑯） |
+| `dsh-bridge/content.js` 内容 | `app/src/gecko/assets/dsh-bridge/manifest.json` 的 `version`（现 `1.0.15`），否则 GeckoView 继续用旧扩展（见 ⑦.7） |
 | `node-runtime.bin` 内容 | `TermuxBootstrap.NODE_VERSION`（`26.4.0-2`） |
 | `engine.bin` 内容 | `MainActivity.assetStamp`（`0.2.1-rc.2-1`） |
 | `pnpm-android-arm64.zip` 内容 | `EngineManager.PNPM_VERSION`（`11.28.3`） |
@@ -29,14 +29,17 @@
 | `ui-probe.js` | 无需改（原生每次启动读一次进内存，见 ⑫.5）。⚠️ 但改了语义要同步升 `ui-probe.js` 内部的 `VERSION`（页面上的旧探针靠它判断要不要换） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
-| `preset-skills.zip` | `EngineManager.PRESET_SKILLS_VERSION`（现 `1.0.0-1`）。判据是 `skills/.preset_skills_version` 里的字符串，**改了内容不改这个常量 ⇒ 老设备永远拿不到新 skill** |
+| `preset-skills.zip` | `EngineManager.PRESET_SKILLS_VERSION`（现 `1.0.0-4`）。判据是 `skills/.preset_skills_version` 里的字符串，**改了内容不改这个常量 ⇒ 老设备永远拿不到新 skill** |
 | `preset-razor.zip` | `EngineManager.PRESET_RAZOR_VERSION`（现 `1.0.3-1`）。⚠️ 它走 profile bundle（解到 `$DSH_HOME/node_modules/dsh-preset-razor/`），判据是包目录里的 `.preset_razor_version`，**改了内容不改这个常量 ⇒ 老设备永远停在旧提示词**（踩过：0.2.1 已删掉 `{{cwd}}` 变量，旧提示词留着它会让「快准狠模式」一选中就处理失败） |
 | `core-memory.zip` | `EngineManager.CORE_MEMORY_VERSION`（现 `1.0.0-2`） |
 
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
 这三个都是踩过的坑。
 
-### ⚠️ 改 `mobile-ui-plugin/**` 的源码**必须手工重打对应的 `.zip`**
+### 改 `mobile-ui-plugin/**` 后必须重打并比对对应的 `.zip`
+
+本 fork 的 CI 由 `tools/ci/assemble-assets.py` 从源码重建全部 13 个插件 zip；本地构建仍需准备资产，
+并逐个比较 zip 内完整文件集合及字节内容。以下为上游手工打包时期的背景与格式约束。
 
 `assets/*.zip` 全部被 `.gitignore` 忽略（L33），**没有任何打包脚本** ——
 `logs-tool.zip` / `bubble-tool.zip` / `statusbar-tool.zip` / `shell-tool.zip` /

@@ -29,6 +29,9 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.dsh.android.account.AccountStore
+import com.dsh.android.account.SignInActivity
+import com.dsh.android.update.UpdateCenter
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
@@ -731,7 +734,8 @@ class MainActivity : AppCompatActivity() {
         Log.i(DshApplication.TAG, "键盘预判结束（$reason）")
     }
 
-    private fun setWebViewBottomMargin(px: Int) {
+    private fun setWebViewBottomMargin(requested: Int) {
+        val px = maxOf(requested, fullscreenBottomPx)
         val lp = web.view.layoutParams
         if (lp is ViewGroup.MarginLayoutParams && lp.bottomMargin != px) {
             lp.bottomMargin = px
@@ -831,6 +835,7 @@ class MainActivity : AppCompatActivity() {
         SystemBarAppearance.attach(this)
         observeEngine()
         observeImeInsets()   // 修复 65：键盘高度自学习 + 预判交接
+        observeFullscreenBottomInset()   // v1.3.0: keyboard/navigation bar in fullscreen
         // 前台服务要在引擎启动前拉起：它同时是「进程不被回收」和 WakeLock 的持有者，
         // 晚一步的话，引擎刚起就切后台仍可能被系统盯上。
         EngineService.start(this)
@@ -838,6 +843,11 @@ class MainActivity : AppCompatActivity() {
         ensureStorageAccess()
         setupShizukuPermissionListener()
         bootEngine()
+        // v1.3.0: first screen (Continue with Google / Use API key) over the boot screen; the engine keeps booting
+        // behind it and is restarted with the new account config when the user signs in.
+        if (savedInstanceState == null && AccountStore(this).needsFirstScreen()) {
+            startActivity(Intent(this, SignInActivity::class.java))
+        }
     }
 
     /**
@@ -1118,6 +1128,7 @@ class MainActivity : AppCompatActivity() {
         //   GeckoView 版本（编译期确定）。所以那里永远不可能「内核过旧」——
         //   版本拦截分支不会触发，这正是内置内核要解决的问题本身。
         webViewMajor = web.engineMajor
+        UpdateCenter.webViewMajor = webViewMajor
         Log.i(
             DshApplication.TAG,
             "Web 内核: ${web.engineLabel}（主版本 $webViewMajor；" +
@@ -2087,6 +2098,15 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { openLogViewer("settings") }
         }
 
+        override fun appState(): String = runCatching { AppState.json(this@MainActivity) }.getOrElse {
+            Log.w(DshApplication.TAG, "appState failed", it)
+            "{}"
+        }
+
+        override fun appAction(name: String, arg: String) {
+            runOnUiThread { AppState.action(this@MainActivity, name, arg) }
+        }
+
         /**
          * 读日志摘要给设置页那一行当副标题。
          *
@@ -2361,7 +2381,7 @@ class MainActivity : AppCompatActivity() {
     private fun pushSystemBarInset(fullscreen: Boolean) {
         // 物理像素 → CSS 像素（÷ density）。density 为 0 时按 1 处理，避免除零。
         val density = resources.displayMetrics.density.let { if (it > 0f) it else 1f }
-        val cssPx = if (fullscreen) Math.round(statusBarHeightPx() / density) else 0
+        val cssPx = if (fullscreen) Math.round(maxOf(statusBarHeightPx(), cutoutTopPx()) / density) else 0
         val js = "(function(){try{document.documentElement.style.setProperty(" +
             "'--dsh-android-system-top','${cssPx}px');}catch(e){}})()"
         web.evaluateJavascript(js, null)
@@ -2382,6 +2402,42 @@ class MainActivity : AppCompatActivity() {
         if (fromRes > 0) return fromRes
         // 兜底：按密度折算 24dp（AOSP 默认值），至少不让页面完全不让位
         return (24 * resources.displayMetrics.density).toInt()
+    }
+
+    /**
+     * Height of the display cutout at the top (physical px), 0 without one or below API 28.
+     *
+     * v1.3.0: a notch or punch hole can be taller than the status bar (the resource value). Fullscreen lets the page
+     * draw under it, so the page must clear whichever is taller, or the header slides under the camera.
+     */
+    private fun cutoutTopPx(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return 0
+        return window.decorView.rootWindowInsets?.displayCutout?.safeInsetTop ?: 0
+    }
+
+    /** Bottom space (px) the keyboard and navigation bar take in fullscreen; see [observeFullscreenBottomInset]. */
+    private var fullscreenBottomPx = 0
+
+    /**
+     * v1.3.0 (owner: content overlapped by the keyboard in fullscreen). `FLAG_LAYOUT_NO_LIMITS` turns `adjustResize`
+     * off, so in fullscreen the window keeps its full height and the keyboard and the transparent navigation bar cover
+     * the composer. In exactly that mode the visible display frame does shrink, so the covered height is
+     * `root height − visible bottom`, and the WebView gets it as a bottom margin. Outside fullscreen this is 0 and
+     * `adjustResize` works as before.
+     */
+    private fun observeFullscreenBottomInset() {
+        val frame = android.graphics.Rect()
+        binding.root.viewTreeObserver.addOnGlobalLayoutListener {
+            val covered = if (fullscreenApplied) {
+                binding.root.getWindowVisibleDisplayFrame(frame)
+                (binding.root.rootView.height - frame.bottom).coerceAtLeast(0)
+            } else 0
+            if (covered != fullscreenBottomPx) {
+                fullscreenBottomPx = covered
+                setWebViewBottomMargin(if (imePrejudging) lastImeHeightPx else 0)
+                Log.i(DshApplication.TAG, "fullscreen bottom inset ${covered}px (keyboard + navigation bar)")
+            }
+        }
     }
 
     /** 最近一次已应用到窗口的全面屏状态（见 [applyFullscreen] 的状态门）。 */
@@ -3400,6 +3456,8 @@ class MainActivity : AppCompatActivity() {
     private fun hideOverlay() {
         if (overlayDismissed) return
         overlayDismissed = true
+        // v1.3.0: the UI is usable; check npm and GitHub for updates (at most daily, one-tap dialog).
+        UpdateCenter.onUiReady(this)
         // 启动层收起 = 页面底色开始可见，此时才把系统栏交给页面底色
         // （之前一直保持 themes.xml 的深色，与深色启动页一致）。
         // 用最近一次上报的底色；还没收到过就保持主题里的深色不动。

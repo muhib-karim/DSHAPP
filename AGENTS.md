@@ -125,6 +125,12 @@ adb logcat -d -s DSH:I     # 引擎就绪 / 界面加载完成 / 各 ensureXxx �
 | [key-pool.md](docs/agents/key-pool.md) | 内置号池、TLS 层注入、**必须降级 HTTP/1.1** |
 | [plugin-source.md](docs/agents/plugin-source.md) | 「添加插件」少了 npm 官方源 |
 
+### 1.3.0（fork）
+
+| 文档 | 什么时候看 |
+|---|---|
+| [v130-signin-plugins-updates.md](docs/agents/v130-signin-plugins-updates.md) | 首屏登录、网页账号本地桥、不透明界面、设置 > 插件、/ 菜单刷新、App 内更新；单元测试命令 |
+
 ### 构建 / 资产 / 发布
 
 | 文档 | 什么时候看 |
@@ -144,3 +150,9 @@ adb logcat -d -s DSH:I     # 引擎就绪 / 界面加载完成 / 各 ensureXxx �
    不能靠"我记得打过了"。踩过一次六个里漏一个，从"改了哪几个文件"看不出来。
 3. **不要为了"修"报错去升 `targetSdk` / 改包名** —— 那是硬约束①②，升了就全线崩，
    而且报错信息不会指向真正的原因。
+
+## Session handoff
+
+Read `docs/PROJECT_BRAIN.md` at session start. Update its Status and Next step after meaningful work and append a
+short UTC Session log entry before a long build or stopping. Commit the handoff with the work; no secrets or machine
+paths in it. Current pass plan: `docs/REVIEW_130_P2.md`.

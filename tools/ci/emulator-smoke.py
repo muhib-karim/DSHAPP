@@ -8,6 +8,10 @@ settings web UI therefore needs a real arm64 device (FORK_NOTES.md). When the en
 test goes on to the chat and settings screens as before; otherwise it checks the native boot-status screen (safe mode,
 view log) and the native log viewer.
 
+v1.3.0: before any of that the app shows its first screen ("Continue with Google" / "Use API key"). The test requires
+both buttons, opens the API-key screen, submits an invalid key and requires the error text (DeepSeek's 401, or the
+offline message when the emulator has no network), then taps "Set up later" and goes on as before.
+
 usage: emulator-smoke.py <apk> <package> <out dir>
 Runs inside reactivecircus/android-emulator-runner (an x86_64 image that translates arm64 apps).
 """
@@ -25,6 +29,12 @@ SETTINGS = re.compile(r"^(设置|Settings)$", re.I)
 SETTINGS_OPEN = re.compile(r"(通用|General|模型|Models|插件|Plugins|外观|Appearance)", re.I)
 VIEW_LOG = re.compile(r"^(查看日志|View log|View logs)$", re.I)
 ENGINE_FAIL = re.compile(r"(启动失败|failed to start|CANNOT LINK|救援模式|Rescue)", re.I)
+GOOGLE = re.compile(r"^Continue with Google$", re.I)
+API_KEY = re.compile(r"^Use API key$", re.I)
+LATER = re.compile(r"^Set up later$", re.I)
+KEY = "sk-smoke-invalid-key-0000000000"
+LOCAL_KEY_ERROR = re.compile(r"^Enter your DeepSeek API key\.$", re.I)
+KEY_ERROR = re.compile(r"(rejected this key|Could not reach api\.deepseek\.com|DeepSeek answered HTTP|no balance|rate limiting)", re.I)
 
 
 def adb(*args, check=False, timeout=120):
@@ -55,12 +65,21 @@ def dump(tag):
 # the background ("Allow", which the app needs to keep its engine alive).
 DISMISS = re.compile(r"^(Wait|Allow|允许|始终允许|OK|确定)$")
 COVER = re.compile(r"(isn't responding|无响应|run in background|后台运行)", re.I)
+CLOSE = re.compile(r"^(Close app|关闭应用)$")
+LAUNCHER_ANR = re.compile(r"(Launcher|启动器).{0,20}(isn't responding|无响应)", re.I)
+LAUNCHERS = ("com.google.android.apps.nexuslauncher", "com.android.launcher3")
 
 
 def dismiss(root):
     texts = " | ".join(label(n) for n in nodes(root))
     if not COVER.search(texts):
         return False
+    # A hung launcher is closed (waiting keeps it holding input focus); anything else gets Wait / Allow.
+    preferred = CLOSE if LAUNCHER_ANR.search(texts) else DISMISS
+    for n in nodes(root):
+        if preferred.match((n.get("text") or "").strip()):
+            print("dismissing system dialog:", texts[:160], flush=True)
+            return tap(n)
     for n in nodes(root):
         if DISMISS.match((n.get("text") or "").strip()):
             print("dismissing system dialog:", texts[:160], flush=True)
@@ -97,13 +116,20 @@ def tap(n):
 
 def main():
     print("abilist:", adb("shell", "getprop", "ro.product.cpu.abilist").strip(), flush=True)
+    # The CI emulator is slow enough that the background Pixel Launcher keeps hitting ANR; its dialog takes input
+    # focus and swallows typed text (run 39958069915). Background ANRs need no dialog here.
+    adb("shell", "settings", "put", "global", "anr_show_background", "0")
+    # Run 39960054520: the hung Pixel Launcher kept input focus (mCurrentFocus) over the app for the whole run, so typed
+    # text never arrived. The test launches the app explicitly and needs no home screen: disable and stop the launcher.
+    for launcher in LAUNCHERS:
+        adb("shell", "pm", "disable-user", "--user", "0", launcher)
+        adb("shell", "am", "force-stop", launcher)
     adb("install", "-r", "-g", APK, check=True, timeout=600)
     adb("shell", "pm", "grant", PKG, "android.permission.POST_NOTIFICATIONS")
     adb("logcat", "-c")
     adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1", check=True)
     time.sleep(25)
-    screen("first")
-    shot("01-first-screen")
+    first_ok, key_ok = sign_in_screens()
 
     chat = False
     boot_status = False
@@ -111,7 +137,10 @@ def main():
     while time.time() < deadline:
         root = screen("wait")
         texts = " | ".join(label(n) for n in nodes(root))
-        if any(n.get("class") == "android.widget.EditText" for n in nodes(root)) or CHAT_HINT.search(texts):
+        if on_sign_in(root):
+            print("still on the sign-in screen; Back", flush=True)
+            adb("shell", "input", "keyevent", "4")
+        elif any(n.get("class") == "android.widget.EditText" for n in nodes(root)) or CHAT_HINT.search(texts):
             chat = True
             break
         if ENGINE_FAIL.search(texts) or VIEW_LOG.search(texts):
@@ -122,7 +151,7 @@ def main():
     time.sleep(5)
     root = screen("status")
     if chat:
-        shot("02-chat")
+        shot("04-chat")
         target = find(root, SETTINGS)
         if target is None:
             corner = [n for n in nodes(root) if n.get("clickable") == "true" and re.match(r"\[(\d+),(\d+)\]", n.get("bounds", ""))]
@@ -134,19 +163,21 @@ def main():
         ok = target is not None and tap(target)
         time.sleep(4)
         ok = ok and SETTINGS_OPEN.search(" | ".join(label(n) for n in nodes(screen("settings")))) is not None
-        shot("03-settings")
+        shot("05-settings")
         result = f"engine up: chat screen and settings screen opened: {ok}"
     else:
-        shot("02-boot-status")
+        shot("04-boot-status")
         button = find(root, VIEW_LOG)
         ok = boot_status and button is not None and tap(button)
         time.sleep(4)
         screen("log")
         resumed = adb("shell", "dumpsys", "activity", "activities")
         ok = ok and "LogViewerActivity" in next((l for l in resumed.splitlines() if "mResumedActivity" in l or "topResumedActivity" in l), "")
-        shot("03-log-viewer")
+        shot("05-log-viewer")
         result = ("engine not up on this x86_64 emulator (arm64-only Termux bootstrap); native boot-status screen shown and "
                   f"log viewer opened: {ok}")
+    result = f"first screen (Google + API key): {first_ok}; API-key screen with error on an invalid key: {key_ok}; " + result
+    ok = ok and first_ok and key_ok
     with open(os.path.join(OUT, "logcat.txt"), "w", encoding="utf-8") as fh:
         fh.write(adb("logcat", "-d", "-v", "time", timeout=120))
     with open(os.path.join(OUT, "RESULT.txt"), "w", encoding="utf-8") as fh:
@@ -154,6 +185,167 @@ def main():
     print(result, flush=True)
     if not ok:
         sys.exit(1)
+
+
+def sign_in_screens():
+    """First screen, API-key screen, an invalid key's error; then "Set up later" back to the app."""
+    root = None
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        root = screen("first")
+        if find(root, GOOGLE) is not None and find(root, API_KEY) is not None:
+            break
+        time.sleep(5)
+    shot("01-first-screen")
+    first_ok = find(root, GOOGLE) is not None and find(root, API_KEY) is not None
+    print("first screen:", first_ok, flush=True)
+    if not first_ok:
+        return False, False
+    # Cancel an untouched API-key panel and reopen it. Back must not dismiss first-run setup or commit an account.
+    tap(find(root, API_KEY))
+    time.sleep(3)
+    root = screen("api-key-cancel")
+    for _ in range(4):
+        if find(root, GOOGLE) is not None and find(root, API_KEY) is not None:
+            break
+        adb("shell", "input", "keyevent", "4")
+        time.sleep(2)
+        root = screen("api-key-canceled")
+    choice = find(root, API_KEY)
+    if choice is None or find(root, GOOGLE) is None:
+        print("API-key cancel did not return to account choices", flush=True)
+        return first_ok, False
+    tap(choice)
+    time.sleep(3)
+    root = screen("api-key")
+    shot("02-api-key-screen")
+    field = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
+    # The key panel must offer an explicit Paste action (the clipboard is never read without a tap).
+    paste = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnPasteKey")), None)
+    paste_ok = paste is not None and bool((paste.get("content-desc") or "").strip())
+    print("API-key paste button:", paste_ok, flush=True)
+    if not paste_ok:
+        return first_ok, False
+    key_ok = False
+    if field is not None:
+        # Empty input is a deterministic local error; it must not depend on the network or accept an account.
+        ensure_app_focus()
+        tap(field)
+        wait_for_ime()
+        adb("shell", "input", "keyevent", "66")
+        deadline = time.time() + 20
+        local_ok = False
+        while time.time() < deadline:
+            root = screen("api-key-empty")
+            if find(root, LOCAL_KEY_ERROR) is not None:
+                local_ok = True
+                break
+            button = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnKeyContinue")), None)
+            if button is not None:
+                tap(button)
+            time.sleep(2)
+        shot("02a-api-key-local-error")
+        if not local_ok:
+            print("empty API key did not show local validation", flush=True)
+            return first_ok, False
+        field = key_field(root)
+        if field is None:
+            return first_ok, False
+        # Run 39953357675 typed before the keyboard was up (nothing arrived); run 39955835370 re-tapped the field's old
+        # bounds after the keyboard had moved the layout and hit "Get a key", which opened Chrome. So: tap once, wait for
+        # the keyboard, type, and re-tap only with bounds from a fresh dump while the app is in front.
+        tap(field)
+        wait_for_ime()
+        for attempt in range(3):
+            ensure_app_focus()
+            adb("shell", "input", "text", KEY)
+            time.sleep(2)
+            root = back_to_app(screen("api-key-typed"))
+            field = key_field(root)
+            typed = field is not None and (field.get("text") or "").strip() not in ("", "DeepSeek API key")
+            print("key typed:", typed, flush=True)
+            if typed or field is None:
+                break
+            tap(field)
+            wait_for_ime()
+        adb("shell", "input", "keyevent", "66")   # IME "Done" submits
+        deadline = time.time() + 75   # DNS failure plus the check's 15 s connect and read timeouts on a slow emulator
+        tapped_continue = False
+        while time.time() < deadline and not key_ok:
+            time.sleep(3)
+            root = back_to_app(screen("api-key-error"))
+            key_ok = find(root, KEY_ERROR) is not None
+            button = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnKeyContinue")), None)
+            if not key_ok and not tapped_continue and button is not None and time.time() > deadline - 65:
+                tap(button)   # the IME action did not submit: press Continue (fresh bounds, app in front)
+                tapped_continue = True
+        shot("03-api-key-error")
+    print("API-key screen error shown:", key_ok, flush=True)
+    # Leave the key panel with the system Back key (its own Back button can be below the fold); a first Back may only
+    # close the keyboard, so repeat until the first screen's "Set up later" is on screen.
+    root = screen("api-key-done")
+    for _ in range(4):
+        later = find(root, LATER)
+        if later is not None and not on_sign_in_key_panel(root):
+            tap(later)
+            time.sleep(3)
+            break
+        adb("shell", "input", "keyevent", "4")
+        time.sleep(2)
+        root = screen("first-again")
+    return first_ok, key_ok
+
+
+def wait_for_ime(timeout=12):
+    """Until the soft keyboard is shown (input text sent earlier is lost)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        dump = adb("shell", "dumpsys", "input_method")
+        if any(flag in dump for flag in ("mInputShown=true", "mIsInputViewShown=true", "isInputViewShown=true")):
+            time.sleep(1)
+            return True
+        time.sleep(1)
+    print("keyboard not reported as shown; typing anyway", flush=True)
+    return False
+
+
+def ensure_app_focus(timeout=20):
+    """Until the app's window has input focus (a system dialog in front takes the typed keys)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        focus = [l for l in adb("shell", "dumpsys", "window").splitlines() if "mCurrentFocus" in l]
+        if focus and PKG in focus[0]:
+            return True
+        print("input focus:", (focus[0].strip() if focus else "?")[:160], flush=True)
+        screen("focus")   # dismisses ANR / background-run dialogs
+        time.sleep(2)
+    return False
+
+
+def back_to_app(root):
+    """If something else came to the front (a browser, a system screen), press Back until the app is there again."""
+    for _ in range(3):
+        packages = {n.get("package") for n in nodes(root)}
+        if PKG in packages or not packages:
+            return root
+        print("not in the app (", ", ".join(sorted(p for p in packages if p)), "); Back", flush=True)
+        adb("shell", "input", "keyevent", "4")
+        time.sleep(2)
+        root = screen("back-to-app")
+    return root
+
+
+def key_field(root):
+    return next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
+
+
+def on_sign_in_key_panel(root):
+    return any((n.get("resource-id") or "").endswith(":id/keyInput") for n in nodes(root))
+
+
+def on_sign_in(root):
+    """The app's own first screen (its key field is not the chat composer)."""
+    return any((n.get("resource-id") or "").endswith((":id/keyInput", ":id/btnGoogle", ":id/btnApiKey")) for n in nodes(root))
 
 
 def find(root, pattern):

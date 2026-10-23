@@ -1,4 +1,4 @@
-﻿# 生成 WebView 兼容资产（webview-compat.zip）
+# 生成 WebView 兼容资产（webview-compat.zip）
 #
 # ── 为什么需要它 ──────────────────────────────────────────────────────
 #
@@ -175,7 +175,13 @@ param(
     #      ⚠️ PR #3 原作把本戳写成 24、把 `MOBILE_UI_VERSION` 写成 1.0.0-68，
     #      那是基于旧的 22/1.0.0-66 算的。合并时**必须取本地已推进的值再 +1**
     #      （33 → 34 / 1.0.0-99 → -100），否则会回退，设备上静默跑回旧 UI。
-    [string]$CompatVersion = "34",
+    # v42：设置 > 关于新增「诊断信息」卡片（`mobileui/lib/client.js`）——
+    #      App/Android/设备/ABI/WebView 标签 + 「打开日志」「重启引擎」动作。
+    #      改的是降级编译的输入，必须与 `MOBILE_UI_VERSION`（1.0.0-108）一起 bump。
+    # v43：App 更新卡新增「取消下载」（`mobileui/lib/client.js`）——下载中显示取消按钮，
+    #      取消后状态为「已取消」而非错误，仍可重试。
+    #      改的是降级编译的输入，必须与 `MOBILE_UI_VERSION`（1.0.0-109）一起 bump。
+    [string]$CompatVersion = "43",
 
     [string]$EngineBin,
     [string]$OutZip

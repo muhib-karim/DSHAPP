@@ -321,4 +321,17 @@ interface PageBridge {
      * 基本类型与 String，返回对象会静默变成 `undefined`。
      */
     fun logSummary(): String
+
+    /**
+     * v1.3.0 settings (Account, Plugins, About & updates): one JSON snapshot of the native side, read synchronously
+     * (`{"account":{mode,label}, "version":{…}, "update":{…}}`, see `AppState`). One getter and one action method
+     * serve all v1.3.0 sections, so the two hand-maintained flavor whitelists grow by two entries, not eight.
+     */
+    fun appState(): String
+
+    /**
+     * v1.3.0 settings actions: `accountSwitch`, `accountSignOut`, `engineRestart`, `updateCheck`, `updateHarness`,
+     * `updateApp`, `harnessRollback` (arg = the previous version shown in About).
+     */
+    fun appAction(name: String, arg: String)
 }

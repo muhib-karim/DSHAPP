@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- v1.3.0: install a newer release APK downloaded from this fork's GitHub releases (Settings > About). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -211,6 +213,40 @@
             ⚠️ `excludeFromRecents` 不设：用户从崩溃浮层跳进来看日志时，
             这个界面出现在最近任务里是合理的（他可能想切出去发截图再切回来）。
         -->
+        <!-- v1.3.0: hands the downloaded update APK to the installer (cache/updates only). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
+
+        <!-- v1.3.0: first screen (Continue with Google / Use API key). Not exported. -->
+        <activity
+            android:name=".account.SignInActivity"
+            android:exported="false"
+            android:theme="@style/Theme.DSH.SignIn"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- v1.3.0: DeepSeek web sign-in. Exported only for the mkdsh://session link that the browser bookmark sends
+             as an explicit intent to this package; the token is taken only within 30 minutes of a browser sign-in. -->
+        <activity
+            android:name=".webbridge.DeepSeekLoginActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.DSH.SignIn"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mkdsh" android:host="session" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".LogViewerActivity"
             android:exported="false"

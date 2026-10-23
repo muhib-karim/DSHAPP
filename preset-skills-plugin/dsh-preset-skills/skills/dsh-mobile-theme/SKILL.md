@@ -16,6 +16,19 @@ DSH 的 Web GUI 是**官方前端 bundle**，本 App 只是用 WebView 把它装
 
 这就是主题的全部机制。**没有第二个机制**，不要去找"主题配置文件"。
 
+### 0.1 干净、不透明（v1.3.0 起的产品规则，Clean and opaque）
+
+主题**只改颜色**。以下一律不做，做了也会被移动端 UI 自动抵消：
+
+- 不加壁纸 / 背景图 / 背景视频 / canvas 动画背景（No wallpaper, background image, video or animated background）。
+  全屏的装饰层会被隐藏，`html` / `body` / `#root` 上的 `background-image` 会被清掉。
+- 不用 `backdrop-filter` / `blur()`（No glass）。所有毛玻璃都会被强制关掉。
+- 表面色（`--dsw-alias-bg-*`、`--dsw-specific-menu`、`--dsw-menu-surface-fill` 等）**必须不透明**：
+  带 alpha 的取值会被压平成不透明色，所以写 `#0b1426` 而不是 `#0b1426aa`。
+- 不给菜单项加发光阴影、渐变底（No glow, no gradients on menu items）。
+
+用户要"好看一点"时，给纯色配色方案，而不是图片。
+
 ## 1. 主题插件的形态
 
 一个 DSH 客户端插件 = 一个普通 npm 包 + 三个文件：
@@ -182,7 +195,7 @@ $DSH_HOME/green-theme/dsh-green-theme/{package.json,lib/index.js,lib/client.js}
 ```yaml
 - insert:
     - id: dsh-green-theme
-      name: "file:///data/user/0/com.dsh.android/files/home/.dsh/green-theme/dsh-green-theme/lib/index.js"
+      name: "file:///data/user/0/com.mkdsh.droid/files/home/.dsh/green-theme/dsh-green-theme/lib/index.js"
 ```
 
 ⚠️ `name` 用 **`file://` + 绝对路径**，指向包的 `lib/index.js`，不是包目录。
@@ -209,7 +222,8 @@ $DSH_HOME/green-theme/dsh-green-theme/{package.json,lib/index.js,lib/client.js}
 
 ## 6. 本项目特有的两条硬约束（改任何东西前必读）
 
-1. **`applicationId` 必须恰好 15 字符**：`com.dsh.android` / `com.dsh.webview`。
+1. **`applicationId` 必须恰好 15 字符**：本 fork 是 `com.mkdsh.droid` / `com.mkdsh.gecko`
+   （上游是 `com.dsh.android` / `com.dsh.webview`）。
    上面示例里的绝对路径含包名，**两个 flavor 的路径不同**。
 2. **`targetSdk` 必须 ≤ 28**，不能升。
 
