@@ -1,4 +1,4 @@
-// Test fixture: what an AI-made "wallpaper" theme does (see mk_dsh_1..6 screenshots).
+// Test fixture: what an AI-made "wallpaper" theme does (as in the owner's v0.3.4 screenshots).
 window.__ModuleLoader__.load({
   id: 'dsh-test-glass-theme',
   factory: () => {

@@ -16,7 +16,7 @@ Kotlin, plain JVM classes where possible so they can be unit tested. The page re
 for the plugin JS, Playwright (local only) for screenshots of the real web UI, GitHub Actions for the release APKs and
 the emulator smoke test.
 
-**Spec:** `/home/user/pro_dev/cc_dsh130.txt` (frozen task). Owner's screenshots: `mk_shots/mk_dsh_1..6`.
+**Spec:** frozen task spec (kept outside the repo). Owner's screenshots of the defects were shared privately (six phone screenshots).
 
 ## Global constraints
 
