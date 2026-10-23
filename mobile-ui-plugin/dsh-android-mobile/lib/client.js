@@ -9504,6 +9504,32 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			return rows;
 		}
 
+		/**
+		 * Case-insensitive plugin search over the visible text of a row: package name, label and description.
+		 * A blank or whitespace-only query returns every row as a copy (callers must not alias the list).
+		 *
+		 * Kept pure so the filter is testable without React; the caller still renders rows in their original
+		 * order, so filtering never reshuffles groups.
+		 */
+		function mpFilterPluginRows(rows, query) {
+			const list = Array.isArray(rows) ? rows : [];
+			const needle = String(query == null ? "" : query).trim().toLowerCase();
+			if (!needle) return list.slice();
+			return list.filter((row) => row && [row.name, row.label, row.description].some((value) =>
+				String(value == null ? "" : value).toLowerCase().includes(needle)));
+		}
+
+		/** Row totals per scope for the group headings: `{ all, user, app, builtin }`. */
+		function mpPluginGroupCounts(rows) {
+			const counts = { all: 0, user: 0, app: 0, builtin: 0 };
+			for (const row of Array.isArray(rows) ? rows : []) {
+				if (!row) continue;
+				counts.all += 1;
+				if (row.kind === "user" || row.kind === "app" || row.kind === "builtin") counts[row.kind] += 1;
+			}
+			return counts;
+		}
+
 		/** Why [spec] cannot be installed from the Plugins section (npm names only), or null. */
 		function pluginSpecProblem(spec) {
 			const s = String(spec == null ? "" : spec).trim();
@@ -9524,9 +9550,17 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			install: "Install",
 			installing: "Installing…",
 			market: "Browse marketplace",
+			searchLabel: "Search plugins",
+			searchPlaceholder: "name, title or description",
+			clearSearch: "Clear",
+			searchCount: "{shown} of {total}",
+			noMatch: "No matching plugins.",
 			groupUser: "Installed by you",
 			groupApp: "Built into the app",
 			groupBuiltin: "Built into DSH",
+			scopeUser: "Yours",
+			scopeApp: "App",
+			scopeBuiltin: "DSH",
 			none: "No plugins installed yet.",
 			on: "On",
 			off: "Off",
@@ -9551,9 +9585,17 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			install: "安装",
 			installing: "安装中…",
 			market: "浏览插件市场",
+			searchLabel: "搜索插件",
+			searchPlaceholder: "名称、标题或说明",
+			clearSearch: "清除",
+			searchCount: "显示 {shown} / {total}",
+			noMatch: "没有匹配的插件。",
 			groupUser: "我安装的",
 			groupApp: "App 内置",
 			groupBuiltin: "DSH 内置",
+			scopeUser: "我装的",
+			scopeApp: "App",
+			scopeBuiltin: "DSH",
 			none: "还没有安装插件。",
 			on: "已开启",
 			off: "已关闭",
@@ -9585,6 +9627,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			const [list, setList] = React.useState({ phase: "loading", rows: [] });
 			const [spec, setSpec] = React.useState("");
 			const [op, setOp] = React.useState(null);
+			const [query, setQuery] = React.useState("");
 			const manager = scope && scope.remote && scope.remote.pluginManager;
 
 			const load = React.useCallback(() => {
@@ -9623,6 +9666,10 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			};
 
 			const busy = op && op.phase === "working";
+			// Filtering is presentation only: list.rows keeps the server's enable/remove facts untouched.
+			const visibleRows = mpFilterPluginRows(list.rows, query);
+			const counts = mpPluginGroupCounts(list.rows);
+			const searching = query.trim().length > 0;
 			const status = op ? h("div", { style: S.next, "data-mp-plugin-status": op.phase },
 				h("span", { style: S.nextText },
 					op.phase === "working" ? t("working") : op.phase === "error" ? op.message
@@ -9630,10 +9677,13 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 				op.phase === "restart" ? h("button", { style: S.btnPrimary, onClick: () => mpAppAction("engineRestart") }, t("restart")) : null,
 			) : null;
 
+			const scopeKey = (kind) => kind === "user" ? "scopeUser" : kind === "builtin" ? "scopeBuiltin" : "scopeApp";
 			const row = (r) => h("div", { key: r.name, style: { ...S.card, gap: "6px" }, "data-mp-plugin": r.name, "data-mp-plugin-kind": r.kind },
 				h("div", { style: S.cardHead },
 					h("h3", { style: { ...S.cardTitle, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, r.label),
-					h("span", { style: { ...S.badge, color: (r.enabled ? MP_PRIV_TONE.on : MP_PRIV_TONE.warn).color,
+					h("span", { style: { ...S.badge, marginLeft: "auto", fontWeight: 500, color: MP_PRIV_TONE.unknown.color,
+						background: MP_PRIV_TONE.unknown.bg }, "data-mp-plugin-scope": r.kind }, t(scopeKey(r.kind))),
+					h("span", { style: { ...S.badge, marginLeft: 0, color: (r.enabled ? MP_PRIV_TONE.on : MP_PRIV_TONE.warn).color,
 						background: (r.enabled ? MP_PRIV_TONE.on : MP_PRIV_TONE.warn).bg } }, r.enabled ? t("on") : t("off")),
 				),
 				r.description ? h("p", { style: { ...S.note, margin: 0 } }, r.description) : null,
@@ -9645,17 +9695,43 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 				) : null,
 			);
 			const group = (kind, title) => {
-				const rows = list.rows.filter((r) => r.kind === kind);
-				if (!rows.length && kind !== "user") return null;
+				const rows = visibleRows.filter((r) => r.kind === kind);
+				// While filtering, empty groups are noise; without a query the "user" group keeps its
+				// "nothing installed yet" hint and the other two disappear when empty.
+				if (!rows.length && (searching || kind !== "user")) return null;
 				return h("div", { style: S.stack, key: kind },
-					h("h3", { style: { ...S.cardTitle, marginTop: "8px" } }, title),
+					h("h3", { style: { ...S.cardTitle, marginTop: "8px", display: "flex", alignItems: "baseline", gap: "6px" },
+						"data-mp-plugin-group": kind },
+						title,
+						h("span", { style: S.accCount, "data-mp-plugin-count": String(rows.length) }, String(rows.length)),
+					),
 					rows.length ? rows.map(row) : h("p", { style: S.note }, t("none")),
 				);
 			};
 
+			const search = h("div", { style: S.card, "data-mp-plugins-search": "" },
+				h("div", { style: S.cardHead },
+					h("h3", { style: S.cardTitle }, t("searchLabel")),
+					searching ? h("span", { style: S.accCount, "data-mp-plugin-count-summary": visibleRows.length + "/" + counts.all },
+						t("searchCount").replace("{shown}", String(visibleRows.length)).replace("{total}", String(counts.all))) : null,
+				),
+				h("div", { style: { display: "flex", alignItems: "center", gap: "8px" } },
+					h("input", {
+						type: "text", inputMode: "search", enterKeyHint: "search", value: query,
+						placeholder: t("searchPlaceholder"), autoCapitalize: "none", autoCorrect: "off", spellCheck: false,
+						onChange: (e) => setQuery(e.target.value),
+						style: { flex: "1 1 auto", minWidth: 0, font: "inherit", fontSize: "14px", padding: "8px 10px", borderRadius: "8px",
+							color: "inherit", border: "0.5px solid var(--dsw-alias-border-l2, #dcdcdc)", background: "var(--dsw-alias-bg-layer-1, #fff)" },
+						"data-mp-plugin-search": "",
+					}),
+					searching ? h("button", { style: S.btnQuiet, onClick: () => setQuery(""), "data-mp-plugin-clear": "" }, t("clearSearch")) : null,
+				),
+			);
+
 			return h("div", { style: S.section },
 				h("h2", { style: S.heading }, t("title")),
 				h("p", { style: S.intro }, t("intro")),
+				search,
 				h("div", { style: S.card },
 					h("h3", { style: S.cardTitle }, t("installLabel")),
 					h("input", {
@@ -9677,6 +9753,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 				group("user", t("groupUser")),
 				group("app", t("groupApp")),
 				group("builtin", t("groupBuiltin")),
+				searching && !visibleRows.length ? h("p", { style: S.note, "data-mp-plugin-no-match": "" }, t("noMatch")) : null,
 			);
 		}
 
@@ -10350,7 +10427,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 		}
 
 		exports.apply = apply;
-		Object.assign(exports.__test, { buildPluginRows, pluginSpecProblem, APP_PLUGINS });
+		Object.assign(exports.__test, { buildPluginRows, pluginSpecProblem, APP_PLUGINS, mpFilterPluginRows, mpPluginGroupCounts });
 		/**
 		 * 本插件依赖的 cordis 服务。
 		 *

@@ -214,6 +214,9 @@ summary and offer the GitHub release page for the full text.
 
 ## 7. Plugins: search, counts and scope badges
 
+**Status:** done — `mpFilterPluginRows` / `mpPluginGroupCounts` exported in `exports.__test`, search/clear, group
+counts, scope badges and the no-match row shipped with pure and render tests.
+
 The plugin list grows with user installs and bundled packages; add a filter and make the groups legible without
 changing install/enable/remove semantics or the server-side read-only policy.
 

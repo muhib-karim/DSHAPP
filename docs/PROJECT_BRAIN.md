@@ -42,12 +42,18 @@ green and no merge, tag or release.
   attempts, deleting the partial image directory, SDK `.temp` and the SDK-manager cache between tries, before the
   pinned emulator action runs. This targets run 39975831370, where a corrupt system-image archive (`ZipFile unknown
   archive`) left no emulator to boot. The fix is committed but cannot be exercised from here (no push).
+- P3 item 7 done: Settings > Plugins has a case-insensitive search over name, title and description with a clear
+  action; group headings show counts for all/user/app/builtin and each row carries a **Yours / App / DSH** scope
+  badge. A query with no hits shows one "No matching plugins." row; install/toggle/remove and the read-only notice are
+  unchanged. Pure `mpFilterPluginRows` / `mpPluginGroupCounts` plus a stateful-hook render test in
+  `plugin-search.test.mjs`. Stamps `1.0.0-107` / compat `41` / preset `1.0.0-4`; zip re-packed and byte-compared.
+  Gate: 186 JVM tests per flavor, 57 Node tests, both APKs built; Gradle stopped.
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. P3 item 6 is done; implement P3 item 7 (plugin search).
+1. P3 item 7 is done; implement P3 item 8 (About: logs, restart, diagnostics).
 2. After all items refresh screenshots and run the full matrix.
 
 
@@ -82,3 +88,4 @@ green and no merge, tag or release.
 - 2026-10-23 15:23Z dsh/DeepSeek V4.1 Flash: CI smoke system-image preinstall with retries added; next: commit fix, item 6.
 - 2026-10-23 15:31Z dsh/DeepSeek V4.1 Flash: P3 item 6 (release notes + trusted release link) implemented; targeted JVM/Node green; next: full both-flavor gate and commit.
 - 2026-10-23 15:35Z dsh/DeepSeek V4.1 Flash: P3 item 6 gate green (186 JVM per flavor, 49 Node, both APKs); next: commit, item 7.
+- 2026-10-23 15:37Z dsh/DeepSeek V4.1 Flash: P3 item 7 (plugin search, counts, scope badges) implemented; full gate green (186 JVM per flavor, 57 Node, both APKs); next: commit, item 8.

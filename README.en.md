@@ -49,8 +49,9 @@ made for you. The header clears the status bar, camera cutout and keyboard in fu
 | <img src="docs/screenshots/v1.3.0/03-chat-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/04-chat-after.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/05-palette-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/06-palette-after.jpg" width="180"> |
 
 **Everything is a plugin.** **Settings > Plugins** lists the plugins you installed next to the app's and DSH's
-built-ins: install from npm or the marketplace, turn plugins on or off, remove yours. New skills appear in the "/"
-menu right away, without a restart.
+built-ins: install from npm or the marketplace, turn plugins on or off, remove yours. Search filters by name, title
+or description as you type, group headings carry counts, and a **Yours / App / DSH** badge on every row keeps
+same-named plugins apart. New skills appear in the "/" menu right away, without a restart.
 
 **Updates in the app.** **Settings > About & updates** (and a daily check on launch) offers a one-tap update of the
 DSH harness from npm, installed with the bundled pnpm. The previous harness is kept, and if the new one does not

@@ -45,6 +45,10 @@ updatable in the app.
     so a stale session fails visibly instead of only in the chat.
 - **Settings > Plugins**: user plugins next to the app's and DSH's built-ins; install an npm name or open the
   marketplace, turn bundles on or off, remove user plugins (dsh's own plugin manager).
+  - The list has a search box that filters by name, title or description as you type, case-insensitively, with a
+    clear button. Every group heading shows how many plugins it holds, and each row carries a **Yours / App / DSH**
+    scope badge so two plugins with similar names are easy to tell apart. A query with no hits shows a single
+    "No matching plugins." row instead of three empty groups.
 - **Live "/" palette**: skills added on disk or by a plugin install show up without a restart.
 - **In-app updates** (Settings > About & updates, and a daily check on launch): the DSH harness from npm with the bundled
   pnpm, keeping the previous harness and rolling back automatically if the new one does not start; once a new harness

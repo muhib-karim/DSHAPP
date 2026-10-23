@@ -41,7 +41,8 @@
 | <img src="docs/screenshots/v1.3.0/03-chat-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/04-chat-after.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/05-palette-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/06-palette-after.jpg" width="180"> |
 
 **一切皆插件。** **设置 > 插件** 把你安装的插件与 App、DSH 的内置插件列在一起：从 npm 或插件市场安装、开关插件、
-移除你装的插件。新技能会立刻出现在「/」菜单里，无需重启。
+移除你装的插件。搜索框按名称、标题或说明即时筛选，分组标题带数量，每行有「我装的 / App / DSH」来源徽章，
+同名插件一眼分清。新技能会立刻出现在「/」菜单里，无需重启。
 
 **App 内更新。** **设置 > 关于与更新**（以及每天一次的启动检查）可一键从 npm 更新 DSH 引擎，用内置的 pnpm 安装；
 旧版本会保留，新版本起不来时 App 自动切回。新引擎正常启动后，同一处还提供 **恢复上一个版本**：确认后重启引擎即可

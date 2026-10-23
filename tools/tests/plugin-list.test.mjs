@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadClient } from './load-client.mjs';
 
 const CLIENT = fileURLToPath(new URL('../../mobile-ui-plugin/dsh-android-mobile/lib/client.js', import.meta.url));
-const { buildPluginRows, pluginSpecProblem, APP_PLUGINS } = loadClient(CLIENT).__test;
+const { buildPluginRows, pluginSpecProblem, APP_PLUGINS, mpFilterPluginRows, mpPluginGroupCounts } = loadClient(CLIENT).__test;
 const plain = (x) => JSON.parse(JSON.stringify(x));
 
 const bundles = [
@@ -88,4 +88,38 @@ test('a bundle error is surfaced', () => {
 test('install spec validation', () => {
   for (const ok of ['dsh-foo', '@acme/dsh-foo', 'dsh-foo@1.2.3', '@acme/dsh-foo@^2', 'dsh-foo@latest']) assert.equal(pluginSpecProblem(ok), null, ok);
   for (const bad of ['', '  ', 'Has Space', 'UPPER', '../evil', 'https://evil/x.tgz', 'git+ssh://x', 'a;rm -rf /', '@acme']) assert.notEqual(pluginSpecProblem(bad), null, bad);
+});
+
+const filterRows = [
+  { name: 'dsh-log-viewer', label: 'Log viewer', description: 'Tail the app log', kind: 'user' },
+  { name: '@acme/theme-pack', label: 'Themes', description: 'Color themes for the shell', kind: 'user' },
+  { name: 'dsh-core-memory', label: 'Core memory', description: 'Long-term notes', kind: 'app' },
+  { name: 'dsh-web-app', label: 'DSH web UI', description: 'The upstream web interface', kind: 'builtin' },
+];
+
+test('plugin search matches names, labels and descriptions case-insensitively', () => {
+  assert.deepEqual(plain(mpFilterPluginRows(filterRows, 'LOG-VIEWER')).map((r) => r.name), ['dsh-log-viewer']);
+  assert.deepEqual(plain(mpFilterPluginRows(filterRows, 'themes')).map((r) => r.name), ['@acme/theme-pack']);
+  assert.deepEqual(plain(mpFilterPluginRows(filterRows, 'long-term')).map((r) => r.name), ['dsh-core-memory']);
+});
+
+test('an empty or whitespace-only query keeps every row in its original order', () => {
+  for (const query of ['', '   ', '\t\n', null, undefined]) {
+    assert.deepEqual(plain(mpFilterPluginRows(filterRows, query)).map((r) => r.name), filterRows.map((r) => r.name));
+  }
+  assert.notEqual(mpFilterPluginRows(filterRows, ''), filterRows, 'the filtered list is a copy');
+});
+
+test('no match gives an empty list, and a query never reshuffles survivors', () => {
+  assert.deepEqual(plain(mpFilterPluginRows(filterRows, 'not-a-plugin')), []);
+  assert.deepEqual(plain(mpFilterPluginRows(filterRows, 'dsh')).map((r) => r.name),
+    ['dsh-log-viewer', 'dsh-core-memory', 'dsh-web-app']);
+});
+
+test('group counts cover all / user / app / builtin and tolerate empty or odd input', () => {
+  assert.deepEqual(plain(mpPluginGroupCounts(filterRows)), { all: 4, user: 2, app: 1, builtin: 1 });
+  assert.deepEqual(plain(mpPluginGroupCounts([])), { all: 0, user: 0, app: 0, builtin: 0 });
+  assert.deepEqual(plain(mpPluginGroupCounts(null)), { all: 0, user: 0, app: 0, builtin: 0 });
+  assert.deepEqual(plain(mpPluginGroupCounts([null, { name: 'x', kind: 'other' }])), { all: 1, user: 0, app: 0, builtin: 0 });
+  assert.deepEqual(plain(mpPluginGroupCounts(mpFilterPluginRows(filterRows, 'themes'))), { all: 1, user: 1, app: 0, builtin: 0 });
 });
