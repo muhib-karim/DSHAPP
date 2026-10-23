@@ -7225,7 +7225,7 @@ class EngineManager private constructor(private val context: Context) {
         // `Configuration for "llm-pi-ai" is overridden by a home patch or
         // command-line overlay` —— 用户表现为「一添加第三方 API 就报错」。
         // 所以改为把内置号池**补进 profile 的用户配置层**（见 [ensureKeyPoolProvider]）。
-        ensureKeyPoolProvider()
+        val hasKeyPool = ensureKeyPoolProvider()
         // 老用户在 GUI 里手填过真密钥 ⇒ `.credentials.yaml` 里有一条
         // `AGNES_CREDENTIAL`，它的优先级**高于**环境变量，会把网关令牌顶掉。
         // 号池改成服务端网关后这条残留必须清掉，详见 [dropStaleBuiltinCredential]。
@@ -7234,7 +7234,7 @@ class EngineManager private constructor(private val context: Context) {
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
         // v1.3.0: the sign-in chosen on the first screen (API key / web account / none) → provider + default model.
-        ensureAccountConfig(PROFILE_NAME, keyInject != null)
+        ensureAccountConfig(PROFILE_NAME, hasKeyPool)
 
         // ⚠️ **救援 profile 也必须拿到同一套用户层配置**，否则救援界面是残废的：
         //   没有默认模型 ⇒ AI 一开口就路由失败；没有号池 ⇒ 用户得自己配 key；
@@ -7252,7 +7252,7 @@ class EngineManager private constructor(private val context: Context) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
             ensureKeyPoolProvider(RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
-            ensureAccountConfig(RESCUE_PROFILE_NAME, keyInject != null)
+            ensureAccountConfig(RESCUE_PROFILE_NAME, hasKeyPool)
         }
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
