@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v1.3.0 app update: the downloaded release APK, handed to the system installer. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

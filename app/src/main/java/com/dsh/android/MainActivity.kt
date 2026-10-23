@@ -31,6 +31,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.dsh.android.account.AccountStore
 import com.dsh.android.account.SignInActivity
+import com.dsh.android.update.UpdateCenter
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
@@ -1127,6 +1128,7 @@ class MainActivity : AppCompatActivity() {
         //   GeckoView 版本（编译期确定）。所以那里永远不可能「内核过旧」——
         //   版本拦截分支不会触发，这正是内置内核要解决的问题本身。
         webViewMajor = web.engineMajor
+        UpdateCenter.webViewMajor = webViewMajor
         Log.i(
             DshApplication.TAG,
             "Web 内核: ${web.engineLabel}（主版本 $webViewMajor；" +
@@ -3454,6 +3456,8 @@ class MainActivity : AppCompatActivity() {
     private fun hideOverlay() {
         if (overlayDismissed) return
         overlayDismissed = true
+        // v1.3.0: the UI is usable; check npm and GitHub for updates (at most daily, one-tap dialog).
+        UpdateCenter.onUiReady(this)
         // 启动层收起 = 页面底色开始可见，此时才把系统栏交给页面底色
         // （之前一直保持 themes.xml 的深色，与深色启动页一致）。
         // 用最近一次上报的底色；还没收到过就保持主题里的深色不动。

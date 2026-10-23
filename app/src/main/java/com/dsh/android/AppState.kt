@@ -9,6 +9,7 @@ import com.dsh.android.account.AccountStore
 import com.dsh.android.account.DshCredentials
 import com.dsh.android.account.SignInActivity
 import com.dsh.android.log.DshLog
+import com.dsh.android.update.UpdateCenter
 import com.dsh.android.webbridge.DeepSeekWebClient
 import com.dsh.android.webbridge.WebAccount
 import org.json.JSONObject
@@ -28,7 +29,7 @@ object AppState {
             .put("code", BuildConfig.VERSION_CODE)
             .put("flavor", if (BuildConfig.BUILT_IN_WEB_ENGINE) "gecko" else "system")
             .put("harness", harnessVersion(activity) ?: JSONObject.NULL)
-        return JSONObject().put("account", account).put("version", version).toString()
+        return JSONObject().put("account", account).put("version", version).put("update", UpdateCenter.json(activity)).toString()
     }
 
     fun action(activity: Activity, name: String, arg: String) {
@@ -39,6 +40,9 @@ object AppState {
                 signOut(activity)
                 activity.startActivity(Intent(activity, SignInActivity::class.java))
             }
+            "updateCheck" -> UpdateCenter.check(activity)
+            "updateHarness" -> UpdateCenter.updateHarness(activity)
+            "updateApp" -> UpdateCenter.updateApp(activity)
             // Settings > Plugins: a plugin change that dsh can only apply on restart.
             "engineRestart" -> EngineManager.get(activity).requestRestart("plugins changed")
             else -> DshLog.w(DshApplication.TAG, "unknown settings action: $name")

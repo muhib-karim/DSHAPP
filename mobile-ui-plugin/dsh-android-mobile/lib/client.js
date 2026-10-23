@@ -9632,6 +9632,99 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			);
 		}
 
+		// ── v1.3.0 settings: About & updates ──────────────────────────────────────────────────────────
+
+		const MP_ABOUT_NS = "dsh-android-mobile.about";
+		const MP_ABOUT_EN = {
+			nav: "About & updates",
+			title: "About & updates",
+			intro: "DSH for Android checks for updates once a day. The DSH harness updates in place from npm and the previous version is kept: if the new one does not start, the app switches back by itself.",
+			harness: "DSH harness",
+			app: "DSH for Android",
+			current: "Installed",
+			latest: "Latest",
+			check: "Check now",
+			checking: "Checking…",
+			lastCheck: "Last checked",
+			never: "never",
+			update: "Update",
+			upToDate: "Up to date",
+			available: "Update available",
+			installing: "Installing",
+			downloading: "Downloading",
+			ready: "Opening installer",
+			blocked: "Not available here",
+			failed: "Failed",
+			unknown: "Not checked yet",
+			noBridge: "Updates are available in the Android app.",
+			releases: "Release notes",
+		};
+		const MP_ABOUT_ZH = {
+			nav: "关于与更新",
+			title: "关于与更新",
+			intro: "DSH for Android 每天检查一次更新。DSH 引擎从 npm 原地更新并保留旧版本：新版本起不来时会自动切回。",
+			harness: "DSH 引擎",
+			app: "DSH for Android",
+			current: "当前版本",
+			latest: "最新版本",
+			check: "立即检查",
+			checking: "检查中…",
+			lastCheck: "上次检查",
+			never: "从未",
+			update: "更新",
+			upToDate: "已是最新",
+			available: "有可用更新",
+			installing: "安装中",
+			downloading: "下载中",
+			ready: "正在打开安装程序",
+			blocked: "此设备不可用",
+			failed: "失败",
+			unknown: "尚未检查",
+			noBridge: "更新功能仅在 Android App 中可用。",
+			releases: "更新说明",
+		};
+
+		function mpAboutSection(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const h = React.createElement;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_ABOUT_EN[key] ?? key;
+			const [state, refresh] = mpUseAppState(React, 1500);
+			if (!state) return h("div", { style: S.section }, h("h2", { style: S.heading }, t("title")), h("p", { style: S.intro }, t("noBridge")));
+			const update = state.update || {};
+			const busyCheck = !!update.checking;
+			const statusText = (u) => ({ current: t("upToDate"), available: t("available"), installing: t("installing"),
+				downloading: t("downloading") + (u.progress >= 0 ? " " + u.progress + "%" : ""), ready: t("ready"), blocked: t("blocked"),
+				error: t("failed") })[u.status] || t("unknown");
+			const tone = (u) => u.status === "available" ? MP_PRIV_TONE.warn : (u.status === "error" || u.status === "blocked") ? MP_PRIV_TONE.off : MP_PRIV_TONE.on;
+			const card = (key, title, u, action) => {
+				u = u || {};
+				const tn = tone(u);
+				return h("div", { style: S.card, "data-mp-update": key, "data-mp-update-status": u.status || "unknown" },
+					h("div", { style: S.cardHead },
+						h("h3", { style: S.cardTitle }, title),
+						h("span", { style: { ...S.badge, color: tn.color, background: tn.bg } }, statusText(u)),
+					),
+					h("div", { style: S.row }, h("span", { style: S.rowLabel }, t("current")), h("span", { style: S.rowValue }, u.current || "—")),
+					h("div", { style: S.row }, h("span", { style: S.rowLabel }, t("latest")), h("span", { style: S.rowValue }, u.latest || "—")),
+					u.message ? h("p", { style: { ...S.note, margin: 0 } }, u.message) : null,
+					u.status === "available" ? h("div", { style: S.actions },
+						h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } }, t("update") + " → " + u.latest)) : null,
+				);
+			};
+			const last = update.lastCheck ? new Date(update.lastCheck).toLocaleString() : t("never");
+			return h("div", { style: S.section },
+				h("h2", { style: S.heading }, t("title")),
+				h("p", { style: S.intro }, t("intro")),
+				card("app", t("app") + (state.version && state.version.flavor === "gecko" ? " (gecko)" : ""), update.app, "updateApp"),
+				card("harness", t("harness") + " (@deepseek-ai/dsh)", update.harness, "updateHarness"),
+				h("div", { style: S.actions },
+					h("button", { style: S.btn, disabled: busyCheck, onClick: () => { mpAppAction("updateCheck"); refresh(); } }, busyCheck ? t("checking") : t("check")),
+					h("span", { style: S.note }, t("lastCheck") + ": " + last),
+				),
+			);
+		}
+
 		/** 最近一次组字结束的时间戳（0 = 从未）。见 setupEnterAsNewline。 */
 		let mpLastCompositionEnd = 0;
 
@@ -10105,6 +10198,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			mpRegisterV13Section(ctx, { id: "dsh-android-account", order: 3, ns: MP_ACCOUNT_NS, zh: MP_ACCOUNT_ZH, en: MP_ACCOUNT_EN, component: mpAccountSection });
 			mpRegisterV13Section(ctx, { id: "dsh-android-plugins", order: 4, ns: MP_PLUGINS_NS, zh: MP_PLUGINS_ZH, en: MP_PLUGINS_EN,
 				component: mpPluginsSection, inject: ["remote", "remote.pluginManager"] });
+			mpRegisterV13Section(ctx, { id: "dsh-android-about", order: 29, ns: MP_ABOUT_NS, zh: MP_ABOUT_ZH, en: MP_ABOUT_EN, component: mpAboutSection });
 			mpRegisterContactSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */

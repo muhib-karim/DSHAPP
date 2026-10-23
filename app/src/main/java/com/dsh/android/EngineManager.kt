@@ -4,6 +4,8 @@ import android.content.Context
 import com.dsh.android.account.AccountConfig
 import com.dsh.android.account.AccountStore
 import com.dsh.android.account.DshCredentials
+import com.dsh.android.update.EngineSlots
+import com.dsh.android.update.HarnessUpdater
 import com.dsh.android.log.DshLog as Log
 import com.dsh.android.log.EventLog
 import com.dsh.android.log.LogStore
@@ -285,6 +287,12 @@ class EngineManager private constructor(private val context: Context) {
      */
     suspend fun ensureExtracted(versionStamp: String) = withContext(Dispatchers.IO) {
         lastAssetStamp = versionStamp
+        // v1.3.0: a harness installed by the in-app updater (stamp `npm:<v>`) stays while it is newer than the bundled one.
+        val installedStamp = runCatching { stampFile.readText().trim() }.getOrNull()
+        if (HarnessUpdater.keepInstalled(installedStamp, versionStamp) && EngineSlots(context.filesDir).isComplete(engineDir)) {
+            Log.i(TAG, "keeping the updated harness ($installedStamp), bundled is $versionStamp")
+            return@withContext
+        }
         if (stampFile.isFile && stampFile.readText().trim() == versionStamp) {
             Log.i(TAG, "引擎资产已是最新（$versionStamp），跳过解包")
             return@withContext
@@ -498,6 +506,12 @@ class EngineManager private constructor(private val context: Context) {
         val dist = File(engineDir, "node_modules/@deepseek-ai/dsh-web-frontend/dist")
         if (!dist.isDirectory) {
             Log.w(TAG, "引擎尚未解包，跳过 WebView 降级资产")
+            return
+        }
+        // v1.3.0: the compat bundle is built for the bundled harness only; an updated harness keeps its own frontend
+        // (webViewCompatApplied stays false, so MainActivity applies the official bundle's WebView threshold).
+        if (runCatching { stampFile.readText() }.getOrDefault("").startsWith("npm:")) {
+            Log.i(TAG, "updated harness: WebView compat frontend not applied")
             return
         }
 
@@ -6935,6 +6949,7 @@ class EngineManager private constructor(private val context: Context) {
 
         val binJs = File(engineDir, "node_modules/@deepseek-ai/dsh/lib/bin.js")
         if (!binJs.isFile) {
+            if (rollBackPendingHarness("entry missing")) return@withContext
             _state.value = State.Failed("找不到引擎入口: ${binJs.absolutePath}")
             return@withContext
         }
@@ -7336,10 +7351,12 @@ class EngineManager private constructor(private val context: Context) {
                     ),
                 )
                 _state.value = State.Ready(url)
+                confirmPendingHarness()
                 Log.i(TAG, "引擎就绪: $url")
                 return@withContext
             }
             _state.value = State.Ready(url)
+            confirmPendingHarness()
             Log.i(TAG, "引擎就绪: $url")
             // ⚠️ 引擎**真的起来了** ⇒ 清掉上次的失败记录。
             //
@@ -7471,6 +7488,8 @@ class EngineManager private constructor(private val context: Context) {
             //   把记录提到广播之前即可根除：广播之后任何时刻读，记录都已就位。
             //   ⚠️ 别改成「广播后再补一次记录」—— 那会让同一场失败被记两次，
             //      计数翻倍，L1/L2/L3 全部提前触发（另一种失真）。
+            // v1.3.0: a just-updated harness that does not boot is swapped back before the rescue ladder counts it.
+            if (rollBackPendingHarness(reason)) return@withContext
             val tailList = synchronized(logLines) { logLines.toList() }
             RescueBoot.recordFailure(
                 bootId = BootState.bootId,
@@ -7588,6 +7607,55 @@ class EngineManager private constructor(private val context: Context) {
         WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
     }
+
+    /** v1.3.0: the updated harness reached Ready once, so it is the harness now. */
+    private fun confirmPendingHarness() {
+        val slots = EngineSlots(context.filesDir)
+        val pending = slots.pending() ?: return
+        slots.confirm()
+        Log.i(TAG, "harness $pending booted; update confirmed")
+        EventLog.record("harness.update-confirmed", mapOf("version" to pending))
+    }
+
+    /**
+     * v1.3.0: if the harness was just updated and has not booted yet, restore the previous one, never offer this
+     * version again, and restart (State.Dead → MainActivity restarts). Returns true when it rolled back.
+     */
+    private fun rollBackPendingHarness(reason: String): Boolean {
+        val slots = EngineSlots(context.filesDir)
+        val pending = slots.pending() ?: return false
+        if (!slots.rollback()) {
+            Log.w(TAG, "harness $pending failed to boot and could not be rolled back ($reason)")
+            return false
+        }
+        Log.w(TAG, "harness $pending failed to boot ($reason); rolled back to ${slots.installedVersion()}")
+        EventLog.record("harness.update-rolled-back", mapOf("version" to pending, "reason" to reason.take(200)))
+        _state.value = State.Dead("harness $pending did not start; previous version restored")
+        return true
+    }
+
+    /**
+     * v1.3.0 harness updater: runs [cmd] in [dir] with exactly the environment of the last real engine launch (PREFIX,
+     * PATH, LD_PRELOAD link compat, certificates). Returns the exit code, or -1 when the engine has not been launched in
+     * this process (no environment to copy) or [timeoutMs] passed.
+     */
+    fun runWithEngineEnv(cmd: List<String>, dir: File, timeoutMs: Long, onLine: (String) -> Unit): Int {
+        val env = activeEnv
+        if (env.isEmpty()) return -1
+        val pb = ProcessBuilder(cmd).directory(dir).redirectErrorStream(true)
+        pb.environment().apply { clear(); putAll(env) }
+        val proc = pb.start()
+        val reader = Thread {
+            runCatching { proc.inputStream.bufferedReader().forEachLine(onLine) }
+        }.apply { isDaemon = true; start() }
+        val done = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        if (!done) proc.destroyForcibly()
+        reader.join(2000)
+        return if (done) proc.exitValue() else -1
+    }
+
+    /** `$PREFIX` of the Termux environment the engine runs in (from the last launch), or null. */
+    val prefixPath: String? get() = activeEnv["PREFIX"]
 
     /**
      * 请求**界面**重启引擎（供救援信箱的 `switch-rescue` / `switch-back` 用）。
