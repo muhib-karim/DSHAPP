@@ -1,22 +1,61 @@
 # DSH for Android
 
 > **This repository is a fork of [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP) (MIT)**, maintained by
-> [muhib-karim](https://github.com/muhib-karim) and **shipped as-is**: the UI and features are upstream's, and all
-> credit goes to the upstream author. The fork only changes:
+> [muhib-karim](https://github.com/muhib-karim). The engine integration, plugins and most of the UI are upstream's, and
+> the credit for them goes to the upstream author. The fork changes:
 > - **Package names**: `com.mkdsh.droid` (system WebView build) and `com.mkdsh.gecko` (GeckoView build), still exactly
 >   15 characters (see "Two hard constraints"), so the fork installs next to upstream DSHAPP and other
 >   `com.dsh.android` apps. The app name is unchanged ("DSH").
-> - **Version**: 0.3.4 (versionCode 30), the next number after upstream's 0.3.3 (29).
+> - **Version**: 1.3.0 (versionCode 31). See [What's new in 1.3.0](#whats-new-in-130) and [CHANGELOG.md](CHANGELOG.md).
 > - **CI build**: `.github/workflows/release-apk.yml` builds signed release APKs on GitHub Actions and uploads the
 >   APKs plus SHA256SUMS; a `v*` tag publishes a GitHub Release. Where each build asset comes from is in
 >   `tools/ci/assemble-assets.py`. Unchanged binary assets are taken from upstream's v0.3.0 release APK, pinned by
 >   sha256. Plugin zips are packed from this repository's source. The JNI helpers are compiled with the NDK.
->   `webview-compat.zip` is rebuilt by upstream's own script.
-> - **No built-in account pool**: upstream's `keyinject.bin` (upstream's own API accounts) is not included; use your own
->   API key.
-> - **Emulator smoke test**: `.github/workflows/emulator-smoke.yml` (first screen, chat and settings screenshots, see
->   `docs/screenshots/`).
+>   `webview-compat.zip` is rebuilt by upstream's own script. Unit tests (JVM and node) run before the build.
+> - **No built-in account pool**: upstream's `keyinject.bin` (upstream's own API accounts) is not included. Sign in
+>   with a DeepSeek web account or your own API key.
+> - **Emulator smoke test**: `.github/workflows/emulator-smoke.yml` (first screen, API-key screen, boot status and log
+>   viewer on an x86_64 emulator; see [FORK_NOTES.md](FORK_NOTES.md)).
 > - Third-party components and licences: [THIRD-PARTY.md](THIRD-PARTY.md). Upstream's LICENSE is kept unchanged.
+
+## What's new in 1.3.0
+
+**Two ways to sign in.** The first screen offers **Continue with Google** (your DeepSeek web account) and **Use API
+key** (a key from platform.deepseek.com, checked once and saved only in DSH's own credentials file).
+
+| First screen | Use API key |
+|---|---|
+| <img src="docs/screenshots/v1.3.0/01-first-screen.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/02-api-key.jpg" width="240"> |
+
+- **Continue with Google** opens DeepSeek's own sign-in page in the app. Google refuses to sign in inside embedded
+  browsers; when it does, *Use your browser* signs in at chat.deepseek.com in your browser and brings the session
+  back. Replies then come from your web account through a small local bridge on the phone (127.0.0.1, random port,
+  protected by a per-install secret). DSH's tools work through a text protocol; images are not sent.
+- **Settings > Account**: see how you are signed in, switch account or sign out.
+
+**A cleaner, opaque interface.** No wallpaper or animated background, no glass: sheets, the "+" and "/" menus,
+dialogs, the header and previews are all solid, in light and dark. This holds for any theme, including themes the AI
+made for you. The header clears the status bar, camera cutout and keyboard in fullscreen.
+
+| Before (a wallpaper theme) | 1.3.0 (same theme) | "/" menu before | "/" menu in 1.3.0 |
+|---|---|---|---|
+| <img src="docs/screenshots/v1.3.0/03-chat-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/04-chat-after.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/05-palette-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/06-palette-after.jpg" width="180"> |
+
+**Everything is a plugin.** **Settings > Plugins** lists the plugins you installed next to the app's and DSH's
+built-ins: install from npm or the marketplace, turn plugins on or off, remove yours. New skills appear in the "/"
+menu right away, without a restart.
+
+**Updates in the app.** **Settings > About & updates** (and a daily check on launch) offers a one-tap update of the
+DSH harness from npm, installed with the bundled pnpm. The previous harness is kept, and if the new one does not
+start, the app switches back by itself. The app itself updates from this repository's GitHub releases (checksum
+verified).
+
+| Plugins | Account | About & updates |
+|---|---|---|
+| <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |
+
+The first two screenshots are from the CI emulator. The others are DSH's real web UI with the app's mobile plugin
+rendered at phone size on a desktop, with a demo model reply and demo account and update values.
 
 **Run a full AI coding agent on your Android phone.**
 
@@ -220,6 +259,11 @@ docs/agents/                           developer docs (35 articles, look up as n
   web engine ship inside the package).
 - **Slow first launch** — the Termux environment and engine must be unpacked;
   roughly 10–60 seconds depending on the device.
+- **Web account (Continue with Google)** — it uses chat.deepseek.com's web API, which is not a public API and can
+  change; DSH's tools run through a text protocol, images are not sent. Google sign-in inside the app may be refused
+  by Google; the browser route always works. Use an API key for the most reliable agent runs.
+- **Harness updates** need about 0.5 GB of free space while installing (the previous harness is kept for rollback);
+  on the system-WebView build the updated harness needs Android System WebView 94 or newer.
 
 Full list: [boundaries.md](docs/agents/boundaries.md).
 
@@ -239,6 +283,8 @@ This project stands on the shoulders of:
 - [Mozilla GeckoView](https://wiki.mozilla.org/Mobile/GeckoView) — bundled web engine
 - [ripgrep](https://github.com/BurntSushi/ripgrep) · [sharp](https://github.com/lovell/sharp)
   · [pnpm](https://github.com/pnpm/pnpm) · [Shizuku](https://github.com/RikkaApps/Shizuku)
+- [deepseek-android](https://github.com/muhib-karim/deepseek-android) (MIT) — the DeepSeek web client, proof-of-work
+  solver and credentials writer the 1.3.0 sign-in is ported from
 
 ## License
 

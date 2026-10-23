@@ -1,18 +1,52 @@
 # DSH for Android
 
 > **本仓库是 [pht88888888/DSHAPP](https://github.com/pht88888888/DSHAPP)（MIT）的分支（fork）**，由
-> [muhib-karim](https://github.com/muhib-karim) 维护，**原样发布**：界面与功能不变，全部归功于上游作者。
-> 本分支只做了：
+> [muhib-karim](https://github.com/muhib-karim) 维护。引擎集成、插件与大部分界面来自上游，归功于上游作者。
+> 本分支的改动：
 > - **包名**：`com.mkdsh.droid`（system 版）/ `com.mkdsh.gecko`（gecko 版），仍为 15 字符（见「两条硬约束」），
 >   以便与上游 DSHAPP 及其它 `com.dsh.android` 应用同装一台机器。应用名不变（仍为「DSH」）。
-> - **版本**：0.3.4（versionCode 30），即上游 0.3.3（29）之后的下一个号。
+> - **版本**：1.3.0（versionCode 31）。见下方「1.3.0 新内容」与 [CHANGELOG.md](CHANGELOG.md)。
 > - **CI 构建**：`.github/workflows/release-apk.yml` 在 GitHub Actions 上构建签名的发行版 APK 并上传
 >   APK + SHA256SUMS；打 `v*` 标签时自动建 Release。构建资产来源见 `tools/ci/assemble-assets.py`
 >   （不变的二进制资产取自上游 v0.3.0 发行版 APK 并按 sha256 固定，插件 zip 由本仓库源码打包，
->   JNI 辅助程序由 NDK 编译，`webview-compat.zip` 由上游脚本重建）。
-> - **不含内置号池**：上游 APK 里的 `keyinject.bin`（上游自己的 API 账号）不会打进本分支的包，请使用你自己的 API Key。
-> - **模拟器冒烟测试**：`.github/workflows/emulator-smoke.yml`（首屏、对话页、设置页截图，见 `docs/screenshots/`）。
+>   JNI 辅助程序由 NDK 编译，`webview-compat.zip` 由上游脚本重建）。构建前先跑单元测试（JVM 与 node）。
+> - **不含内置号池**：上游 APK 里的 `keyinject.bin`（上游自己的 API 账号）不会打进本分支的包。请用 DeepSeek 网页账号或你自己的 API Key 登录。
+> - **模拟器冒烟测试**：`.github/workflows/emulator-smoke.yml`（x86_64 模拟器上的首屏、API Key 界面、启动状态与日志界面，见 [FORK_NOTES.md](FORK_NOTES.md)）。
 > - 第三方组件与许可证：[THIRD-PARTY.md](THIRD-PARTY.md)。上游 LICENSE 原样保留。
+
+## 1.3.0 新内容
+
+**两种登录方式。** 首屏提供 **Continue with Google**（DeepSeek 网页账号）与 **Use API key**（platform.deepseek.com
+的 API Key，校验一次后只保存在 DSH 自己的凭据文件里）。
+
+| 首屏 | API Key |
+|---|---|
+| <img src="docs/screenshots/v1.3.0/01-first-screen.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/02-api-key.jpg" width="240"> |
+
+- **Continue with Google** 在 App 内打开 DeepSeek 自己的登录页。Google 不允许在内嵌浏览器里登录；遇到这种情况，
+  点 *Use your browser* 在手机浏览器里登录 chat.deepseek.com，再把会话带回 App。之后的回复经手机上的本地桥
+  （127.0.0.1、随机端口、每台设备独立的密钥）来自你的网页账号。DSH 的工具通过文本协议调用；不发送图片。
+- **设置 > 账号**：查看当前登录方式、切换账号或退出登录。
+
+**更干净、不透明的界面。** 没有壁纸、动态背景和毛玻璃：底部弹层、「+」与「/」菜单、对话框、顶栏和预览全部为实色，
+浅色深色都一样。任何主题（包括 AI 帮你做的主题）都遵守这条规则。全面屏下顶栏会避开状态栏、挖孔和键盘。
+
+| 之前（壁纸主题） | 1.3.0（同一主题） | 之前的「/」菜单 | 1.3.0 的「/」菜单 |
+|---|---|---|---|
+| <img src="docs/screenshots/v1.3.0/03-chat-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/04-chat-after.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/05-palette-before.jpg" width="180"> | <img src="docs/screenshots/v1.3.0/06-palette-after.jpg" width="180"> |
+
+**一切皆插件。** **设置 > 插件** 把你安装的插件与 App、DSH 的内置插件列在一起：从 npm 或插件市场安装、开关插件、
+移除你装的插件。新技能会立刻出现在「/」菜单里，无需重启。
+
+**App 内更新。** **设置 > 关于与更新**（以及每天一次的启动检查）可一键从 npm 更新 DSH 引擎，用内置的 pnpm 安装；
+旧版本会保留，新版本起不来时 App 自动切回。App 本身从本仓库的 GitHub Releases 更新（校验 SHA-256）。
+
+| 插件 | 账号 | 关于与更新 |
+|---|---|---|
+| <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |
+
+前两张截图来自 CI 模拟器；其余为 DSH 真实的 Web 界面加本 App 的移动端插件，在电脑上按手机尺寸渲染，
+其中的模型回复、账号与版本信息为演示数据。
 
 **在 Android 手机上跑一个完整的 AI 编码 Agent。**
 
@@ -198,6 +232,10 @@ docs/agents/                           开发文档（35 篇，按需检索）
 - **APK 较大** —— system 版约 137 MB，gecko 版约 216 MB（引擎与内核随包分发）。
 - **首次启动较慢** —— 要解包 Termux 环境与引擎，视设备约 10–60 秒。
 
+- **网页账号（Continue with Google）**：走 chat.deepseek.com 的网页接口，它不是公开 API，可能变化；DSH 的工具通过文本协议
+  调用，不发送图片。App 内的 Google 登录可能被 Google 拒绝，浏览器登录始终可用。要最稳定地跑 Agent，请用 API Key。
+- **引擎更新** 安装期间约需 0.5 GB 空闲空间（旧版本会保留用于回滚）；system 版更新后的引擎需要 Android System WebView 94 或更高。
+
 完整清单见 [boundaries.md](docs/agents/boundaries.md)。
 
 ## 参与贡献
@@ -215,6 +253,7 @@ docs/agents/                           开发文档（35 篇，按需检索）
 - [Mozilla GeckoView](https://wiki.mozilla.org/Mobile/GeckoView) —— 内置 Web 内核
 - [ripgrep](https://github.com/BurntSushi/ripgrep) · [sharp](https://github.com/lovell/sharp)
   · [pnpm](https://github.com/pnpm/pnpm) · [Shizuku](https://github.com/RikkaApps/Shizuku)
+- [deepseek-android](https://github.com/muhib-karim/deepseek-android)（MIT）—— 1.3.0 登录功能移植自它的 DeepSeek 网页客户端、工作量证明求解器与凭据写入器
 
 ## 许可证
 

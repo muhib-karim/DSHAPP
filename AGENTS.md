@@ -125,6 +125,12 @@ adb logcat -d -s DSH:I     # 引擎就绪 / 界面加载完成 / 各 ensureXxx �
 | [key-pool.md](docs/agents/key-pool.md) | 内置号池、TLS 层注入、**必须降级 HTTP/1.1** |
 | [plugin-source.md](docs/agents/plugin-source.md) | 「添加插件」少了 npm 官方源 |
 
+### 1.3.0（fork）
+
+| 文档 | 什么时候看 |
+|---|---|
+| [v130-signin-plugins-updates.md](docs/agents/v130-signin-plugins-updates.md) | 首屏登录、网页账号本地桥、不透明界面、设置 > 插件、/ 菜单刷新、App 内更新；单元测试命令 |
+
 ### 构建 / 资产 / 发布
 
 | 文档 | 什么时候看 |

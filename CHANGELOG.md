@@ -20,6 +20,42 @@
 
 ---
 
+## [1.3.0] — 2026-10-23
+
+Fork release (muhib-karim/DSHAPP), versionCode 31, both flavors. Engine: `@deepseek-ai/dsh` 0.2.1-rc.2 (npm `latest`),
+updatable in the app.
+
+### Added
+
+- **First screen with two sign-ins**: "Continue with Google" (DeepSeek web account) and "Use API key".
+  - API key: checked with one `GET https://api.deepseek.com/models`, then written to dsh's own
+    `$DSH_HOME/.credentials.yaml` (mode 600, other refs and records kept); default model `deepseek-official/deepseek-flash`.
+  - Web account: chat.deepseek.com sign-in in an in-app WebView, or in the phone's browser with a bookmark/paste
+    hand-off when Google refuses the embedded WebView. The session token is encrypted with an Android Keystore key.
+    dsh reaches it through a local OpenAI-compatible bridge (127.0.0.1, random port, per-install bearer secret) that
+    solves DeepSeek's proof of work and maps tool calls through a text protocol.
+  - Settings > Account: switch account, sign out (token, cookies, page storage and keys removed).
+- **Settings > Plugins**: user plugins next to the app's and DSH's built-ins; install an npm name or open the
+  marketplace, turn bundles on or off, remove user plugins (dsh's own plugin manager).
+- **Live "/" palette**: skills added on disk or by a plugin install show up without a restart.
+- **In-app updates** (Settings > About & updates, and a daily check on launch): the DSH harness from npm with the bundled
+  pnpm, keeping the previous harness and rolling back automatically if the new one does not start; the APK from this
+  fork's GitHub releases, SHA-256 checked, installed through a FileProvider.
+- JVM and node unit tests (credentials writer, profile patch, key check, PoW solver, SSE parser, bridge mapping and
+  server, version compare, update slots, plugin list, skill refresh, opaque surfaces); CI runs them before the build.
+  The emulator smoke test now covers the first screen and the API-key screen.
+
+### Changed
+
+- **No wallpaper, no glass**: every theme's translucent surface colours are flattened to opaque, full-screen decorative
+  layers are hidden, `backdrop-filter` is off, the "+"/"/" menus are flat, the header is solid. The theme skill and the
+  status-bar tool no longer suggest wallpapers.
+- Fullscreen insets include the display cutout; keyboard and navigation bar no longer cover the composer in fullscreen.
+- Without the upstream key pool, the default model is no longer the unusable `agnes` route.
+- Settings back bar: opaque, readable chevron, follows the UI language.
+
+---
+
 ## [0.3.0] — 2026-10-17
 
 ### 新增
