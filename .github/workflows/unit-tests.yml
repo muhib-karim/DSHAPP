@@ -1,0 +1,54 @@
+name: Unit tests
+
+# Fork (muhib-karim/DSHAPP): the app's JVM unit tests (system flavor) on every feature push and pull request.
+# Fails when any test fails; the counts are printed in the log and in the job summary.
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jvm-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@99b8673ff64fbf99d8d325f52d9a5bdedb8483e9 # v4.2.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: testSystemDebugUnitTest
+        run: |
+          # gradle.properties routes Gradle through upstream's local proxy (127.0.0.1:7897); a runner connects directly.
+          sed -i '/^systemProp\.https\?\.proxy\(Host\|Port\)=/d' gradle.properties
+          bash ./gradlew --no-daemon testSystemDebugUnitTest
+      - name: Test counts
+        if: always()
+        run: |
+          python3 -I - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          total = failed = skipped = 0
+          for path in glob.glob('app/build/test-results/testSystemDebugUnitTest/*.xml'):
+              root = ET.parse(path).getroot()
+              total += int(root.get('tests', 0))
+              failed += int(root.get('failures', 0)) + int(root.get('errors', 0))
+              skipped += int(root.get('skipped', 0))
+              for case in root.iter('testcase'):
+                  if any(child.tag in ('failure', 'error') for child in case):
+                      print(f"FAILED {case.get('classname')}.{case.get('name')}")
+          print(f"TESTS passed={total - failed - skipped} failed={failed} skipped={skipped}")
+          EOF
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: unit-test-results
+          path: app/build/test-results/testSystemDebugUnitTest/
+          if-no-files-found: warn
+          retention-days: 7
