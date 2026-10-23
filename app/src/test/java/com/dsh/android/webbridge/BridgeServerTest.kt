@@ -109,6 +109,30 @@ class BridgeServerTest {
         assertEquals(413, code)
     }
 
+    private fun raw(request: String): String = java.net.Socket("127.0.0.1", server.port).use { sock ->
+        sock.soTimeout = 5000
+        sock.getOutputStream().write(request.toByteArray())
+        sock.getInputStream().readBytes().toString(Charsets.UTF_8)
+    }
+
+    @Test fun negativeOrJunkContentLengthIs400AndTheServerStaysUp() {
+        val auth = "Authorization: Bearer $secret\r\n"
+        assertTrue(raw("POST /v1/chat/completions HTTP/1.1\r\n${auth}Content-Length: -1\r\n\r\n").startsWith("HTTP/1.1 400"))
+        assertTrue(raw("POST /v1/chat/completions HTTP/1.1\r\n${auth}Content-Length: abc\r\n\r\n").startsWith("HTTP/1.1 400"))
+        assertEquals(200, call("/v1/models").first)
+    }
+
+    @Test fun authIsCheckedBeforeTheBodyIsRead() {
+        // A huge declared body without the key is refused at once, not read.
+        assertTrue(raw("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n").startsWith("HTTP/1.1 401"))
+    }
+
+    @Test fun aThrowingUpstreamIs500NotACrash() {
+        reply = { _, _, _ -> throw IllegalStateException("boom") }
+        assertEquals(500, call("/v1/chat/completions", chat).first)
+        assertEquals(200, call("/v1/models").first)
+    }
+
     @Test fun unknownPathIs404() {
         assertEquals(404, call("/v1/embeddings", "{}").first)
     }

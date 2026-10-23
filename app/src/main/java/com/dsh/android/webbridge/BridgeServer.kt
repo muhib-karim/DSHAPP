@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Local OpenAI-compatible endpoint for the DeepSeek web account: dsh's `llm-pi-ai` route `deepseek-web` talks to it.
  *
  * Bound to 127.0.0.1 on a random port; every request needs `Authorization: Bearer <per-install secret>` (compared in
- * constant time), so other apps on the phone cannot use the account. Plain HTTP/1.1, one request per connection.
+ * constant time, checked before the body is read), so other apps on the phone cannot use the account. Plain HTTP/1.1,
+ * one request per connection, at most [MAX_CONNECTIONS] at once; nothing a client sends can throw out of a handler.
  * Routes: `GET /v1/models`, `POST /v1/chat/completions` (`stream` true or false).
  */
 class BridgeServer(
@@ -67,9 +68,12 @@ class BridgeServer(
         client.use { s ->
             s.soTimeout = 120_000
             val out = BufferedOutputStream(s.getOutputStream())
+            if (!slots.tryAcquire()) {
+                runCatching { error(out, 503, "too many connections") }
+                return
+            }
             try {
                 val request = read(s.getInputStream())
-                if (!authorized(request.headers["authorization"])) throw HttpError(401, "missing or wrong bridge key")
                 when {
                     request.method == "GET" && request.path == "/v1/models" -> json(out, 200, OpenAiMapping.modelsJson())
                     request.method == "POST" && request.path == "/v1/chat/completions" -> completion(out, request)
@@ -79,9 +83,18 @@ class BridgeServer(
                 runCatching { error(out, e.status, e.message ?: "error") }
             } catch (e: IOException) {
                 // client went away
+            } catch (t: Throwable) {
+                // Never let a request take the app process down (an uncaught throwable in a pool thread would).
+                log("web bridge: ${t.javaClass.simpleName}: ${t.message}")
+                runCatching { error(out, 500, "internal error") }
+            } finally {
+                slots.release()
             }
         }
     }
+
+    /** At most [MAX_CONNECTIONS] requests at once; more get 503 instead of a thread each. */
+    private val slots = java.util.concurrent.Semaphore(MAX_CONNECTIONS)
 
     private fun completion(out: OutputStream, request: Request) {
         val body = try { JSONObject(String(request.body, Charsets.UTF_8)) } catch (e: Exception) { throw HttpError(400, "body is not JSON") }
@@ -171,8 +184,11 @@ class BridgeServer(
         if (parts.size < 2) throw HttpError(400, "bad request line")
         val headers = lines.drop(1).filter { it.contains(':') }
             .associate { it.substringBefore(':').trim().lowercase() to it.substringAfter(':').trim() }
+        // Auth before anything is read or allocated for the body.
+        if (!authorized(headers["authorization"])) throw HttpError(401, "missing or wrong bridge key")
         if (headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true) throw HttpError(411, "send a Content-Length")
-        val length = headers["content-length"]?.toLongOrNull() ?: 0L
+        val rawLength = headers["content-length"]
+        val length = if (rawLength == null) 0L else rawLength.toLongOrNull()?.takeIf { it >= 0 } ?: throw HttpError(400, "bad Content-Length")
         if (length > MAX_BODY) throw HttpError(413, "request body over ${MAX_BODY / 1024 / 1024} MB")
         val body = ByteArray(length.toInt())
         var read = 0
@@ -195,12 +211,13 @@ class BridgeServer(
         json(out, status, JSONObject().put("error", JSONObject().put("message", message).put("type", "deepseek_web_bridge").put("code", status)))
 
     private fun reason(status: Int) = when (status) {
-        200 -> "OK"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 404 -> "Not Found"; 411 -> "Length Required"
+        200 -> "OK"; 400 -> "Bad Request"; 401 -> "Unauthorized"; 404 -> "Not Found"; 411 -> "Length Required"; 500 -> "Internal Server Error"; 503 -> "Service Unavailable"
         413 -> "Payload Too Large"; 429 -> "Too Many Requests"; 431 -> "Request Header Fields Too Large"; else -> "Bad Gateway"
     }
 
     companion object {
         const val MAX_BODY = 8 * 1024 * 1024
+        const val MAX_CONNECTIONS = 8
         private const val MAX_HEAD = 64 * 1024
     }
 }
