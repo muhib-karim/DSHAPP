@@ -32,6 +32,7 @@ ENGINE_FAIL = re.compile(r"(启动失败|failed to start|CANNOT LINK|救援模�
 GOOGLE = re.compile(r"^Continue with Google$", re.I)
 API_KEY = re.compile(r"^Use API key$", re.I)
 LATER = re.compile(r"^Set up later$", re.I)
+KEY = "sk-smoke-invalid-key-0000000000"
 KEY_ERROR = re.compile(r"(rejected this key|Could not reach api\.deepseek\.com|DeepSeek answered HTTP|no balance|rate limiting)", re.I)
 
 
@@ -189,17 +190,29 @@ def sign_in_screens():
     field = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
     key_ok = False
     if field is not None:
-        tap(field)
-        time.sleep(1)
-        adb("shell", "input", "text", "sk-smoke-invalid-key-0000000000")
+        typed = False
+        for attempt in range(3):
+            tap(field)
+            time.sleep(2 + attempt)   # the keyboard has to be up before "input text" reaches the field
+            adb("shell", "input", "text", KEY)
+            time.sleep(1)
+            root = screen("api-key-typed")
+            field = key_field(root) or field
+            typed = KEY in (field.get("text") or "")
+            print("key typed:", typed, flush=True)
+            if typed:
+                break
         adb("shell", "input", "keyevent", "66")   # IME "Done" submits
-        deadline = time.time() + 45
+        deadline = time.time() + 75   # DNS failure plus the check's 15 s connect and read timeouts on a slow emulator
+        tapped_continue = False
         while time.time() < deadline and not key_ok:
             time.sleep(3)
             root = screen("api-key-error")
             key_ok = find(root, KEY_ERROR) is not None
-        adb("shell", "input", "keyevent", "111")   # hide the keyboard (ESC) for a clean screenshot
-        time.sleep(1)
+            button = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnKeyContinue")), None)
+            if not key_ok and not tapped_continue and button is not None and time.time() > deadline - 65:
+                tap(button)   # the IME action did not submit: press Continue
+                tapped_continue = True
         shot("03-api-key-error")
     print("API-key screen error shown:", key_ok, flush=True)
     # Leave the key panel with the system Back key (its own Back button can be below the fold); a first Back may only
@@ -215,6 +228,10 @@ def sign_in_screens():
         time.sleep(2)
         root = screen("first-again")
     return first_ok, key_ok
+
+
+def key_field(root):
+    return next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
 
 
 def on_sign_in_key_panel(root):
