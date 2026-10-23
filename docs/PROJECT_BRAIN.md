@@ -31,12 +31,16 @@ green and no merge, tag or release.
   reason (save failures no longer echo the exception), and a consumed/superseded attempt is reported instead of a silent
   no-op. New `KeyEntry` + 6 JVM tests and a smoke assertion for the Paste button.
   Both-flavor gate: 182 JVM tests each, 45 Node tests, both APKs built; Gradle stopped.
+- CI smoke hardening: `emulator-smoke.yml` now pre-installs the API 34 `google_apis` x86_64 image with three
+  attempts, deleting the partial image directory, SDK `.temp` and the SDK-manager cache between tries, before the
+  pinned emulator action runs. This targets run 39975831370, where a corrupt system-image archive (`ZipFile unknown
+  archive`) left no emulator to boot. The fix is committed but cannot be exercised from here (no push).
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. Commit P3 item 5 after the both-flavor gate, then implement P3 item 6 (release notes).
+1. CI smoke retry fix is committed; implement P3 item 6 (release notes and trusted release link).
 2. After all items refresh screenshots and run the full matrix.
 
 
@@ -68,3 +72,4 @@ green and no merge, tag or release.
 - 2026-10-23 14:58Z dsh/DeepSeek V4.1 Flash: P3 item 4 (API-key replace + masked hint) implemented; new Node test green, zip/stamps bumped; next: both-flavor gate and commit.
 - 2026-10-23 15:08Z dsh/DeepSeek V4.1 Flash: P3 item 5 (paste, rotation restore, clearer key errors) implemented; KeyEntry tests added and smoke checks the Paste button; next: both-flavor gate and commit.
 - 2026-10-23 15:19Z dsh/DeepSeek V4.1 Flash: P3 item 5 gate green (182 JVM per flavor, 45 Node, both APKs); next: commit, item 6.
+- 2026-10-23 15:23Z dsh/DeepSeek V4.1 Flash: CI smoke system-image preinstall with retries added; next: commit fix, item 6.
