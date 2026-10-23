@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 30
+        versionCode = 31
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -198,7 +198,39 @@ android {
         //        否则插件指向另一个 App 的私有目录、必然加载失败。
         //     ⑤ 修初版一个真机 bug：导入的文件选择用了 `AlertDialog.setItems()`，
         //        深色主题下白底白字、整行看不见，用户以为点不动。改成自绘卡片。
-        versionName = "0.3.4"
+        //
+        // ⚠️ 31（本次）**换 versionName：0.3.4 → 0.4.0**。
+        //   0.4.0 的主题是**AI 拥有一台属于自己的手机浏览器**。
+        //     ① 新增 `AiBrowserView`：一个**独立于官方界面**的原生 WebView。
+        //        引擎自带的侧栏浏览器是 iframe，而 GitHub（`X-Frame-Options: deny`）、
+        //        Google（CSP）拒绝被嵌入 ⇒ 那个方案连登录页都加载不出来，
+        //        而「让 AI 登录网站」恰恰是需求核心。原生 WebView 没有这个限制，
+        //        渲染在本地、零延迟、Cookie 天然持久，且**不消耗任何服务器资源**
+        //        （每个用户跑在自己手机上）。
+        //     ② 带完整浏览器壳：前进/后退/刷新/首页/地址栏/加载进度/多标签（上限 6）/
+        //        文件下载（落 App 专属外部 Download 目录，不需要存储权限）/
+        //        文件上传（走宿主已有的系统选择器）/ 视口截图落盘。
+        //     ③ **控制权一次只有一方**：AI 操作时吃掉所有触摸（否则用户随手一点
+        //        就会让 AI 正在填的表单失焦），顶部状态 chip 显示「AI 操作中」，
+        //        用户点一下即可接管 —— 共享同一个浏览器，冲突靠锁而不是靠谦让。
+        //     ④ 新增 `browser` 工具（`mobile-ui-plugin/dsh-android-browser` →
+        //        `assets/browser-tool.zip` → `$DSH_HOME/browser-tool/`），经
+        //        `BrowserBridge` 的文件信箱把「开网页/读页面/点按钮/填表单/截图」
+        //        接到模型的工具列表里。读页面回的是**可交互元素清单**（带稳定
+        //        编号），因为让模型猜 CSS 选择器在真实站点上十次有八次落空。
+        //     ⑤ 模型第一次调用 `browser` 时浏览器**按需创建并自动显示**，
+        //        不需要用户先手动打开。
+        //     ⑥ 用户入口：右边缘常驻「浏览」把手（启动层收起后出现），
+        //        打开浏览器时自动隐藏；返回键优先归浏览器（后退 → 关标签 → 收起）。
+        //     ⑦ 修一个初版的静默 bug：工具栏按钮用 `ImageButton` 装 `TextView`
+        //        子视图，而 `ImageButton` 继承 `ImageView`、**不是 `ViewGroup`** ——
+        //        Kotlin 的隐式接收者解析把它变成了外层 `FrameLayout.addView`，
+        //        文字被加到根布局左上角（被页面盖住），按钮本身是空的 ⇒ 工具栏
+        //        什么都不显示。改为纯 `TextView` 按钮。
+        //     ⑧ 同批修掉 `type` 动作 JS 里把 `var` 写成 `val` 的致命笔误
+        //        （会让所有输入操作抛 `SyntaxError`），已用 node --check 逐段验证
+        //        拼接后的五段 JS。
+        versionName = "0.4.0"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {

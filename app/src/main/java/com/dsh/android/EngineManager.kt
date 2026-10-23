@@ -4088,6 +4088,80 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出**浏览器工具**插件（`browser-tool.zip` → `$DSH_HOME/browser-tool/dsh-android-browser/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `browser` 的**独立工具**，让模型能：
+     * 打开网页、读页面结构（可见文本 + 带编号的可交互元素）、点按钮、填表单、
+     * 截图、管理标签页。真实执行者是 [com.dsh.android.browser.BrowserBridge]
+     * 与 [com.dsh.android.browser.AiBrowserView]。
+     *
+     * ⚠️ **必须解到 `$DSH_HOME/browser-tool/` 而不是 profile 的 `node_modules`**：
+     *   与 [ensureBubbleTool] 同一个坑 —— 那个目录归 pnpm 管，而本包不在 profile
+     *   的 `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`。
+     *
+     * 与其它工具插件一样**不做版本戳**：包很小（两个文件），每次启动覆盖写。
+     */
+    private fun ensureBrowserTool() {
+        val target = File(dshHome, "$BROWSER_TOOL_DIR/$BROWSER_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(BROWSER_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装浏览器工具插件 $BROWSER_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 browser 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装浏览器工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载浏览器工具的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeUiToolPatch] 同构。**没有「能力探测」这一步**：浏览器不需要
+     * 任何特权，只要插件入口在就挂载 —— 浏览器实例由
+     * [com.dsh.android.MainActivity.ensureAiBrowser] 在模型第一次调用时按需创建。
+     */
+    private fun writeBrowserToolPatch(): File? {
+        val patch = File(dshHome, BROWSER_TOOL_PATCH)
+        val entry = File(dshHome, "$BROWSER_TOOL_DIR/$BROWSER_TOOL_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "浏览器工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载浏览器工具插件：注册一个独立的 `browser` 工具，
+                # 让模型能用自己的 WebView 上网、登录、读页面、点按钮。
+                - insert:
+                    - id: $BROWSER_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入浏览器工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入浏览器工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出**日志工具**插件（`logs-tool.zip` → `$DSH_HOME/logs-tool/dsh-android-logs/`）。
      *
      * 该插件在 `apply()` 里注册一个名为 `logs` 的**独立工具**，让模型能：
@@ -7031,6 +7105,12 @@ class EngineManager private constructor(private val context: Context) {
         //   同样必须早于引擎启动：overlay 要在 profile 解析前落盘。
         ensureUiTool()
         val uiToolPatch = writeUiToolPatch()
+        // 浏览器工具：把「上网 / 登录 / 读页面 / 点按钮」接到模型的工具列表里。
+        // ⚠️ 与 ui 工具**完全并列且独立**：ui 操作的是本 App 自己的界面，
+        //   browser 操作的是一个独立的第二个 WebView（别的网站）。同样必须
+        //   早于引擎启动：overlay 要在 profile 解析前落盘。
+        ensureBrowserTool()
+        val browserToolPatch = writeBrowserToolPatch()
         // 日志工具：把「读日志 / 看崩溃现场 / 生成诊断包」接到模型的工具列表里。
         // ⚠️ 与上面三个工具**完全并列且独立**（不同信箱、不同能力），同样与特权无关：
         //   读日志不需要任何授权。必须早于引擎启动（overlay 要在 profile 解析前落盘）。
@@ -7112,6 +7192,7 @@ class EngineManager private constructor(private val context: Context) {
             petPatch,
             uiToolPatch,
             logsToolPatch,
+            browserToolPatch,
             // ⚠️ **必须排在最后**：这一层只做 `disabled: true`，而它要禁用的条目
             //   正是前面那些 `- insert:` 插进来的。`--patch` 按顺序应用，排在
             //   插入之前会让 patch 匹配不到目标 id（官方行为：warn 后跳过，静默失效）。
@@ -9551,6 +9632,32 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val LOGS_TOOL_DIR = "logs-tool"
+
+        // ── 浏览器工具 ───────────────────────────────────────────────
+        //
+        // 与 bubble / statusbar / ui / logs **同一套做法**（独立工具 + 文件信箱 +
+        // 刻意在 pnpm 管辖之外），差别只在能力：那些操作**这个 App**，这个**上网**。
+        //
+        // 为什么需要它：引擎自带的侧栏浏览器是 iframe，而 GitHub
+        // （`X-Frame-Options: deny`）、Google（CSP）拒绝被嵌入 —— iframe 方案
+        // 连登录页都加载不出来。所以换成原生 `AiBrowserView`（真 WebView，
+        // 跑在用户手机上），本插件把「开网页/读页面/点按钮/填表单」注册成
+        // `browser` 工具，靠 [com.dsh.android.browser.BrowserBridge] 的文件信箱
+        // 把命令送回原生。详见 `mobile-ui-plugin/dsh-android-browser/lib/index.js`。
+        //
+        // ⚠️ **信箱必须是独立文件**：命令可能并发发起，回执按 `id` 配对，
+        //   而各插件各自从 1 自增 —— 共用文件会让工具调用收到对方的回执。
+        //
+        // ⚠️ **没有「能力探测」这一步**：浏览器不需要任何授权，只要入口在就挂载。
+        //   浏览器实例由 [com.dsh.android.MainActivity.ensureAiBrowser] 按需创建。
+
+        /** 注册 `browser` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val BROWSER_TOOL_ASSET = "browser-tool.zip"
+        private const val BROWSER_TOOL_PACKAGE = "dsh-android-browser"
+        private const val BROWSER_TOOL_PATCH = "browser-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
+        private const val BROWSER_TOOL_DIR = "browser-tool"
 
         // ── 定向隔离层（L1.5） ────────────────────────────────────────
         //

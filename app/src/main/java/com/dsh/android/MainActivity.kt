@@ -831,6 +831,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // AI 浏览器 —— **临时测试入口**，跑通后会移到官方侧栏。
+        // ⚠️ 打开后启动层还在，会挡住浏览器；所以打开的同时把启动层收掉。
+        //    （正式版由侧栏按钮触发，不存在这个问题。）
+        binding.overlayBrowser.setOnClickListener {
+            hideOverlay()
+            openAiBrowser()
+        }
+
         // 降级态常驻横幅（不变量 I4）。**入口必须在 onCreate 就装好**，不能等到
         // 引擎就绪 —— 救援态恰恰可能在引擎起来之前用户就想退出（比如他确信
         // 自己刚卸载了那个坏插件，想直接回正常模式试一次）。
@@ -842,6 +850,7 @@ class MainActivity : AppCompatActivity() {
         setupBackNavigation()
         installBubbleBridge()
         installUiProbeBridge()
+        installBrowserBridge()
         // ⚠️ 必须在这里就绪：插件可能**在 App 前台**下发悬浮球外观，而那时
         //   onAppBackground 还没跑过。不提前记 context 的话 bubbleApply 会静默返回
         //   false（真机实测踩到），表现为"插件改了没反应"。
@@ -1233,6 +1242,143 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // AI 浏览器
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * AI 浏览器实例。**懒创建** —— 大多数会话用不到它，白占 100~200 MB。
+     *
+     * ⚠️ 与官方界面的 WebView 是**两个独立实例**：各自有独立的浏览历史、
+     *   独立的页面状态。它们共享同一个 WebView 数据目录（Android 默认行为），
+     *   所以 Cookie 是共享的 —— 目前可接受，见 [AiBrowserView] 的类注释。
+     */
+    private var aiBrowser: com.dsh.android.browser.AiBrowserView? = null
+
+    /**
+     * 拿到（必要时创建）AI 浏览器实例。**必须在主线程调用。**
+     *
+     * 拆出来是为了给 [installBrowserBridge] 用：模型说「打开某个网址」时
+     * 浏览器可能还不存在，需要按需建出来。
+     */
+    private fun ensureAiBrowser(): com.dsh.android.browser.AiBrowserView? {
+        aiBrowser?.let { return it }
+        if (isFinishing || isDestroyed) return null
+        val v = com.dsh.android.browser.AiBrowserView(this)
+        v.visibility = View.GONE
+        // ⚠️ 挂在**根布局**上，不是 `webContainer`：启动层（overlay）是
+        //    webContainer 的兄弟节点且盖在它上面，挂进 webContainer 的视图
+        //    会被启动层挡住。根布局的最上层子视图永远在最前。
+        binding.root.addView(
+            v,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        // ✕ 只是隐藏，页面状态与登录态都留在内存里。
+        v.onClose = { closeAiBrowser() }
+        // 截图落在 workspace 下的隐藏目录，模型可以直接 read 那张图。
+        v.shotDir = java.io.File(workspaceDir(), ".browser-shots")
+        // 文件上传走宿主已有的系统选择器（三条收尾路径由 launchFileChooser 保证）
+        v.onPickFile = { cb ->
+            launchFileChooser(multiple = false) { uris -> cb.onReceiveValue(uris) }
+        }
+        aiBrowser = v
+        Log.i(DshApplication.TAG, "AI 浏览器实例已创建")
+        return v
+    }
+
+    /** 打开 AI 浏览器（覆盖在官方界面之上）。 */
+    fun openAiBrowser(url: String? = null) {
+        val view = ensureAiBrowser() ?: return
+        view.visibility = View.VISIBLE
+        view.bringToFront()
+        hideBrowserHandle()
+        if (url != null) view.loadUrl(url)
+        else if (view.currentUrl().isEmpty()) view.loadUrl(com.dsh.android.browser.AiBrowserView.HOME_URL)
+        Log.i(DshApplication.TAG, "AI 浏览器已打开: ${view.currentUrl()}")
+    }
+
+    // ── 常驻入口：右侧贴边把手 ──────────────────────────────────────
+    //
+    // 浏览器是整个 App 最上面的一层，一旦打开就盖住官方界面；但**打开它的
+    // 入口**不能只在启动层上 —— 启动层收起后就再也点不到了。
+    //
+    // 所以贴一个把手在右边缘（垂直居中）：它属于原生层，不碰官方前端的任何
+    // DOM，坏了最多是「入口看不见」，绝不会把界面搞白。
+
+    /** 右侧贴边把手。懒创建，启动层收起后才显示。 */
+    private var browserHandle: View? = null
+
+    /**
+     * 创建（或取出）右手边的浏览器把手。
+     *
+     * ⚠️ 必须 addView 到**根布局**且排在浏览器之前 —— 浏览器 `bringToFront()`
+     *   之后要盖住它。
+     */
+    private fun ensureBrowserHandle(): View {
+        browserHandle?.let { return it }
+        val d = resources.displayMetrics.density
+        fun px(v: Int) = (v * d).toInt()
+
+        val handle = TextView(this).apply {
+            text = "浏览"
+            setTextColor(0xFFDCE6F5.toInt())
+            textSize = 10f
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, px(8), 0, px(8))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xCC2B3444.toInt())
+                // 只圆左边两个角，右边贴着屏幕边缘
+                cornerRadii = floatArrayOf(
+                    px(9).toFloat(), px(9).toFloat(),
+                    0f, 0f,
+                    0f, 0f,
+                    px(9).toFloat(), px(9).toFloat(),
+                )
+            }
+            isClickable = true
+            isFocusable = true
+            visibility = View.GONE
+            contentDescription = "打开 AI 浏览器"
+            setOnClickListener { openAiBrowser() }
+        }
+        binding.root.addView(
+            handle,
+            android.widget.FrameLayout.LayoutParams(px(24), px(56)).apply {
+                gravity = android.view.Gravity.END or android.view.Gravity.CENTER_VERTICAL
+            },
+        )
+        browserHandle = handle
+        return handle
+    }
+
+    /** 显示把手（启动层收起后调用）。 */
+    private fun showBrowserHandle() {
+        ensureBrowserHandle().visibility = View.VISIBLE
+    }
+
+    /** 隐藏把手（浏览器打开时）。 */
+    private fun hideBrowserHandle() {
+        browserHandle?.visibility = View.GONE
+    }
+
+    /** 当前 workspace 目录（截图等落盘用）。 */
+    private fun workspaceDir(): java.io.File =
+        java.io.File(filesDir, "workspace").apply { if (!exists()) mkdirs() }
+
+    /** 关闭 AI 浏览器（只隐藏，保留页面状态与登录态，下次打开还是原样）。 */
+    fun closeAiBrowser() {
+        aiBrowser?.visibility = View.GONE
+        // 收起浏览器时把入口还回来 —— 否则用户关掉之后再没有路进去。
+        if (overlayDismissed) showBrowserHandle()
+        Log.i(DshApplication.TAG, "AI 浏览器已隐藏")
+    }
+
+    /** AI 浏览器是否正在显示。 */
+    fun isAiBrowserVisible(): Boolean = aiBrowser?.visibility == View.VISIBLE
+
     /**
      * 拉起系统的文件选择器，把结果交回内核。
      *
@@ -1481,6 +1627,32 @@ class MainActivity : AppCompatActivity() {
      * 此时最不该做的就是继续把用户困在 App 里。
      */
     private fun queryPageBack() {
+        // ── AI 浏览器优先 ──────────────────────────────────────────────
+        // 浏览器是整个 App 最上面的一层，返回键先归它：
+        //   标签 > 1 且当前页无历史 → 关掉这个标签；
+        //   当前页有历史 → 后退；
+        //   否则 → 收起浏览器（回到官方界面），**不退出 App**。
+        // ⚠️ 必须放在 `backQueryPending` 守卫之前：那条路是问页面要
+        //    `__DSH_MOBILE_BACK__`，而浏览器盖住页面时页面根本不该被问到。
+        if (isAiBrowserVisible()) {
+            val b = aiBrowser
+            if (b != null) {
+                if (b.currentUrl().isNotEmpty() && b.tabsCount() > 1 && !b.canGoBack()) {
+                    b.closeCurrentTab()
+                    Log.i(DshApplication.TAG, "返回键：关闭浏览器当前标签")
+                } else if (b.canGoBack()) {
+                    b.goBack()
+                    Log.i(DshApplication.TAG, "返回键：浏览器内后退")
+                } else {
+                    closeAiBrowser()
+                    Log.i(DshApplication.TAG, "返回键：收起 AI 浏览器")
+                }
+            } else {
+                closeAiBrowser()
+            }
+            return
+        }
+
         if (backQueryPending) return
         backQueryPending = true
         val seq = ++backQuerySeq
@@ -3433,6 +3605,10 @@ class MainActivity : AppCompatActivity() {
             .withEndAction {
                 binding.overlay.visibility = View.GONE
                 binding.overlay.alpha = 1f
+                // 启动层彻底收起后才露出手把 —— 它 addView 在根布局的最上层，
+                // 提前显示会盖在启动页上（启动页正中间是头像，右上角才是按钮）。
+                // 浏览器此刻若已打开（AI 先动手了），把手不该出现。
+                if (!isAiBrowserVisible()) showBrowserHandle()
             }
             .start()
     }
@@ -3604,6 +3780,43 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 装好 **AI 浏览器**的原生侧。
+     *
+     * ```
+     * browser 工具(插件) ──写 browser-cmd.json──▶ BrowserBridge ──▶ AiBrowserView
+     *              ◀──读 browser-result.json────          ◀── 页面结果 ──┘
+     * ```
+     *
+     * 与 [installUiProbeBridge] 同构，但有两点不同：
+     * ① 浏览器是**独立 WebView**，不受官方页面状态影响；
+     * ② 它可能**还没被创建** —— `browserOrNull()` 会按需建出来并显示，
+     *    所以模型说「打开 example.com」时用户会看到浏览器自己弹出来。
+     *
+     * ⚠️ [BrowserBridge.start] 幂等，Activity 重建时重复调用安全，
+     *   且正好把 provider 换成新实例。
+     */
+    private fun installBrowserBridge() {
+        com.dsh.android.browser.BrowserBridge.start(
+            home = engine.dshHomeDir,
+            host = {
+                // ⚠️ 未初始化时返回 null 而不是抛 —— 轮询线程抛异常会直接死掉
+                if (isFinishing || isDestroyed) null else object : com.dsh.android.browser.BrowserBridge.BrowserHost {
+                    override fun browserOrNull(): com.dsh.android.browser.AiBrowserView? {
+                        // ⚠️ 走 `openAiBrowser()` 而不是 `ensureAiBrowser()`：
+                        //   后者只创建、`visibility = GONE`，模型操作了用户却**什么都
+                        //   看不见** —— 那正好违背「用户可以旁观」这个前提。
+                        //   `openAiBrowser` 会显示 + bringToFront + 收起把手。
+                        openAiBrowser()
+                        return aiBrowser
+                    }
+
+                    override fun isBrowserVisible(): Boolean = isAiBrowserVisible()
+                }
+            },
+        )
+    }
+
+    /**
      * 把一段文本送进页面的官方 composer，并触发发送。
      *
      * **必须在主线程调用**（`evaluateJavascript` 的要求）—— 气泡的按钮回调本来
@@ -3682,6 +3895,16 @@ class MainActivity : AppCompatActivity() {
         //   拆 WebExtension），交给 [WebHost]。必须在 super 之前 ——
         //   super.onDestroy() 之后 binding 里的视图树已经被拆掉。
         if (::web.isInitialized) web.destroy()
+        // AI 浏览器是**第二个 WebView 实例**，不归 [WebHost] 管 —— 必须单独销毁，
+        // 否则它的渲染进程与 Cookie 存储会一直挂着（每个 WebView 几十 MB）。
+        // ⚠️ 放在 web.destroy() 之后：两者共享同一个 WebView 数据目录，
+        //   先销毁"非官方"的那个，避免数据目录句柄的释放顺序出问题。
+        aiBrowser?.let {
+            it.visibility = View.GONE
+            it.destroy()
+        }
+        aiBrowser = null
+        browserHandle = null
         // ⚠️ **正常退出标记**：这是区分「崩溃」与「被系统杀掉」的唯一依据。
         //
         // 本 App 的 `targetSdk = 28`，用不了 API 30 的 `ApplicationExitInfo`
