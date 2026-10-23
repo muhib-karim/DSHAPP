@@ -285,6 +285,8 @@ class EngineManager private constructor(private val context: Context) {
      */
     suspend fun ensureExtracted(versionStamp: String) = withContext(Dispatchers.IO) {
         lastAssetStamp = versionStamp
+        // 1.3.2-en: one clean pass over files another build of this package left behind (see LegacyData).
+        LegacyData.migrateOnce(context, dshHome)
         if (stampFile.isFile && stampFile.readText().trim() == versionStamp) {
             Log.i(TAG, "引擎资产已是最新（$versionStamp），跳过解包")
             return@withContext
