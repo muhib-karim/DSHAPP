@@ -9,13 +9,14 @@ green and no merge, tag or release.
 - Version / branch: 1.3.0 / 31, feature/v1.3.0; P2 delivered; P3 plan committed as `51bff9c` before P3 code.
 - P3 plan: update identity, manual harness rollback, web-session expiry, API-key replacement/hint, first-screen
   polish, release notes, plugin search, About tools, cancelable downloads, then docs/screenshots and full gates.
-- Baseline after the plan: both debug APKs built and both flavor JVM test tasks passed; Gradle stopped.
+- P3 item 1 done: downloaded APKs are checked for package name and signing certificate before the installer;
+  `ApkIdentity` has 10 JVM tests. Both debug APKs built and both flavor suites passed; Gradle stopped.
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. Implement the assigned P3 plan item on `feature/v1.3.0` with its tests and version-stamp/zip checks.
+1. Implement P3 item 2 (manual harness rollback) with its tests and version-stamp/zip checks.
 2. After all items, refresh CHANGELOG/README/PROJECT_BRAIN and the affected screenshots, then run the full matrix.
 
 
@@ -40,3 +41,4 @@ green and no merge, tag or release.
 - 2026-10-23 14:00Z Codex/gpt-6-astra: sign-out and lifecycle targeted regressions green; starting both-flavor full tests/builds, then commit and push.
 - 2026-10-23 14:02Z Codex/gpt-6-astra: local full gates and live frontend checks passed; committing delivery record before security checks, push and exact-head CI watch.
 - 2026-10-23 14:27Z dsh/DeepSeek V4.1 Flash: P3 plan `51bff9c` committed after baseline both-flavor build/tests; next: implement plan items.
+- 2026-10-23 14:36Z dsh/DeepSeek V4.1 Flash: P3 item 1 (APK identity) implemented and tested; both-flavor gate green; next: item 2.

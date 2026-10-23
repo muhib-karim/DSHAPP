@@ -3,6 +3,9 @@ package com.dsh.android.update
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.content.pm.Signature
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -212,12 +215,14 @@ object UpdateCenter {
         thread(name = "app-update") {
             try {
                 val ready = downloadedApk?.takeIf { it.isFor(rel) }
-                if (ready != null && ready.verify()) {
+                if (ready != null && ready.verify() && identityProblem(activity, ready.file) == null) {
                     appStatus = "ready"
                     appProgress = 100
                     activity.runOnUiThread { install(activity, ready.file) }
                     return@thread
                 }
+                // A previously downloaded APK that is missing, changed or no longer matches this app is not reusable.
+                ready?.file?.delete()
                 downloadedApk = null
                 val dir = File(activity.cacheDir, "updates").apply { deleteRecursively(); mkdirs() }
                 val apk = File(dir, rel.apkName)
@@ -244,6 +249,15 @@ object UpdateCenter {
                 } finally { conn.disconnect() }
                 val actual = digest.digest().joinToString("") { "%02x".format(it) }
                 if (actual != expected) { apk.delete(); throw IOException("checksum mismatch") }
+                // The checksum only says the archive is what the release published. It can still be the other flavor
+                // or be signed with another key; verify identity before the installer is allowed to see it.
+                if (identityProblem(activity, apk) != null) {
+                    apk.delete()
+                    appStatus = "error"
+                    appMessage = ApkIdentity.INVALID_MESSAGE
+                    appProgress = -1
+                    return@thread
+                }
                 downloadedApk = AppUpdater.DownloadedApk(rel, apk, expected)
                 appStatus = "ready"
                 appProgress = 100
@@ -255,6 +269,49 @@ object UpdateCenter {
                 appProgress = -1
             }
         }
+    }
+
+    /**
+     * Null when [apk] is this app: same package name and signed by one of the installed app's current signers.
+     * Everything is extracted here (Android APIs); the decision itself is [ApkIdentity], tested on the JVM.
+     */
+    private fun identityProblem(activity: Activity, apk: File): String? {
+        val (archivePackage, archiveSigners) = archiveIdentity(activity, apk)
+        val problem = ApkIdentity.problem(
+            activity.packageName, installedSigners(activity), archivePackage, archiveSigners,
+        )
+        if (problem != null) DshLog.w(TAG, "rejected update APK: $problem")
+        return problem
+    }
+
+    /** The signer digests of the installed app, key-rotation history included; empty when Android cannot report them. */
+    private fun installedSigners(activity: Activity): Set<String> = runCatching {
+        val info = activity.packageManager.getPackageInfo(activity.packageName, signatureFlags())
+        signerDigests(info).toSet()
+    }.getOrDefault(emptySet())
+
+    /** The package name and signer digests of the archive at [apk]; `(null, empty)` when it cannot be read as an APK. */
+    private fun archiveIdentity(activity: Activity, apk: File): Pair<String?, Set<String>> = runCatching {
+        val info = activity.packageManager.getPackageArchiveInfo(apk.absolutePath, signatureFlags())
+            ?: return@runCatching null to emptySet<String>()
+        // Some PackageManager implementations only expose certificates once the archive path is on the ApplicationInfo.
+        info.applicationInfo?.let { it.sourceDir = apk.absolutePath; it.publicSourceDir = apk.absolutePath }
+        info.packageName to signerDigests(info).toSet()
+    }.getOrDefault(null to emptySet())
+
+    @Suppress("DEPRECATION")
+    private fun signatureFlags(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES
+        else PackageManager.GET_SIGNATURES
+
+    @Suppress("DEPRECATION")
+    private fun signerDigests(info: PackageInfo): List<String> {
+        val certificates: Array<Signature>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val signing = info.signingInfo ?: return emptyList()
+            // Sideloaded updates may rotate the key: accept anything in the installed app's history.
+            if (signing.hasMultipleSigners()) signing.apkContentsSigners else signing.signingCertificateHistory
+        } else info.signatures
+        return certificates.orEmpty().mapNotNull { it?.toByteArray() }.map { ApkIdentity.certificateSha256(it) }
     }
 
     private fun install(activity: Activity, apk: File) {
