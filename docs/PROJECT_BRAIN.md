@@ -2,22 +2,21 @@
 Persistent memory for agent sessions. Short, current, true. Newest wins.
 
 ## Goal
-Complete the 1.3.0 second review pass against the frozen requirements, with local gates and both CI workflows green
-on the final feature branch head. No merge, tag or release.
+Complete the 1.3.0 third implementation pass by delivering the ten items in `docs/PLAN_130_P3.md`, with local gates
+green and no merge, tag or release.
 
 ## Status
-- Version / branch: 1.3.0 / 31, feature/v1.3.0; P2 plan committed before code as 2f77d8d.
-- Account/bridge, opaque theme/plugin controls, watcher fallback and recoverable update activation are implemented.
-- Independent final review found no unresolved important issues; sign-out persistence and update/start races fixed.
-- Final local gates: 152 JVM tests per flavor, both debug APKs, 34 Node tests and 5 Chromium tests passed.
-- Smoke script syntax and all 13 plugin archive/source byte comparisons pass; Gradle is stopped.
+- Version / branch: 1.3.0 / 31, feature/v1.3.0; P2 delivered; P3 plan committed as `51bff9c` before P3 code.
+- P3 plan: update identity, manual harness rollback, web-session expiry, API-key replacement/hint, first-screen
+  polish, release notes, plugin search, About tools, cancelable downloads, then docs/screenshots and full gates.
+- Baseline after the plan: both debug APKs built and both flavor JVM test tasks passed; Gradle stopped.
+- P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
-- Live upstream frontend: skill add/remove refreshes without reload; real light/dark Settings surfaces are opaque.
-- Delivery gate: security checks, push and exact-head Release APK + Emulator smoke; final line records both run IDs.
+- Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. Run security gates and push the completed P2 commits; watch both exact-head CI workflows until green.
-2. Hand off P3; verify CI IDs from the final delivery line and retain live account/arm64 acceptance limitations.
+1. Implement the assigned P3 plan item on `feature/v1.3.0` with its tests and version-stamp/zip checks.
+2. After all items, refresh CHANGELOG/README/PROJECT_BRAIN and the affected screenshots, then run the full matrix.
 
 
 ## Decisions (why things are the way they are)
@@ -40,3 +39,4 @@ on the final feature branch head. No merge, tag or release.
 - 2026-10-23 13:59Z Codex/gpt-6-astra: final review fixes complete; Node/browser/archive gates pass; next: both-flavor JVM/build verification and delivery.
 - 2026-10-23 14:00Z Codex/gpt-6-astra: sign-out and lifecycle targeted regressions green; starting both-flavor full tests/builds, then commit and push.
 - 2026-10-23 14:02Z Codex/gpt-6-astra: local full gates and live frontend checks passed; committing delivery record before security checks, push and exact-head CI watch.
+- 2026-10-23 14:27Z dsh/DeepSeek V4.1 Flash: P3 plan `51bff9c` committed after baseline both-flavor build/tests; next: implement plan items.
