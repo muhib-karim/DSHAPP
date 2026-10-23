@@ -795,7 +795,8 @@ class AiBrowserView(context: Context) : FrameLayout(context) {
         val w = width.coerceAtLeast(1)
         val h = height.coerceAtLeast(1)
         if (lp.width == w && lp.height == h &&
-            lp.leftMargin == left && lp.topMargin == top
+            lp.leftMargin == left && lp.topMargin == top &&
+            visibility == View.VISIBLE
         ) {
             return   // 没变就别重建布局（ResizeObserver 会高频打过来）
         }

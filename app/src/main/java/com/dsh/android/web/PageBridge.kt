@@ -205,6 +205,15 @@ interface PageBridge {
     fun aiBrowserDetach()
 
     /**
+     * 查询 AI 浏览器当前可见性，返回 `"visible"` 或 `"hidden"`。
+     *
+     * 面板挂载时要先对一次状态：AI 可能已经用工具把网页打开了，用户这时才点
+     * 开侧栏 tab —— 面板的本地 state 是「没开」，不查询就会显示成一个打开按钮，
+     * 而浏览器其实正盖在屏幕上。
+     */
+    fun aiBrowserState(): String
+
+    /**
      * 读「键盘避让」状态。返回 JSON：`{"enabled":bool,"a11y":bool}`。
      *
      * 两个字段是**两件独立的事实**，不要合并：

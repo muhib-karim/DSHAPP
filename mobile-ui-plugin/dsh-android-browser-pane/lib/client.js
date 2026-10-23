@@ -59,6 +59,12 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 原生 → 前端的状态事件名。**必须与 `MainActivity.notifyBrowserPane`
+		 * 里 `dispatchEvent` 的事件名逐字一致。**
+		 */
+		const STATE_EVENT = "dsh:browser-state";
+
+		/**
 		 * 右侧栏「AI 浏览器」面板的正文。
 		 *
 		 * ## 它其实是个「占位 + 覆盖」
@@ -68,8 +74,15 @@ window.__ModuleLoader__.load({
 		 * 空 div，把它 `getBoundingClientRect()` 量出来上报给原生，原生再把
 		 * WebView 摆到屏幕上同一块矩形上。
 		 *
-		 * 视觉结果就是：浏览器的内容正好嵌在「AI 浏览器」这个 tab 下面，
-		 * 上面是官方的 tab 头，下面是浏览器自己的工具栏和页面。
+		 * ## 两个方向都必须有通知（只做单向会留下两个 bug）
+		 *
+		 * ```
+		 * 前端 → 原生：aiBrowserLayout(rect)   面板在哪、多大
+		 * 原生 → 前端：dsh:browser-state      浏览器还在不在
+		 * ```
+		 *
+		 * 少了第二条，用户点 ✕ 之后面板会僵在「一片空白 + 不再响应点击」：
+		 * 浏览器已经被原生隐藏，面板却以为还在显示，于是既不重开也不提示。
 		 *
 		 * ## 为什么要 ResizeObserver 而不是量一次
 		 *
@@ -84,8 +97,14 @@ window.__ModuleLoader__.load({
 			const React = require("react");
 			const e = React.createElement;
 			const slotRef = React.useRef(null);
-			// idle = 还没量到有效矩形；live = 已上报并显示；noBridge = 旧版 APK
+			// idle = 还没量到有效矩形；live = 浏览器正在这块区域里显示
 			const [phase, setPhase] = React.useState("idle");
+			// ⚠️ 这两个必须用 ref 而不是闭包变量 / state：
+			//   闭包变量在 effect 外（点击回调里）读不到，state 在 measure 那个
+			//   rAF 回调里读到的是旧值。ref 两边都能读写当前值。
+			const liveRef = React.useRef(false);
+			const scheduleRef = React.useRef(null);
+			const rectPayloadRef = React.useRef(null);
 
 			React.useEffect(() => {
 				const bridge = window.DSHAndroid;
@@ -96,20 +115,23 @@ window.__ModuleLoader__.load({
 
 				let raf = 0;
 				let lastPayload = "";
-				let reported = false;
 
-				const measure = () => {
-					raf = 0;
+				/**
+				 * 量出占位区域的当前矩形（CSS 视口坐标）。
+				 *
+				 * @returns {object|null} 尺寸无效（面板收起中）时 null。
+				 */
+				const rectPayload = () => {
 					const node = slotRef.current;
-					if (!node) return;
+					if (!node) return null;
 					let rect = node.getBoundingClientRect();
 					// 占位 div 在某些面板里高度会塌成 0（父级是 auto 高度）。
 					// 那就退一步量父元素 —— 面板本身的矩形才是我们真正要的区域。
 					if (rect.height < 8 && node.parentElement) {
 						rect = node.parentElement.getBoundingClientRect();
 					}
-					if (rect.width < 8 || rect.height < 8) return;
-					const payload = JSON.stringify({
+					if (rect.width < 8 || rect.height < 8) return null;
+					return JSON.stringify({
 						x: Math.round(rect.left),
 						y: Math.round(rect.top),
 						w: Math.round(rect.width),
@@ -117,14 +139,36 @@ window.__ModuleLoader__.load({
 						vw: Math.round(window.innerWidth),
 						vh: Math.round(window.innerHeight),
 					});
+				};
+				rectPayloadRef.current = rectPayload;
+
+				const measure = () => {
+					raf = 0;
+					const payload = rectPayload();
+					// ⚠️ 量不出有效矩形 = 面板被收起了（点右上角收起侧栏、窗口太窄）。
+					//   这时要主动 detach，否则原生那块 WebView 还留在屏幕上，
+					//   看起来就是「侧栏收起来了但浏览器赖着不走」。
+					if (!payload) {
+						if (liveRef.current) {
+							liveRef.current = false;
+							lastPayload = "";
+							setPhase("idle");
+							try {
+								if (typeof bridge.aiBrowserDetach === "function") bridge.aiBrowserDetach();
+							} catch (error) {
+								/* 面板正在收起，什么都不做 */
+							}
+						}
+						return;
+					}
+					// 只有「正在显示」时才上报矩形：浏览器没开的时候上报会让原生
+					// 把它显示出来（applyEmbedRect 末尾会 setVisibility(VISIBLE)），
+					// 于是用户一打开侧栏 tab，浏览器就自己冒出来了。
+					if (!liveRef.current) return;
 					if (payload === lastPayload) return;
 					lastPayload = payload;
 					try {
 						bridge.aiBrowserLayout(payload);
-						if (!reported) {
-							reported = true;
-							setPhase("live");
-						}
 					} catch (error) {
 						console.warn("[dsh-android-browser-pane] 上报面板矩形失败:", error && error.message);
 					}
@@ -134,26 +178,81 @@ window.__ModuleLoader__.load({
 					if (raf) return;
 					raf = window.requestAnimationFrame(measure);
 				};
+				scheduleRef.current = schedule;
+
+				/** 原生通知浏览器开了 / 关了。 */
+				const onState = (event) => {
+					const visible = !!(event && event.detail && event.detail.visible);
+					liveRef.current = visible;
+					lastPayload = "";
+					setPhase(visible ? "live" : "idle");
+					// 重新变可见时要立刻把矩形补上：面板自己的尺寸没变，
+					// ResizeObserver 不会再触发。
+					if (visible) schedule();
+				};
+
+				window.addEventListener(STATE_EVENT, onState);
 
 				let observer = null;
 				try {
 					observer = new ResizeObserver(schedule);
 					if (slotRef.current) observer.observe(slotRef.current);
 				} catch (error) {
-					// 老内核没有 ResizeObserver：退回轮询（下面那三个定时器）也够用
+					// 老内核没有 ResizeObserver：退回定时测量（下面那几拍）也够用
 					console.warn("[dsh-android-browser-pane] 无 ResizeObserver，退回定时测量");
+				}
+
+				// ⚠️ 收起侧栏时占位元素的**尺寸常常不变**（只是被移出可视区 / 换了
+				//   父容器），ResizeObserver 不会触发，浏览器就会赖在屏幕上不走。
+				//   IntersectionObserver 专门抓「离开可视区」这一种情况。
+				let viewObserver = null;
+				try {
+					viewObserver = new IntersectionObserver((entries) => {
+						for (const entry of entries) {
+							// 完全不可见 + 浏览器正开着 ⇒ 立即 detach
+							if (!entry.isIntersecting && entry.intersectionRatio === 0 && liveRef.current) {
+								liveRef.current = false;
+								setPhase("idle");
+								try {
+									if (typeof bridge.aiBrowserDetach === "function") bridge.aiBrowserDetach();
+								} catch (error) {
+									/* 面板正在卸载，忽略 */
+								}
+								return;
+							}
+						}
+						schedule();
+					}, { threshold: [0, 1] });
+					if (slotRef.current) viewObserver.observe(slotRef.current);
+				} catch (error) {
+					console.warn("[dsh-android-browser-pane] 无 IntersectionObserver，收起侧栏可能不会自动隐藏浏览器");
 				}
 				window.addEventListener("resize", schedule);
 				window.addEventListener("orientationchange", schedule);
+
+				// 挂载时先对齐一次原生状态：AI 可能已经用工具打开了网页，
+				// 用户这时才点开 tab —— 面板得直接进入 live，而不是显示一个按钮。
+				try {
+					if (typeof bridge.aiBrowserState === "function" && bridge.aiBrowserState() === "visible") {
+						liveRef.current = true;
+						setPhase("live");
+					}
+				} catch (error) {
+					/* 老 APK 没有这个方法：按「没开」处理即可 */
+				}
 
 				// 面板打开的动画 / 抽屉滑动不触发 resize，补几拍。
 				schedule();
 				const timers = [80, 200, 420, 900].map((ms) => window.setTimeout(schedule, ms));
 
 				return () => {
+					scheduleRef.current = null;
+					rectPayloadRef.current = null;
 					for (const t of timers) window.clearTimeout(t);
 					if (raf) window.cancelAnimationFrame(raf);
 					if (observer) observer.disconnect();
+					if (viewObserver) viewObserver.disconnect();
+					window.removeEventListener(STATE_EVENT, onState);
 					window.removeEventListener("resize", schedule);
 					window.removeEventListener("orientationchange", schedule);
 					// tab 切走 / 面板卸载：把浏览器收起来（只隐藏，状态保留）。
@@ -165,12 +264,50 @@ window.__ModuleLoader__.load({
 				};
 			}, []);
 
+			/**
+			 * 点「打开」时的动作。
+			 *
+			 * 先切到 live 再上报矩形：`measure` 只在 live 时才肯上报（见上面的
+			 * 注释），所以顺序不能反 —— 反了就是「点了没反应」。
+			 */
+			const openBrowser = () => {
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.openAiBrowser !== "function") return;
+				// ⚠️ 顺序不能反：先把矩形推过去让原生把 WebView 摆到面板上并显示，
+				//   再调 openAiBrowser 加载首页。反过来的话 WebView 会先以
+				//   MATCH_PARENT（全屏）露出来一帧，用户看到一次「闪全屏」。
+				const payload = rectPayloadRef.current ? rectPayloadRef.current() : null;
+				if (payload && typeof bridge.aiBrowserLayout === "function") {
+					try {
+						bridge.aiBrowserLayout(payload);
+					} catch (error) {
+						console.warn("[dsh-android-browser-pane] 摆位失败:", error && error.message);
+					}
+				}
+				openNativeAiBrowser();
+				liveRef.current = true;
+				setPhase("live");
+				// 面板尺寸没变，ResizeObserver 不会再触发 —— 补一拍。
+				if (scheduleRef.current) scheduleRef.current();
+			};
+
 			const note = { fontSize: "12px", lineHeight: 1.65, opacity: 0.72 };
 			const card = {
 				padding: "14px",
 				borderRadius: "12px",
 				background: "rgba(127,127,147,.10)",
 				border: "1px solid rgba(127,127,147,.22)",
+			};
+			const button = {
+				marginTop: "10px",
+				padding: "7px 16px",
+				fontSize: "13px",
+				fontWeight: 600,
+				borderRadius: "999px",
+				border: "1px solid rgba(127,127,147,.34)",
+				background: "transparent",
+				color: "inherit",
+				cursor: "pointer",
 			};
 
 			return e("div", {
@@ -188,13 +325,23 @@ window.__ModuleLoader__.load({
 					ref: slotRef,
 					style: { position: "absolute", left: 0, top: 0, right: 0, bottom: 0 },
 				}),
-				phase === "live" ? null : e("div", { style: Object.assign({}, card, { position: "absolute", left: 0, top: 0, right: 0 }) },
-					e("div", { style: { fontSize: "13.5px", fontWeight: 600, marginBottom: "6px" } }, "AI 浏览器"),
-					phase === "noBridge"
-						? e("div", { style: Object.assign({}, note, { color: "#E0A33A" }) },
-							"这个 APK 的原生桥还没有 aiBrowserLayout —— 面板没法把浏览器嵌进来。")
-						: e("div", { style: note }, "正在把浏览器放到这里…"),
-				),
+				phase === "live"
+					? null
+					: e("div", { style: Object.assign({}, card, { position: "absolute", left: 0, top: 0, right: 0 }) },
+						e("div", { style: { fontSize: "13.5px", fontWeight: 600, marginBottom: "6px" } }, "AI 浏览器"),
+						phase === "noBridge"
+							? e("div", { style: Object.assign({}, note, { color: "#E0A33A" }) },
+								"这个 APK 的原生桥还没有 aiBrowserLayout —— 面板没法把浏览器嵌进来。")
+							: e("div", { style: note },
+								"这台浏览器跑在你自己的手机上，登录状态会保留。AI 可以直接用它上网、登录、填表单；你也可以随时从顶部状态按钮接管。"),
+						phase === "noBridge"
+							? null
+							: e("button", {
+								type: "button",
+								style: button,
+								onClick: openBrowser,
+							}, "打开浏览器"),
+					),
 			);
 		}
 

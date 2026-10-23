@@ -1299,6 +1299,7 @@ class MainActivity : AppCompatActivity() {
         view.bringToFront()
         if (url != null) view.loadUrl(url)
         else if (view.currentUrl().isEmpty()) view.loadUrl(com.dsh.android.browser.AiBrowserView.HOME_URL)
+        notifyBrowserPane(visible = true)
         Log.i(DshApplication.TAG, "AI 浏览器已打开: ${view.currentUrl()}")
     }
 
@@ -1306,10 +1307,34 @@ class MainActivity : AppCompatActivity() {
     private fun workspaceDir(): java.io.File =
         java.io.File(filesDir, "workspace").apply { if (!exists()) mkdirs() }
 
-    /** 关闭 AI 浏览器（只隐藏，保留页面状态与登录态，下次打开还是原样）。 */
+    /**
+     * 关闭 AI 浏览器（只隐藏，保留页面状态与登录态，下次打开还是原样）。
+     *
+     * ⚠️ **必须反向通知前端。** 侧栏面板是靠「自己量出矩形 → 上报 → 原生把
+     *   WebView 摆过去」显示的，它并不知道原生这边被关了。不通知的话，用户点
+     *   ✕ 之后面板会留在一片空白里（浏览器没了，占位区域还在），而且再点也没
+     *   反应 —— 他得先关掉整个 tab 再重新打开。
+     */
     fun closeAiBrowser() {
         aiBrowser?.visibility = View.GONE
+        notifyBrowserPane(visible = false)
         Log.i(DshApplication.TAG, "AI 浏览器已隐藏")
+    }
+
+    /**
+     * 把浏览器可见性告诉侧栏面板（原生 → 前端）。
+     *
+     * 走 `window` 上的自定义事件，而不是让面板轮询：面板在 `useEffect` 里挂
+     * 一个监听就行，原生这边只有一个 `evaluateJavascript`。
+     *
+     * ⚠️ 事件名 `dsh:browser-state` 与插件 `lib/client.js` 里的常量必须一致。
+     */
+    private fun notifyBrowserPane(visible: Boolean) {
+        if (!::web.isInitialized) return
+        val script = "window.dispatchEvent(new CustomEvent('dsh:browser-state'," +
+            "{detail:{visible:$visible}}))"
+        runCatching { web.evaluateJavascript(script, null) }
+            .onFailure { Log.w(DshApplication.TAG, "通知侧栏面板失败: ${it.message}") }
     }
 
     /** AI 浏览器是否正在显示。 */
@@ -2023,6 +2048,18 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        /**
+         * 查询 AI 浏览器当前是否显示 —— 面板挂载时用它对齐状态。
+         *
+         * 面板可能晚于浏览器挂载（AI 先用工具打开了网页，用户才点开侧栏 tab），
+         * 这时面板的本地状态是「未打开」，但浏览器其实已经在屏幕上。不查询就
+         * 会出现「浏览器盖着网页、侧栏面板却显示一个打开按钮」。
+         *
+         * @return `"visible"` / `"hidden"`。
+         */
+        override fun aiBrowserState(): String =
+            if (isAiBrowserVisible()) "visible" else "hidden"
 
         override fun aiBrowserDetach() {
             // 只隐藏，不销毁：页面状态与登录态保留，下次开 tab 还是原样。

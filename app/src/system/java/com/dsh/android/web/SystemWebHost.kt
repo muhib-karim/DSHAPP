@@ -609,6 +609,9 @@ private class SystemPageBridge(private val impl: PageBridge) {
     @android.webkit.JavascriptInterface
     fun aiBrowserDetach() = impl.aiBrowserDetach()
 
+    @android.webkit.JavascriptInterface
+    fun aiBrowserState(): String = impl.aiBrowserState()
+
     // ── 甩动手感三开关（见「悬浮气泡」设置页）────────────────────────────
     // ⚠️ 与 gecko 版白名单必须逐条对齐，两边方法名少一个就是「点了没反应」。
     @android.webkit.JavascriptInterface

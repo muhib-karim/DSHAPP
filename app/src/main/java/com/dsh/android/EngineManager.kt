@@ -2288,7 +2288,7 @@ class EngineManager private constructor(private val context: Context) {
             }
             Log.i(TAG, "已安装侧栏浏览器入口插件 $BROWSER_PANE_PACKAGE (${clientJs.length()} 字节)")
         } catch (t: Throwable) {
-            // 装不上就只是侧栏里少一项（右边缘把手仍在），不该拖垮启动
+            // 装不上就只是侧栏里少一项（没有别的入口可退，但启动不该因此失败）
             Log.w(TAG, "安装侧栏浏览器入口插件失败: ${t.message}")
         }
     }
