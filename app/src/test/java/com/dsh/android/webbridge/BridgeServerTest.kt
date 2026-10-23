@@ -97,6 +97,25 @@ class BridgeServerTest {
         assertTrue(!text.contains("<tool_call>"))
     }
 
+    @Test fun dsmlSplitAcrossChunksComesBackAsToolCalls() {
+        val dsml = "Let me check.<｜DSML｜function_calls><｜DSML｜invoke name=\"bash\">" +
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"
+        // Chunk boundaries inside tags, the bar and the parameter value, as the web stream may cut them.
+        val cuts = listOf(15, 17, 40, 41, 90, 120)
+        reply = { _, _, on ->
+            var from = 0
+            for (cut in cuts + dsml.length) { on(WebDelta.Text(dsml.substring(from, cut))); from = cut }
+            on(WebDelta.Finished)
+        }
+        val body = """{"model":"deepseek-web-chat","stream":true,"messages":[{"role":"user","content":"Hi"}],"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}}]}"""
+        val (_, text) = call("/v1/chat/completions", body)
+        assertTrue(text, text.contains("\"tool_calls\""))
+        assertTrue(text.contains("\"name\":\"bash\""))
+        assertTrue(text.contains("\"finish_reason\":\"tool_calls\""))
+        assertTrue(text.contains("Let me check."))
+        assertTrue(text, !text.contains("DSML"))
+    }
+
     @Test fun expiredSessionIs401WithAClearMessage() {
         reply = { _, _, _ -> throw WebServiceError(40003, "expired") }
         val (code, body) = call("/v1/chat/completions", chat)

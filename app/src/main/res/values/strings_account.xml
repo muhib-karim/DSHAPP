@@ -27,11 +27,11 @@
     <string name="login_close">Close</string>
     <string name="login_google_hint">Google won\'t open here?</string>
     <string name="login_use_browser">Use your browser</string>
-    <string name="login_browser_steps">1. Sign in at chat.deepseek.com in your browser (Google works there).\n2. Copy the bookmark below, save it as a bookmark, and open it on chat.deepseek.com.\n3. Tap "Open in DSH", or copy the session and paste it here.</string>
+    <string name="login_browser_steps">1. Tap \"Copy bookmarklet code\" and save it as a browser bookmark named \"DSH Handoff\" (step-by-step guide below).\n2. Sign in at chat.deepseek.com in your browser (Google works there), then open the bookmark.\n3. Tap \"Open in DSH\", or tap \"Copy session instead\" and paste it here.</string>
     <string name="login_open_browser">Open chat.deepseek.com</string>
-    <string name="login_copy_bookmark">Copy bookmark</string>
+    <string name="login_copy_bookmark">Copy bookmarklet code</string>
     <string name="login_paste_hint">Paste session</string>
-    <string name="login_bookmark_copied">Bookmark copied. Save it in your browser\'s bookmarks.</string>
+    <string name="login_bookmark_copied">Bookmarklet code copied. Save it as a bookmark named \"DSH Handoff\" (see the guide below).</string>
     <string name="login_switch_account">Choose another account on the page, or use your browser. Closing keeps your current DSH account.</string>
     <string name="login_save_failed">Could not save the account. Try again.</string>
     <string name="login_checking">Signing in…</string>
@@ -40,5 +40,16 @@
     <string name="login_offline">Could not reach chat.deepseek.com. Check your connection.</string>
     <string name="login_confirm_account">Sign in to DSH as %1$s?</string>
     <string name="login_bad_paste">That is not a DeepSeek session.</string>
+    <string name="login_link_title">Use this DeepSeek session?</string>
+    <string name="login_link_confirm">Sign in to DSH as %1$s?\n\nThis link did not come from a sign-in started in DSH. Continue only if you just tapped \"Open in DSH\" yourself.</string>
+    <string name="login_guide_title">How to set up the \"DSH Handoff\" bookmark</string>
+    <string name="login_guide_android_title">Android Chrome</string>
+    <string name="login_guide_android">1. Tap \"Copy bookmarklet code\" above.\n2. Open Chrome and go to chat.deepseek.com.\n3. Tap the ⋮ menu, then tap ☆ to bookmark the page.\n4. Tap Edit (on the \"Bookmarked\" message, or long-press the bookmark under Bookmarks), rename it to \"DSH Handoff\", replace the URL with the copied code, and tap Save.\n\nTo run it: be signed in on chat.deepseek.com, tap the address bar, type \"DSH Handoff\" and tap the suggestion with the STAR icon (not a search suggestion). A panel appears at the bottom of the page with \"Open in DSH\" and \"Copy session instead\".\n\nNote: Chrome removes \"javascript:\" if you paste the code into the address bar, so it only works as a bookmark.</string>
+    <string name="login_guide_desktop_title">Desktop (Chrome, Edge, Firefox)</string>
+    <string name="login_guide_desktop">1. Get the bookmarklet code onto your computer (for example, send the copied code to yourself).\n2. Right-click the bookmarks bar and choose Add page or Add bookmark.\n3. Name it \"DSH Handoff\", paste the code as the URL, and save.\n4. Open chat.deepseek.com signed in and click the bookmark. On a computer, tap \"Copy session instead\", then paste the session into this app\'s \"Paste session\" field.</string>
+    <string name="login_guide_buttons_title">The two buttons</string>
+    <string name="login_guide_buttons">• \"Open in DSH\" opens this app on the phone and passes the session directly. If you did not start from the app first, DSH shows the account and asks before using it.\n• \"Copy session instead\" copies the session so you can paste it into the \"Paste session\" field above. Use it if the link does not open the app.</string>
+    <string name="login_guide_security_title">Security</string>
+    <string name="login_guide_security">The session is a live sign-in credential for your DeepSeek account. Use it only on your own device and never share it with anyone.</string>
     <string name="shortcut_account">DeepSeek account</string>
 </resources>

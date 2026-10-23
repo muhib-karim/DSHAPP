@@ -74,6 +74,69 @@ class OpenAiMappingTest {
         assertEquals(2, calls.map { it.id }.toSet().size)
     }
 
+    @Test fun dsmlInvokesBecomeToolCalls() {
+        val reply = "Checking.\n<｜DSML｜function_calls>\n" +
+            "<｜DSML｜invoke name=\"bash\">\n" +
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la /tmp && echo \"ok\"</｜DSML｜parameter>\n" +
+            "<｜DSML｜parameter name=\"description\" string=\"true\">List files</｜DSML｜parameter>\n" +
+            "</｜DSML｜invoke>\n" +
+            "<｜DSML｜invoke name=\"read_file\">\n" +
+            "<｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n" +
+            "<｜DSML｜parameter name=\"limit\" string=\"false\">20</｜DSML｜parameter>\n" +
+            "<｜DSML｜parameter name=\"opts\" string=\"false\">{\"raw\": true}</｜DSML｜parameter>\n" +
+            "</｜DSML｜invoke>\n" +
+            "</｜DSML｜function_calls>"
+        val (text, calls) = OpenAiMapping.parseToolCalls(reply)
+        assertEquals("Checking.", text)
+        assertEquals(listOf("bash", "read_file"), calls.map { it.name })
+        val bash = JSONObject(calls[0].arguments)
+        assertEquals("ls -la /tmp && echo \"ok\"", bash.getString("command"))
+        assertEquals("List files", bash.getString("description"))
+        val read = JSONObject(calls[1].arguments)
+        assertEquals("a.txt", read.getString("path"))
+        assertEquals(20, read.getInt("limit"))
+        assertEquals(true, read.getJSONObject("opts").getBoolean("raw"))
+        assertEquals(2, calls.map { it.id }.toSet().size)
+    }
+
+    @Test fun dsmlToleratesAsciiBarsSpacesAndTheShortWrapper() {
+        // As seen on a phone: spaces inside the tags, `calls` instead of `function_calls`, ASCII and fullwidth bars.
+        val reply = "< ｜DSML｜ invoke name=\"bash\">< ｜DSML｜ parameter name=\"command\" string=\"true\">echo hi</ ｜DSML｜ parameter>" +
+            "</ ｜DSML｜ invoke>< |DSML| invoke name=\"glob\"><|DSML|parameter name=\"pattern\">*.svg</|DSML|parameter></|DSML|invoke>" +
+            "</｜DSML｜calls>"
+        val (text, calls) = OpenAiMapping.parseToolCalls(reply)
+        assertEquals("", text)
+        assertEquals(listOf("bash", "glob"), calls.map { it.name })
+        assertEquals("echo hi", JSONObject(calls[0].arguments).getString("command"))
+        assertEquals("*.svg", JSONObject(calls[1].arguments).getString("pattern"))
+    }
+
+    @Test fun dsmlStringFalseThatIsNotJsonStaysAString() {
+        val (_, calls) = OpenAiMapping.parseToolCalls(
+            "<｜DSML｜invoke name=\"t\"><｜DSML｜parameter name=\"n\" string=\"false\">12 apples</｜DSML｜parameter></｜DSML｜invoke>"
+        )
+        assertEquals("12 apples", JSONObject(calls.single().arguments).getString("n"))
+    }
+
+    @Test fun dsmlWithoutANameOrInvokeStaysText() {
+        val noName = "<｜DSML｜invoke name=\" \"><｜DSML｜parameter name=\"a\">b</｜DSML｜parameter></｜DSML｜invoke>"
+        val (text, calls) = OpenAiMapping.parseToolCalls(noName)
+        assertTrue(calls.isEmpty())
+        assertEquals(noName, text)
+        val talk = "The marker <｜DSML｜function_calls> is how DeepSeek writes tools."
+        assertEquals(talk to emptyList<OpenAiMapping.ToolCall>(), OpenAiMapping.parseToolCalls(talk))
+    }
+
+    @Test fun toolCallBlocksAndDsmlInOneReply() {
+        val (text, calls) = OpenAiMapping.parseToolCalls(
+            "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>" +
+                "<｜DSML｜function_calls><｜DSML｜invoke name=\"b\"></｜DSML｜invoke></｜DSML｜function_calls>"
+        )
+        assertEquals("", text)
+        assertEquals(listOf("a", "b"), calls.map { it.name })
+        assertEquals("{}", calls[1].arguments)
+    }
+
     @Test fun malformedBlocksStayText() {
         val (text, calls) = OpenAiMapping.parseToolCalls("<tool_call>{not json}</tool_call> ok")
         assertTrue(calls.isEmpty())

@@ -2,6 +2,7 @@ package com.dsh.android.webbridge
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.security.SecureRandom
 
 /**
@@ -67,7 +68,10 @@ object OpenAiMapping {
         return WebPrompt(head + body + tail, thinking, false, tools != null)
     }
 
-    /** Splits `<tool_call>` blocks out of a reply; malformed blocks stay in the text. */
+    /**
+     * Splits `<tool_call>` blocks, then DeepSeek's own DSML tool-call markup ([parseDsml]), out of a reply; malformed
+     * blocks stay in the text.
+     */
     fun parseToolCalls(reply: String): Pair<String, List<ToolCall>> {
         val calls = mutableListOf<ToolCall>()
         val text = TOOL_BLOCK.replace(reply) { match ->
@@ -83,8 +87,45 @@ object OpenAiMapping {
             calls += ToolCall("call_" + randomId(), name, args)
             ""
         }
-        return text.trim() to calls
+        return parseDsml(text, calls).trim() to calls
     }
+
+    /**
+     * The web model sometimes ignores the `<tool_call>` protocol and answers in its native DSML markup:
+     * `<｜DSML｜function_calls><｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>
+     * </｜DSML｜invoke></｜DSML｜function_calls>`. Each well-formed invoke becomes a [ToolCall] appended to [calls]; the
+     * bar may be fullwidth (U+FF5C) or ASCII, tags may carry spaces, the wrapper may be `function_calls` or `calls`.
+     * `string="false"` parameters are JSON values (number, boolean, object, array), anything else is a string. An invoke
+     * without a name stays in the text. The bridge parses only complete replies, so tags split across stream chunks
+     * are whole by the time this runs.
+     */
+    private fun parseDsml(text: String, calls: MutableList<ToolCall>): String {
+        if (!DSML_MARK.containsMatchIn(text)) return text
+        var found = false
+        val rest = DSML_INVOKE.replace(text) { match ->
+            val name = match.groupValues[1].trim()
+            if (name.isEmpty()) return@replace match.value
+            val args = JSONObject()
+            for (param in DSML_PARAM.findAll(match.groupValues[2])) {
+                val key = param.groupValues[1].trim()
+                if (key.isEmpty()) continue
+                val raw = param.groupValues[3].trim('\n', '\r')
+                val json = DSML_STRING_ATTR.find(param.groupValues[2])?.groupValues?.get(1)?.lowercase() == "false"
+                args.put(key, if (json) jsonValue(raw) else raw)
+            }
+            calls += ToolCall("call_" + randomId(), name, args.toString())
+            found = true
+            ""
+        }
+        return if (found) DSML_WRAPPER.replace(rest, "") else text
+    }
+
+    /** A `string="false"` value as JSON; text that is not exactly one JSON value stays a string. */
+    private fun jsonValue(raw: String): Any = runCatching {
+        val tokener = JSONTokener(raw.trim())
+        val value = tokener.nextValue()
+        if (tokener.nextClean() == 0.toChar()) value else raw
+    }.getOrDefault(raw)
 
     fun completionJson(id: String, model: String, created: Long, text: String, reasoning: String,
                        calls: List<ToolCall>, promptTokens: Int, completionTokens: Int): JSONObject {
@@ -156,4 +197,18 @@ object OpenAiMapping {
     private val random = SecureRandom()
     private fun randomId() = (1..16).map { "abcdefghijklmnopqrstuvwxyz0123456789"[random.nextInt(36)] }.joinToString("")
     private val TOOL_BLOCK = Regex("<tool_call>(.*?)</tool_call>", RegexOption.DOT_MATCHES_ALL)
+
+    /** `｜DSML｜` with a fullwidth or ASCII bar and optional spaces, as the web model writes it. */
+    private const val DSML_BAR = """\s*[｜|]+\s*DSML\s*[｜|]+\s*"""
+    private val DSML_MARK = Regex("""[｜|]\s*DSML\s*[｜|]""")
+    private val DSML_INVOKE = Regex(
+        """<${DSML_BAR}invoke\s+name\s*=\s*"([^"]*)"\s*>(.*?)<\s*/${DSML_BAR}invoke\s*>""",
+        RegexOption.DOT_MATCHES_ALL,
+    )
+    private val DSML_PARAM = Regex(
+        """<${DSML_BAR}parameter\s+name\s*=\s*"([^"]*)"((?:\s+[A-Za-z_-]+\s*=\s*"[^"]*")*)\s*>(.*?)<\s*/${DSML_BAR}parameter\s*>""",
+        RegexOption.DOT_MATCHES_ALL,
+    )
+    private val DSML_STRING_ATTR = Regex("""string\s*=\s*"(true|false)"""", RegexOption.IGNORE_CASE)
+    private val DSML_WRAPPER = Regex("""<\s*/?${DSML_BAR}(?:function_)?calls\s*>""")
 }

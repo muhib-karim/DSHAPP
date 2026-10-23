@@ -38,6 +38,25 @@ class WebTokenTest {
         assertNull(WebToken.fromLink(token, start, start - 1))
     }
 
+    @Test fun coldOrLateLinksAreKeptButMarkedNotFromTheApp() {
+        val token = "a".repeat(40)
+        val start = 1_000_000L
+        assertEquals(WebToken.Link(token, fromApp = true), WebToken.classifyLink(token, start, start + 60_000))
+        // Bookmark run without starting from the app, or after the window: still usable, after the user confirms.
+        assertEquals(WebToken.Link(token, fromApp = false), WebToken.classifyLink(token, null, start))
+        assertEquals(WebToken.Link(token, fromApp = false), WebToken.classifyLink(token, start, start + WebToken.WINDOW_MILLIS + 1))
+        assertEquals(WebToken.Link(token, fromApp = false), WebToken.classifyLink(token, start, start - 1))
+        assertNull(WebToken.classifyLink("not a token", start, start))
+        assertNull(WebToken.classifyLink(null, null, start))
+    }
+
+    @Test fun bookmarkletKeepsItsPanelButtonsAndFollowsTheGeckoPackage() {
+        val js = java.net.URLDecoder.decode(WebToken.bookmarklet("com.mkdsh.gecko").removePrefix("javascript:").replace("+", "%2B"), "UTF-8")
+        assertTrue(js.contains("btn('Open in DSH')"))
+        assertTrue(js.contains("btn('Copy session instead')"))
+        assertTrue(js.contains("package=com.mkdsh.gecko;S.token="))
+    }
+
     @Test fun bookmarkletTargetsThisPackageOnly() {
         val b = WebToken.bookmarklet("com.mkdsh.droid")
         assertTrue(b.startsWith("javascript:"))

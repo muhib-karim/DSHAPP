@@ -20,6 +20,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.dsh.android.MainActivity
 import com.dsh.android.R
 import com.dsh.android.account.AccountChanges
 import com.dsh.android.account.AccountConfig
@@ -73,7 +74,7 @@ class DeepSeekLoginActivity : AppCompatActivity() {
         binding.btnOpenBrowser.setOnClickListener { openBrowser() }
         binding.btnCopyBookmark.setOnClickListener {
             val clip = getSystemService(ClipboardManager::class.java)
-            clip?.setPrimaryClip(ClipData.newPlainText("DSH bookmark", WebToken.bookmarklet(packageName)))
+            clip?.setPrimaryClip(ClipData.newPlainText("DSH Handoff", WebToken.bookmarklet(packageName)))
             Toast.makeText(this, R.string.login_bookmark_copied, Toast.LENGTH_LONG).show()
         }
         binding.btnPasteContinue.setOnClickListener {
@@ -92,12 +93,13 @@ class DeepSeekLoginActivity : AppCompatActivity() {
     private fun handleLink(intent: Intent?): Boolean {
         val data = intent?.data ?: return false
         if (data.scheme != WebToken.LINK_SCHEME || data.host != WebToken.LINK_HOST) return false
-        val token = WebToken.fromLink(intent.getStringExtra(WebToken.EXTRA_TOKEN), store.browserSignInStartedAt, System.currentTimeMillis())
+        val link = WebToken.classifyLink(intent.getStringExtra(WebToken.EXTRA_TOKEN), store.browserSignInStartedAt, System.currentTimeMillis())
         // One link per browser sign-in: another app or page cannot keep sending sessions inside the window.
         store.browserSignInStartedAt = null
         showBrowserRoute()
-        // A link can come from anything on the phone, so its account is shown and confirmed before it is used.
-        if (token == null) status(getString(R.string.login_bad_paste)) else verify(token, confirm = true)
+        // A link can come from anything on the phone, so its account is shown and confirmed before it is used; a link
+        // that did not follow a sign-in started here (bookmark run on its own, or after 30 minutes) says so.
+        if (link == null) status(getString(R.string.login_bad_paste)) else verify(link.token, confirm = true, fromApp = link.fromApp)
         return true
     }
 
@@ -166,7 +168,7 @@ class DeepSeekLoginActivity : AppCompatActivity() {
         runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(WebToken.SIGN_IN_URL))) }
     }
 
-    private fun verify(token: String, confirm: Boolean = false) {
+    private fun verify(token: String, confirm: Boolean = false, fromApp: Boolean = true) {
         val pending = attempt ?: return
         if (isFinishing || isDestroyed || !pending.isCurrent || verifying || token == lastRejected) return
         verifying = true
@@ -185,8 +187,8 @@ class DeepSeekLoginActivity : AppCompatActivity() {
                     confirm -> {
                         verifying = true
                         AlertDialog.Builder(this)
-                        .setTitle(R.string.login_title)
-                        .setMessage(getString(R.string.login_confirm_account, WebToken.label(user)))
+                        .setTitle(if (fromApp) R.string.login_title else R.string.login_link_title)
+                        .setMessage(getString(if (fromApp) R.string.login_confirm_account else R.string.login_link_confirm, WebToken.label(user)))
                         .setPositiveButton(R.string.signin_key_continue) { _, _ -> accept(token, user) }
                         .setNegativeButton(R.string.login_close) { _, _ -> status(getString(R.string.login_failed)) }
                         .setOnDismissListener { verifying = false }
@@ -223,6 +225,8 @@ class DeepSeekLoginActivity : AppCompatActivity() {
             DshLog.i("DSH", "DeepSeek web account signed in")
             thread(name = "web-sign-in-apply") { SignInActivity.restartEngine(app) }
             setResult(RESULT_OK)
+            // Opened straight from the browser link with the app closed: continue into the app, not back to the browser.
+            if (isTaskRoot) startActivity(Intent(this, MainActivity::class.java))
             finish()
         }
     }

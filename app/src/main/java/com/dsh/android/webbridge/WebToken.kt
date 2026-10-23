@@ -52,6 +52,19 @@ object WebToken {
     fun fromLink(extra: String?, startedAtMillis: Long?, nowMillis: Long): String? =
         if (startedAtMillis != null && nowMillis >= startedAtMillis && nowMillis - startedAtMillis <= WINDOW_MILLIS) parse(extra) else null
 
+    /** A session from an `mkdsh://session` link; [fromApp] when it follows a browser sign-in this app started. */
+    data class Link(val token: String, val fromApp: Boolean)
+
+    /**
+     * Any well-formed session from the link, so a bookmark run without starting from the app still works. The caller
+     * always shows the account and asks before using it; [Link.fromApp] = false makes that question say the link did
+     * not follow a sign-in started in DSH.
+     */
+    fun classifyLink(extra: String?, startedAtMillis: Long?, nowMillis: Long): Link? {
+        val token = parse(extra) ?: return null
+        return Link(token, fromLink(extra, startedAtMillis, nowMillis) != null)
+    }
+
     /**
      * Bookmark for the browser route. On chat.deepseek.com it adds two buttons: one opens this app (an explicit intent
      * to [packageName] only) with the session, one copies it for the app's paste field. It sends nothing anywhere.
