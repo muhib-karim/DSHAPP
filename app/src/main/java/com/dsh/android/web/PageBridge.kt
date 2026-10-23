@@ -168,6 +168,20 @@ interface PageBridge {
     fun bubbleRequestOverlay()
 
     /**
+     * 打开 **AI 浏览器**（官方右侧边栏里的「AI 浏览器」面板调用）。
+     *
+     * 没有返回值是**刻意**的：gecko 版的桥走 `postMessage` 异步派发，回传值要多
+     * 绕一层；而页面侧不需要知道结果（浏览器要么弹出来、要么不弹，用户看得见）。
+     * 保持 void 让两个 flavor 的白名单能逐条对齐。
+     *
+     * ⚠️ 往这里加方法**必须同步加进两份白名单**（`SystemWebHost` 的
+     *   `@JavascriptInterface` 与 `GeckoWebHost.dispatchInvoke`），否则页面侧
+     *   `window.DSHAndroid.openAiBrowser` 是 undefined，表现为「点了没反应」，
+     *   而原生日志一切正常。0.3.3 的 keyboardAvoid 就是这么漏的。
+     */
+    fun openAiBrowser()
+
+    /**
      * 读「键盘避让」状态。返回 JSON：`{"enabled":bool,"a11y":bool}`。
      *
      * 两个字段是**两件独立的事实**，不要合并：

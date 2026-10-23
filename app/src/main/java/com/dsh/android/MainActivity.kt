@@ -2023,6 +2023,14 @@ class MainActivity : AppCompatActivity() {
          *   `requestPermissions` 对它无效），只能把用户送到这个设置页手动开。
          *   个别 ROM 没有这个 Activity，所以要 catch 后回落到应用详情页。
          */
+        override fun openAiBrowser() {
+            // 官方右侧边栏的「AI 浏览器」面板点进来。必须在主线程建 View。
+            Log.i(DshApplication.TAG, "侧边栏请求打开 AI 浏览器")
+            // ⚠️ 必须显式写 this@MainActivity：本类是 inner class，直接调
+            //   `openAiBrowser()` 会解析成自己 ⇒ 无限递归（StackOverflow）。
+            runOnUiThread { this@MainActivity.openAiBrowser() }
+        }
+
         override fun bubbleRequestOverlay() {
             Log.i(DshApplication.TAG, "设置页请求悬浮窗授权")
             runOnUiThread {

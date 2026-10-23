@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 31
+        versionCode = 32
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -230,7 +230,25 @@ android {
         //     ⑧ 同批修掉 `type` 动作 JS 里把 `var` 写成 `val` 的致命笔误
         //        （会让所有输入操作抛 `SyntaxError`），已用 node --check 逐段验证
         //        拼接后的五段 JS。
-        versionName = "0.4.0"
+        // ⚠️ 32（本次）**换 versionName：0.4.0 → 0.4.1**。
+        //   0.4.0 的 AI 浏览器入口是**右边缘贴边把手**，不是用户要的位置 ——
+        //   他明确要求「从应用右侧边栏进入」。0.4.1 把它做到官方右侧边栏里。
+        //     ① 新增**客户端插件** `dsh-android-browser-pane`（独立包，8 KB）：
+        //        经 `sidebarRightTabs.register` 注册一种 tab + 经
+        //        `slots.register("sidebar.right.pane.tab")` 提供正文。
+        //        两个接缝缺一不可：少了前者侧栏列表里没有这一项，少了后者
+        //        tab 能开出来但一片空白。
+        //     ② 点开即调原生 `openAiBrowser()`（`PageBridge` 新增方法），
+        //        **两份 flavor 白名单都已同步**（SystemWebHost 的
+        //        `@JavascriptInterface` 与 GeckoWebHost 的 `dispatchInvoke`）——
+        //        0.3.3 的 keyboardAvoid 就是漏了这份白名单，症状是「点了没反应」。
+        //     ③ **为什么不并进 `dsh-android-mobile`**：那个包的 `lib/client.js`
+        //        在 dev / main 两条分支上差 17 万字节，而 `assets/mobile-ui.zip`
+        //        是**跨工作树共享的符号链接资产** —— 重打它会把另一条分支的
+        //        移动端修复整个回退掉。独立成包互不干扰。
+        //     ④ 右边缘把手**暂时保留**：侧栏入口尚无真机验证，留一条退路；
+        //        确认侧栏可用后可以删（见 `ensureBrowserHandle` 的注释）。
+        versionName = "0.4.1"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {

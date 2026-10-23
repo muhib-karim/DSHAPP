@@ -99,6 +99,48 @@ node --check 展开后的.js
 这个坑踩过一次：`type` 动作的 `var v` 写成了 `val v`，导致**所有输入操作**
 静默失败，而编译与日志都没有任何异常。
 
+## 入口：官方右侧边栏
+
+用户要的位置是**官方右侧边栏**里的一项，不是悬浮按钮。这由**独立的客户端插件**
+`dsh-android-browser-pane`（`mobile-ui-plugin/dsh-android-browser-pane/` →
+`assets/browser-pane.zip` → `$DSH_HOME/browser-pane/`）实现。
+
+官方右侧栏的接缝是**两个**，缺一不可：
+
+| 接缝 | 作用 | 缺了会怎样 |
+|---|---|---|
+| `ctx.sidebarRightTabs.register({ id, kind, title, guide })` | 定义一种 tab —— 右侧栏的「+」新建列表与空态引导页会列出 `guide` 里的胶囊 | 列表里根本没有这一项 |
+| `slots.register({ name: "sidebar.right.pane.tab", key })` | 提供这个 tab 的**正文** | tab 能开出来，但一片空白 |
+
+⚠️ `key` 必须等于上面那个 `id` —— 座位按类型 id 找正文。
+
+⚠️ **客户端半的 `inject` 是空数组**（刻意不声明依赖，免得某个服务缺失就让整个
+插件不激活），所以外层 `ctx` 取不到 `slots` / `sidebarRightTabs`
+（`cannot get property ... without inject`）。必须用
+`ctx.inject([...], (scope) => ...)` 开子 fiber，从 `scope` 上取。这是踩过的坑，
+`mobile-ui` 里也有一模一样的注释。
+
+⚠️ **为什么单独成包**：`assets/mobile-ui.zip` 是**跨工作树共享的符号链接资产**，
+dev 分支的 `lib/client.js` 比 main 多 17 万字节。往那个包里加东西就必须重打整包，
+一次重打会把另一条分支的移动端修复整个回退掉。独立成包（8 KB）互不干扰。
+
+⚠️ **这个包必须在引擎启动之前解包**：它是**客户端插件**（`dsh.client` 声明），
+引擎启动时才扫描声明并把客户端代码编进前端 bundle。解晚一步就是「文件在、
+侧栏里没有这一项」，且没有任何报错。
+
+点开侧栏项 ⇒ 客户端调 `window.DSHAndroid.openAiBrowser()` ⇒ 原生
+`PageBridge.openAiBrowser()` ⇒ `MainActivity.openAiBrowser()` ⇒ 全屏 WebView。
+
+⚠️ 往 `PageBridge` 加方法**必须同步改两份白名单**：`SystemWebHost` 的
+`@JavascriptInterface` 与 `GeckoWebHost.dispatchInvoke`。0.3.3 的
+`keyboardAvoid*` 就是漏了这份白名单，症状是「点了没反应」而原生日志一切正常。
+
+### 右边缘把手（过渡期保留）
+
+`MainActivity.ensureBrowserHandle()` 那个 24dp 宽的「浏览」条**是 0.4.0 的产物**，
+在侧栏入口尚无真机验证前留作退路。侧栏确认可用后可以删掉 —— 删的时候一并清理
+`showBrowserHandle` / `hideBrowserHandle` 与 `hideOverlay` 里的调用。
+
 ## 已知边界
 
 - **截图只截可见视口**，不是整页长图。`WebView.draw()` 只能拿到当前画面；
@@ -125,9 +167,12 @@ adb logcat -d -s DSH:I | grep -i "浏览器\|browser"
 期望看到：
 
 ```
+已安装侧栏浏览器入口插件 dsh-android-browser-pane (NNNN 字节)
+已写入侧栏浏览器入口 overlay: browser-pane.patch.yml
 已安装浏览器工具插件 dsh-android-browser (NNNNN 字节)
 已写入浏览器工具 overlay: browser-tool.patch.yml
 [engine] 已注册 browser 工具: /data/user/0/com.dsh.android/files/home/.dsh/browser-cmd.json
+侧边栏请求打开 AI 浏览器
 AI 浏览器实例已创建
 AI 浏览器已打开: https://github.com/
 ```

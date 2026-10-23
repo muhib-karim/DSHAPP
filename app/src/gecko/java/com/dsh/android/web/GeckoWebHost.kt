@@ -674,6 +674,9 @@ class GeckoWebHost(
                     "switchToTcpMode" -> b.switchToTcpMode()
                     "bubbleSetEnabled" -> b.bubbleSetEnabled(args.optBoolean(0))
                     "bubbleRequestOverlay" -> b.bubbleRequestOverlay()
+                    // AI 浏览器（官方右侧边栏的「AI 浏览器」面板）。
+                    // ⚠️ 与 system 版逐条对齐：漏了就「点了没反应」。
+                    "openAiBrowser" -> b.openAiBrowser()
                     // 甩动手感三开关（见「悬浮气泡」设置页）。
                     "bubbleSetThrow" -> b.bubbleSetThrow(args.optBoolean(0))
                     "bubbleSetShake" -> b.bubbleSetShake(args.optBoolean(0))

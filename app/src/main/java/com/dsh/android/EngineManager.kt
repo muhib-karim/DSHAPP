@@ -2250,6 +2250,82 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出**右侧栏「AI 浏览器」入口**插件（`browser-pane.zip` →
+     * `$DSH_HOME/browser-pane/dsh-android-browser-pane/`）。
+     *
+     * 该插件是**客户端插件**（`dsh.client` 声明 + `lib/client.js`），在官方右侧
+     * 边栏里注册一项「AI 浏览器」：点开就调原生 `openAiBrowser()` 打开
+     * [com.dsh.android.browser.AiBrowserView]。
+     *
+     * ## 为什么单独成包，而不是并进 `dsh-android-mobile`
+     *
+     * 那个包的 `lib/client.js` 在 dev 与 main 两条分支上差 17 万字节，而
+     * `assets/mobile-ui.zip` 是**跨工作树共享的符号链接资产** —— 往它里面加东西
+     * 就必须重打整包，一次重打会把另一条分支的移动端修复整个回退掉。
+     * 独立成包互不干扰，代价只是多一个 8 KB 的 zip。
+     *
+     * ⚠️ 与 `bubble-tool` / `uiagent-tool` 那类**工具插件**不同，这个包是
+     *   **客户端插件**：它必须在**引擎启动之前**解包落盘，因为引擎启动时才会
+     *   扫描 `dsh.client` 声明并把客户端代码编进前端 bundle。解晚一步就是
+     *   「文件在、侧栏里没有这一项」，而且没有任何报错。
+     */
+    private fun ensureBrowserPane() {
+        val target = File(dshHome, "$BROWSER_PANE_DIR/$BROWSER_PANE_PACKAGE")
+        val clientJs = File(target, "lib/client.js")
+        try {
+            target.deleteRecursively()
+            java.util.zip.ZipInputStream(context.assets.open(BROWSER_PANE_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(target, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            Log.i(TAG, "已安装侧栏浏览器入口插件 $BROWSER_PANE_PACKAGE (${clientJs.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是侧栏里少一项（右边缘把手仍在），不该拖垮启动
+            Log.w(TAG, "安装侧栏浏览器入口插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载侧栏浏览器入口的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeMobileUiPatch] 完全同构（`file://` 绝对路径 + `insert`）。
+     */
+    private fun writeBrowserPanePatch(): File? {
+        val patch = File(dshHome, BROWSER_PANE_PATCH)
+        val entry = File(dshHome, "$BROWSER_PANE_DIR/$BROWSER_PANE_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "侧栏浏览器入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载右侧栏「AI 浏览器」入口插件；插件包随 APK 分发，已解到 .dsh/${BROWSER_PANE_DIR}。
+                - insert:
+                    - id: $BROWSER_PANE_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入侧栏浏览器入口 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入侧栏浏览器入口 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出 Agnes 多模态插件（`generate_image` / `generate_video` + 多模态配置页）。
      *
      * 与 [ensureMobileUi] 同一套做法、同一套理由：包解到 `$DSH_HOME/agnes-multimodal/`
@@ -6973,6 +7049,11 @@ class EngineManager private constructor(private val context: Context) {
         ensurePickerRoots()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
         ensureMobileUi()
+        // 右侧栏「AI 浏览器」入口（客户端插件）。必须在引擎启动前解包：
+        // 引擎启动时才扫描 dsh.client 声明并编译前端 bundle，晚一步就是
+        // 「文件在、侧栏里没有这一项」，且没有任何报错。
+        ensureBrowserPane()
+        val browserPanePatch = writeBrowserPanePatch()
         // 降级 bundle：polyfill 只补 API，语法缺口得靠换 bundle 覆盖 dist 与各插件。
         // ⚠️ **必须在 ensureMobileUi() 之后**：那一支在版本戳不一致时会
         // `deleteRecursively()` 重解包 mobile-ui 目录，先降级会被它整个抹掉。
@@ -7180,6 +7261,7 @@ class EngineManager private constructor(private val context: Context) {
         //   后应用的覆盖先应用的）。这里的顺序与改造前逐项一致，别顺手调。
         val overlays = listOfNotNull(
             mobileUiPatch,
+            browserPanePatch,
             agnesMmPatch,
             marketPatch,
             sandboxPatch,
@@ -9658,6 +9740,20 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val BROWSER_TOOL_DIR = "browser-tool"
+
+        // ── 右侧栏「AI 浏览器」入口（**客户端插件**）──────────────────────
+        //
+        // 与上面那些**工具插件**不同：这个包不含任何工具，它只在前端注册一个
+        // 右侧栏 tab，点开就调原生 `openAiBrowser()`。所以它必须在**引擎启动前**
+        // 落盘 —— 引擎启动时才扫描 `dsh.client` 声明并编译前端 bundle。
+        //
+        // ⚠️ 单独成包、不复用 `mobile-ui.zip`：那个 zip 是**跨工作树共享的符号
+        //   链接资产**，dev 分支的 `client.js` 比 main 多 17 万字节；重打它会把
+        //   另一条分支的移动端修复整个回退掉。
+        private const val BROWSER_PANE_ASSET = "browser-pane.zip"
+        private const val BROWSER_PANE_PACKAGE = "dsh-android-browser-pane"
+        private const val BROWSER_PANE_PATCH = "browser-pane.patch.yml"
+        private const val BROWSER_PANE_DIR = "browser-pane"
 
         // ── 定向隔离层（L1.5） ────────────────────────────────────────
         //

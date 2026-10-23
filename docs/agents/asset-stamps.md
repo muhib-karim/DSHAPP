@@ -27,6 +27,7 @@
 | `uiagent-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.5） |
 | `logs-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.6） |
 | `browser-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.8） |
+| `browser-pane.zip` | 无需改（每次启动解包覆盖写，见 ⑫.8）。⚠️ 它是**客户端插件**，必须在引擎启动前落盘 |
 | `ui-probe.js` | 无需改（原生每次启动读一次进内存，见 ⑫.5）。⚠️ 但改了语义要同步升 `ui-probe.js` 内部的 `VERSION`（页面上的旧探针靠它判断要不要换） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
