@@ -38,6 +38,7 @@ for (const [kind, update, label, action] of [
   ['app', { status: 'error', canUpdate: true, canInstall: false }, 'Update', 'updateApp'],
   ['app', { status: 'error', canUpdate: false, canInstall: true }, 'Install', 'updateApp'],
   ['app', { status: 'ready', canUpdate: false, canInstall: true }, 'Install', 'updateApp'],
+  ['app', { status: 'cancelled', canUpdate: true, canInstall: false }, 'Update', 'updateApp'],
 ]) test(`${kind} ${update.status} keeps the eligible ${label.toLowerCase()} action available`, () => {
   const { tree, actions } = render({ [kind]: { current: '1.3.0', latest: '1.4.0', ...update } });
   const card = find(tree, (node) => node.props['data-mp-update'] === kind);
@@ -55,6 +56,38 @@ for (const status of ['downloading', 'installing', 'blocked', 'current', 'availa
     assert.equal(find(card, (node) => node.tag === 'button'), undefined);
   });
 }
+
+test('a running download offers cancel instead of update', () => {
+  const { tree, actions } = render({ app: { status: 'downloading', progress: 42, current: '1.3.0', latest: '1.4.0',
+    canUpdate: false, canInstall: false, canCancel: true } });
+  const card = find(tree, (node) => node.props['data-mp-update'] === 'app');
+  const cancel = find(card, (node) => node.props['data-mp-update-action'] === 'cancelAppUpdate');
+  assert.ok(cancel, 'the cancel action is visible while downloading');
+  assert.equal(cancel.children.join(''), 'Cancel download');
+  assert.equal(find(card, (node) => node.props['data-mp-update-action'] === 'updateApp'), undefined,
+    'starting a second download is not offered');
+  cancel.props.onClick();
+  assert.deepEqual(actions, [['cancelAppUpdate', '']]);
+});
+
+test('cancel is hidden unless native reports a cancellable download', () => {
+  for (const update of [
+    { status: 'downloading', canUpdate: false, canInstall: false },
+    { status: 'ready', canUpdate: false, canInstall: true, canCancel: false },
+    { status: 'cancelled', canUpdate: true, canInstall: false, canCancel: false },
+  ]) {
+    const { tree } = render({ app: { ...update, current: '1.3.0', latest: '1.4.0' } });
+    const card = find(tree, (node) => node.props['data-mp-update'] === 'app');
+    assert.equal(find(card, (node) => node.props['data-mp-update-action'] === 'cancelAppUpdate'), undefined);
+  }
+});
+
+test('a cancelled download is labelled as cancelled', () => {
+  const { tree } = render({ app: { status: 'cancelled', current: '1.3.0', latest: '1.4.0', canUpdate: true, canInstall: false } });
+  const card = find(tree, (node) => node.props['data-mp-update'] === 'app');
+  const badge = find(card, (node) => node.tag === 'span');
+  assert.equal(badge.children.join(''), 'Cancelled');
+});
 
 test('harness offers the previous version and confirms before restoring exactly that version', () => {
   const { tree, actions, confirms } = render({ harness: { current: '0.2.3', previous: '0.2.2', canRollback: true,

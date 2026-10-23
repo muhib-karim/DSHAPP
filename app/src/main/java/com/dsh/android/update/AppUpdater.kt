@@ -100,6 +100,17 @@ object AppUpdater {
             !path.contains("..") && !path.contains('%') && !path.contains('\\')
     }.getOrDefault(false)
 
+    /**
+     * Deletes everything left in the app-update cache except [keep] — the APK already handed to the system installer,
+     * which may still be reading it. Returns how many entries were removed; a missing directory removes nothing.
+     */
+    fun cleanUpdateCache(dir: File, keep: File? = null): Int = runCatching {
+        val keepPath = keep?.absolutePath
+        dir.listFiles().orEmpty().count { file ->
+            file.absolutePath != keepPath && runCatching { file.deleteRecursively() }.getOrDefault(false)
+        }
+    }.getOrDefault(0)
+
     /** The lowercase sha256 of [apkName] in a `sha256sum` listing, or null. */
     fun sha256For(sums: String, apkName: String): String? = sums.lineSequence().mapNotNull { line ->
         val m = Regex("^([0-9a-fA-F]{64})\\s+[*]?(?:\\./)?(\\S+)$").find(line.trim()) ?: return@mapNotNull null

@@ -1,14 +1,22 @@
 package com.dsh.android.update
 
-/** Eligibility survives transient errors and an installer cancellation; progress only disables concurrent work. */
-data class UpdateActions(val canUpdate: Boolean, val canInstall: Boolean = false) {
+/**
+ * Eligibility survives transient errors and an installer cancellation; progress only disables concurrent work.
+ * [canCancel] is set only while the app APK is actually downloading, so the page never offers a no-op cancel.
+ */
+data class UpdateActions(
+    val canUpdate: Boolean,
+    val canInstall: Boolean = false,
+    val canCancel: Boolean = false,
+) {
     companion object {
         fun harness(hasOffer: Boolean, status: String, blocked: Boolean) =
             UpdateActions(hasOffer && status != "installing" && !blocked)
 
         fun app(hasOffer: Boolean, status: String, hasVerifiedApk: Boolean): UpdateActions {
-            val available = hasOffer && status != "downloading"
-            return UpdateActions(available && !hasVerifiedApk, available && hasVerifiedApk)
+            val downloading = status == "downloading"
+            val available = hasOffer && !downloading
+            return UpdateActions(available && !hasVerifiedApk, available && hasVerifiedApk, downloading)
         }
 
         /**

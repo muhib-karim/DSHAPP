@@ -45,6 +45,18 @@ object UpdateCenter {
     @Volatile private var release: AppUpdater.Release? = null
     @Volatile private var downloadedApk: AppUpdater.DownloadedApk? = null
 
+    /** Invalidates the app download when the user cancels, so its worker cannot publish a late `ready`/`error`. */
+    private val appDownloads = DownloadGuard()
+
+    /** The active APK connection, disconnected by [cancelAppUpdate]; null between attempts. */
+    @Volatile private var appConnection: HttpURLConnection? = null
+
+    /** The `.part` file of the current attempt; only its own worker or [cancelAppUpdate] deletes it. */
+    @Volatile private var appPartial: File? = null
+
+    /** The verified APK most recently handed to the installer; cache cleanup never deletes it. */
+    @Volatile private var installerApk: File? = null
+
     private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private fun slots(c: Context) = EngineSlots(c.applicationContext.filesDir)
 
@@ -88,6 +100,7 @@ object UpdateCenter {
             })
             .put("message", appMessage).put("progress", appProgress)
             .put("canUpdate", appActions.canUpdate).put("canInstall", appActions.canInstall)
+            .put("canCancel", appActions.canCancel)
         return JSONObject().put("harness", harness).put("app", app)
             .put("checking", checking).put("lastCheck", p.getLong("lastCheck", 0L))
             // Settings > About diagnostics: 0 while the page has not reported its WebView, which the card shows as "—".
@@ -224,66 +237,139 @@ object UpdateCenter {
             }
             return
         }
+        val generation = appDownloads.begin()
         appStatus = "downloading"
         appMessage = ""
         appProgress = 0
         thread(name = "app-update") {
+            var partial: File? = null
             try {
                 val ready = downloadedApk?.takeIf { it.isFor(rel) }
                 if (ready != null && ready.verify() && identityProblem(activity, ready.file) == null) {
-                    appStatus = "ready"
-                    appProgress = 100
-                    activity.runOnUiThread { install(activity, ready.file) }
+                    if (appDownloads.finish(generation) {
+                            installerApk = ready.file
+                            appStatus = "ready"
+                            appProgress = 100
+                        }) activity.runOnUiThread { install(activity, ready.file) }
                     return@thread
                 }
                 // A previously downloaded APK that is missing, changed or no longer matches this app is not reusable.
-                ready?.file?.delete()
+                // A file the installer is already reading is only unlinked (never rewritten) and is kept below.
+                if (ready != null && ready.file.absolutePath != installerApk?.absolutePath) ready.file.delete()
                 downloadedApk = null
-                val dir = File(activity.cacheDir, "updates").apply { deleteRecursively(); mkdirs() }
-                val apk = File(dir, rel.apkName)
+                val dir = File(activity.cacheDir, "updates").apply { mkdirs() }
+                // Only the update cache is cleared, and the verified APK handed to the installer is kept: the package
+                // manager may still be reading it while the user looks at the install screen.
+                AppUpdater.cleanUpdateCache(dir, keep = installerApk)
+                // The bytes go to a generation-specific ".part" file and are renamed only at commit, so a retry can
+                // never truncate the APK an installer is reading and a cancelled attempt can always be deleted.
+                val part = File(dir, rel.apkName + "." + generation + ".part")
+                partial = part
+                appPartial = part
                 val expected = rel.sumsUrl?.let { AppUpdater.sha256For(httpGet(it), rel.apkName) }
                     ?: throw IOException("the release has no checksum for ${rel.apkName}")
+                // Fetching the checksum is another request; a cancel during it must not start the APK transfer.
+                if (!appDownloads.isActive(generation)) return@thread
                 val digest = MessageDigest.getInstance("SHA-256")
                 val conn = open(rel.apkUrl)
+                appConnection = conn
+                var aborted = false
                 try {
                     val total = conn.contentLengthLong.takeIf { it > 0 } ?: rel.apkSize
                     conn.inputStream.use { input ->
-                        apk.outputStream().use { out ->
+                        part.outputStream().use { out ->
                             val buf = ByteArray(64 * 1024)
                             var done = 0L
                             while (true) {
+                                if (!appDownloads.isActive(generation)) { aborted = true; break }
                                 val n = input.read(buf)
                                 if (n < 0) break
                                 out.write(buf, 0, n)
                                 digest.update(buf, 0, n)
                                 done += n
-                                if (total > 0) appProgress = ((done * 100) / total).toInt().coerceIn(0, 100)
+                                if (total > 0) {
+                                    val progress = ((done * 100) / total).toInt().coerceIn(0, 100)
+                                    appDownloads.publish(generation) { appProgress = progress }
+                                }
                             }
                         }
                     }
-                } finally { conn.disconnect() }
+                } finally {
+                    appConnection = null
+                    runCatching { conn.disconnect() }
+                }
+                // Cancelled or superseded while the socket was still unwinding: publish nothing.
+                if (aborted || !appDownloads.isActive(generation)) return@thread
                 val actual = digest.digest().joinToString("") { "%02x".format(it) }
-                if (actual != expected) { apk.delete(); throw IOException("checksum mismatch") }
+                if (actual != expected) throw IOException("checksum mismatch")
                 // The checksum only says the archive is what the release published. It can still be the other flavor
                 // or be signed with another key; verify identity before the installer is allowed to see it.
-                if (identityProblem(activity, apk) != null) {
-                    apk.delete()
-                    appStatus = "error"
-                    appMessage = ApkIdentity.INVALID_MESSAGE
-                    appProgress = -1
+                if (identityProblem(activity, part) != null) {
+                    appDownloads.finish(generation) {
+                        appStatus = "error"
+                        appMessage = ApkIdentity.INVALID_MESSAGE
+                        appProgress = -1
+                    }
                     return@thread
                 }
-                downloadedApk = AppUpdater.DownloadedApk(rel, apk, expected)
-                appStatus = "ready"
-                appProgress = 100
-                activity.runOnUiThread { install(activity, apk) }
+                var complete: File? = null
+                appDownloads.finish(generation) {
+                    val apk = File(dir, rel.apkName)
+                    // Same-directory rename replaces the directory entry; an installer still reading an older APK
+                    // keeps its inode, so installing while a new download finishes is safe.
+                    if (part.renameTo(apk)) {
+                        complete = apk
+                        downloadedApk = AppUpdater.DownloadedApk(rel, apk, expected)
+                        installerApk = apk
+                        appStatus = "ready"
+                        appProgress = 100
+                    } else {
+                        appStatus = "error"
+                        appMessage = "Download failed: could not finish the download"
+                        appProgress = -1
+                    }
+                }
+                complete?.let { apk -> activity.runOnUiThread { install(activity, apk) } }
             } catch (t: Throwable) {
-                DshLog.w(TAG, "app update failed: ${t.message}")
-                appStatus = "error"
-                appMessage = "Download failed: ${t.message}"
-                appProgress = -1
+                // Log and publish only when this attempt still owns the download; after a cancel it must stay silent.
+                appDownloads.finish(generation) {
+                    DshLog.w(TAG, "app update failed: ${t.message}")
+                    appStatus = "error"
+                    appMessage = "Download failed: ${t.message}"
+                    appProgress = -1
+                }
+            } finally {
+                // Only clear the slot if a newer attempt has not already claimed it.
+                if (partial != null && appPartial == partial) appPartial = null
+                if (partial != null && partial.absolutePath != downloadedApk?.file?.absolutePath) {
+                    runCatching { partial.delete() }
+                }
             }
         }
+    }
+
+    /**
+     * Settings > About & updates: stop the APK download. The generation is invalidated before the socket is touched,
+     * so the worker can no longer publish `ready`/`error`; its partial file is deleted and progress resets to unknown.
+     * A verified APK the installer may still be reading is never deleted.
+     */
+    fun cancelAppUpdate(context: Context) {
+        if (!appDownloads.cancel()) return
+        val conn = appConnection
+        appConnection = null
+        val partial = appPartial
+        appPartial = null
+        if (partial != null) runCatching { partial.delete() }
+        AppUpdater.cleanUpdateCache(
+            File(context.applicationContext.cacheDir, "updates"),
+            keep = installerApk ?: downloadedApk?.file,
+        )
+        appStatus = "cancelled"
+        appMessage = "Download cancelled."
+        appProgress = -1
+        DshLog.i(TAG, "app update download cancelled")
+        // disconnect() can block on a stalled socket, so it runs after the observable state is already consistent.
+        if (conn != null) thread(name = "app-update-cancel") { runCatching { conn.disconnect() } }
     }
 
     /**

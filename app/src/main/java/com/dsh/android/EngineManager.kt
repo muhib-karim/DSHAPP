@@ -9245,8 +9245,12 @@ class EngineManager private constructor(private val context: Context) {
           *      外加「打开日志」与「重启引擎」两个动作（重启需确认；原生侧在启动或重启中会忽略）。
           *      只改 `mobileui/lib/client.js`，降级产物随之变化。
           *      ⚠️ 两个戳都 bump（本常量 107 → 108，-CompatVersion 41 → 42）。
+          * 1.0.0-109：设置 > 关于的 App 更新卡新增「取消下载」：下载中可随时取消，进度清零、
+          *      不会弹出迟到的错误；已下载校验通过的 APK 与安装器正在读的文件不会被清理。
+          *      只改 `mobileui/lib/client.js`，降级产物随之变化。
+          *      ⚠️ 两个戳都 bump（本常量 108 → 109，-CompatVersion 42 → 43）。
           */
-        private const val MOBILE_UI_VERSION = "1.0.0-108"
+        private const val MOBILE_UI_VERSION = "1.0.0-109"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

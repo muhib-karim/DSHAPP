@@ -122,4 +122,24 @@ class AppUpdaterTest {
         assertFalse(ready.isFor(rel))
         assertFalse(ready.verify())
     }
+
+    @Test fun cacheCleanupKeepsTheApkTheInstallerMayBeReading() {
+        val dir = tmp.newFolder("updates")
+        val installer = File(dir, "DSH1.3.1-mk.apk").apply { writeText("apk") }
+        val partial = File(dir, "DSH1.4.0-mk.apk.7.part").apply { writeText("partial") }
+        val sums = File(dir, "SHA256SUMS.txt").apply { writeText("sums") }
+        val nested = File(dir, "old").apply { mkdirs() }
+        File(nested, "junk").writeText("junk")
+
+        assertEquals(3, AppUpdater.cleanUpdateCache(dir, keep = installer))
+        assertTrue(installer.isFile)
+        assertFalse(partial.exists())
+        assertFalse(sums.exists())
+        assertFalse(nested.exists())
+        assertTrue(dir.isDirectory)
+    }
+
+    @Test fun cacheCleanupToleratesAMissingDirectory() {
+        assertEquals(0, AppUpdater.cleanUpdateCache(File(tmp.root, "missing")))
+    }
 }

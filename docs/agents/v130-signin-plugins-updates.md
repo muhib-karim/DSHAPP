@@ -13,7 +13,7 @@
 | Opaque UI | `mobile-ui-plugin/dsh-android-mobile/lib/client.js` (`CLEAN_CSS`, `mpApplyOpaqueTokens`, `mpHideWallpaperLayers`), `MainActivity.cutoutTopPx` / `observeFullscreenBottomInset` | `tools/tests/mobile-clean.test.mjs`, `mobile-clean.browser.mjs`, fixture `tools/tests/fixtures/dsh-test-glass-theme` |
 | Settings > Account / Plugins / About & updates | `client.js` (`mpAccountSection`, `mpPluginsSection`, `mpAboutSection`); native side `AppState.kt` through `PageBridge.appState()` / `appAction(name, arg)` | `tools/tests/plugin-list.test.mjs`, `tools/tests/account-expiry.test.mjs`, `tools/tests/account-key.test.mjs` |
 | Live "/" palette | `mobile-ui-plugin/dsh-android-mobile/lib/skill-refresh.js` (re-emits `plugin-manager/changed`) | `tools/tests/skill-refresh.test.mjs` |
-| Updates | `update/Versions.kt`, `EngineSlots.kt`, `HarnessUpdater.kt`, `AppUpdater.kt`, `UpdateCenter.kt`; `EngineManager` hooks `rollBackPendingHarness` / `pendingHarnessReady` / `activateHarnessUpdate` / `activatePreviousHarness` / `runWithEngineEnv` | `VersionsTest`, `EngineSlotsTest`, `HarnessUpdaterTest`, `AppUpdaterTest`, `HarnessActivationTest`, `EngineLifecycleTest`, `UpdateActionsTest` |
+| Updates | `update/Versions.kt`, `EngineSlots.kt`, `HarnessUpdater.kt`, `AppUpdater.kt`, `UpdateCenter.kt`; `EngineManager` hooks `rollBackPendingHarness` / `pendingHarnessReady` / `activateHarnessUpdate` / `activatePreviousHarness` / `runWithEngineEnv` | `VersionsTest`, `EngineSlotsTest`, `HarnessUpdaterTest`, `AppUpdaterTest`, `HarnessActivationTest`, `EngineLifecycleTest`, `UpdateActionsTest`, `DownloadGuardTest` |
 
 ## Rules that are easy to break
 
@@ -46,13 +46,24 @@
    Account card offers **Sign in again** through the existing `accountSwitch` action. Saving a new token, signing out of
    the web account, switching to an API key and a full sign-out all clear the flag. Wrong bearer tokens and other
    upstream errors must not set it.
+10. **A cancelled APK download must stay cancelled.** `DownloadGuard` owns a generation number: `cancelAppUpdate`
+    invalidates it before disconnecting the socket, and the worker publishes progress, `ready` and `error` only from
+    `publish`/`finish` for its own generation. The download goes to a generation-specific `.part` file and is renamed
+    only at commit, so a retry never truncates an APK an installer is reading. Cancelling clears `cache/updates`
+    except the verified APK last handed to the installer, and sets the non-error `cancelled` state that still offers
+    **Update** for a retry. Never delete or rewrite that installer APK while the package manager may be reading it.
 
 ## Tests
 
 ```bash
 node --test tools/tests/*.test.mjs
-./gradlew --no-daemon testSystemDebugUnitTest
+./gradlew --no-daemon testSystemDebugUnitTest testGeckoDebugUnitTest
 ```
+
+Manual cancel check (arm64 device, an APK release is offered): start the download, tap **Cancel download**, and confirm
+the badge turns grey **Cancelled**, progress disappears, no error appears and **Update** remains for a retry. Then start
+again, let it reach **Opening installer**, and while the installer screen is open start another download: the installer
+must still complete, because the verified APK is not deleted or rewritten under it.
 
 ## Pass 2 review
 

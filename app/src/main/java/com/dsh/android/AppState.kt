@@ -61,6 +61,7 @@ object AppState {
             "updateCheck" -> UpdateCenter.check(activity)
             "updateHarness" -> UpdateCenter.updateHarness(activity)
             "updateApp" -> UpdateCenter.updateApp(activity)
+            "cancelAppUpdate" -> UpdateCenter.cancelAppUpdate(activity)
             "openReleasePage" -> openReleasePage(activity)
             "harnessRollback" -> restorePreviousHarness(activity, arg)
             // Settings > About: the host's own log viewer (crashes, engine log, export), not a copy of it in the page.

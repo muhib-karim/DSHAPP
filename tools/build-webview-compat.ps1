@@ -178,7 +178,10 @@ param(
     # v42：设置 > 关于新增「诊断信息」卡片（`mobileui/lib/client.js`）——
     #      App/Android/设备/ABI/WebView 标签 + 「打开日志」「重启引擎」动作。
     #      改的是降级编译的输入，必须与 `MOBILE_UI_VERSION`（1.0.0-108）一起 bump。
-    [string]$CompatVersion = "42",
+    # v43：App 更新卡新增「取消下载」（`mobileui/lib/client.js`）——下载中显示取消按钮，
+    #      取消后状态为「已取消」而非错误，仍可重试。
+    #      改的是降级编译的输入，必须与 `MOBILE_UI_VERSION`（1.0.0-109）一起 bump。
+    [string]$CompatVersion = "43",
 
     [string]$EngineBin,
     [string]$OutZip

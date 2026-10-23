@@ -60,7 +60,10 @@ section goes back to the one before it (after a confirmation and a restart). The
 repository's GitHub releases (checksum verified, and the archive's package name and signing certificate are checked
 against the installed app before the installer opens, so a wrong download is refused and can be retried).
 The release notes expand as plain text in the card (long notes are truncated), and **Release page** opens this
-repository's GitHub release — the page cannot supply a different URL.
+repository's GitHub release — the page cannot supply a different URL. While the APK is downloading, **Cancel
+download** closes the active connection, resets progress and discards the abandoned attempt's result, so no late
+error appears. Cancelling also clears stale update-cache files but keeps the verified APK an installer may still be
+reading, so an install already in progress is not interrupted and the download can be started again.
 
 The same card lists the app version and build, Android release, device, ABI and WebView version for bug reports.
 **Open logs** opens the app's own log viewer; **Restart engine** restarts after one confirmation, and a request made

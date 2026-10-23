@@ -9781,6 +9781,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			ready: "Opening installer",
 			blocked: "Not available here",
 			failed: "Failed",
+			cancelled: "Cancelled",
+			cancelDownload: "Cancel download",
 			unknown: "Not checked yet",
 			noBridge: "Updates are available in the Android app.",
 			releases: "Release notes",
@@ -9818,6 +9820,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			ready: "正在打开安装程序",
 			blocked: "此设备不可用",
 			failed: "失败",
+			cancelled: "已取消",
+			cancelDownload: "取消下载",
 			unknown: "尚未检查",
 			noBridge: "更新功能仅在 Android App 中可用。",
 			releases: "更新说明",
@@ -9855,8 +9859,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			];
 			const statusText = (u) => ({ current: t("upToDate"), available: t("available"), installing: t("installing"),
 				downloading: t("downloading") + (u.progress >= 0 ? " " + u.progress + "%" : ""), ready: t("ready"), blocked: t("blocked"),
-				error: t("failed") })[u.status] || t("unknown");
-			const tone = (u) => u.status === "available" ? MP_PRIV_TONE.warn : (u.status === "error" || u.status === "blocked") ? MP_PRIV_TONE.off : MP_PRIV_TONE.on;
+				cancelled: t("cancelled"), error: t("failed") })[u.status] || t("unknown");
+			const tone = (u) => u.status === "available" ? MP_PRIV_TONE.warn : (u.status === "error" || u.status === "blocked") ? MP_PRIV_TONE.off : u.status === "cancelled" ? MP_PRIV_TONE.unknown : MP_PRIV_TONE.on;
 			const card = (key, title, u, action) => {
 				u = u || {};
 				const tn = tone(u);
@@ -9873,8 +9877,14 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 						h("summary", { style: S.foldHead }, t("releases")),
 						h("pre", { style: { ...S.note, margin: "8px 0 0", maxHeight: "220px", overflowY: "auto",
 							whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit" } }, u.notes)) : null,
-					u.canUpdate || u.canInstall ? h("div", { style: S.actions },
-						h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } }, t(u.canInstall ? "install" : "update") + " → " + u.latest)) : null,
+					u.canUpdate || u.canInstall || u.canCancel === true ? h("div", { style: S.actions },
+						u.canUpdate || u.canInstall ? h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } },
+							t(u.canInstall ? "install" : "update") + " → " + u.latest) : null,
+						// Cancelling keeps the verified download state native-side; the page only reflects the snapshot.
+						u.canCancel === true ? h("button", { style: S.btn, "data-mp-update-action": "cancelAppUpdate", onClick: () => {
+							mpAppAction("cancelAppUpdate");
+							refresh();
+						} }, t("cancelDownload")) : null) : null,
 					key === "app" && typeof u.page === "string" && u.page ? h("div", { style: S.actions },
 						h("button", { style: S.btn, "data-mp-update-action": "openReleasePage", onClick: () => {
 							mpAppAction("openReleasePage");

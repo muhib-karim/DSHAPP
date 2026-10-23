@@ -20,6 +20,22 @@ class UpdateActionsTest {
         }
     }
 
+    @Test fun onlyADownloadingAppCanBeCancelled() {
+        assertTrue(UpdateActions.app(true, "downloading", false).canCancel)
+        assertTrue(UpdateActions.app(true, "downloading", true).canCancel)
+        for (status in listOf("idle", "error", "cancelled", "ready", "available", "current")) {
+            assertFalse(status, UpdateActions.app(true, status, false).canCancel)
+        }
+        assertFalse(UpdateActions.harness(true, "downloading", false).canCancel)
+    }
+
+    @Test fun aCancelledDownloadKeepsTheRetryAction() {
+        val actions = UpdateActions.app(hasOffer = true, status = "cancelled", hasVerifiedApk = false)
+        assertTrue(actions.canUpdate)
+        assertFalse(actions.canInstall)
+        assertFalse(actions.canCancel)
+    }
+
     @Test fun anActiveDownloadOrAnOldReleaseCannotBeStartedAgain() {
         assertFalse(UpdateActions.app(true, "downloading", false).canUpdate)
         assertFalse(UpdateActions.app(true, "downloading", true).canInstall)
