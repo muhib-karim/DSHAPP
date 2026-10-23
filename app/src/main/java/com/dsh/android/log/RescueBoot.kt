@@ -110,10 +110,10 @@ object RescueBoot {
      */
     enum class Tier(val id: String, val label: String) {
         /** L0 正常启动。 */
-        NORMAL("normal", "正常"),
+        NORMAL("normal", "Normal"),
 
         /** L1 自动隔离：摘掉了可疑的第三方插件，其余照常。 */
-        ISOLATED("isolated", "已隔离可疑插件"),
+        ISOLATED("isolated", "Suspect plugins isolated"),
 
         /**
          * L1.5 定向隔离：定位到了**具体某个**插件并把它禁掉，其余插件全部照常。
@@ -123,13 +123,13 @@ object RescueBoot {
          * 本层级禁的是**引擎条目 id**（写 `quarantine.patch.yml` 的 `disabled: true`）。
          * 两者都命中时以本层级为准 —— 它更精确，且不需要改用户的 `package.json`。
          */
-        QUARANTINED("quarantined", "已隔离坏插件"),
+        QUARANTINED("quarantined", "Broken plugins isolated"),
 
         /** L2 救援启动：不含任何第三方插件的干净 profile。 */
-        RESCUE("rescue", "救援模式"),
+        RESCUE("rescue", "Rescue mode"),
 
         /** L3 安全模式：推开一切 + 重解包。 */
-        SAFE_MODE("safemode", "安全模式"),
+        SAFE_MODE("safemode", "Safe mode"),
         ;
 
         companion object {

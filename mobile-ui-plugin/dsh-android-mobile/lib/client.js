@@ -1179,60 +1179,60 @@ window.__ModuleLoader__.load({
 		// 生成方式：读取两个模块根下各包 package.json 的 description 后逐条译写，见
 		// /root/ui-design/plugin-descs-zh.json（156 条，覆盖全部 182 个插件条目）。
 		const MP_PLUGIN_DESCS = {
-			"./plugins/argfix3.js":"cordis 工具参数扁平化补丁（会话预设 cordis-argfix 自带）", "@deepseek-ai/cordis-plugin-hmr":"cordis 的热模块替换（HMR）插件", "@deepseek-ai/cordis-plugin-timer":"为 cordis 提供定时器服务",
-			"@deepseek-ai/dsh-agent":"Agent 接口、注册表、发起者作用域与事件词汇", "@deepseek-ai/dsh-agent-default-model":"Agent 各入口共用的默认模型选择", "@deepseek-ai/dsh-agent-instructions":"加载工作区 AGENTS.md/CLAUDE.md 指令文件",
-			"@deepseek-ai/dsh-agent-loop":"智能体主循环的具体实现插件", "@deepseek-ai/dsh-agent-presets":"按预设 cordis.yml 文件为每个会话组装智能体", "@deepseek-ai/dsh-api-gateway":"Typert 远程宿主分发器与客户端 API 端点",
-			"@deepseek-ai/dsh-api-remotes":"远程 BFF 装配与 Host 端 Agent／Session 查找策略", "@deepseek-ai/dsh-attachment-local":"DSH_HOME 内按内容寻址的私有附件存储", "@deepseek-ai/dsh-bash-sandbox":"消费沙箱的 bash 执行器实现，逐条命令受限并报告结果",
-			"@deepseek-ai/dsh-client-connection":"连接消费层：上行 HTTP、下行 WebSocket 与可重连的双流", "@deepseek-ai/dsh-client-hmr":"仅开发用的客户端热重载驱动：SSE 帧重建触发 fiber 交换", "@deepseek-ai/dsh-client-locale":"语言插件：Host 侧中英偏好、浏览器回退与命名空间词典",
-			"@deepseek-ai/dsh-client-modules":"客户端模块系统：node 半构建入口图，浏览器半为惰性 CJS 表", "@deepseek-ai/dsh-client-runtime":"客户端核心服务：SlotRegistry 与 SessionRuntime", "@deepseek-ai/dsh-client-ui-agent-preset":"智能体预设界面：后续会话默认值、本会话席位与编排编辑器",
-			"@deepseek-ai/dsh-client-ui-attachment":"对话输入与消息图片插槽的动态附件展示插件", "@deepseek-ai/dsh-client-ui-brand-official":"Web 端侧边栏与对话 Hero 插槽的官方品牌内容", "@deepseek-ai/dsh-client-ui-commands":"客户端命令界面：全局目录缓存、/ 来源与 popupSelect 注册表",
-			"@deepseek-ai/dsh-client-ui-conversation":"会话域：骨架、有序对话流、带 Host 端忙碌回车偏好的输入框与详情宿主", "@deepseek-ai/dsh-client-ui-cordis":"Cordis 动态插件定义卡片：cordis_define 工具行与运行开关", "@deepseek-ai/dsh-client-ui-deliverables":"Web 端产出文件回合尾部与最终回复的可点击文件引用",
-			"@deepseek-ai/dsh-client-ui-directory-picker-browse":"应用内目录浏览界面：渲染宿主列举与创建原语的工作区目录流", "@deepseek-ai/dsh-client-ui-goal":"会话目标界面：停靠输入框上方的 GoalBar，读取目标会话投影", "@deepseek-ai/dsh-client-ui-input-trigger":"输入触发管线：检测 / 与 @、候选菜单、把选择路由到已注册来源",
-			"@deepseek-ai/dsh-client-ui-jobs":"会话头部后台任务列表：镜像 session/jobs 帧的实时注册表状态", "@deepseek-ai/dsh-client-ui-layout":"外壳插件：三栏 AppFrame 与 ctx.layout 视图状态", "@deepseek-ai/dsh-client-ui-message-feedback":"助手消息操作栏的逐条反馈控件，由 messageFeedback 支撑",
-			"@deepseek-ai/dsh-client-ui-model-selection":"模型选择：session.selectModel 上的 /model 弹窗", "@deepseek-ai/dsh-client-ui-permission-presets":"权限界面：新会话默认值设置与当前会话的 /permission 弹窗", "@deepseek-ai/dsh-client-ui-plan":"计划模式输入控件：plan 席位与 /plan 命令通道",
-			"@deepseek-ai/dsh-client-ui-reference":"Web 端统一的 @file 与 @session 引用来源", "@deepseek-ai/dsh-client-ui-renderer":"浏览器 UI 渲染器：ctx.uiRenderer 插槽绑定与应用根装配", "@deepseek-ai/dsh-client-ui-settings":"设置域基础插件：settings 命名空间作用域服务与标准设置插槽契约",
-			"@deepseek-ai/dsh-client-ui-settings-general":"通用设置分节、外壳头部内容、设置词典与版本化欢迎提示", "@deepseek-ai/dsh-client-ui-settings-models":"模型设置与共享的产品引导弹窗，复用既有设置与凭据关联", "@deepseek-ai/dsh-client-ui-settings-plugin-inventory":"Web 插件设置中的只读 Cordis Loader 清单标签页",
-			"@deepseek-ai/dsh-client-ui-settings-plugins":"插件设置分节：各功能自有的标签页与可配置的宿主平面插件卡片", "@deepseek-ai/dsh-client-ui-sidebar":"侧边栏插件：会话多级树、搜索、分组与状态圆点", "@deepseek-ai/dsh-client-ui-skill":"Web 端 skill 引用与专用的 skill 工具行",
-			"@deepseek-ai/dsh-client-ui-subagent":"子智能体会话目录、续接路由 UI 与 @ 引用来源", "@deepseek-ai/dsh-client-ui-theme":"主题插件：亮暗与系统主题状态、--dsw-* 令牌样式", "@deepseek-ai/dsh-client-ui-tool":"客户端工具调用树渲染器与按工具键入的展示插槽",
-			"@deepseek-ai/dsh-client-ui-trajectory":"轨迹事件账本与交互式耗时总览：注册进会话 ViewMap 的纯消费插件", "@deepseek-ai/dsh-client-ui-user-questions":"ask_user_question 功能：宿主工具挂载与提问界面", "@deepseek-ai/dsh-client-ui-workflow-run":"Web 端持久化工作流运行的会话节点与嵌套成员展开",
-			"@deepseek-ai/dsh-client-ui-workspace":"工作区选择插件：向侧边栏与空状态插槽注册 WorkspacePicker", "@deepseek-ai/dsh-code-runtime-worker-thread":"代码执行抽象层的 worker-thread 实现", "@deepseek-ai/dsh-command-compact":"显式压缩会话的斜杠命令",
-			"@deepseek-ai/dsh-command-feedback":"仅记录日志的会话反馈与斜杠命令", "@deepseek-ai/dsh-command-goal":"持久化会话目标的斜杠命令", "@deepseek-ai/dsh-commands":"面向 UI 的命令注册表，由插件提供",
-			"@deepseek-ai/dsh-compaction-basic":"基于 token 计量的压缩策略与 LLM 摘要后端", "@deepseek-ai/dsh-compaction-tool-result-pruner":"可重放的免模型工具结果头中尾裁剪", "@deepseek-ai/dsh-cordis-client-runner":"动态双半插件的浏览器半：事件订阅、闭包求值与守卫门面",
-			"@deepseek-ai/dsh-cordis-host-runner":"动态包定义注册表、host 半沙箱生命周期与调用处理表", "@deepseek-ai/dsh-credentials-local":"文件存储的凭据提供方（$DSH_HOME/.env）", "@deepseek-ai/dsh-file-reference-local":"本地文件系统 ctx.fileReferences 提供方，带限界模糊索引",
-			"@deepseek-ai/dsh-fs-observation-policy":"文件上下文策略：经 fs/* 事件闸门实现观察态、先读后写与版本校验", "@deepseek-ai/dsh-fs-sandbox":"文件系统抽象层的沙箱实现：按调用级沙箱模式拦截写/编辑，读取放行", "@deepseek-ai/dsh-goal":"事件溯源的会话目标状态与生命周期服务",
-			"@deepseek-ai/dsh-goal-round-driver":"带竞态防护的会话目标轮次驱动", "@deepseek-ai/dsh-host-apiproxy":"API 网关：ApiProxy 契约与 ctx.apiProxy 提供方", "@deepseek-ai/dsh-host-directory-picker-auto":"目录选择抽象层的自适应选择器：按启动环境挂载原生或浏览后端",
-			"@deepseek-ai/dsh-host-directory-picker-browse":"目录选择抽象层的应用内浏览后端：宿主文件系统的列举与创建原语", "@deepseek-ai/dsh-host-plugin-inventory":"当前 Cordis Loader 插件状态的只读远程投影", "@deepseek-ai/dsh-host-webserver":"Web 路由注册插件：HTTP 路由、index 改写与静态资源回退",
-			"@deepseek-ai/dsh-jobs-local":"后台任务注册表（ctx.jobs）的进程内实现", "@deepseek-ai/dsh-llm":"提供方中立的 LLM 服务接口", "@deepseek-ai/dsh-llm-deepseek":"为 LLM 抽象层实现 DeepSeek chat-completions 适配",
-			"@deepseek-ai/dsh-llm-pi-ai":"基于 pi-ai 的 DeepSeek 适配器，dsh-llm-deepseek 的设计验证孪生", "@deepseek-ai/dsh-llm-retry":"按提供方路由的 LLM 请求重试策略", "@deepseek-ai/dsh-message-feedback":"与生命周期绑定的逐条消息评分与备注",
-			"@deepseek-ai/dsh-permission-presets":"面向用户的权限预设：一个 Permissions 下拉，统一沙箱模式与审批策略", "@deepseek-ai/dsh-persona":"由编排定义的部署级人格提示分节", "@deepseek-ai/dsh-plan-mode":"按智能体记录的计划模式，含退出确认",
-			"@deepseek-ai/dsh-pwsh-sandbox":"消费沙箱的 PowerShell 执行器实现，逐条命令受限并报告结果", "@deepseek-ai/dsh-repeat-tool-reminder":"重复工具调用防护：智能体循环调用时给出提醒", "@deepseek-ai/dsh-sandbox-local":"沙箱抽象层的本地后端（bwrap、landlock、Seatbelt 等）",
-			"@deepseek-ai/dsh-sandbox-policy":"逐次调用的沙箱策略解析器与当前模型上下文", "@deepseek-ai/dsh-session":"基于事件溯源的会话存储", "@deepseek-ai/dsh-session-checkpoint-policy":"模型请求与工具副作用前的会话持久化检查点",
-			"@deepseek-ai/dsh-session-log-export":"Web 会话日志导出命令与共用的下载弹窗", "@deepseek-ai/dsh-session-persistence-jsonl":"JSONL 持久化会话存储后端", "@deepseek-ai/dsh-session-projection":"会话投影抽象层：投影类型表、提供方契约与当前值注册表",
-			"@deepseek-ai/dsh-session-projection-cache":"持久化投影缓存：逐会话检查点、节流写回与冷读回放", "@deepseek-ai/dsh-session-query-sqlite":"带 SQLite FTS5 全文检索的 ctx.sessionQuery 后端", "@deepseek-ai/dsh-session-reference":"跨会话快照引用与持久化的非可信模型上下文",
-			"@deepseek-ai/dsh-session-stats":"全日志会话计数与耗时投影 sessionStats", "@deepseek-ai/dsh-session-telemetry-otel":"遥测抽象层的 OpenTelemetry 后端，会话记录交给 OTel 日志管道", "@deepseek-ai/dsh-session-title":"基于日志的会话标题服务与提供方注册表",
-			"@deepseek-ai/dsh-session-title-first-prompt-llm":"用首条消息生成会话标题的 LLM 提供方", "@deepseek-ai/dsh-settings-file":"文件存储的设置提供方（settings.yaml）", "@deepseek-ai/dsh-shell-env":"与工具无关的托管 DSH_* shell 环境注册表",
-			"@deepseek-ai/dsh-skill":"智能体 Skill 提供方注册表", "@deepseek-ai/dsh-skill-badge":"内置 dsh badge 徽章技能的提供方", "@deepseek-ai/dsh-skill-filesystem":"本地文件系统的 Skill 提供方",
-			"@deepseek-ai/dsh-spill-local":"溢出存储抽象层的本地文件系统实现", "@deepseek-ai/dsh-spill-policy":"工具结果溢出策略：超长结果替换为预览与溢出文件路径", "@deepseek-ai/dsh-storage":"存储中枢 ctx.storage：具名后端注册表与数据形态设施",
-			"@deepseek-ai/dsh-storage-domain":"领域数据形态：经 schema 校验、可发事件的 KV 领域", "@deepseek-ai/dsh-storage-json":"存储中枢的 JSON 文件 KV 后端", "@deepseek-ai/dsh-subagent":"子智能体抽象层（ctx.subagents）与提供方注册表",
-			"@deepseek-ai/dsh-subagent-fork-in-process":"进程内 fork 子智能体后端：用父日志前缀启动子智能体", "@deepseek-ai/dsh-subagent-spawn-in-process":"进程内 spawn 子智能体后端（ctx.agents）", "@deepseek-ai/dsh-subprocess-local":"子进程抽象层的本地实现",
-			"@deepseek-ai/dsh-system-prompt":"系统提示词组装注册表", "@deepseek-ai/dsh-token-meter":"可重放的 token 计量服务（ctx.tokenMeter）", "@deepseek-ai/dsh-tool-ask-user":"基于 ctx.userQuestions 抽象层的提问工具",
-			"@deepseek-ai/dsh-tool-bash":"面向模型的 bash 工具，支持后台任务与沙箱提权", "@deepseek-ai/dsh-tool-call-timeout-policy":"工具调用超时策略：按工具设置截止时间并返回超时错误", "@deepseek-ai/dsh-tool-cordis":"自省式 Cordis 工具集：查看运行时状态、挂载与卸载模型编写的插件",
-			"@deepseek-ai/dsh-tool-fs":"面向模型的文件读写与编辑工具（ctx.fs）", "@deepseek-ai/dsh-tool-fs-search":"面向模型的文件检索工具（glob/grep，ripgrep 支持）", "@deepseek-ai/dsh-tool-goal":"面向模型的同会话目标工具，带执行期权限校验",
-			"@deepseek-ai/dsh-tool-jobs":"面向模型的后台任务工具（job_output、job_list、job_kill）", "@deepseek-ai/dsh-tool-present":"把文件登记为本次任务的交付物", "@deepseek-ai/dsh-tool-pwsh":"基于 bash 执行器抽象层的 pwsh 工具",
-			"@deepseek-ai/dsh-tool-ralph":"面向模型的 Ralph 循环：全新智能体多轮迭代", "@deepseek-ai/dsh-tool-skill":"面向模型的 skill 加载工具", "@deepseek-ai/dsh-tool-str-replace-editor":"面向模型的文件查看、创建、替换与插入工具",
-			"@deepseek-ai/dsh-tool-subagent":"面向模型的子智能体委派工具（ctx.subagents）", "@deepseek-ai/dsh-tool-subagent-control":"全局命名工具：send_message 等子智能体续接操作", "@deepseek-ai/dsh-tool-subagent-control/list-agents":"全局命名工具：send_message 等子智能体续接操作",
-			"@deepseek-ai/dsh-tool-subagent-report":"子智能体作用域的 report 上报工具", "@deepseek-ai/dsh-tool-todo":"面向模型的 todo_write 待办工具", "@deepseek-ai/dsh-tool-web":"面向模型的网络工具：web_search 与 web_fetch",
-			"@deepseek-ai/dsh-tool-workflow":"面向模型的 workflow 工具：执行 JS 编排脚本", "@deepseek-ai/dsh-tools":"工具注册表与工具执行流水线", "@deepseek-ai/dsh-typert-loader":"生成的 Typert 包贡献的加载器集成",
-			"@deepseek-ai/dsh-typert-registry":"生成包反射与 Zod schema 的运行时注册表", "@deepseek-ai/dsh-user-approval":"用户审批抽象层（ctx.approval）：一次性授权经应答方瀑布派发，默认拒绝", "@deepseek-ai/dsh-user-questions":"agent 运行期间向人提问的抽象层（ctx.userQuestions）",
-			"@deepseek-ai/dsh-web":"网络访问抽象层 ctx.web：搜索/抓取提供方注册表与 WebError 分类", "@deepseek-ai/dsh-web-app":"浏览器界面 bundle：dsh-base 的 web 补丁层与运行时粘合插件", "@deepseek-ai/dsh-web-app/startup":"浏览器界面 bundle：dsh-base 的 web 补丁层与运行时粘合插件",
-			"@deepseek-ai/dsh-web-search-deepseek":"DeepSeek 搜索提供方：经兼容 API 调用原生 web_search", "@deepseek-ai/dsh-workflow-worker-thread":"worker-thread 工作流引擎：宿主事件循环外执行编排脚本", "@deepseek-ai/dsh-workspace":"工作区实体注册表：持久化记录与经校验的会话挂载",
-			"@dsh-android/dsh-client-ui-responsive":"移动端核心响应式布局：窄屏抽屉侧栏、底部弹层、手机顶栏与安全区", "@dsh-external/dsh-thinking-loop-guard":"检测并打断思维链死循环：推理反复重复时自动中止本轮并注入纠正提示", "dsh-android-mobile":"移动端界面打磨：顶栏、消息操作、插件分组、设置页两级化等 24 项修复",
-			"@xmanrui/dsh-im":"接入九种 IM 机器人与公网 AI Office，把消息转发给本机 Harness", "cordis:include":"Cordis 组合的 include 指令，把外部插件文件并入当前组合", "dsh-agconfig":"在设置里填写 Agnes AI 密钥，供图片与视频生成两个工具共用",
-			"dsh-agimage":"Agnes AI 图片生成工具（generate_image），结果图在会话内直接显示", "dsh-agvideo":"Agnes AI 视频生成工具（generate_video），支持文生、首尾帧、参考图三模式", "dsh-away-nudge":"离开提醒：AI 回复后你久未查看时，自动唤醒会话并发微信提醒",
-			"dsh-basic-auth":"给 DSH 网页入口加一道账号密码门卫：凭据由浏览器保管，换设备也不用重新登录", "dsh-client-ui-file-upload":"在「+」菜单加「文件上传」，文件落到会话 uploads/ 目录供 AI 读取", "dsh-client-ui-photo-upload":"在「+」菜单加「照片上传」，手机可直接从相册或相机发图",
-			"dsh-file-show":"让 AI 把本地文件展示进对话：图片成图卡，其它类型成可点文件卡", "dsh-im-proactive":"让 AI 主动发消息给你的工具（send_im_message）", "dsh-imgswitch":"设置页「图片输入」开关：按渠道或模型开关图片输入，免手改配置",
-			"dsh-memory":"跨会话记忆与回复风格：核心记忆常驻注入，另有 7 个记忆工具与设置页", "dsh-restart-local":"独立自重启控制：设置页按钮与 restart_harness 工具", "dsh-skill-list":"在设置 → 插件里加「Skill 列表」页，列出当前会话可用的 Skill",
-			"dshmarket":"DSH 可视化插件市场：浏览、搜索并一键安装社区插件",
+			"./plugins/argfix3.js":"Flattens cordis tool arguments (bundled with the cordis-argfix session preset)", "@deepseek-ai/cordis-plugin-hmr":"Hot module replacement (HMR) plugin for cordis", "@deepseek-ai/cordis-plugin-timer":"Provides a timer service for cordis",
+			"@deepseek-ai/dsh-agent":"Agent interfaces, registry, initiator scopes and event vocabulary", "@deepseek-ai/dsh-agent-default-model":"Default model selection shared by all agent entry points", "@deepseek-ai/dsh-agent-instructions":"Loads workspace AGENTS.md/CLAUDE.md instruction files",
+			"@deepseek-ai/dsh-agent-loop":"Concrete implementation of the agent main loop", "@deepseek-ai/dsh-agent-presets":"Assembles an agent for each session from preset cordis.yml files", "@deepseek-ai/dsh-api-gateway":"Typert remote host dispatcher and client API endpoints",
+			"@deepseek-ai/dsh-api-remotes":"Remote BFF assembly and host-side agent/session lookup strategy", "@deepseek-ai/dsh-attachment-local":"Content-addressed private attachment storage in DSH_HOME", "@deepseek-ai/dsh-bash-sandbox":"Sandbox-aware bash executor: restricts each command and reports the result",
+			"@deepseek-ai/dsh-client-connection":"Connection layer: upstream HTTP, downstream WebSocket and a reconnectable dual stream", "@deepseek-ai/dsh-client-hmr":"Dev-only client hot reload driver: SSE frame rebuilds trigger fiber swaps", "@deepseek-ai/dsh-client-locale":"Language plugin: host-side Chinese/English preference, browser fallback and namespaced dictionaries",
+			"@deepseek-ai/dsh-client-modules":"Client module system: entry graph for the Node half, lazy CJS table for the browser half", "@deepseek-ai/dsh-client-runtime":"Core client services: SlotRegistry and SessionRuntime", "@deepseek-ai/dsh-client-ui-agent-preset":"Agent preset UI: defaults for new sessions, seats for this session and the composition editor",
+			"@deepseek-ai/dsh-client-ui-attachment":"Dynamic attachment display for the chat input and message image slots", "@deepseek-ai/dsh-client-ui-brand-official":"Official brand content for the web sidebar and chat hero slots", "@deepseek-ai/dsh-client-ui-commands":"Client command UI: global catalog cache, / source and popupSelect registry",
+			"@deepseek-ai/dsh-client-ui-conversation":"Session domain: skeleton, ordered chat flow, input box with host-side busy-Enter preference, and details host", "@deepseek-ai/dsh-client-ui-cordis":"Cordis dynamic plugin definition cards: cordis_define tool rows and run toggles", "@deepseek-ai/dsh-client-ui-deliverables":"Clickable references to web output files at the end of a turn and in the final reply",
+			"@deepseek-ai/dsh-client-ui-directory-picker-browse":"In-app directory browser UI: workspace directory flow rendering the host list/create primitives", "@deepseek-ai/dsh-client-ui-goal":"Session goal UI: a GoalBar docked above the input box, reading the goal session projection", "@deepseek-ai/dsh-client-ui-input-trigger":"Input trigger pipeline: detects / and @, shows candidate menus and routes picks to registered sources",
+			"@deepseek-ai/dsh-client-ui-jobs":"Background job list in the session header: live registry state mirroring session/jobs frames", "@deepseek-ai/dsh-client-ui-layout":"Shell plugin: three-column AppFrame and ctx.layout view state", "@deepseek-ai/dsh-client-ui-message-feedback":"Per-message feedback controls in the assistant message action bar, backed by messageFeedback",
+			"@deepseek-ai/dsh-client-ui-model-selection":"Model selection: the /model dialog on session.selectModel", "@deepseek-ai/dsh-client-ui-permission-presets":"Permissions UI: new-session defaults in Settings and the /permission dialog for the current session", "@deepseek-ai/dsh-client-ui-plan":"Plan mode input controls: plan seat and /plan command channel",
+			"@deepseek-ai/dsh-client-ui-reference":"Unified @file and @session reference sources for the web", "@deepseek-ai/dsh-client-ui-renderer":"Browser UI renderer: ctx.uiRenderer slot binding and app root assembly", "@deepseek-ai/dsh-client-ui-settings":"Settings domain base plugin: settings namespace scoped service and standard settings slot contract",
+			"@deepseek-ai/dsh-client-ui-settings-general":"General settings section, shell header content, settings dictionary and versioned welcome tips", "@deepseek-ai/dsh-client-ui-settings-models":"Model settings and the shared product onboarding dialog, reusing existing settings and credential links", "@deepseek-ai/dsh-client-ui-settings-plugin-inventory":"Read-only Cordis Loader inventory tab in the web plugin settings",
+			"@deepseek-ai/dsh-client-ui-settings-plugins":"Plugin settings section: per-feature tabs and configurable host-plane plugin cards", "@deepseek-ai/dsh-client-ui-sidebar":"Sidebar plugin: multi-level session tree, search, grouping and status dots", "@deepseek-ai/dsh-client-ui-skill":"Web skill references and a dedicated skill tool row",
+			"@deepseek-ai/dsh-client-ui-subagent":"Subagent session catalog, resume routing UI and @ reference source", "@deepseek-ai/dsh-client-ui-theme":"Theme plugin: light/dark/system theme state and --dsw-* token styles", "@deepseek-ai/dsh-client-ui-tool":"Client tool-call tree renderer and per-tool display slots",
+			"@deepseek-ai/dsh-client-ui-trajectory":"Trajectory event ledger and interactive timing overview: a pure consumer registered in the session ViewMap", "@deepseek-ai/dsh-client-ui-user-questions":"ask_user_question feature: host tool mount and question UI", "@deepseek-ai/dsh-client-ui-workflow-run":"Session nodes and nested member expansion for persisted web workflow runs",
+			"@deepseek-ai/dsh-client-ui-workspace":"Workspace picker plugin: registers WorkspacePicker in the sidebar and empty-state slots", "@deepseek-ai/dsh-code-runtime-worker-thread":"worker-thread implementation of the code execution layer", "@deepseek-ai/dsh-command-compact":"Slash command to explicitly compact a session",
+			"@deepseek-ai/dsh-command-feedback":"Log-only session feedback and slash command", "@deepseek-ai/dsh-command-goal":"Slash command for persistent session goals", "@deepseek-ai/dsh-commands":"UI-facing command registry, supplied by plugins",
+			"@deepseek-ai/dsh-compaction-basic":"Token-metered compaction strategy and LLM summary backend", "@deepseek-ai/dsh-compaction-tool-result-pruner":"Replayable, model-free head/middle/tail trimming of tool results", "@deepseek-ai/dsh-cordis-client-runner":"Browser half of dynamic two-half plugins: event subscriptions, closure evaluation and guarded facade",
+			"@deepseek-ai/dsh-cordis-host-runner":"Dynamic package definition registry, host-half sandbox lifecycle and call handler table", "@deepseek-ai/dsh-credentials-local":"File-backed credential provider ($DSH_HOME/.env)", "@deepseek-ai/dsh-file-reference-local":"Local filesystem ctx.fileReferences provider with a bounded fuzzy index",
+			"@deepseek-ai/dsh-fs-observation-policy":"File context policy: observed state, read-before-write and version checks via fs/* event gates", "@deepseek-ai/dsh-fs-sandbox":"Sandboxed filesystem layer: intercepts writes/edits per call sandbox mode, lets reads through", "@deepseek-ai/dsh-goal":"Event-sourced session goal state and lifecycle service",
+			"@deepseek-ai/dsh-goal-round-driver":"Session goal round driver with race protection", "@deepseek-ai/dsh-host-apiproxy":"API gateway: ApiProxy contract and ctx.apiProxy provider", "@deepseek-ai/dsh-host-directory-picker-auto":"Adaptive picker for the directory selection layer: mounts the native or browse backend based on the launch environment",
+			"@deepseek-ai/dsh-host-directory-picker-browse":"In-app browse backend for directory selection: host filesystem list and create primitives", "@deepseek-ai/dsh-host-plugin-inventory":"Read-only remote projection of the current Cordis Loader plugin state", "@deepseek-ai/dsh-host-webserver":"Web route registration plugin: HTTP routes, index rewriting and static asset fallback",
+			"@deepseek-ai/dsh-jobs-local":"In-process implementation of the background job registry (ctx.jobs)", "@deepseek-ai/dsh-llm":"Provider-neutral LLM service interface", "@deepseek-ai/dsh-llm-deepseek":"DeepSeek chat-completions adapter for the LLM layer",
+			"@deepseek-ai/dsh-llm-pi-ai":"DeepSeek adapter built on pi-ai, a design-validation twin of dsh-llm-deepseek", "@deepseek-ai/dsh-llm-retry":"Per-provider LLM request retry policy", "@deepseek-ai/dsh-message-feedback":"Lifecycle-bound per-message ratings and notes",
+			"@deepseek-ai/dsh-permission-presets":"User-facing permission presets: one Permissions drop-down unifying sandbox mode and approval policy", "@deepseek-ai/dsh-persona":"Deployment-level persona prompt sections defined by the composition", "@deepseek-ai/dsh-plan-mode":"Per-agent plan mode with exit confirmation",
+			"@deepseek-ai/dsh-pwsh-sandbox":"Sandbox-aware PowerShell executor: restricts each command and reports the result", "@deepseek-ai/dsh-repeat-tool-reminder":"Repeated tool call guard: reminds the agent when it calls in a loop", "@deepseek-ai/dsh-sandbox-local":"Local backend for the sandbox layer (bwrap, landlock, Seatbelt, etc.)",
+			"@deepseek-ai/dsh-sandbox-policy":"Per-call sandbox policy resolver and current model context", "@deepseek-ai/dsh-session":"Event-sourced session store", "@deepseek-ai/dsh-session-checkpoint-policy":"Session persistence checkpoints before model requests and tool side effects",
+			"@deepseek-ai/dsh-session-log-export":"Web session log export command and shared download dialog", "@deepseek-ai/dsh-session-persistence-jsonl":"JSONL session persistence backend", "@deepseek-ai/dsh-session-projection":"Session projection layer: projection type table, provider contract and current-value registry",
+			"@deepseek-ai/dsh-session-projection-cache":"Persistent projection cache: per-session checkpoints, throttled write-back and cold-read replay", "@deepseek-ai/dsh-session-query-sqlite":"ctx.sessionQuery backend with SQLite FTS5 full-text search", "@deepseek-ai/dsh-session-reference":"Cross-session snapshot references and persisted untrusted model context",
+			"@deepseek-ai/dsh-session-stats":"Full-log session counts and timing projection (sessionStats)", "@deepseek-ai/dsh-session-telemetry-otel":"OpenTelemetry backend for the telemetry layer; session records go to the OTel log pipeline", "@deepseek-ai/dsh-session-title":"Log-based session title service and provider registry",
+			"@deepseek-ai/dsh-session-title-first-prompt-llm":"LLM provider that titles a session from its first message", "@deepseek-ai/dsh-settings-file":"File-backed settings provider (settings.yaml)", "@deepseek-ai/dsh-shell-env":"Tool-agnostic registry of managed DSH_* shell environment variables",
+			"@deepseek-ai/dsh-skill":"Agent skill provider registry", "@deepseek-ai/dsh-skill-badge":"Provider for the built-in dsh badge skill", "@deepseek-ai/dsh-skill-filesystem":"Local filesystem skill provider",
+			"@deepseek-ai/dsh-spill-local":"Local filesystem implementation of the spill storage layer", "@deepseek-ai/dsh-spill-policy":"Tool result spill policy: replaces oversized results with a preview and the spill file path", "@deepseek-ai/dsh-storage":"Storage hub ctx.storage: named backend registry and data-shape facilities",
+			"@deepseek-ai/dsh-storage-domain":"Domain data shapes: schema-validated, event-emitting KV domains", "@deepseek-ai/dsh-storage-json":"JSON file KV backend for the storage hub", "@deepseek-ai/dsh-subagent":"Subagent layer (ctx.subagents) and provider registry",
+			"@deepseek-ai/dsh-subagent-fork-in-process":"In-process fork subagent backend: starts subagents with the parent log prefix", "@deepseek-ai/dsh-subagent-spawn-in-process":"In-process spawn subagent backend (ctx.agents)", "@deepseek-ai/dsh-subprocess-local":"Local implementation of the subprocess layer",
+			"@deepseek-ai/dsh-system-prompt":"System prompt assembly registry", "@deepseek-ai/dsh-token-meter":"Replayable token metering service (ctx.tokenMeter)", "@deepseek-ai/dsh-tool-ask-user":"Question tool built on the ctx.userQuestions layer",
+			"@deepseek-ai/dsh-tool-bash":"Model-facing bash tool with background jobs and sandbox escalation", "@deepseek-ai/dsh-tool-call-timeout-policy":"Tool call timeout policy: per-tool deadlines that return a timeout error", "@deepseek-ai/dsh-tool-cordis":"Introspective Cordis toolset: inspect runtime state, mount and unmount model-written plugins",
+			"@deepseek-ai/dsh-tool-fs":"Model-facing file read, write and edit tools (ctx.fs)", "@deepseek-ai/dsh-tool-fs-search":"Model-facing file search tools (glob/grep, powered by ripgrep)", "@deepseek-ai/dsh-tool-goal":"Model-facing same-session goal tool with run-time permission checks",
+			"@deepseek-ai/dsh-tool-jobs":"Model-facing background job tools (job_output, job_list, job_kill)", "@deepseek-ai/dsh-tool-present":"Registers files as deliverables of the current task", "@deepseek-ai/dsh-tool-pwsh":"pwsh tool built on the bash executor layer",
+			"@deepseek-ai/dsh-tool-ralph":"Model-facing Ralph loop: multi-round iteration with fresh agents", "@deepseek-ai/dsh-tool-skill":"Model-facing skill loading tool", "@deepseek-ai/dsh-tool-str-replace-editor":"Model-facing tool to view, create, replace and insert in files",
+			"@deepseek-ai/dsh-tool-subagent":"Model-facing subagent delegation tool (ctx.subagents)", "@deepseek-ai/dsh-tool-subagent-control":"Globally named tools: send_message and other subagent resume operations", "@deepseek-ai/dsh-tool-subagent-control/list-agents":"Globally named tools: send_message and other subagent resume operations",
+			"@deepseek-ai/dsh-tool-subagent-report":"Subagent-scoped report tool", "@deepseek-ai/dsh-tool-todo":"Model-facing todo_write task tool", "@deepseek-ai/dsh-tool-web":"Model-facing web tools: web_search and web_fetch",
+			"@deepseek-ai/dsh-tool-workflow":"Model-facing workflow tool: runs JS orchestration scripts", "@deepseek-ai/dsh-tools":"Tool registry and tool execution pipeline", "@deepseek-ai/dsh-typert-loader":"Loader integration for generated Typert package contributions",
+			"@deepseek-ai/dsh-typert-registry":"Runtime registry for generated package reflection and Zod schemas", "@deepseek-ai/dsh-user-approval":"User approval layer (ctx.approval): one-off grants dispatched through a responder waterfall, denied by default", "@deepseek-ai/dsh-user-questions":"Layer for asking the user questions during an agent run (ctx.userQuestions)",
+			"@deepseek-ai/dsh-web":"Web access layer ctx.web: search/fetch provider registry and WebError classes", "@deepseek-ai/dsh-web-app":"Browser UI bundle: dsh-base web patch layer and runtime glue plugin", "@deepseek-ai/dsh-web-app/startup":"Browser UI bundle: dsh-base web patch layer and runtime glue plugin",
+			"@deepseek-ai/dsh-web-search-deepseek":"DeepSeek search provider: calls the native web_search through the compatible API", "@deepseek-ai/dsh-workflow-worker-thread":"worker-thread workflow engine: runs orchestration scripts off the host event loop", "@deepseek-ai/dsh-workspace":"Workspace entity registry: persisted records and validated session mounts",
+			"@dsh-android/dsh-client-ui-responsive":"Core responsive mobile layout: narrow-screen drawer sidebar, bottom sheets, phone header bar and safe areas", "@dsh-external/dsh-thinking-loop-guard":"Detects and breaks reasoning loops: when the reasoning keeps repeating, stops the turn and injects a corrective prompt", "dsh-android-mobile":"Mobile UI polish: header bar, message actions, plugin grouping, two-level settings and more (24 fixes)",
+			"@xmanrui/dsh-im":"Connects nine IM bots and the public AI Office, forwarding messages to the local harness", "cordis:include":"Cordis composition include directive: merges external plugin files into the current composition", "dsh-agconfig":"Enter your Agnes AI key in Settings, shared by the image and video generation tools",
+			"dsh-agimage":"Agnes AI image generation tool (generate_image); results show right in the chat", "dsh-agvideo":"Agnes AI video generation tool (generate_video): text-to-video, first/last frame and reference image modes", "dsh-away-nudge":"Away nudge: if you haven’t checked a reply for a while, wakes the session and sends a WeChat reminder",
+			"dsh-basic-auth":"Adds a username/password gate to the DSH web entry; the browser keeps the credentials, so switching devices needs no new sign-in", "dsh-client-ui-file-upload":"Adds “Upload file” to the “+” menu; files land in the session uploads/ folder for the AI to read", "dsh-client-ui-photo-upload":"Adds “Upload photo” to the “+” menu so phones can send pictures from the gallery or camera",
+			"dsh-file-show":"Lets the AI show local files in the chat: images as image cards, other types as clickable file cards", "dsh-im-proactive":"Tool that lets the AI message you first (send_im_message)", "dsh-imgswitch":"“Image input” toggle in Settings: turn image input on or off per channel or model without editing config",
+			"dsh-memory":"Cross-session memory and reply style: core memory always injected, plus 7 memory tools and a settings page", "dsh-restart-local":"Standalone self-restart control: a settings button and the restart_harness tool", "dsh-skill-list":"Adds a “Skill list” page under Settings → Plugins listing the skills available to the current session",
+			"dshmarket":"DSH visual plugin marketplace: browse, search and install community plugins in one tap",
 		};
 		// 注入描述。幂等判据：已注入且 dataset.mpDescFor 与目标文案一致则不动 DOM
 		// ——否则自己写 DOM 又会触发 observer，重复重建会拖死页面（见修复 24）。
@@ -1408,9 +1408,9 @@ window.__ModuleLoader__.load({
 				});
 				if (!groupedSignature(userCards, officialCards) && rebuildAllowed()) {
 					u.replaceChildren(
-						mkHeader("user", "自装插件", userCards.length),
+						mkHeader("user", "Installed by you", userCards.length),
 						...userCards,
-						mkHeader("official", "官方插件", officialCards.length),
+						mkHeader("official", "Official plugins", officialCards.length),
 						...officialCards,
 					);
 				}
@@ -1466,6 +1466,8 @@ window.__ModuleLoader__.load({
 			["图片输入", "image"],
 			["AI 回复风格", "style"],
 			["AI回复风格", "style"],
+			// 1.3.2-en: core-memory's section label is English now; keep its icon.
+			["AI reply style", "style"],
 			["Agent 预设", "agent"],
 			["Agent预设", "agent"],
 			["IM机器人", "im"],
@@ -1588,8 +1590,8 @@ window.__ModuleLoader__.load({
 			// 顶部返回条：只有圆形返回按钮 + 标题，不再放 ✕
 			const backBar = document.createElement("div");
 			backBar.className = "mp-back-bar";
-			backBar.innerHTML = '<button type="button" class="mp-back-circle" aria-label="返回">‹</button>'
-				+ '<span class="mp-title">设置</span>';
+			backBar.innerHTML = '<button type="button" class="mp-back-circle" aria-label="Back">‹</button>'
+				+ '<span class="mp-title">Settings</span>';
 			Object.assign(backBar.style, {
 				display: "flex", flex: "0 0 auto", alignItems: "center", gap: "4px",
 				minHeight: "56px", padding: "8px 12px", boxSizing: "border-box",
@@ -1618,7 +1620,7 @@ window.__ModuleLoader__.load({
 			};
 			// 返回按钮：一级页关闭设置，二级页回一级
 			const showList = () => {
-				titleSpan.textContent = "设置";
+				titleSpan.textContent = "Settings";
 				// 用 !important 压过 dsh-market 的
 				//   @media (max-width:560px){ [role=dialog]:has([data-dsh-market-root])>nav{display:none} }
 				// 市场组件（data-dsh-market-root）挂载后一直留在 dialog 里，:has() 只看 DOM
@@ -1629,7 +1631,7 @@ window.__ModuleLoader__.load({
 			};
 			const showContent = (titleText) => {
 				const sectionTitle = content?.querySelector(".zGbnIq_title, h2");
-				titleSpan.textContent = titleText || (sectionTitle ? sectionTitle.textContent : "设置");
+				titleSpan.textContent = titleText || (sectionTitle ? sectionTitle.textContent : "Settings");
 				// 与 showList 对称：用 !important，确保能覆盖 showList 留下的 flex !important
 				nav.style.setProperty("display", "none", "important");
 				if (content) {
@@ -1677,10 +1679,10 @@ window.__ModuleLoader__.load({
 				}
 				if (navList && !navList.querySelector("[data-mp-group]")) {
 					const groups = [
-						{ label: "通用", items: ["通用设置"] },
-						{ label: "模型", items: ["模型"] },
-						{ label: "插件", items: ["插件"] },
-						{ label: "高级", items: ["Agent 预设", "快照", "附件缓存", "特权权限", "悬浮气泡"] },
+						{ label: "General", items: ["通用设置"] },
+						{ label: "Models", items: ["模型"] },
+						{ label: "Plugins", items: ["插件"] },
+						{ label: "Advanced", items: ["Agent 预设", "快照", "附件缓存", "特权权限", "悬浮气泡"] },
 					];
 					for (const g of groups) {
 						const first = [...navList.querySelectorAll("button")].find((b) => g.items.includes((b.innerText || "").trim()));
@@ -1726,7 +1728,7 @@ window.__ModuleLoader__.load({
 				const btn = e.target.closest("button");
 				if (!btn) return;
 				const titleText = (btn.innerText || "").trim();
-				setTimeout(() => showContent(titleText || "设置"), 0);
+				setTimeout(() => showContent(titleText || "Settings"), 0);
 			});
 			// 立即应用，去掉 800ms 延迟（旧样式闪烁根因）
 			applyNavStyle();
@@ -2986,7 +2988,7 @@ window.__ModuleLoader__.load({
 				const btn = document.createElement("button");
 				btn.type = "button";
 				btn.className = "mp-nav-btn";
-				btn.setAttribute("aria-label", "打开导航");
+				btn.setAttribute("aria-label", "Open navigation");
 				btn.innerHTML = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3 5.5h14M3 10h14M3 14.5h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
 				btn.addEventListener("click", (e) => { e.stopPropagation(); mpToggleDrawer(); });
 				document.body.appendChild(btn);
@@ -3031,7 +3033,7 @@ window.__ModuleLoader__.load({
 				mpInjectTraceItem(list);
 				if (list.querySelector('[data-mp-item="refresh"]')) return;
 				// 修复 30c：刷新图标（30 重构时漏传 SVG，只剩空壳 → 菜单里看不见图标）
-				mpInjectMenuItem(list, "refresh", "刷新",
+				mpInjectMenuItem(list, "refresh", "Refresh",
 					'<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
 					'<path d="M13.5 8a5.5 5.5 0 1 1-1.62-3.9M13.5 2.2v3.2h-3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>' +
 					"</svg>",
@@ -3697,7 +3699,7 @@ window.__ModuleLoader__.load({
 					const body = mpTranscriptText(mpTranscriptVisibleText(inner), MP_TRANSCRIPT_MAX_CHARS);
 					items.push({
 						role: "tool",
-						text: body || sample || "工具调用",
+						text: body || sample || "Tool call",
 						running: state === "running",
 					});
 					continue;
@@ -3852,12 +3854,12 @@ window.__ModuleLoader__.load({
 		 */
 		const UI_READY_MAX_WAIT_MS = 9000;
 
-		const MP_TIMING_UNAVAILABLE = "首 token 时间不可用";		const MP_TIMING_NOT_RECORDED = "未记录";
-		const MP_TIMING_STEP_START_UNAVAILABLE = "步骤开始时间不可用";
-		const MP_TIMING_DURATION_TOO_SHORT = "时长过短";
-		const MP_TIMING_PENDING = "等待中";
-		const MP_TIMING_USAGE_UNAVAILABLE = "用量不可用";
-		const MP_TIMING_OUTPUT_UNAVAILABLE = "输出 token 数不可用";
+		const MP_TIMING_UNAVAILABLE = "首 token 时间不可用";		const MP_TIMING_NOT_RECORDED = "Not recorded";
+		const MP_TIMING_STEP_START_UNAVAILABLE = "Step start time unavailable";
+		const MP_TIMING_DURATION_TOO_SHORT = "Duration too short";
+		const MP_TIMING_PENDING = "Pending";
+		const MP_TIMING_USAGE_UNAVAILABLE = "Usage unavailable";
+		const MP_TIMING_OUTPUT_UNAVAILABLE = "Output token count unavailable";
 
 		// 与官方 dsh-llm `isTokenDelta` 完全一致的判据：
 		// 非空 text/reasoning delta，或带非空 argumentsDelta / 有 name 的 tool-call delta。
@@ -3953,8 +3955,8 @@ window.__ModuleLoader__.load({
 			return map;
 		}
 		function mpFormatDuration(ms) {
-			if (ms < 1e3) return Math.round(ms) + " 毫秒";
-			return (ms / 1e3).toFixed(ms < 1e4 ? 2 : 1) + " 秒";
+			if (ms < 1e3) return Math.round(ms) + " ms";
+			return (ms / 1e3).toFixed(ms < 1e4 ? 2 : 1) + " s";
 		}
 		// 官方三行文案的等价复现（判据、顺序、格式全对齐官方实现）
 		function mpTimingText(kind, m) {
@@ -4034,12 +4036,12 @@ window.__ModuleLoader__.load({
 				mask.className = "mp-rename-mask";
 				mask.innerHTML =
 					'<div class="mp-rename-box">' +
-					'<p class="mp-rename-title">重命名会话</p>' +
+					'<p class="mp-rename-title">Rename session</p>' +
 					'<input class="mp-rename-input" type="text" maxlength="120" autocomplete="off" />' +
 					'<div class="mp-rename-error"></div>' +
 					'<div class="mp-rename-row">' +
-					'<button type="button" class="mp-rename-btn mp-rename-cancel">取消</button>' +
-					'<button type="button" class="mp-rename-btn mp-rename-ok">确定</button>' +
+					'<button type="button" class="mp-rename-btn mp-rename-cancel">Cancel</button>' +
+					'<button type="button" class="mp-rename-btn mp-rename-ok">OK</button>' +
 					'</div></div>';
 				document.body.appendChild(mask);
 				const input = mask.querySelector(".mp-rename-input");
@@ -4055,7 +4057,7 @@ window.__ModuleLoader__.load({
 					if (busy) return;
 					const title = input.value.trim();
 					if (!title) {
-						error.textContent = "标题不能为空";
+						error.textContent = "Title can’t be empty";
 						return;
 					}
 					busy = true;
@@ -4064,7 +4066,7 @@ window.__ModuleLoader__.load({
 					try {
 						const result = await session.rename(title);
 						if (result.ok) closeRename(mask);
-						else error.textContent = result.error?.message || "重命名失败";
+						else error.textContent = result.error?.message || "Rename failed";
 					} catch (err) {
 						error.textContent = err instanceof Error ? err.message : String(err);
 					} finally {

@@ -26,14 +26,14 @@ export const MAX_CUSTOM_TEXT = 4000;
 export const PRESETS = [
   {
     id: 'default',
-    name: '默认',
-    summary: '不注入任何风格指令，使用模型原生语气',
+    name: 'Default',
+    summary: 'No style instructions; the model keeps its native tone',
     text: '',
   },
   {
     id: 'warm',
-    name: '热情活力',
-    summary: '元气满满、多用感叹号、积极鼓励，表情适度',
+    name: 'Warm & upbeat',
+    summary: 'Full of energy, plenty of exclamation marks, encouraging, emoji in moderation',
     text: [
       '以「热情活力」的风格与用户交流：',
       '- 元气满满、有活力，多用感叹号，句子有精神头。',
@@ -45,8 +45,8 @@ export const PRESETS = [
   },
   {
     id: 'concise',
-    name: '简洁专业',
-    summary: '直给结论、砍掉客套、要点化，少修饰',
+    name: 'Concise & professional',
+    summary: 'Straight to the conclusion, no pleasantries, bullet points, little decoration',
     text: [
       '以「简洁专业」的风格与用户交流：',
       '- 先给结论或结果，再按需补充必要细节。',
@@ -58,8 +58,8 @@ export const PRESETS = [
   },
   {
     id: 'rigorous',
-    name: '严谨学术',
-    summary: '结论有依据、区分事实与推测、术语精确',
+    name: 'Rigorous & academic',
+    summary: 'Evidence-backed conclusions, facts kept apart from guesses, precise terms',
     text: [
       '以「严谨学术」的风格与用户交流：',
       '- 结论要有依据：说明推理过程、来源或前提条件。',
@@ -71,8 +71,8 @@ export const PRESETS = [
   },
   {
     id: 'humorous',
-    name: '幽默风趣',
-    summary: '轻松俏皮、适度玩梗、用类比化解枯燥',
+    name: 'Witty & humorous',
+    summary: 'Light and playful, a few jokes, analogies to break up the dull parts',
     text: [
       '以「幽默风趣」的风格与用户交流：',
       '- 语气轻松俏皮，适度开玩笑、玩梗、用比喻和类比化解枯燥。',
@@ -83,8 +83,8 @@ export const PRESETS = [
   },
   {
     id: 'gentle',
-    name: '温柔倾听',
-    summary: '先共情再解决、语气柔和、多确认理解',
+    name: 'Gentle listener',
+    summary: 'Empathy first, then solutions; soft tone, often checks understanding',
     text: [
       '以「温柔倾听」的风格与用户交流：',
       '- 先回应用户的情绪和处境，再进入问题解决。',
@@ -101,8 +101,8 @@ export const PRESETS = [
   // 「技术准确性不让路」的底线，避免风格损害实用性。
   {
     id: 'socratic',
-    name: '苏格拉底',
-    summary: '不直接给答案，用提问引导你自己想明白',
+    name: 'Socratic',
+    summary: 'No direct answers; guides you with questions until you work it out',
     text: [
       '以「苏格拉底式」的风格与用户交流：',
       '- 面对问题，先用反问把用户引向答案，而不是直接给结论。',
@@ -114,8 +114,8 @@ export const PRESETS = [
   },
   {
     id: 'tsundere',
-    name: '毒舌傲娇',
-    summary: '嘴上嫌弃你笨，手上却把问题解得明明白白',
+    name: 'Sharp-tongued tsundere',
+    summary: 'Teases you for being slow, yet solves the problem crystal clear',
     text: [
       '以「毒舌傲娇」的风格与用户交流：',
       '- 嘴上先嫌弃一句（「这都不会？」「行吧，勉强教你一次」），但紧接着认真、完整地解答。',
@@ -127,8 +127,8 @@ export const PRESETS = [
   },
   {
     id: 'storyteller',
-    name: '说书人',
-    summary: '把知识讲成故事，用场景和悬念带你走',
+    name: 'Storyteller',
+    summary: 'Turns knowledge into stories, leading you on with scenes and suspense',
     text: [
       '以「说书人」的风格与用户交流：',
       '- 尽量把抽象知识放进具体场景：谁、在什么处境下、遇到了什么问题。',
@@ -140,8 +140,8 @@ export const PRESETS = [
   },
   {
     id: 'roast',
-    name: '吐槽役',
-    summary: '一本正经地吐槽，把枯燥的事讲得好笑',
+    name: 'Deadpan roaster',
+    summary: 'Roasts with a straight face, making dull things funny',
     text: [
       '以「吐槽役」的风格与用户交流：',
       '- 用一本正经的语气说好笑的话，笑点来自精准的观察而非夸张。',
@@ -154,8 +154,8 @@ export const PRESETS = [
   },
   {
     id: 'minimalist',
-    name: '极简电报',
-    summary: '能三个字说完的绝不用四个字，惜字如金',
+    name: 'Telegram minimalist',
+    summary: 'Never four words where three will do; every word counts',
     text: [
       '以「极简电报」的风格与用户交流：',
       '- 极限压缩：能一句话说清就不写两句，能一个词说清就不写一句。',
@@ -167,8 +167,8 @@ export const PRESETS = [
   },
   {
     id: 'custom',
-    name: '自定义',
-    summary: '由你自己编写风格描述',
+    name: 'Custom',
+    summary: 'Write your own style description',
     text: '',
   },
 ];
@@ -290,7 +290,7 @@ export function normalizePersonaInput(patch, current) {
     custom: typeof patch.custom === 'string' ? patch.custom : base.custom,
   };
   if (!PRESET_BY_ID.has(next.preset)) {
-    return { ok: false, error: '未知的风格预设：' + next.preset + '。可用：' + PRESETS.map((p) => p.id).join(' / ') };
+    return { ok: false, error: 'Unknown style preset: ' + next.preset + '. Available: ' + PRESETS.map((p) => p.id).join(' / ') };
   }
   if (next.preset === 'custom') {
     if (!next.custom.trim()) return { ok: false, error: '自定义风格正文不能为空。' };

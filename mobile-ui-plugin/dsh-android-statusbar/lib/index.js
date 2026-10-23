@@ -414,10 +414,10 @@ function statusBarTool(home) {
 		presentCall: (args) => ({
 			card: 'generic',
 			title: args.action === 'get'
-				? '读取系统栏配色'
+				? 'Read system bar colors'
 				: args.action === 'stopflash'
-					? '停止系统栏闪烁'
-					: args.action === 'reset' ? '恢复系统栏默认' : '修改系统栏配色',
+					? 'Stop system bar flashing'
+					: args.action === 'reset' ? 'Reset system bars' : 'Change system bar colors',
 			description: describeCall(args),
 		}),
 		async execute(args) {
@@ -506,35 +506,35 @@ function summarizeFields(fields) {
 
 /** 把一次调用压成一行给用户看的说明。 */
 function describeCall(args) {
-	if (args?.action === 'get') return '读取状态栏与导航栏的当前配色';
-	if (args?.action === 'reset') return '两条栏都恢复为跟随页面底色，并停止闪烁';
-	if (args?.action === 'stopflash') return '停止系统栏闪烁（钦定色保留）';
+	if (args?.action === 'get') return 'Read current status bar and navigation bar colors';
+	if (args?.action === 'reset') return 'Both bars follow the page background again; flashing stops';
+	if (args?.action === 'stopflash') return 'Stop system bar flashing (pinned colors kept)';
 	const bits = [];
-	if (args?.fullscreen === true) bits.push('开启全面屏（背景铺满全屏）');
-	if (args?.fullscreen === false) bits.push('关闭全面屏');
+	if (args?.fullscreen === true) bits.push('Full screen on (background fills the screen)');
+	if (args?.fullscreen === false) bits.push('Full screen off');
 	if (args?.statusBar !== undefined) {
-		bits.push(args.statusBar === '' ? '状态栏跟随页面' : `状态栏 ${args.statusBar}`);
+		bits.push(args.statusBar === '' ? 'Status bar follows page' : `Status bar ${args.statusBar}`);
 	}
 	if (args?.navBar !== undefined) {
-		bits.push(args.navBar === '' ? '导航栏跟随页面' : `导航栏 ${args.navBar}`);
+		bits.push(args.navBar === '' ? 'Navigation bar follows page' : `Navigation bar ${args.navBar}`);
 	}
 	if (args?.statusBarIcons !== undefined && args.statusBarIcons !== 'auto') {
-		bits.push(`状态栏图标${args.statusBarIcons === 'light' ? '浅色' : '深色'}`);
+		bits.push(`Status bar icons ${args.statusBarIcons === 'light' ? 'light' : 'dark'}`);
 	}
 	if (args?.navBarIcons !== undefined && args.navBarIcons !== 'auto') {
-		bits.push(`导航栏图标${args.navBarIcons === 'light' ? '浅色' : '深色'}`);
+		bits.push(`Navigation bar icons ${args.navBarIcons === 'light' ? 'light' : 'dark'}`);
 	}
-	for (const [key, label] of [['statusBarFlash', '状态栏闪烁'], ['navBarFlash', '导航栏闪烁']]) {
+	for (const [key, label] of [['statusBarFlash', 'Status bar flash'], ['navBarFlash', 'Navigation bar flash']]) {
 		const value = args?.[key];
 		if (Array.isArray(value)) {
-			bits.push(value.length === 0 ? `${label}停止` : `${label} ${value.length} 色`);
+			bits.push(value.length === 0 ? `${label} off` : `${label} ${value.length} colors`);
 		}
 	}
-	if (typeof args?.flashIntervalMs === 'number') bits.push(`每帧 ${args.flashIntervalMs}ms`);
+	if (typeof args?.flashIntervalMs === 'number') bits.push(`${args.flashIntervalMs}ms per frame`);
 	if (typeof args?.flashLoops === 'number') {
-		bits.push(args.flashLoops < 0 ? '无限循环' : `${args.flashLoops} 圈`);
+		bits.push(args.flashLoops < 0 ? 'Loop forever' : `${args.flashLoops} loops`);
 	}
-	return bits.length > 0 ? bits.join(' · ') : '应用系统栏配色';
+	return bits.length > 0 ? bits.join(' · ') : 'Apply system bar colors';
 }
 
 /**
@@ -550,9 +550,9 @@ function describeCall(args) {
  */
 function renderText(value) {
 	const lines = [];
-	lines.push(value.ok ? '结果: 成功' : '结果: 失败');
+	lines.push(value.ok ? 'Result: success' : 'Result: failed');
 	if (value.appearance !== '') {
-		lines.push(`当前配色: ${value.appearance}`);
+		lines.push(`Current colors: ${value.appearance}`);
 		try {
 			const state = JSON.parse(value.appearance);
 			const hasFlash = Array.isArray(state?.statusBarFlash) && state.statusBarFlash.length > 0

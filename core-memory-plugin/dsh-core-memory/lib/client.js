@@ -147,7 +147,7 @@ window.__ModuleLoader__.load({
 						.then(function (r) { return r.json().then(function (v) { return { status: r.status, value: v }; }); })
 						.then(function (out) {
 							if (out.value && out.value.error) throw new Error(out.value.error);
-							if (out.status !== 200) throw new Error('保存失败（HTTP ' + out.status + '）');
+							if (out.status !== 200) throw new Error('Save failed (HTTP ' + out.status + ')');
 							setData(function (cur) { return cur ? Object.assign({}, cur, { persona: out.value.persona, presets: out.value.presets || cur.presets }) : out.value; });
 							if (out.value.persona) setDraft(out.value.persona.custom || '');
 							setTouched(false);
@@ -161,12 +161,12 @@ window.__ModuleLoader__.load({
 
 				if (error && !data) {
 					return React.createElement('div', { className: 'persona-page' },
-						React.createElement('div', { className: 'persona-error' }, '加载失败：' + error),
-						React.createElement('button', { className: 'persona-btn', onClick: reload }, '重试'));
+						React.createElement('div', { className: 'persona-error' }, 'Failed to load: ' + error),
+						React.createElement('button', { className: 'persona-btn', onClick: reload }, 'Retry'));
 				}
 				if (!data) {
 					return React.createElement('div', { className: 'persona-page' },
-						React.createElement('div', { className: 'persona-hint' }, '加载中…'));
+						React.createElement('div', { className: 'persona-hint' }, 'Loading…'));
 				}
 
 				var persona = data.persona || { enabled: true, preset: 'default', custom: '' };
@@ -177,23 +177,23 @@ window.__ModuleLoader__.load({
 
 				children.push(React.createElement('div', { className: 'persona-bar', key: 'bar' },
 					React.createElement('div', null,
-						React.createElement('div', { className: 'persona-bar-label' }, '启用回复风格'),
-						React.createElement('div', { className: 'persona-bar-sub' }, '关闭后不注入任何风格指令，使用模型原生语气')),
+						React.createElement('div', { className: 'persona-bar-label' }, 'Enable reply style'),
+						React.createElement('div', { className: 'persona-bar-sub' }, 'When off, no style instructions are injected and the model keeps its native tone')),
 					Switch({
 						on: !!persona.enabled,
 						disabled: busy,
-						title: '风格注入总开关',
-						onClick: function () { save({ enabled: !persona.enabled }, !persona.enabled ? '已启用' : '已停用'); },
+						title: 'Master switch for style injection',
+						onClick: function () { save({ enabled: !persona.enabled }, !persona.enabled ? 'Enabled' : 'Disabled'); },
 					})));
 
 				children.push(React.createElement('div', { className: 'persona-hint', key: 'hint' },
-					'所选风格会注入每个会话的系统提示，修改后在下一次模型组装时生效。'));
+					'The selected style is injected into every session’s system prompt; changes apply the next time the model prompt is assembled.'));
 
 				if (error) children.push(React.createElement('div', { className: 'persona-error', key: 'err' }, error));
 				if (notice) children.push(React.createElement('div', { className: 'persona-ok', key: 'ok' }, notice));
 
 				// 分组标题：为选项列表建立视觉层级
-				children.push(React.createElement('div', { className: 'persona-group-label', key: 'gl' }, '选择风格'));
+				children.push(React.createElement('div', { className: 'persona-group-label', key: 'gl' }, 'Choose a style'));
 
 				var cards = presets.map(function (p) {
 					var on = persona.preset === p.id;
@@ -208,29 +208,29 @@ window.__ModuleLoader__.load({
 								React.createElement('textarea', {
 									className: 'persona-textarea',
 									value: draft,
-									placeholder: '描述你想要的回复风格，例如：\n- 语气：轻松但专业\n- 句式：先给结论，再列要点\n- 用词：少用形容词\n- 参考口吻：「直接说重点。」',
+									placeholder: 'Describe the reply style you want, for example:\n- Tone: relaxed but professional\n- Sentences: conclusion first, then key points\n- Wording: few adjectives\n- Sample voice: “Get straight to the point.”',
 									onChange: function (e) { setDraft(e.target.value); setTouched(true); setNotice(null); },
 									onClick: function (e) { e.stopPropagation(); },
 								}),
 								React.createElement('div', { className: 'persona-editor-foot' },
 									React.createElement('span', { className: 'persona-count' + (over ? ' over' : '') },
-										draft.length + ' / ' + maxLen + ' 字符' + (over ? '（超出上限）' : '')),
+										draft.length + ' / ' + maxLen + ' characters' + (over ? ' (over the limit)' : '')),
 									React.createElement('span', { className: 'persona-actions' },
 										React.createElement('button', {
 											className: 'persona-btn primary',
 											disabled: busy || over || !draft.trim(),
-											onClick: function (e) { e.stopPropagation(); save({ preset: 'custom', custom: draft }, '自定义风格已保存'); },
-										}, '保存')))) : null,
+											onClick: function (e) { e.stopPropagation(); save({ preset: 'custom', custom: draft }, 'Custom style saved'); },
+										}, 'Save')))) : null,
 						),
 					];
 					var onClick = function () {
 						if (p.id === 'custom') {
 							// 「自定义」先本地展开编辑区（不写盘）：已有草稿则直接切换为自定义风格，
 							// 否则等用户填写后点「保存」再写入，避免把空占位文本写进配置。
-							if (draft.trim()) save({ preset: 'custom', custom: draft }, '已切换到自定义风格');
+							if (draft.trim()) save({ preset: 'custom', custom: draft }, 'Switched to custom style');
 							else setLocalCustom(true);
 						} else {
-							save({ preset: p.id }, '已切换到「' + p.name + '」');
+							save({ preset: p.id }, 'Switched to “' + p.name + '”');
 						}
 					};
 					return React.createElement('div', {
@@ -251,7 +251,7 @@ window.__ModuleLoader__.load({
 			ctx.effect(function () {
 				return slots.inject('settings.section', function () {
 					return slots.register(
-						{ name: 'settings.section', id: 'persona', order: 17, label: 'AI 回复风格' },
+						{ name: 'settings.section', id: 'persona', order: 17, label: 'AI reply style' },
 						PersonaSection
 					);
 				});

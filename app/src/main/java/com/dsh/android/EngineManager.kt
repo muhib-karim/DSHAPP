@@ -335,13 +335,13 @@ class EngineManager private constructor(private val context: Context) {
 
             engineDir.deleteRecursively()
             if (!staging.renameTo(engineDir)) {
-                throw java.io.IOException("无法将解包目录重命名为 $engineDir")
+                throw java.io.IOException("Could not rename the unpacked directory to $engineDir")
             }
             _state.value = State.Extracting(100)
             Log.i(TAG, "引擎资产解包完成：${engineDir.absolutePath}")
         } catch (t: Throwable) {
             staging.deleteRecursively()
-            _state.value = State.Failed("引擎解包失败: ${t.message}")
+            _state.value = State.Failed("Could not unpack the engine: ${t.message}")
             throw t
         }
     }
@@ -5020,7 +5020,7 @@ class EngineManager private constructor(private val context: Context) {
         //   模式」这个事实仍成立，界面必须照实显示。
         RescueBoot.setTier(
             RescueBoot.Tier.SAFE_MODE,
-            "安全模式：推开损坏的配置并重新解包引擎（改动=$changed）",
+            "Safe mode: set aside damaged settings and unpacked the engine again (changed=$changed)",
         )
 
         Log.w(TAG, "安全模式：已推开损坏的配置（改动=$changed），准备重启引擎")
@@ -5721,7 +5721,7 @@ class EngineManager private constructor(private val context: Context) {
                     " ⇒ 不是插件问题，降级到 L2 救援模式",
             )
             escalateToRescue(
-                "连续 ${f.consecutiveFailures} 次启动失败，且引擎未报 required 插件未激活（不是插件问题）",
+                "Startup failed ${f.consecutiveFailures} times in a row and the engine reported no inactive required plugins (not a plugin problem)",
             )
             return null
         }
@@ -5757,7 +5757,7 @@ class EngineManager private constructor(private val context: Context) {
             //     有常驻横幅 + 一键退出），所以这里推进不会造成损害；而停在
             //     NORMAL 是**确定**打不开。
             Log.w(TAG, "L1 隔离：未能给出结论（见上面那行）⇒ 降级到 L2 救援模式")
-            escalateToRescue("L1 无法给出结论（清单缺失/解析失败/备份失败）")
+            escalateToRescue("L1 could not reach a conclusion (plugin list missing, unparseable, or backup failed)")
             return null
         }
         Log.w(TAG, "L1 隔离结论：${r.reason}（试启动 ${r.attempts} 次，已验证=${r.verified}）")
@@ -5817,7 +5817,7 @@ class EngineManager private constructor(private val context: Context) {
         //   代价是用户这次看不到自己的插件 —— 但那正是"一定打得开"的定价，
         //   而且 `state.json` 里记着原因、界面常驻提示、可一键退出（I4）。
         Log.w(TAG, "L1 隔离未能定位致命插件（${r.reason}）⇒ 降级到 L2 救援模式")
-        escalateToRescue("${r.reason}（试启动 ${r.attempts} 次）")
+        escalateToRescue("${r.reason} (${r.attempts} trial starts)")
         return r
     }
 
@@ -5845,7 +5845,7 @@ class EngineManager private constructor(private val context: Context) {
         //   写死会让事件时间线把一次 NORMAL→RESCUE 的直接降级记成 L1 的产物，
         //   排查时按 `from=l1` 找证据会落空（同族缺陷：「结论与它描述的对象不符」）。
         EventLog.record("rescue.degrade.l2", mapOf("from" to from, "reason" to reason))
-        RescueBoot.setTier(tier = RescueBoot.Tier.RESCUE, reason = "自动降级：$reason")
+        RescueBoot.setTier(tier = RescueBoot.Tier.RESCUE, reason = "Auto-downgrade: $reason")
     }
 
     /**
@@ -5942,7 +5942,7 @@ class EngineManager private constructor(private val context: Context) {
         if (third.isEmpty() && shadowed.isEmpty()) {
             Log.w(TAG, "L1 隔离：清单里没有第三方 bundle，也没有遮蔽副本，不是插件问题")
             return@withContext IsolationResult(
-                emptyList(), "清单里没有第三方插件 —— 不是插件问题", 0, false,
+                emptyList(), "No third-party plugins in the list — not a plugin problem", 0, false,
             )
         }
         Log.w(
@@ -6022,8 +6022,8 @@ class EngineManager private constructor(private val context: Context) {
                 Log.w(TAG, "L1 隔离完成：语法预检定位到 ${syntaxBad.size} 个坏插件，摘掉后能正常启动")
                 return@withContext IsolationResult(
                     syntaxBad,
-                    "语法预检定位到 ${syntaxBad.size} 个损坏的插件（${syntaxBad.joinToString()}），" +
-                        "摘掉后能正常启动（其余 ${third.size - syntaxBad.size} 个保留）",
+                    "Syntax pre-check found ${syntaxBad.size} broken plugins (${syntaxBad.joinToString()}); " +
+                        "startup works without them (the other ${third.size - syntaxBad.size} kept)",
                     attempts,
                     true,
                 )
@@ -6111,8 +6111,8 @@ class EngineManager private constructor(private val context: Context) {
                         Log.w(TAG, "L1 隔离完成：摘掉 ${moved.size} 个遮蔽副本后能正常启动")
                         return@withContext IsolationResult(
                             moved.map { it.name },
-                            "profile 里遮蔽引擎自带包的 ${moved.size} 个旧副本（" +
-                                "${moved.joinToString { it.name }}）已隔离，摘掉后能正常启动",
+                            "Isolated ${moved.size} old copies in the profile that shadowed engine-bundled packages (" +
+                                "${moved.joinToString { it.name }}); startup works without them",
                             attempts,
                             true,
                         )
@@ -6151,7 +6151,7 @@ class EngineManager private constructor(private val context: Context) {
             if (!writeBundles(manifest, core, third)) {
                 Log.w(TAG, "L1 隔离：还原清单失败（用户配置可能停留在已摘状态，备份仍在）")
             }
-            return@withContext IsolationResult(emptyList(), "全摘之后仍起不来 —— 不是插件问题", attempts, false)
+            return@withContext IsolationResult(emptyList(), "Still fails with all third-party plugins removed — not a plugin problem", attempts, false)
         }
 
         // 二分：找**第一个**致命插件。
@@ -6178,7 +6178,7 @@ class EngineManager private constructor(private val context: Context) {
         val culprit = candidates.firstOrNull()
         if (culprit == null) {
             Log.w(TAG, "L1 隔离：没收敛到具体插件，交 L2")
-            return@withContext IsolationResult(emptyList(), "二分未收敛", attempts, false)
+            return@withContext IsolationResult(emptyList(), "Bisection did not converge", attempts, false)
         }
 
         // 收尾：只摘这一个，确认真的能起来。
@@ -6189,7 +6189,7 @@ class EngineManager private constructor(private val context: Context) {
             Log.w(TAG, "L1 隔离完成：摘掉 1 个（$culprit），其余 ${third.size - 1} 个保留")
             IsolationResult(
                 listOf(culprit),
-                "二分定位到 $culprit，摘掉后能正常启动（其余 ${third.size - 1} 个插件保留）",
+                "Bisection found $culprit; startup works without it (the other ${third.size - 1} plugins kept)",
                 attempts,
                 true,
             )
@@ -6199,7 +6199,7 @@ class EngineManager private constructor(private val context: Context) {
             Log.w(TAG, "L1 隔离：摘掉 $culprit 后仍起不来 ⇒ 还有别的致命插件，交 L2")
             IsolationResult(
                 listOf(culprit),
-                "找到 $culprit 但摘掉后仍起不来（还有别的致命插件，或预算耗尽）",
+                "Found $culprit, but startup still fails without it (another fatal plugin remains, or the trial budget ran out)",
                 attempts,
                 false,
             )
@@ -6632,7 +6632,7 @@ class EngineManager private constructor(private val context: Context) {
         // 真机实测：正常态体检耗时 0.7~0.8 秒，对 7~10 秒的启动时间可忽略。
         if (!bootstrap.installNodeRuntime()) {
             _state.value = State.Failed(
-                "Termux 环境未就绪，无法启动引擎。\n" +
+                "Termux environment is not ready. Cannot start the engine.\n" +
                     "prefix=${bootstrap.prefixDir.absolutePath}\n" +
                     "node=${bootstrap.nodeBinary.absolutePath}"
             )
@@ -6641,7 +6641,7 @@ class EngineManager private constructor(private val context: Context) {
 
         val nodeBin = bootstrap.nodeBinary
         if (!nodeBin.isFile) {
-            _state.value = State.Failed("找不到 Node 可执行文件: ${nodeBin.absolutePath}")
+            _state.value = State.Failed("Node executable not found: ${nodeBin.absolutePath}")
             return@withContext
         }
 
@@ -6935,7 +6935,7 @@ class EngineManager private constructor(private val context: Context) {
 
         val binJs = File(engineDir, "node_modules/@deepseek-ai/dsh/lib/bin.js")
         if (!binJs.isFile) {
-            _state.value = State.Failed("找不到引擎入口: ${binJs.absolutePath}")
+            _state.value = State.Failed("Engine entry point not found: ${binJs.absolutePath}")
             return@withContext
         }
 
@@ -7120,7 +7120,7 @@ class EngineManager private constructor(private val context: Context) {
         ) {
             Log.w(TAG, "L1 已把层级改为救援模式，本次不发车，改用救援 profile 重启")
             EventLog.record("engine.restart.for-rescue", mapOf("staleProfile" to targetProfile))
-            requestRestart("L1 降级到救援模式")
+            requestRestart("L1 downgraded to rescue mode")
             return@withContext
         }
 
@@ -7142,7 +7142,7 @@ class EngineManager private constructor(private val context: Context) {
         val proc = try {
             pb.start()
         } catch (t: Throwable) {
-            _state.value = State.Failed("引擎进程启动失败: ${t.message}")
+            _state.value = State.Failed("Could not start the engine process: ${t.message}")
             return@withContext
         }
         process = proc
@@ -7305,8 +7305,8 @@ class EngineManager private constructor(private val context: Context) {
                 val tierNow = RescueBoot.tier().tier
                 if (tierNow == RescueBoot.Tier.NORMAL && rescueAvailable) {
                     escalateToRescue(
-                        "引擎起来了但 typert gateway 整体下线（contributor 注册失败：" +
-                            "${gatewayCulprit.ifEmpty { "包名未解析到" }}）",
+                        "Engine started but the typert gateway went offline (contributor registration failed: " +
+                            "${gatewayCulprit.ifEmpty { "package name not resolved" }})",
                         // 这条降级**没有经过 L1 二分**（引擎是「成功」启动的，L1 的闸门
                         // 一个都没开），所以事件里必须如实标成 gateway 检测，不能冒 L1 的名。
                         from = "gateway",
@@ -7316,7 +7316,7 @@ class EngineManager private constructor(private val context: Context) {
                     //   状态打成 [State.Dead] 而不是 [State.Failed] —— 引擎没崩、页面能
                     //   加载，而 Failed 会把用户引向**破坏性**的「安全模式」按钮；
                     //   Dead 的「原样重启」正是这里要的（同 [requestRestart] 的 KDoc）。
-                    requestRestart("typert gateway 整体下线，切救援模式")
+                    requestRestart("typert gateway offline, switching to rescue mode")
                     return@withContext
                 }
                 // 走到这里 = 已经是救援态仍失效，或救援 profile 不可用。
@@ -7438,9 +7438,9 @@ class EngineManager private constructor(private val context: Context) {
             // （原来只有崩溃现场文件里才有，日志行里看不到）。
             val waited = System.currentTimeMillis() - startMs
             val reason = if (waited >= READY_TIMEOUT_MS) {
-                "等待 ${waited / 1000} 秒仍未打印 URL（确为超时）"
+                "No URL printed after ${waited / 1000} s (startup timed out)"
             } else {
-                "引擎进程在打印 URL 之前就结束了（等了 ${waited} ms）"
+                "Engine process exited before printing a URL (waited ${waited} ms)"
             }
             // ⚠️ **顺序是要害：先落盘「为什么失败」，再广播 `State.Failed`。**
             //
@@ -7479,7 +7479,7 @@ class EngineManager private constructor(private val context: Context) {
                 exitCode = runCatching { proc.exitValue() }.getOrNull(),
                 tailLines = tailList,
             )
-            _state.value = State.Failed("引擎启动失败（$reason）。最后输出:\n$tail")
+            _state.value = State.Failed("Engine startup failed ($reason). Last output:\n$tail")
             // ⚠️ **P0：把「真实启动失败」变成可读的状态**（见 RescueBoot 的类注释）。
             //
             // 这里传的是**真实启动**的 stdout 尾部 —— 这一点是整个修复的要害：
@@ -7677,7 +7677,7 @@ class EngineManager private constructor(private val context: Context) {
         if (process !== proc) return
         if (!wasReady) return
         val code = runCatching { proc.exitValue() }.getOrNull()
-        val detail = if (code != null) "退出码 $code" else "进程已退出"
+        val detail = if (code != null) "Exit code $code" else "Process exited"
         Log.w(TAG, "引擎在运行期退出（$detail），界面已失去后端")
         // ⚠️ 「引擎在运行期自己死了」是仅次于「起不来」的严重故障：用户正用着，
         //   界面突然什么都点不动，且**没有任何报错**。崩溃现场文件是这里唯一的
@@ -7705,7 +7705,7 @@ class EngineManager private constructor(private val context: Context) {
         if (!adbHome.isDirectory) {
             return WirelessDebugging.Result(
                 false,
-                "内置 adb 工具链未就绪（$ADB_WIRELESS_DIR 不存在），无线调试不可用。",
+                "Bundled adb toolchain is not ready ($ADB_WIRELESS_DIR is missing). Wireless debugging is unavailable.",
             )
         }
         val result = WirelessDebugging.pair(
@@ -7751,7 +7751,7 @@ class EngineManager private constructor(private val context: Context) {
                 //   这里用新端口补切成功，那句话此刻已经不成立。不改的话通知栏会告诉
                 //   用户「请去设置页点『切到固定端口』重试」—— 而实际上什么都不用做，
                 //   用户白跑一趟还会以为修复没生效。
-                return result.copy(message = "配对成功，并已切到固定端口 5555 —— 现在关掉无线调试、关掉 Wi-Fi 都不影响特权通道。")
+                return result.copy(message = "Paired and switched to fixed port 5555. Turning off wireless debugging or Wi-Fi no longer affects privileged access.")
             }
             Log.w(TAG, "配对成功但补切固定端口失败: ${switched.message}")
         }
@@ -7773,7 +7773,7 @@ class EngineManager private constructor(private val context: Context) {
         if (!adbHome.isDirectory) {
             return WirelessDebugging.Result(
                 false,
-                "内置 adb 工具链未就绪（$ADB_WIRELESS_DIR 不存在），无线调试不可用。",
+                "Bundled adb toolchain is not ready ($ADB_WIRELESS_DIR is missing). Wireless debugging is unavailable.",
             )
         }
         return WirelessDebugging.switchToTcp(
@@ -8178,7 +8178,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val AGNES_MM_DIR = "agnes-multimodal"
 
         /** 插件内容版本戳：改了 `agnes-multimodal.zip` 里任何东西都必须改这里。 */
-        private const val AGNES_MM_VERSION = "1.0.0-3"
+        private const val AGNES_MM_VERSION = "1.0.0-5"
         private const val AGNES_MM_STAMP = ".agnes_mm_version"
 
         /** 插件自己的账号池状态文件（`lib/index.js` 的 `readAccounts()` 读的就是它）。 */
@@ -8216,7 +8216,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val PRESET_RAZOR_MARKER = ".preset_razor_bundle_registered"
 
         /** 内容版本戳：改了 `preset-razor.zip` 里任何东西都必须改这里。 */
-        private const val PRESET_RAZOR_VERSION = "1.0.3-1"
+        private const val PRESET_RAZOR_VERSION = "1.0.3-2"
         private const val PRESET_RAZOR_STAMP = ".preset_razor_version"
 
         /**
@@ -8417,7 +8417,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val CORE_MEMORY_LEGACY_DIR = "core-memory"
 
         /** 内容版本戳：改了 `core-memory.zip` 里任何东西都必须改这里。 */
-        private const val CORE_MEMORY_VERSION = "1.0.0-2"
+        private const val CORE_MEMORY_VERSION = "1.0.0-3"
         private const val CORE_MEMORY_STAMP = ".core_memory_version"
 
         /** 插件市场（dsh-android-market）：资产名、包名、overlay 文件名。 */
@@ -8434,7 +8434,7 @@ class EngineManager private constructor(private val context: Context) {
          * ⚠️ 尤其**重跑 `tools/market-collect.mjs` 更新了 `lib/seed.json` 之后**
          * 也要改 —— 否则老设备会继续用包里那份旧种子。
          */
-        private const val MARKET_VERSION = "1.0.0-6"
+        private const val MARKET_VERSION = "1.0.0-7"
         private const val MARKET_STAMP = ".market_version"
 
         /**

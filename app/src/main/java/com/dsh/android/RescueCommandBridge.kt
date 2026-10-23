@@ -275,17 +275,17 @@ object RescueCommandBridge {
             "switch-rescue" -> {
                 RescueBoot.setTier(
                     RescueBoot.Tier.RESCUE,
-                    "AI 请求切回救援模式",
+                    "AI asked to switch back to rescue mode",
                 )
-                engine.requestRestart("AI 请求切回救援模式")
+                engine.requestRestart("AI asked to switch back to rescue mode")
                 Triple(true, "已切到救援模式，界面即将重启", null)
             }
             "switch-back" -> {
                 // ⚠️ 复位到 NORMAL 而不是"删掉 state.json"：文件留着，
                 //   历史原因（`since`/`reason`）还读得到，诊断包也还能说清
                 //   "什么时候从救援模式回来的"。
-                RescueBoot.setTier(RescueBoot.Tier.NORMAL, "AI 请求切回正常模式")
-                engine.requestRestart("AI 请求切回正常模式")
+                RescueBoot.setTier(RescueBoot.Tier.NORMAL, "AI asked to switch back to normal mode")
+                engine.requestRestart("AI asked to switch back to normal mode")
                 Triple(true, "已切回正常模式，界面即将重启", null)
             }
             else -> Triple(false, "未知 action: $action", null)

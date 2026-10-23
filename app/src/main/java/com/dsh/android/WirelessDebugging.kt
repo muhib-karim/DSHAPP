@@ -508,7 +508,7 @@ object WirelessDebugging {
         //    会互相把 adbd 重启掉，比不切还糟。后来者**如实报「没切」**——
         //    不能报成功：调用方（设置页按钮 / 守护）要据此判断通道到底可不可用。
         if (!switching.compareAndSet(false, true)) {
-            return Result(false, "已有一次固定端口切换正在进行中，请稍等几秒后重新检测。")
+            return Result(false, "A fixed-port switch is already in progress. Wait a few seconds, then check again.")
         }
         try {
             return ensureTcpPortLocked(context, nodeBin, runner, adbHome, dshHome)
@@ -573,8 +573,8 @@ object WirelessDebugging {
             Log.w(TAG, "固定端口未就绪，且 $attempt 次发现都没拿到无线调试端口")
             return Result(
                 false,
-                "固定端口 5555 未就绪，且没发现无线调试端口（已重试 $attempt 次）。" +
-                    "请在系统「开发者选项 → 无线调试」里打开它，或先用电脑执行一次 adb tcpip 5555。",
+                "Fixed port 5555 is not ready and no wireless debugging port was found (retried $attempt times). " +
+                    "Turn on Wireless debugging in system Developer options, or run adb tcpip 5555 from a computer once.",
             )
         }
         // 把**刚发现的新鲜端口**传下去。这一点是必需的：`adb tcpip` 要通过无线
@@ -638,8 +638,8 @@ object WirelessDebugging {
         code: String,
         knownPort: Int = -1,
     ): Result {
-        if (!runner.isFile) return Result(false, "执行通道文件不存在：${runner.absolutePath}")
-        if (!nodeBin.isFile) return Result(false, "Node 可执行文件不存在：${nodeBin.absolutePath}")
+        if (!runner.isFile) return Result(false, "Execution channel file not found: ${runner.absolutePath}")
+        if (!nodeBin.isFile) return Result(false, "Node executable not found: ${nodeBin.absolutePath}")
 
         // 优先用通知带下来的端口；没有再自己发现。
         val port = if (knownPort > 0) {
@@ -651,8 +651,8 @@ object WirelessDebugging {
         if (port <= 0) {
             return Result(
                 false,
-                "没找到配对端口。请先在系统「开发者选项 → 无线调试」里点开" +
-                    "「使用配对码配对设备」，让那个界面保持显示，再回到这里点配对。",
+                "No pairing port found. In system Developer options → Wireless debugging, open " +
+                    "Pair device with pairing code, keep that screen open, then come back here and tap Pair.",
             )
         }
         Log.i(TAG, "配对端口 $port，开始配对")
@@ -675,7 +675,7 @@ object WirelessDebugging {
             code
         } catch (t: Throwable) {
             Log.w(TAG, "配对失败", t)
-            return Result(false, "启动配对进程失败：${t.message}")
+            return Result(false, "Could not start pairing: ${t.message}")
         }
 
         val text = output.toString().trim()
@@ -694,11 +694,11 @@ object WirelessDebugging {
             if (text.contains(SWITCH_TC_FAILED_MARK)) {
                 Result(
                     true,
-                    "配对成功，但还没切到固定端口 —— 现在只能靠无线调试，关掉 Wi-Fi 或" +
-                        "无线调试开关后特权通道会失效。请回设置页点「切到固定端口」重试。",
+                    "Paired, but not yet switched to the fixed port. Privileged access now depends on wireless debugging and stops if you turn off Wi-Fi or " +
+                        "wireless debugging. Go back to Settings and tap Switch to fixed port to retry.",
                 )
             } else {
-                Result(true, "配对成功，ADB 密钥已被设备信任。")
+                Result(true, "Paired. The device now trusts the ADB key.")
             }
         } else {
             Result(false, pairingFailureReason(exit, text))
@@ -738,8 +738,8 @@ object WirelessDebugging {
         dshHome: File,
         knownPort: Int = -1,
     ): Result {
-        if (!runner.isFile) return Result(false, "执行通道文件不存在：${runner.absolutePath}")
-        if (!nodeBin.isFile) return Result(false, "Node 可执行文件不存在：${nodeBin.absolutePath}")
+        if (!runner.isFile) return Result(false, "Execution channel file not found: ${runner.absolutePath}")
+        if (!nodeBin.isFile) return Result(false, "Node executable not found: ${nodeBin.absolutePath}")
 
         val output = StringBuilder()
         val exit: Int = try {
@@ -761,26 +761,26 @@ object WirelessDebugging {
             code
         } catch (t: Throwable) {
             Log.w(TAG, "切换 TCP 模式失败", t)
-            return Result(false, "启动切换进程失败：${t.message}")
+            return Result(false, "Could not start the port switch: ${t.message}")
         }
 
         return if (exit == 0) {
-            Result(true, "已切到固定端口 5555 —— 现在关掉无线调试、关掉 Wi-Fi 都不影响特权通道。")
+            Result(true, "Switched to fixed port 5555. Turning off wireless debugging or Wi-Fi no longer affects privileged access.")
         } else {
-            Result(false, "切换失败（退出码 $exit）。请确认无线调试开着，或先用电脑连一次。\n${output.toString().trim()}")
+            Result(false, "Switch failed (exit code $exit). Make sure wireless debugging is on, or connect from a computer once.\n${output.toString().trim()}")
         }
     }
 
     /** 把 adb 的报错翻译成用户能照着做的说明。 */
     private fun pairingFailureReason(exit: Int, output: String): String = when {
         output.contains("Failed to parse pairing code") || output.contains("invalid pairing code") ->
-            "配对码不对（必须是系统界面上显示的 6 位数字）。"
+            "Wrong pairing code (it must be the 6-digit code shown in system settings)."
         output.contains("Connection refused") ->
-            "配对端口连不上 —— 那个「使用配对码配对设备」的界面可能已经关了，请重新打开再试。"
+            "Cannot reach the pairing port. The Pair device with pairing code screen may have closed. Reopen it and try again."
         output.contains("already paired") ->
-            "这台设备已经配过对了，可以直接用无线通道。"
+            "This device is already paired. You can use the wireless connection directly."
         else ->
-            "配对失败（退出码 $exit）。\n$output"
+            "Pairing failed (exit code $exit).\n$output"
     }
 
     /**

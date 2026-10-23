@@ -1011,9 +1011,9 @@ function bubbleTool(home) {
 		presentCall: (args) => ({
 			card: 'generic',
 			title: args.action === 'get'
-				? '读取悬浮窗外观'
-				: args.action === 'notify' ? '推送状态消息'
-					: args.action === 'state' ? '驱动宠物动作' : '修改悬浮窗',
+				? 'Read floating window appearance'
+				: args.action === 'notify' ? 'Push status message'
+					: args.action === 'state' ? 'Drive pet action' : 'Change floating window',
 			description: describeCall(args),
 		}),
 		async execute(args) {
@@ -1245,63 +1245,63 @@ function summarizeFields(fields) {
 
 /** 把一次调用压成一行给用户看的说明。 */
 function describeCall(args) {
-	if (args?.action === 'get') return '读取当前状态、大小、形状与配色';
+	if (args?.action === 'get') return 'Read current state, size, shape and colors';
 	if (args?.action === 'notify') {
 		const text = typeof args?.text === 'string' ? args.text : '';
-		return text === '' ? '推送状态消息' : `推送状态消息：${text}`;
+		return text === '' ? 'Push status message' : `Push status message: ${text}`;
 	}
 	if (args?.action === 'state') {
 		const bits = [];
-		if (args?.runState) bits.push(`状态 ${args.runState}`);
+		if (args?.runState) bits.push(`State ${args.runState}`);
 		if (args?.playAction !== undefined) {
-			bits.push(args.playAction === '' ? '动作恢复自动' : `动作 ${args.playAction}`);
+			bits.push(args.playAction === '' ? 'Action back to auto' : `Action ${args.playAction}`);
 		}
-		return bits.length > 0 ? `驱动宠物：${bits.join(' · ')}` : '驱动宠物动作';
+		return bits.length > 0 ? `Drive pet: ${bits.join(' · ')}` : 'Drive pet action';
 	}
 	const bits = [];
 	if (args?.state !== undefined) bits.push(String(args.state));
 	if (args?.actions !== undefined) {
 		const n = args.actions && typeof args.actions === 'object' ? Object.keys(args.actions).length : 0;
-		bits.push(`配 ${n} 个动作`);
+		bits.push(`${n} actions`);
 	}
-	if (args?.actionMap !== undefined) bits.push(`状态映射 ${Object.keys(args.actionMap ?? {}).length} 项`);
+	if (args?.actionMap !== undefined) bits.push(`State map: ${Object.keys(args.actionMap ?? {}).length} entries`);
 	if (args?.pinAction !== undefined) {
-		bits.push(args.pinAction === '' ? '动作恢复自动' : `钦定动作 ${args.pinAction}`);
+		bits.push(args.pinAction === '' ? 'Action back to auto' : `Pinned action ${args.pinAction}`);
 	}
 	if (args?.size !== undefined) bits.push(`${args.size}dp`);
 	// ⚠️ `0` 不是"没给"，是"自动"这个取值本身 —— 用 `!== undefined` 判，
 	//   不能写成 `if (args?.boxWidth)`，那会把 `boxWidth:0`（= 恢复自动）静默吞掉，
 	//   用户看到的正是"说了改回自动却没反应"。
 	if (args?.boxWidth !== undefined || args?.boxHeight !== undefined) {
-		const w = args?.boxWidth === undefined || args.boxWidth === 0 ? '自动' : `${args.boxWidth}dp`;
-		const h = args?.boxHeight === undefined || args.boxHeight === 0 ? '自动' : `${args.boxHeight}dp`;
-		bits.push(`画布 ${w}×${h}`);
+		const w = args?.boxWidth === undefined || args.boxWidth === 0 ? 'auto' : `${args.boxWidth}dp`;
+		const h = args?.boxHeight === undefined || args.boxHeight === 0 ? 'auto' : `${args.boxHeight}dp`;
+		bits.push(`Canvas ${w}×${h}`);
 	}
-	if (args?.showDot !== undefined) bits.push(args.showDot ? '显示状态点' : '隐藏状态点');
+	if (args?.showDot !== undefined) bits.push(args.showDot ? 'Show status dot' : 'Hide status dot');
 	if (args?.shape !== undefined) bits.push(String(args.shape));
-	if (args?.shapePath !== undefined) bits.push('自定义形状');
+	if (args?.shapePath !== undefined) bits.push('Custom shape');
 	if (args?.bg !== undefined) bits.push(String(args.bg));
-	if (args?.bgOpacity !== undefined) bits.push(`背景不透明度 ${args.bgOpacity}`);
-	if (args?.avatarOpacity !== undefined) bits.push(`图片不透明度 ${args.avatarOpacity}`);
-	if (args?.spin !== undefined && args.spin !== 0) bits.push(`旋转 ${args.spin}°/s`);
-	if (args?.pulse === true) bits.push('呼吸动画');
+	if (args?.bgOpacity !== undefined) bits.push(`Background opacity ${args.bgOpacity}`);
+	if (args?.avatarOpacity !== undefined) bits.push(`Image opacity ${args.avatarOpacity}`);
+	if (args?.spin !== undefined && args.spin !== 0) bits.push(`Spin ${args.spin}°/s`);
+	if (args?.pulse === true) bits.push('Breathing animation');
 	if (Array.isArray(args?.frameFiles)) {
 		const n = args.frameFiles.length;
 		bits.push(args?.spriteRows && args?.spriteCols
-			? `精灵图 ${args.spriteRows}×${args.spriteCols}`
-			: `轮播 ${n} 帧`);
+			? `Sprite sheet ${args.spriteRows}×${args.spriteCols}`
+			: `${n}-frame loop`);
 	}
-	if (args?.avatarFile !== undefined) bits.push(`头像 ${path.basename(String(args.avatarFile))}`);
-	else if (args?.avatar === 'none') bits.push('去掉图片');
-	else if (args?.avatar !== undefined) bits.push('自定义头像');
-	return bits.length > 0 ? bits.join(' · ') : '应用外观改动';
+	if (args?.avatarFile !== undefined) bits.push(`Avatar ${path.basename(String(args.avatarFile))}`);
+	else if (args?.avatar === 'none') bits.push('Remove image');
+	else if (args?.avatar !== undefined) bits.push('Custom avatar');
+	return bits.length > 0 ? bits.join(' · ') : 'Apply appearance changes';
 }
 
 /** 把结果渲染成模型可见文本。 */
 function renderText(value) {
 	const lines = [];
-	lines.push(value.ok ? '结果: 成功' : '结果: 失败');
-	if (value.appearance !== '') lines.push(`当前外观: ${value.appearance}`);
+	lines.push(value.ok ? 'Result: success' : 'Result: failed');
+	if (value.appearance !== '') lines.push(`Current appearance: ${value.appearance}`);
 	if (value.message !== '') lines.push(value.message);
 	return lines.join('\n');
 }

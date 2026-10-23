@@ -376,16 +376,16 @@ object BootState {
 
         /** 给界面的一句话（中文）。 */
         fun describe(): String = when {
-            !known -> "首次启动，无历史记录"
+            !known -> "First launch, no history"
             // 这一支的 startedAt 是**退出时刻**（markCleanExit 写的），说「退出」是对的。
-            clean -> "上次正常退出（${fmt.format(Date(startedAt))}）"
-            unstable -> "连续 $consecutiveUncleanCount 次未正常结束，建议查看日志"
+            clean -> "Last run exited normally (${fmt.format(Date(startedAt))})"
+            unstable -> "$consecutiveUncleanCount unclean exits in a row. Check the logs"
             // ⚠️ **必须说成「上次启动于」**：这一支的 startedAt 是上次**启动**的时刻。
             //   原来写「上次未正常结束（<时刻>，无堆栈）」，读者会把它当成故障发生
             //   的时刻，去日志里按这个时间去对齐 —— 而它其实是启动那一行的时间。
             //   真机实测：lastExit.at = 04:04:44.898（上次启动），而本次启动是
             //   04:07:01.997，真正的消失发生在两者之间，日志里根本没有那个时刻。
-            else -> "上次未正常结束（上次启动于 ${fmt.format(Date(startedAt))}，无堆栈）"
+            else -> "Last run ended abnormally (started at ${fmt.format(Date(startedAt))}; no stack trace)"
         }
     }
 

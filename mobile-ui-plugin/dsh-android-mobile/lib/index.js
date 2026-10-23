@@ -236,7 +236,7 @@ async function probe() {
 	};
 
 	if (runnerStat === null) {
-		snapshot.identity.reason = '执行通道文件不存在，无法探测';
+		snapshot.identity.reason = 'Exec channel file is missing; cannot probe';
 		snapshot.identity.kind = 'no-runner';
 		return snapshot;
 	}
@@ -271,10 +271,10 @@ async function probe() {
 		snapshot.identity.reason = fallback !== null
 			? fallback[1]
 			: result.timedOut
-				? `探测超时（${PROBE_TIMEOUT_MS / 1000} 秒）`
+				? `Probe timed out (${PROBE_TIMEOUT_MS / 1000} s)`
 				: uid === ''
-					? '执行通道没有返回身份'
-					: `实际身份是 uid ${uid}，没有拿到 uid 2000`;
+					? 'Exec channel returned no identity'
+					: `Actual identity is uid ${uid}, not uid 2000`;
 		// ⚠️ **机器可读的失败分类**，来自 runner 那条 `诊断: kind=… key=… …` 行。
 		//
 		// 上面那句 `reason` 是给人看的（且受 `FALLBACK_RE` 的非贪婪匹配限制，

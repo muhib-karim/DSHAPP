@@ -63,15 +63,15 @@ window.__ModuleLoader__.load({
 			var CN_ENDPOINT = "https://api.agnes-ai.cn/v1";
 			var INTL_ENDPOINT = "https://apihub.agnes-ai.cn/v1";
 			var REGIONS = [
-				{ label: "国内站", endpoint: CN_ENDPOINT },
-				{ label: "国际站", endpoint: INTL_ENDPOINT }
+				{ label: "China site", endpoint: CN_ENDPOINT },
+				{ label: "International site", endpoint: INTL_ENDPOINT }
 			];
 			// Longest edge of a single media card, in px.
 			var SINGLE_MAX = 240;
 			// Settings-sidebar entry label. Also the text used to locate the nav
 			// cell when painting the plugin glyph, because the shell's navIcon
 			// map is keyed by section id and offers no icon field to register.
-			var NAV_LABEL = "多模态配置";
+			var NAV_LABEL = "Multimodal settings";
 			// Locale namespace of the shipped conversation UI; tool rows register
 			// against it so their labels resolve through the same catalogue.
 			var CONVERSATION_NS = "conversation";
@@ -412,7 +412,7 @@ window.__ModuleLoader__.load({
 
 					var eyeBtn = h("button", {
 						className: "am-btn",
-						title: shown ? "隐藏密钥" : "显示密钥",
+						title: shown ? "Hide key" : "Show key",
 						onClick: function() {
 							setReveal(function(prev) {
 								var next = Object.assign({}, prev);
@@ -420,7 +420,7 @@ window.__ModuleLoader__.load({
 								return next;
 							});
 						}
-					}, shown ? "隐藏" : "显示");
+					}, shown ? "Hide" : "Show");
 
 					var rowTest = tests[idx];
 					var busy = rowTest && rowTest.phase === "testing";
@@ -428,13 +428,13 @@ window.__ModuleLoader__.load({
 						className: "am-btn",
 						disabled: row.key.trim().length === 0 || busy,
 						onClick: function() { testRow(idx); }
-					}, busy ? "测试中" : "测试");
+					}, busy ? "Testing" : "Test");
 
 					var testResult = null;
 					if (rowTest && rowTest.phase === "done") {
-						if (rowTest.ok) testResult = h("span", { className: "am-hint am-ok" }, "✓ 密钥有效");
-						else if (rowTest.reason === "invalid") testResult = h("span", { className: "am-hint am-bad" }, "✗ 密钥无效");
-						else testResult = h("span", { className: "am-hint am-warn" }, "✗ 连接失败");
+						if (rowTest.ok) testResult = h("span", { className: "am-hint am-ok" }, "✓ Key is valid");
+						else if (rowTest.reason === "invalid") testResult = h("span", { className: "am-hint am-bad" }, "✗ Key is invalid");
+						else testResult = h("span", { className: "am-hint am-warn" }, "✗ Connection failed");
 					}
 
 					return h("div", { className: "am-row", key: idx },
@@ -444,7 +444,7 @@ window.__ModuleLoader__.load({
 						eyeBtn,
 						testBtn,
 						testResult,
-						h("button", { className: "am-btn", onClick: function() { removeRow(idx); } }, "移除")
+						h("button", { className: "am-btn", onClick: function() { removeRow(idx); } }, "Remove")
 					);
 				});
 
@@ -456,8 +456,8 @@ window.__ModuleLoader__.load({
 				if (builtin !== null) {
 					var builtinRegion = regionFor(builtin.endpoint);
 					builtinRow = h("div", { className: "am-row am-row-builtin" },
-						h("span", { className: "am-idx" }, "内置"),
-						h("span", { className: "am-badge" }, "内置"),
+						h("span", { className: "am-idx" }, "Built-in"),
+						h("span", { className: "am-badge" }, "Built-in"),
 						h("span", { className: "am-region-fixed" },
 							builtinRegion !== null ? builtinRegion.label : builtin.endpoint
 						),
@@ -467,22 +467,22 @@ window.__ModuleLoader__.load({
 							value: "sk-ANON••••••••••••••••••••••••••••••••••••••",
 							readOnly: true,
 							tabIndex: -1,
-							title: "内置免费号池，密钥在传输层注入，不可查看或修改"
+							title: "Built-in free key pool; the key is injected at the transport layer and cannot be viewed or changed"
 						}),
 						h("span", { className: "am-hint" },
 							userValid > 0
-								? "免费号池 · 不可修改 · 已让位给自定义号（排在其后兜底）"
-								: "免费号池 · 不可修改 · 当前生效"
+								? "Free pool · read-only · your own keys go first (this one is the fallback)"
+								: "Free pool · read-only · in use"
 						)
 					);
 				}
 				var statusLine;
-				if (phase === "loading") statusLine = h("span", { className: "am-hint" }, "读取中…");
-				else if (phase === "error") statusLine = h("span", { className: "am-hint am-bad" }, "无法连接配置服务");
-				else if (saveSt.phase === "saving") statusLine = h("span", { className: "am-hint" }, "保存中…");
-				else if (saveSt.phase === "saved") statusLine = h("span", { className: "am-hint am-ok" }, "已保存 ✓");
-				else if (saveSt.phase === "error") statusLine = h("span", { className: "am-hint am-bad" }, "保存失败");
-				else statusLine = h("span", { className: "am-hint" }, userValid > 0 ? "有未保存的改动" : "尚未添加自定义号，当前使用内置免费号池");
+				if (phase === "loading") statusLine = h("span", { className: "am-hint" }, "Loading…");
+				else if (phase === "error") statusLine = h("span", { className: "am-hint am-bad" }, "Can’t reach the settings service");
+				else if (saveSt.phase === "saving") statusLine = h("span", { className: "am-hint" }, "Saving…");
+				else if (saveSt.phase === "saved") statusLine = h("span", { className: "am-hint am-ok" }, "Saved ✓");
+				else if (saveSt.phase === "error") statusLine = h("span", { className: "am-hint am-bad" }, "Save failed");
+				else statusLine = h("span", { className: "am-hint" }, userValid > 0 ? "Unsaved changes" : "No keys of your own yet; using the built-in free pool");
 
 				var pageHead = h("div", { className: "am-page-head" },
 					h("div", { className: "am-page-title-row" },
@@ -490,33 +490,33 @@ window.__ModuleLoader__.load({
 						h("h2", { className: "am-page-title" }, NAV_LABEL)
 					),
 					h("p", { className: "am-page-desc" },
-						"管理 Agnes AI 账号池。这一页是插件自己的设置页，与「插件」页并列。"
+						"Manage the Agnes AI account pool. This is the plugin’s own settings page, next to the Plugins page."
 					)
 				);
 
 				var hero = h("div", { className: "am-hero" },
 					h("div", { className: "am-hero-head" },
 						h("span", { className: "am-dot" + (valid > 0 ? "" : " off") }),
-						h("span", { className: "am-title" }, "账号池状态")
+						h("span", { className: "am-title" }, "Account pool status")
 					),
 					h("div", { className: "am-desc" },
-						"一个账号池同时供图片生成（generate_image）与视频生成（generate_video）使用，按号轮询。"
-						+ "每个号是独立的限流槽位：多一个号，视频速率 +1 次/分钟，图片并发 +10。"
-						+ "国内站与国际站各自计费与限流。"
-						+ "自定义号排在前面先试，内置免费号池恒在最后兜底，两者都不用时工具仍可用。"
+						"One account pool serves both image generation (generate_image) and video generation (generate_video), rotating through the keys. "
+						+ "Each key is its own rate-limit slot: every extra key adds +1 video per minute and +10 concurrent images. "
+						+ "The China and International sites are billed and rate-limited separately. "
+						+ "Your own keys are tried first and the built-in free pool is always the last fallback, so the tools work even if you add none."
 					),
 					h("div", { className: "am-stats" },
 						h("div", { className: "am-stat" },
 							h("span", { className: "am-stat-num" }, String(valid)),
-							h("span", { className: "am-stat-label" }, "可用账号")
+							h("span", { className: "am-stat-label" }, "Available keys")
 						),
 						h("div", { className: "am-stat" },
 							h("span", { className: "am-stat-num" }, String(valid > 0 ? imageCapacity : 10)),
-							h("span", { className: "am-stat-label" }, "图片并发上限")
+							h("span", { className: "am-stat-label" }, "Max concurrent images")
 						),
 						h("div", { className: "am-stat" },
-							h("span", { className: "am-stat-num" }, String(valid > 0 ? valid : 1) + "/分"),
-							h("span", { className: "am-stat-label" }, "视频生成速率")
+							h("span", { className: "am-stat-num" }, String(valid > 0 ? valid : 1) + "/min"),
+							h("span", { className: "am-stat-label" }, "Video generation rate")
 						)
 					)
 				);
@@ -528,13 +528,13 @@ window.__ModuleLoader__.load({
 						rows.length > 0 ? rows : null,
 						builtinRow
 					),
-					h("button", { className: "am-btn am-btn-dashed", onClick: addRow }, "+ 添加账号"),
+					h("button", { className: "am-btn am-btn-dashed", onClick: addRow }, "+ Add key"),
 					h("div", { className: "am-actions" },
 						h("button", {
 							className: "am-btn am-btn-primary",
 							disabled: saveSt.phase === "saving" || phase !== "ready",
 							onClick: save
-						}, "保存"),
+						}, "Save"),
 						statusLine
 					)
 				);
@@ -672,21 +672,21 @@ window.__ModuleLoader__.load({
 						type: "button",
 						className: "am-mimg-error",
 						"data-variant": variant,
-						title: "图片加载失败，点击重试",
+						title: "Image failed to load; tap to retry",
 						onClick: function() { setAttempt(function(a) { return a + 1; }); }
-					}, "图片加载失败，点击重试");
+					}, "Image failed to load; tap to retry");
 				}
 
-				var label = ref.name || "生成的图片";
+				var label = ref.name || "Generated image";
 				var frame = h("button", {
 					type: "button",
 					className: "am-mimg-frame",
 					"data-variant": variant,
 					style: fit === null ? null : { width: fit.width, height: fit.height },
-					title: url === null ? "加载中…" : "点击查看原图",
+					title: url === null ? "Loading…" : "Tap to view full size",
 					onClick: function() { if (url !== null) setOpen(true); }
 				}, url === null
-					? h("span", { className: "am-mimg-loading" }, "加载中…")
+					? h("span", { className: "am-mimg-loading" }, "Loading…")
 					: h("img", {
 						src: url,
 						alt: label,
@@ -725,25 +725,25 @@ window.__ModuleLoader__.load({
 				var block = props.phase === "result" ? props.block : null;
 
 				if (props.phase !== "result") {
-					return h("span", { className: "am-loading" }, "正在生成图片…");
+					return h("span", { className: "am-loading" }, "Generating image…");
 				}
 				if (block && block.isError) {
 					var errText = textOf(block.content).trim();
-					return h("span", { className: "am-err" }, "图片生成失败" + (errText ? "：" + errText.slice(0, 300) : ""));
+					return h("span", { className: "am-err" }, "Image generation failed" + (errText ? ": " + errText.slice(0, 300) : ""));
 				}
 				// The finished result carries each generated PNG as a durable image
 				// block in its content, which is what the Web Client renders.
 				var refs = imageRefs(block);
 				if (refs.length === 0) {
-					return h("span", { className: "am-hint" }, "本次未生成可预览的图片");
+					return h("span", { className: "am-hint" }, "No previewable image was generated");
 				}
 				if (typeof props.loadImage !== "function") {
-					return h("span", { className: "am-hint" }, "图片加载器不可用");
+					return h("span", { className: "am-hint" }, "Image loader unavailable");
 				}
 				return h("div", { className: "am-media" },
 					h("div", { className: "am-media-head" },
-						h("span", null, "图片生成"),
-						h("span", { className: "am-chip" }, String(refs.length) + " 张")
+						h("span", null, "Image generation"),
+						h("span", { className: "am-chip" }, String(refs.length) + " image(s)")
 					),
 					h(MediaGallery, { images: refs, load: props.loadImage })
 				);
@@ -786,7 +786,7 @@ window.__ModuleLoader__.load({
 					);
 					var prompt = excerpt(v.prompt, 90);
 					var metaRow = h("div", { className: "am-vmeta" },
-						h("span", { className: "am-vidx" }, "视频 " + (i + 1) + (v.video_id ? " · " + String(v.video_id).slice(0, 18) : "")),
+						h("span", { className: "am-vidx" }, "Video " + (i + 1) + (v.video_id ? " · " + String(v.video_id).slice(0, 18) : "")),
 						prompt ? h("span", { className: "am-vprompt", title: String(v.prompt || "") }, prompt) : null
 					);
 					return h("div", {
@@ -803,25 +803,25 @@ window.__ModuleLoader__.load({
 				// Same stage contract as the image card: the view mounts during
 				// `preparing` and only the `result` stage carries the tool result.
 				if (props.phase !== "result") {
-					return h("span", { className: "am-loading" }, "正在生成视频…");
+					return h("span", { className: "am-loading" }, "Generating video…");
 				}
 				var block = props.block;
 				if (block && block.isError) {
 					var errText = textOf(block.content).trim();
-					return h("span", { className: "am-err" }, "视频生成失败" + (errText ? "：" + errText.slice(0, 300) : ""));
+					return h("span", { className: "am-err" }, "Video generation failed" + (errText ? ": " + errText.slice(0, 300) : ""));
 				}
 				var meta = block ? block.meta : null;
 				var list = videoList(meta);
 				if (list.length === 0) {
 					return meta && meta.shown === true
-						? h("span", { className: "am-loading" }, "视频未展示")
-						: h("span", { className: "am-hint" }, "本次未生成可预览的视频");
+						? h("span", { className: "am-loading" }, "Video not shown")
+						: h("span", { className: "am-hint" }, "No previewable video was generated");
 				}
 
 				return h("div", { className: "am-media" },
 					h("div", { className: "am-media-head" },
-						h("span", null, "视频生成"),
-						h("span", { className: "am-chip" }, String(list.length) + " 个")
+						h("span", null, "Video generation"),
+						h("span", { className: "am-chip" }, String(list.length) + " video(s)")
 					),
 					h(VideoGrid, { list: list })
 				);
@@ -919,7 +919,7 @@ window.__ModuleLoader__.load({
 					// Sit after the shipped pages so the stock ordering is
 					// unchanged; a high order keeps this page last.
 					order: 200,
-					label: "多模态配置"
+					label: "Multimodal settings"
 				}, ConfigPanel);
 			});
 

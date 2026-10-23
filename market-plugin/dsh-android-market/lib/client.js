@@ -586,7 +586,7 @@ window.__ModuleLoader__.load({
 				(name, approvedBuilds) => {
 					const manager = scope && scope.remote && scope.remote.pluginManager;
 					if (!manager || typeof manager.installBundle !== "function") {
-						setOps((prev) => ({ ...prev, [name]: { phase: "error", message: "插件管理器不可用" } }));
+						setOps((prev) => ({ ...prev, [name]: { phase: "error", message: "Plugin manager unavailable" } }));
 						return;
 					}
 					setOps((prev) => ({ ...prev, [name]: { phase: "installing" } }));

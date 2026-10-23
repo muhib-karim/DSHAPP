@@ -202,13 +202,13 @@ function truncateBytes(text, limit) {
  */
 function renderText(value) {
 	if (value?.ok === false && value?.timeout === true) {
-		return `结果: 超时\n${value.message ?? ''}`;
+		return `Result: timed out\n${value.message ?? ''}`;
 	}
 	if (value?.ok !== true) {
-		return `结果: 失败\n${value?.message ?? '原生侧未返回原因'}`;
+		return `Result: failed\n${value?.message ?? '原生侧未返回原因'}`;
 	}
 
-	const lines = ['结果: 成功'];
+	const lines = ['Result: success'];
 
 	// summary 分支
 	if (typeof value.headline === 'string' && value.headline !== '') {
@@ -304,16 +304,16 @@ function describeCall(args) {
 	const action = args?.action ?? 'summary';
 	if (action === 'read') {
 		const bits = [];
-		if (args?.level && args.level !== 'all') bits.push(`级别 ${args.level}`);
-		if (args?.source && args.source !== 'all') bits.push(`来源 ${args.source}`);
-		if (args?.query) bits.push(`关键字「${args.query}」`);
-		return bits.length > 0 ? bits.join(' · ') : '读取最近日志';
+		if (args?.level && args.level !== 'all') bits.push(`Level ${args.level}`);
+		if (args?.source && args.source !== 'all') bits.push(`Source ${args.source}`);
+		if (args?.query) bits.push(`Keyword “${args.query}”`);
+		return bits.length > 0 ? bits.join(' · ') : 'Read recent logs';
 	}
 	if (action === 'crashes') {
-		return args?.crashFile ? `读取现场 ${path.basename(String(args.crashFile))}` : '列出崩溃现场';
+		return args?.crashFile ? `Read report ${path.basename(String(args.crashFile))}` : 'List crash reports';
 	}
-	if (action === 'export') return '生成诊断包';
-	return '读取日志摘要';
+	if (action === 'export') return 'Create diagnostics bundle';
+	return 'Read log summary';
 }
 
 /**
@@ -398,9 +398,9 @@ function logsTool(home) {
 		presentCall: (args) => ({
 			card: 'generic',
 			title: (args?.action ?? 'summary') === 'read'
-				? '读取运行日志'
-				: args?.action === 'crashes' ? '查看崩溃现场'
-					: args?.action === 'export' ? '生成诊断包' : '读取日志摘要',
+				? 'Read app logs'
+				: args?.action === 'crashes' ? 'View crash reports'
+					: args?.action === 'export' ? 'Create diagnostics bundle' : 'Read log summary',
 			description: describeCall(args),
 		}),
 		async execute(args) {

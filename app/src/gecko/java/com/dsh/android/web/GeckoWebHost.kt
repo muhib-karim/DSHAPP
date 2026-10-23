@@ -114,7 +114,7 @@ class GeckoWebHost(
      */
     override val engineMajor: Int = GECKO_MAJOR
 
-    override val engineLabel: String = "GeckoView $GECKO_VERSION（内置）"
+    override val engineLabel: String = "GeckoView $GECKO_VERSION (built-in)"
 
     init {
         geckoView.setBackgroundColor(Color.parseColor("#0F1115"))

@@ -3493,7 +3493,7 @@ class FloatingBubble(private val context: Context) {
         if (text.isEmpty()) return
         val fn = sendText
         if (fn == null) {
-            toast("发送通道未就绪")
+            toast("Message channel is not ready")
             return
         }
         val ok = try {
@@ -3504,9 +3504,9 @@ class FloatingBubble(private val context: Context) {
         }
         if (ok) {
             input.setText("")
-            toast("已发送")
+            toast("Sent")
         } else {
-            toast("发送失败，请打开 App")
+            toast("Could not send. Please open the app")
         }
     }
 
@@ -3523,7 +3523,7 @@ class FloatingBubble(private val context: Context) {
     private fun doStop() {
         val fn = stopRun
         if (fn == null) {
-            toast("停止通道未就绪")
+            toast("Stop channel is not ready")
             return
         }
         val ok = try {
@@ -3532,7 +3532,7 @@ class FloatingBubble(private val context: Context) {
             Log.w(TAG, "气泡停止失败: ${t.message}")
             false
         }
-        toast(if (ok) "已请求中断" else "中断失败，请打开 App")
+        toast(if (ok) "Stop requested" else "Could not stop. Please open the app")
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -3561,8 +3561,8 @@ class FloatingBubble(private val context: Context) {
 
             val action = when {
                 status.text.isNotEmpty() -> status.text
-                status.running -> "思考中…"
-                else -> "空闲"
+                status.running -> "Thinking…"
+                else -> "Idle"
             }
             panelAction?.text = action
 
@@ -3610,7 +3610,7 @@ class FloatingBubble(private val context: Context) {
         }
         val text = when {
             status.text.isNotEmpty() -> status.text
-            status.running -> "思考中…"
+            status.running -> "Thinking…"
             // 空闲时若还有正文（上一轮的结论），也值得露一句 —— 但只取首行，
             // 且限长，否则标签会变成一大块。
             status.body.isNotEmpty() -> firstLine(status.body)
@@ -3841,16 +3841,16 @@ class FloatingBubble(private val context: Context) {
 
     /** 一条消息的角色标签。用户消息不显示（蓝色气泡本身就是标志）。 */
     private fun roleLabel(item: ChatTranscript.Item): String = when (item.role) {
-        ChatTranscript.Role.TOOL -> if (item.running) "工具调用 · 进行中" else "工具调用"
-        ChatTranscript.Role.ERROR -> "错误"
-        ChatTranscript.Role.REASONING -> if (item.running) "AI 思考 · 进行中" else "AI 思考"
-        ChatTranscript.Role.ASSISTANT -> if (item.running) "AI · 正在输出" else "AI"
+        ChatTranscript.Role.TOOL -> if (item.running) "Tool call · running" else "Tool call"
+        ChatTranscript.Role.ERROR -> "Error"
+        ChatTranscript.Role.REASONING -> if (item.running) "AI thinking · running" else "AI thinking"
+        ChatTranscript.Role.ASSISTANT -> if (item.running) "AI · replying" else "AI"
         else -> item.role
     }
 
     /** 转录为空时的提示。空面板会让人以为界面坏了。 */
     private fun makeEmptyHint(): TextView = TextView(context).apply {
-        text = "（这个会话还没有内容）"
+        text = "(This session has no messages yet)"
         textSize = 12f
         setTextColor(colorOr(appearance.panelText, DEFAULT_TEXT) and 0x00FFFFFF or 0x66000000)
         gravity = Gravity.CENTER
