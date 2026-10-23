@@ -105,7 +105,7 @@ object UpdateCenter {
     }
 
     private fun offerDialog(activity: Activity) {
-        if (activity.isFinishing) return
+        if (activity.isFinishing || activity.isDestroyed) return
         val p = prefs(activity)
         val state = json(activity)
         val h = state.getJSONObject("harness")

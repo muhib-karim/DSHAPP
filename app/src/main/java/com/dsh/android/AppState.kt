@@ -36,27 +36,25 @@ object AppState {
         DshLog.i(DshApplication.TAG, "settings action: $name")
         when (name) {
             "accountSwitch" -> activity.startActivity(Intent(activity, SignInActivity::class.java).putExtra(SignInActivity.EXTRA_SWITCH, true))
-            "accountSignOut" -> {
-                signOut(activity)
-                activity.startActivity(Intent(activity, SignInActivity::class.java))
+            "accountSignOut" -> signOut(activity) {
+                if (!activity.isFinishing && !activity.isDestroyed) activity.startActivity(Intent(activity, SignInActivity::class.java))
             }
             "updateCheck" -> UpdateCenter.check(activity)
             "updateHarness" -> UpdateCenter.updateHarness(activity)
             "updateApp" -> UpdateCenter.updateApp(activity)
             // Settings > Plugins: a plugin change that dsh can only apply on restart.
-            "engineRestart" -> EngineManager.get(activity).requestRestart("plugins changed")
+            "engineRestart" -> Thread({ EngineManager.get(activity).requestRestart("plugins changed") }, "engine-restart").start()
             else -> DshLog.w(DshApplication.TAG, "unknown settings action: $name")
         }
     }
 
-    /** Forgets both sign-ins: web session (token, cookies, page storage) and API key; dsh restarts without them. */
-    fun signOut(activity: Activity) {
-        AccountStore(activity).signOut()
-        WebAccount.stop()
-        runCatching {
-            DshCredentials.write(EngineManager.get(activity).dshHomeDir,
-                mapOf(DshCredentials.DEEPSEEK_API_KEY to null, DshCredentials.WEB_BRIDGE_KEY to null))
-        }.onFailure { DshLog.w(DshApplication.TAG, "sign-out: credentials not cleared: ${it.message}") }
+    /**
+     * Forgets both sign-ins: web session (token, cookies, page storage) and API key; dsh restarts without them.
+     * Cookies and page storage are cleared on the main thread, files off it; [then] runs on the main thread.
+     */
+    fun signOut(activity: Activity, then: () -> Unit = {}) {
+        val app = activity.applicationContext
+        AccountStore(app).signOut()
         runCatching {
             val cookies = CookieManager.getInstance()
             val host = DeepSeekWebClient.ORIGIN.removePrefix("https://")
@@ -69,7 +67,15 @@ object AppState {
             cookies.flush()
             WebStorage.getInstance().deleteOrigin(DeepSeekWebClient.ORIGIN)
         }
-        SignInActivity.restartEngine(activity)
+        Thread({
+            WebAccount.stop()
+            runCatching {
+                DshCredentials.write(EngineManager.get(app).dshHomeDir,
+                    mapOf(DshCredentials.DEEPSEEK_API_KEY to null, DshCredentials.WEB_BRIDGE_KEY to null))
+            }.onFailure { DshLog.w(DshApplication.TAG, "sign-out: credentials not cleared: ${it.message}") }
+            SignInActivity.restartEngine(app)
+            activity.runOnUiThread(then)
+        }, "sign-out").start()
     }
 
     /** Version of the installed `@deepseek-ai/dsh` (engine/node_modules/@deepseek-ai/dsh/package.json). */

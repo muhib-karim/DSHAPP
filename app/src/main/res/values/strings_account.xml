@@ -27,6 +27,7 @@
     <string name="login_birthday">Finish your DeepSeek profile on the page first.</string>
     <string name="login_failed">That session was not accepted. Sign in again.</string>
     <string name="login_offline">Could not reach chat.deepseek.com. Check your connection.</string>
+    <string name="login_confirm_account">Sign in to DSH as %1$s?</string>
     <string name="login_bad_paste">That is not a DeepSeek session.</string>
     <string name="update_title">Update available</string>
     <string name="update_later">Later</string>

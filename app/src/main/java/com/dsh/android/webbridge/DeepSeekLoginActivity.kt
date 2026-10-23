@@ -18,6 +18,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.dsh.android.R
 import com.dsh.android.account.AccountStore
@@ -81,8 +82,11 @@ class DeepSeekLoginActivity : AppCompatActivity() {
         val data = intent?.data ?: return false
         if (data.scheme != WebToken.LINK_SCHEME || data.host != WebToken.LINK_HOST) return false
         val token = WebToken.fromLink(intent.getStringExtra(WebToken.EXTRA_TOKEN), store.browserSignInStartedAt, System.currentTimeMillis())
+        // One link per browser sign-in: another app or page cannot keep sending sessions inside the window.
+        store.browserSignInStartedAt = null
         showBrowserRoute()
-        if (token == null) status(getString(R.string.login_bad_paste)) else verify(token)
+        // A link can come from anything on the phone, so its account is shown and confirmed before it is used.
+        if (token == null) status(getString(R.string.login_bad_paste)) else verify(token, confirm = true)
         return true
     }
 
@@ -142,7 +146,7 @@ class DeepSeekLoginActivity : AppCompatActivity() {
         runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(WebToken.SIGN_IN_URL))) }
     }
 
-    private fun verify(token: String) {
+    private fun verify(token: String, confirm: Boolean = false) {
         if (verifying || token == lastRejected) return
         verifying = true
         status(getString(R.string.login_checking))
@@ -157,17 +161,30 @@ class DeepSeekLoginActivity : AppCompatActivity() {
                     user == null && outcome.exceptionOrNull() is IOException -> status(getString(R.string.login_offline))
                     user == null -> { lastRejected = token; status(getString(R.string.login_failed)) }
                     user.optBoolean("need_birthday", false) -> status(getString(R.string.login_birthday))
-                    else -> {
-                        store.saveWebToken(token)
-                        store.webLabel = WebToken.label(user)
-                        store.browserSignInStartedAt = null
-                        DshLog.i("DSH", "DeepSeek web account signed in")
-                        setResult(RESULT_OK)
-                        finish()
-                    }
+                    confirm -> AlertDialog.Builder(this)
+                        .setTitle(R.string.login_title)
+                        .setMessage(getString(R.string.login_confirm_account, WebToken.label(user)))
+                        .setPositiveButton(R.string.signin_key_continue) { _, _ -> accept(token, user) }
+                        .setNegativeButton(R.string.login_close) { _, _ -> status(getString(R.string.login_failed)) }
+                        .show()
+                    else -> accept(token, user)
                 }
             }
         }
+    }
+
+    private fun accept(token: String, user: JSONObject) {
+        store.saveWebToken(token)
+        store.webLabel = WebToken.label(user)
+        store.browserSignInStartedAt = null
+        DshLog.i("DSH", "DeepSeek web account signed in")
+        if (callingActivity == null) {
+            // Opened by the browser link rather than from the first screen: nobody waits for the result, so apply it here.
+            store.mode = com.dsh.android.account.AccountConfig.Mode.WEB
+            com.dsh.android.account.SignInActivity.restartEngine(applicationContext)
+        }
+        setResult(RESULT_OK)
+        finish()
     }
 
     private fun status(text: String) {

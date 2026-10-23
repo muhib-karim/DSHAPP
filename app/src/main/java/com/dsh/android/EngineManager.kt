@@ -298,6 +298,11 @@ class EngineManager private constructor(private val context: Context) {
             return@withContext
         }
 
+        // v1.3.0: the bundled engine replaces whatever is there; an update that never booted is recorded as bad so it
+        // is not offered again (it would otherwise be "confirmed" when the bundled engine reaches Ready).
+        EngineSlots(context.filesDir).let { slots ->
+            slots.pending()?.let { v -> slots.markBad(v); slots.confirm(); Log.w(TAG, "harness $v replaced by the bundled engine before it booted") }
+        }
         _state.value = State.Extracting(0)
         // 先解到临时目录，成功后再原子替换，避免中途失败留下半成品
         val staging = File(context.filesDir, "engine.staging")
@@ -7351,12 +7356,12 @@ class EngineManager private constructor(private val context: Context) {
                     ),
                 )
                 _state.value = State.Ready(url)
-                confirmPendingHarness()
+                onEngineReady()
                 Log.i(TAG, "引擎就绪: $url")
                 return@withContext
             }
             _state.value = State.Ready(url)
-            confirmPendingHarness()
+            onEngineReady()
             Log.i(TAG, "引擎就绪: $url")
             // ⚠️ 引擎**真的起来了** ⇒ 清掉上次的失败记录。
             //
@@ -7606,6 +7611,30 @@ class EngineManager private constructor(private val context: Context) {
         // 守护线程同理：引擎都停了，再去切 adbd 没有意义，还白耗电
         WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
+    }
+
+    /** v1.3.0: a restart asked for while a boot was in progress; done once that boot reaches Ready. */
+    @Volatile private var restartWhenReady: String? = null
+
+    /**
+     * v1.3.0: restart so dsh re-reads its account config (sign-in, sign-out). Ready → now; a boot in progress → once it
+     * reaches Ready (restarting mid-boot would start a second pipeline next to the running one); stopped or failed → the
+     * next start reads the new config anyway. Never blocks the caller (stop() waits for the process to exit).
+     */
+    fun restartForConfigChange(reason: String) {
+        when (_state.value) {
+            is State.Ready -> Thread({ requestRestart(reason) }, "engine-restart").start()
+            is State.Starting, is State.Extracting -> restartWhenReady = reason
+            else -> Unit
+        }
+    }
+
+    private fun onEngineReady() {
+        confirmPendingHarness()
+        restartWhenReady?.let { reason ->
+            restartWhenReady = null
+            Thread({ requestRestart("$reason (after boot)") }, "engine-restart").start()
+        }
     }
 
     /** v1.3.0: the updated harness reached Ready once, so it is the harness now. */
