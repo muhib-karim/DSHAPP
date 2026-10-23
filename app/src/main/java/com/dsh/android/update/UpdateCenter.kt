@@ -40,6 +40,7 @@ object UpdateCenter {
     @Volatile private var appMessage = ""
     @Volatile private var appProgress = -1
     @Volatile private var release: AppUpdater.Release? = null
+    @Volatile private var downloadedApk: AppUpdater.DownloadedApk? = null
 
     private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private fun slots(c: Context) = EngineSlots(c.applicationContext.filesDir)
@@ -49,6 +50,7 @@ object UpdateCenter {
         val current = slots(context).installedVersion()
         val latest = p.getString("harnessLatest", null)
         val offer = HarnessUpdater(slots(context)).offer(current, latest)
+        val harnessActions = UpdateActions.harness(offer != null, harnessStatus, harnessBlocked() != null)
         val harness = JSONObject().put("current", current ?: JSONObject.NULL).put("latest", latest ?: JSONObject.NULL)
             .put("status", when {
                 harnessStatus != "idle" -> harnessStatus
@@ -58,7 +60,12 @@ object UpdateCenter {
                 else -> "unknown"
             })
             .put("message", harnessMessage.ifEmpty { if (offer != null) harnessBlocked().orEmpty() else "" })
+            .put("canUpdate", harnessActions.canUpdate).put("canInstall", false)
         val appLatest = release?.version ?: p.getString("appLatest", null)
+        val appActions = UpdateActions.app(
+            appLatest != null && Versions.isNewer(appLatest, BuildConfig.VERSION_NAME), appStatus,
+            release?.let { downloadedApk?.isFor(it) } == true,
+        )
         val app = JSONObject().put("current", BuildConfig.VERSION_NAME).put("latest", appLatest ?: JSONObject.NULL)
             .put("status", when {
                 appStatus != "idle" -> appStatus
@@ -67,6 +74,7 @@ object UpdateCenter {
                 else -> "unknown"
             })
             .put("message", appMessage).put("progress", appProgress)
+            .put("canUpdate", appActions.canUpdate).put("canInstall", appActions.canInstall)
         return JSONObject().put("harness", harness).put("app", app)
             .put("checking", checking).put("lastCheck", p.getLong("lastCheck", 0L))
     }
@@ -98,6 +106,8 @@ object UpdateCenter {
                 rel?.let { putString("appLatest", it.version) }
             }.apply()
             if (rel != null) release = rel
+            if (harnessStatus == "error") { harnessStatus = "idle"; harnessMessage = "" }
+            if (appStatus == "error") { appStatus = "idle"; appMessage = "" }
             checking = false
             DshLog.i(TAG, "update check: harness latest=$harness, app latest=${rel?.version}")
             then?.let { activity.runOnUiThread(it) }
@@ -164,22 +174,20 @@ object UpdateCenter {
                     harnessMessage = "Update failed: $problem"
                     return@thread
                 }
-                engine.stop()
-                if (!slots.promote()) {
+                if (!engine.activateHarnessUpdate(target)) {
                     harnessStatus = "error"
                     harnessMessage = "Could not switch to the new harness; the current one is unchanged."
-                    engine.requestRestart("harness update aborted")
                     return@thread
                 }
                 DshLog.i(TAG, "harness $target installed; restarting (previous kept for rollback)")
                 harnessStatus = "idle"
                 harnessMessage = ""
-                engine.requestRestart("harness updated to $target")
             } catch (t: Throwable) {
                 DshLog.w(TAG, "harness update crashed: ${t.message}")
-                slots.next.deleteRecursively()
                 harnessStatus = "error"
                 harnessMessage = "Update failed: ${t.message}"
+                // Activation recovers under the engine lifecycle gate. Preserve every slot if recovery itself failed;
+                // an incomplete staging directory is harmless and the next preparation replaces it.
             }
         }
     }
@@ -189,9 +197,10 @@ object UpdateCenter {
         val rel = release
         if (rel == null) { check(activity) { if (release != null) updateApp(activity) }; return }
         if (appStatus == "downloading") return
+        if (!AppUpdater.isUpdate(rel, BuildConfig.VERSION_NAME)) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
             appStatus = "error"
-            appMessage = "Allow DSH to install apps, then tap Update again."
+            appMessage = "Allow DSH to install apps, then retry the update here."
             runCatching {
                 activity.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}")))
             }
@@ -202,6 +211,14 @@ object UpdateCenter {
         appProgress = 0
         thread(name = "app-update") {
             try {
+                val ready = downloadedApk?.takeIf { it.isFor(rel) }
+                if (ready != null && ready.verify()) {
+                    appStatus = "ready"
+                    appProgress = 100
+                    activity.runOnUiThread { install(activity, ready.file) }
+                    return@thread
+                }
+                downloadedApk = null
                 val dir = File(activity.cacheDir, "updates").apply { deleteRecursively(); mkdirs() }
                 val apk = File(dir, rel.apkName)
                 val expected = rel.sumsUrl?.let { AppUpdater.sha256For(httpGet(it), rel.apkName) }
@@ -227,6 +244,7 @@ object UpdateCenter {
                 } finally { conn.disconnect() }
                 val actual = digest.digest().joinToString("") { "%02x".format(it) }
                 if (actual != expected) { apk.delete(); throw IOException("checksum mismatch") }
+                downloadedApk = AppUpdater.DownloadedApk(rel, apk, expected)
                 appStatus = "ready"
                 appProgress = 100
                 activity.runOnUiThread { install(activity, apk) }
@@ -240,10 +258,12 @@ object UpdateCenter {
     }
 
     private fun install(activity: Activity, apk: File) {
-        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.updates", apk)
-        val intent = Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        runCatching { activity.startActivity(intent) }.onFailure { appStatus = "error"; appMessage = "No installer: ${it.message}" }
+        runCatching {
+            val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.updates", apk)
+            val intent = Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(intent)
+        }.onFailure { appStatus = "error"; appMessage = "No installer: ${it.message}" }
     }
 
     private fun open(url: String): HttpURLConnection {

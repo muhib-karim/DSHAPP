@@ -5,8 +5,12 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
+import java.io.File
 
 class AppUpdaterTest {
+    @get:Rule val tmp = TemporaryFolder()
     private fun release(tag: String, draft: Boolean = false, pre: Boolean = false) = """
         {"tag_name":"$tag","draft":$draft,"prerelease":$pre,"html_url":"https://github.com/muhib-karim/DSHAPP/releases/tag/$tag","body":"Notes",
          "assets":[
@@ -47,5 +51,26 @@ class AppUpdaterTest {
         assertEquals("b".repeat(64), AppUpdater.sha256For(sums, "DSH1.3.1-mk-gecko.apk"))
         assertNull(AppUpdater.sha256For(sums, "DSH1.3.1.apk"))
         assertNull(AppUpdater.sha256For("zz  ./DSH1.3.1-mk.apk", "DSH1.3.1-mk.apk"))
+    }
+
+    @Test fun verifiedDownloadCanBeReusedAfterTheInstallerWasCancelled() {
+        val rel = AppUpdater.parseRelease(release("v1.3.1"), false)!!
+        val apk = File(tmp.root, rel.apkName).apply { writeText("abc") }
+        val ready = AppUpdater.DownloadedApk(rel, apk, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        assertTrue(ready.isFor(rel))
+        assertTrue(ready.verify())
+        assertFalse(ready.isFor(AppUpdater.parseRelease(release("v1.3.2"), false)!!))
+        assertFalse(ready.isFor(AppUpdater.parseRelease(release("v1.3.1"), true)!!))
+    }
+
+    @Test fun changedOrMissingDownloadedApkCannotReachTheInstaller() {
+        val rel = AppUpdater.parseRelease(release("v1.3.1"), false)!!
+        val apk = File(tmp.root, rel.apkName).apply { writeText("abc") }
+        val ready = AppUpdater.DownloadedApk(rel, apk, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        apk.writeText("bad")
+        assertFalse(ready.verify())
+        apk.delete()
+        assertFalse(ready.isFor(rel))
+        assertFalse(ready.verify())
     }
 }

@@ -19,11 +19,11 @@ object Versions {
         if (preA.isEmpty() || preB.isEmpty()) return preB.size.compareTo(0) - preA.size.compareTo(0)
         for (i in 0 until minOf(preA.size, preB.size)) {
             val x = preA[i]; val y = preB[i]
-            val nx = x.toLongOrNull(); val ny = y.toLongOrNull()
+            val nx = x.all(Char::isDigit); val ny = y.all(Char::isDigit)
             val c = when {
-                nx != null && ny != null -> nx.compareTo(ny)
-                nx != null -> -1
-                ny != null -> 1
+                nx && ny -> x.length.compareTo(y.length).takeIf { it != 0 } ?: x.compareTo(y)
+                nx -> -1
+                ny -> 1
                 else -> x.compareTo(y)
             }
             if (c != 0) return c
@@ -45,7 +45,8 @@ object Versions {
     private fun split(v: String): Pair<List<Long>, List<String>>? {
         val core = v.substringBefore('-')
         if (!CORE.matches(core)) return null
-        val pre = if (v.contains('-')) v.substringAfter('-').split('.').filter { it.isNotEmpty() } else emptyList()
-        return core.split('.').map { it.toLong() } to pre
+        val pre = if (v.contains('-')) v.substringAfter('-').split('.') else emptyList()
+        if (pre.any { !it.matches(Regex("[0-9A-Za-z-]+")) || (it.length > 1 && it.all(Char::isDigit) && it.startsWith('0')) }) return null
+        return core.split('.').map { it.toLongOrNull() ?: return null } to pre
     }
 }

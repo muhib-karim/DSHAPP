@@ -17,7 +17,7 @@ on the final feature branch head. No merge, tag or release.
 - Mobile code/stamps committed as 499587a; account/bridge committed as 1a8826e.
 - Updater targeted green: 44 tests. Sign-out write-failure and lifecycle-race regressions reproduced and fixed.
 - Independent final review found no unresolved important issues; final targeted gate passed updater 46/46 and account changes 8/8.
-- Full both-flavor JVM suites and debug assembly are running under the shared Gradle resource guard.
+- Full both-flavor gates are running under the shared Gradle resource guard; system JVM 152/152 and system debug assembly passed.
 - Final Node/Chromium gates repeated green: 34 + 5 tests; smoke syntax and all 13 archive/source comparisons pass.
 - Server restart interrupted work; existing edits retained and subsystem workers resumed from their diffs.
 

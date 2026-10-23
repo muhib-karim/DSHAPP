@@ -1,6 +1,8 @@
 package com.dsh.android.update
 
 import org.json.JSONObject
+import java.io.File
+import java.security.MessageDigest
 
 /** App updates from this fork's GitHub releases (pure parts: parsing and checks; download and install in UpdateCenter). */
 object AppUpdater {
@@ -8,6 +10,25 @@ object AppUpdater {
 
     data class Release(val version: String, val apkName: String, val apkUrl: String, val apkSize: Long,
                        val sumsUrl: String?, val page: String, val notes: String)
+
+    data class DownloadedApk(val release: Release, val file: File, val sha256: String) {
+        fun isFor(candidate: Release) = file.isFile && release.version == candidate.version &&
+            release.apkName == candidate.apkName && release.apkUrl == candidate.apkUrl
+
+        /** Recheck before each installer handoff, without hashing the APK during UI polling. */
+        fun verify(): Boolean = runCatching {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) } == sha256
+        }.getOrDefault(false)
+    }
 
     /** The latest published release and the APK of this flavor (`DSH<v>-mk.apk` / `DSH<v>-mk-gecko.apk`), or null. */
     fun parseRelease(json: String, gecko: Boolean): Release? = runCatching {

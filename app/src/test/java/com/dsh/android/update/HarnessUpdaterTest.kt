@@ -39,6 +39,14 @@ class HarnessUpdaterTest {
         assertNull(updater.offer(current = null, latest = null))
     }
 
+    @Test fun pendingActivationCannotBeReplacedByAnotherUpdate() {
+        File(tmp.root, "engine.pending").writeText("0.2.2")
+        val slots = EngineSlots(tmp.root)
+        assertNull(HarnessUpdater(slots).offer(current = "0.2.2", latest = "0.2.3"))
+        slots.confirm()
+        assertEquals("0.2.3", HarnessUpdater(slots).offer(current = "0.2.2", latest = "0.2.3"))
+    }
+
     @Test fun nextSlotIsAPrivatePackageWithAHoistedLayout() {
         val slots = EngineSlots(tmp.root)
         slots.next.mkdirs(); File(slots.next, "leftover").writeText("x")

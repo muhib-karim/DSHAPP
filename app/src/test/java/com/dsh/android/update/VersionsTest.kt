@@ -42,4 +42,20 @@ class VersionsTest {
         assertEquals("0.2.1-rc.2", Versions.harnessOfAssetStamp("0.2.1-rc.2"))
         assertNull(Versions.harnessOfAssetStamp(""))
     }
+
+    @Test fun oversizedNumericVersionsAreRejectedWithoutThrowing() {
+        assertFalse(Versions.isNewer("999999999999999999999999.0.0", "1.3.0"))
+        assertTrue(Versions.isNewer("1.3.1", "999999999999999999999999.0.0"))
+    }
+
+    @Test fun malformedPrereleaseIdentifiersAreNotUpdates() {
+        for (candidate in listOf("2.0.0-", "2.0.0-rc..2", "2.0.0-rc/2", "2.0.0-01")) {
+            assertFalse(candidate, Versions.isNewer(candidate, "1.3.0"))
+        }
+    }
+
+    @Test fun numericPrereleasesKeepNumericOrderingBeyondLongRange() {
+        lt("1.0.0-9999999999999999999999", "1.0.0-10000000000000000000000")
+        lt("1.0.0-9999999999999999999999", "1.0.0-alpha")
+    }
 }

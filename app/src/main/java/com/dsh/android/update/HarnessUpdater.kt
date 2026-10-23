@@ -13,6 +13,7 @@ class HarnessUpdater(private val slots: EngineSlots) {
     /** [latest] when it is newer than [current] and has not failed to boot here before; otherwise null. */
     fun offer(current: String?, latest: String?): String? {
         if (current == null || latest == null) return null
+        if (slots.pending() != null) return null
         if (!Versions.isNewer(latest, current)) return null
         return latest.takeIf { it !in slots.badVersions() }
     }
