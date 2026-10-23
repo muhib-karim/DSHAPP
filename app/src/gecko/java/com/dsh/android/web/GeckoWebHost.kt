@@ -1,5 +1,6 @@
 package com.dsh.android.web
 
+import com.dsh.android.R
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
@@ -114,7 +115,7 @@ class GeckoWebHost(
      */
     override val engineMajor: Int = GECKO_MAJOR
 
-    override val engineLabel: String = "GeckoView $GECKO_VERSION（内置）"
+    override val engineLabel: String = context.getString(R.string.web_engine_builtin, GECKO_VERSION)
 
     init {
         geckoView.setBackgroundColor(Color.parseColor("#0F1115"))
@@ -674,6 +675,13 @@ class GeckoWebHost(
                     "switchToTcpMode" -> b.switchToTcpMode()
                     "bubbleSetEnabled" -> b.bubbleSetEnabled(args.optBoolean(0))
                     "bubbleRequestOverlay" -> b.bubbleRequestOverlay()
+                    // AI 浏览器（官方右侧边栏的「AI 浏览器」面板）。
+                    // ⚠️ 与 system 版逐条对齐：漏了就「点了没反应」。
+                    "openAiBrowser" -> b.openAiBrowser()
+                    // AI 浏览器嵌入定位：前端量出面板矩形后高频上报（ResizeObserver）。
+                    "aiBrowserLayout" -> b.aiBrowserLayout(args.optString(0, ""))
+                    "aiBrowserDetach" -> b.aiBrowserDetach()
+                    "aiBrowserState" -> b.aiBrowserState()
                     // 甩动手感三开关（见「悬浮气泡」设置页）。
                     "bubbleSetThrow" -> b.bubbleSetThrow(args.optBoolean(0))
                     "bubbleSetShake" -> b.bubbleSetShake(args.optBoolean(0))

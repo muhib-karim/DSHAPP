@@ -44,13 +44,25 @@ files/bubble-frames/sets/work/   动作 `work`
     "thinking": "think",
     "working":  "work",
     "waiting":  "wait",
-    "error":    "sad"
+    "error":    "sad",
+    "result":   "read",                // 可选：工具刚跑完、在消化结果
+    "success":  "cheer"                // 可选：上一轮顺利收工（瞬时）
   }
 }
 ```
 
-运行状态固定五个：`idle` / `thinking` / `working` / `waiting` / `error`
-（`BubbleAppearance.RUN_STATES`，与插件侧 `RUN_STATES` 必须一致）。
+运行状态固定七个：`idle` / `thinking` / `working` / `waiting` / `error` /
+`result` / `success`（`BubbleAppearance.RUN_STATES`，与插件侧 `RUN_STATES` 必须一致）。
+
+⚠️ **后两个是追加的，位置式配置不会因此错位。** `workStatusTexts` / `statusImages`
+按 `RUN_STATES` 顺序**按下标**取值，所以 5 元素的数组仍然精确表示原来那 5 个状态
+（`result` / `success` 两档留空 ⇒ 用默认文案/无图）。**不要为了"凑满 7 个"去补空数组**，
+补了反而会把 `error` 的档位错开。
+
+- `result`：工具**已返回**、模型在消化结果。与 `working`（工具执行**中**）的区别是
+  "手上有没有活在跑"。单列是因为这两个状态体感明显不同，宠物能表达这个差别。
+- `success`：上一轮顺利收工，**瞬时**状态 —— 由 `turn/end` 带 `completed` 触发，
+  随即回到 `idle`。宠物在这段时间播"庆祝"类动作。
 
 **该播哪个动作的优先级**（`FloatingBubble.wantedAction()`）：
 

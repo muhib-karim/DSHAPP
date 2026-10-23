@@ -95,6 +95,10 @@ Both flavors pass 200 JVM tests each; 66 Node and 5 Chromium checks pass, and bo
 
 ---
 
+## Language
+
+English is the default. Chinese is shown on devices using a Chinese (`zh*`) locale.
+
 ## What is this
 
 DSH for Android brings the [DSH](https://github.com/deepseek-ai) (DeepSeek Harness)

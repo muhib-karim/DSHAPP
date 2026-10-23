@@ -118,8 +118,18 @@ jobs:
           python3 - <<'PY'
           import re, subprocess, sys, os
 
-          files = subprocess.run(["git", "ls-files", "*.md"],
-                                 capture_output=True, text=True, check=True).stdout.split()
+          # ⚠️ **必须用 `-z` + 按 NUL 切分。**
+          #
+          #   默认 `git ls-files` 会给非 ASCII 文件名**加引号并八进制转义**，
+          #   于是 `docs/guides/从零做….md` 变成 `"docs/guides/\344\273\216….md"`
+          #   （带引号、反斜杠），后面 `open()` 必然 No such file。
+          #   症状是：只要仓库里有中文文件名的 .md，这项检查就永远失败，
+          #   而报错信息看起来像「文档链接坏了」，实际与链接无关。
+          #
+          #   `-z` 输出 NUL 分隔的原始字节，中文文件名原样保留。
+          raw = subprocess.run(["git", "ls-files", "-z", "*.md"],
+                               capture_output=True, check=True).stdout
+          files = [f for f in raw.decode("utf-8", errors="surrogateescape").split("\0") if f]
           link_re = re.compile(r'\]\(([^)\s]+?\.md)(#[^)]*)?\)')
           broken = []
 

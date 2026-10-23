@@ -168,6 +168,52 @@ interface PageBridge {
     fun bubbleRequestOverlay()
 
     /**
+     * 打开 **AI 浏览器**（官方右侧边栏里的「AI 浏览器」面板调用）。
+     *
+     * 没有返回值是**刻意**的：gecko 版的桥走 `postMessage` 异步派发，回传值要多
+     * 绕一层；而页面侧不需要知道结果（浏览器要么弹出来、要么不弹，用户看得见）。
+     * 保持 void 让两个 flavor 的白名单能逐条对齐。
+     *
+     * ⚠️ 往这里加方法**必须同步加进两份白名单**（`SystemWebHost` 的
+     *   `@JavascriptInterface` 与 `GeckoWebHost.dispatchInvoke`），否则页面侧
+     *   `window.DSHAndroid.openAiBrowser` 是 undefined，表现为「点了没反应」，
+     *   而原生日志一切正常。0.3.3 的 keyboardAvoid 就是这么漏的。
+     */
+    fun openAiBrowser()
+
+    /**
+     * 把 AI 浏览器摆到官方右侧边栏面板的内容区上。
+     *
+     * `json` 是前端量出来的矩形：
+     * `{"x":0,"y":120,"w":411,"h":700,"vw":411,"vh":880}`
+     * —— `x/y/w/h` 是 `getBoundingClientRect()` 的 **CSS 视口坐标/尺寸**，
+     * `vw/vh` 是 `window.innerWidth/innerHeight`（用来算 CSS→物理的缩放比）。
+     *
+     * ⚠️ 换算必须在原生侧做：页面里拿不到自己在屏幕上的位置（`window.screenX`
+     *   在 WebView 里恒为 0），只有原生能 `getLocationOnScreen()`。
+     *
+     * ⚠️ 这个方法会被高频调用（ResizeObserver），原生侧必须做「矩形没变就
+     *   直接返回」的短路，否则每次都会触发一轮 layout。
+     */
+    fun aiBrowserLayout(json: String)
+
+    /**
+     * 面板卸载 / tab 关掉时调用：把 AI 浏览器收起来。
+     *
+     * 只隐藏，**不销毁** —— 页面状态与登录态留在内存里，下次开 tab 还是原样。
+     */
+    fun aiBrowserDetach()
+
+    /**
+     * 查询 AI 浏览器当前可见性，返回 `"visible"` 或 `"hidden"`。
+     *
+     * 面板挂载时要先对一次状态：AI 可能已经用工具把网页打开了，用户这时才点
+     * 开侧栏 tab —— 面板的本地 state 是「没开」，不查询就会显示成一个打开按钮，
+     * 而浏览器其实正盖在屏幕上。
+     */
+    fun aiBrowserState(): String
+
+    /**
      * 读「键盘避让」状态。返回 JSON：`{"enabled":bool,"a11y":bool}`。
      *
      * 两个字段是**两件独立的事实**，不要合并：

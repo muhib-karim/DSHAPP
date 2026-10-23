@@ -189,7 +189,7 @@ Shape layer:
 - \`shape\`: "circle" | "square" | "rounded" | "path"
 - \`shapePath\`: an SVG path \`d\` string — used when \`shape\` is "path", and this is how you give the ball ANY outline (star, heart, hexagon, speech bubble, logo). Coordinates are in \`shapeViewBox\` units, not dp, so the same path scales to any \`size\`. Example five-pointed star, viewBox "0 0 100 100": \`M50 3 L61 38 L98 38 L68 60 L79 95 L50 73 L21 95 L32 60 L2 38 L39 38 Z\`. Max 4000 characters. Invalid paths fall back to a circle.
 - \`shapeViewBox\`: "minX minY width height", default "0 0 100 100".
-- \`size\`: ball diameter in dp, 24–160. When the canvas is auto-sized, this is its LONG edge.
+- \`size\`: ball diameter in dp, 24–320. When the canvas is auto-sized, this is its LONG edge.
 - \`boxWidth\` / \`boxHeight\`: the canvas (background box / window) size in dp, 16–400. \`0\` (the default) means AUTO: the canvas fits the current subject material — its long edge becomes \`size\` and the short edge follows the material's aspect ratio. So a square avatar/video gives the classic square ball, and a wide sprite sheet gives a wide box. Give only ONE of the two and the other still follows the material. Empty space around the subject is transparent (use \`bgOpacity:0\` to drop the visible background box entirely).
 - \`showDot\`: boolean, default **false**. The small status dot in the bottom-right corner; it overlaps the pet artwork, so it is off unless you want it.
 - \`cornerRadius\`: dp, 0–80 (only meaningful for "rounded")
@@ -226,6 +226,25 @@ Panel and status:
 - \`throwEnabled\`: boolean, default true. Flick the ball and it **flies, bounces off all four
   walls and the floor, and comes to rest where it lands** (no snap-back). This is the desktop
   pet feel; set false for the old "drop and stick to the edge" behaviour.
+
+### The edge sliver (the state after the ball is dragged off-screen)
+
+Drag the ball past the screen edge and it collapses into a **sliver pinned to that edge**.
+That sliver is a first-class, fully editable surface — not a fixed 6dp strip:
+
+- \`edgeImage\`: "default" (built-in peeking character) | "none" (plain colour sliver, the old
+  behaviour) | "custom" | a \`data:image/...;base64,...\` URI | \`edgeFile\` (an absolute path,
+  read and sent like \`avatarFile\`). Default is "default".
+- \`edgeWidth\`: visible width in dp, 6–120, default **28**. The old build hard-coded 6dp, which
+  users reported as *too small to tap* — that is why 28 is the new default.
+- \`edgeHeight\`: visible height in dp, 0 (default) = follow the ball's canvas height, max 400.
+- \`edgeOpacity\`: 0–1, default 1.
+- \`edgeAnchor\`: 0–1 fixes the sliver's vertical position (0 = top, 1 = bottom) so the peeking
+  character always appears at the same height. \`-1\` (default) keeps whatever y the ball had
+  when it was dragged out.
+
+The image is drawn with \`fitCenter\`, so a tall peeking character is never squashed; the
+letterboxed area stays transparent and **is still part of the tappable region**.
 
 ## Desktop pet: one animation per state
 
@@ -395,6 +414,7 @@ function pickFields(args) {
 		'spin', 'pulse',
 		'panelWidth', 'panelHeight', 'panelBg', 'panelText', 'panelAccent',
 		'statusAutoHideMs', 'edgeSnap', 'throwEnabled',
+		'edgeImage', 'edgeWidth', 'edgeHeight', 'edgeOpacity', 'edgeAnchor',
 		'moveEnabled', 'moveIntervalSec', 'moveMinDp', 'moveMaxDp',
 		'statusImageSizeDp', 'flipOnTurn',
 		// ⚠️ 这几个允许空对象/空数组（那是"清空"这个语义本身），所以能走通用循环；
@@ -911,7 +931,7 @@ function bubbleTool(home) {
 				shape: { type: 'string', enum: ['circle', 'square', 'rounded', 'path'] },
 				shapePath: { type: 'string', description: 'SVG path "d" for shape:"path" — any outline you like, in shapeViewBox units. Max 4000 chars.' },
 				shapeViewBox: { type: 'string', description: '"minX minY width height" for shapePath, default "0 0 100 100".' },
-				size: { type: 'number', description: 'Ball diameter in dp, 24–160. When the canvas is auto-sized, this is its LONG edge.' },
+				size: { type: 'number', description: 'Ball diameter in dp, 24–320. When the canvas is auto-sized, this is its LONG edge.' },
 				boxWidth: { type: 'number', description: 'Canvas width in dp, 16–400. 0 (default) = auto: fit to the current subject material, long edge = size. Give only one of boxWidth/boxHeight and the other still follows the material.' },
 				boxHeight: { type: 'number', description: 'Canvas height in dp, 16–400. 0 (default) = auto. See boxWidth.' },
 				showDot: { type: 'boolean', description: 'Show the small status dot at the bottom-right. Default false (hidden) — it sits on top of the pet artwork.' },
@@ -989,6 +1009,12 @@ function bubbleTool(home) {
 				statusAutoHideMs: { type: 'number', description: 'Milliseconds before the status strip hides once its content stops changing; 0 disables it.' },
 				edgeSnap: { type: 'boolean', description: 'Default false. False = the ball stays where the user drops it (anywhere on screen). True = it is pulled back to the nearest left/right edge after each drag. Dragging the ball off-screen always collapses it into an edge sliver either way.' },
 				throwEnabled: { type: 'boolean', description: 'Default true. True = flick the ball and it flies, bounces off all four walls and the floor, then rests where it lands (desktop-pet feel). False = the old drop-and-stick-to-edge behaviour.' },
+				edgeImage: { type: 'string', description: '"default" (built-in peeking character) | "none" (plain colour sliver) | a data:image/...;base64 URI. The image shown while the ball is collapsed against a screen edge.' },
+				edgeFile: { type: 'string', description: 'Absolute path to an image used as the edge sliver; read by this process and sent as edgeImage. Takes precedence over edgeImage.' },
+				edgeWidth: { type: 'number', description: 'Edge sliver visible width in dp, 6–120, default 28. The old build hard-coded 6dp, which users reported as too small to tap.' },
+				edgeHeight: { type: 'number', description: 'Edge sliver visible height in dp; 0 (default) follows the ball canvas height. Max 400.' },
+				edgeOpacity: { type: 'number', description: 'Edge sliver image opacity, 0–1, default 1.' },
+				edgeAnchor: { type: 'number', description: '0–1 fixes the sliver vertical position (0 = top, 1 = bottom). -1 (default) keeps the y the ball had when dragged out.' },
 				text: { type: 'string', description: 'For action:"notify" — the message to show in the status strip above the ball.' },
 				durationMs: { type: 'number', description: 'For action:"notify" — how long the message stays, in ms. Omit to use statusAutoHideMs.' },
 				sticky: { type: 'boolean', description: 'For action:"notify" — true keeps the message up until the next notify.' },
@@ -1168,6 +1194,16 @@ function bubbleTool(home) {
 				fields.avatar = read.uri;
 			}
 
+			// `edgeFile` → data URI。与 `avatarFile` 完全同构：读失败明确报错，
+			// 不静默退回内置图（否则用户看到贴边形象莫名变回默认，却没有任何提示）。
+			if (typeof args?.edgeFile === 'string' && args.edgeFile !== '') {
+				const read = readImageFile(args.edgeFile);
+				if (!read.ok) {
+					return { ok: false, appearance: '', message: `贴边图文件不可用（${read.error}）` };
+				}
+				fields.edgeImage = read.uri;
+			}
+
 			// `frameFiles` → data URI 数组。同上：读失败就整批放弃。
 			if (args?.frameFiles !== undefined) {
 				const read = readFrameFiles(args.frameFiles);
@@ -1292,6 +1328,7 @@ function describeCall(args) {
 			: `轮播 ${n} 帧`);
 	}
 	if (args?.avatarFile !== undefined) bits.push(`头像 ${path.basename(String(args.avatarFile))}`);
+	if (args?.edgeFile !== undefined) bits.push(`贴边图 ${path.basename(String(args.edgeFile))}`);
 	else if (args?.avatar === 'none') bits.push('去掉图片');
 	else if (args?.avatar !== undefined) bits.push('自定义头像');
 	return bits.length > 0 ? bits.join(' · ') : '应用外观改动';

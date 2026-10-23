@@ -99,14 +99,36 @@
 
       ⚠️ 宽高由代码按球的尺寸算（`applyAppearance`），XML 里这两项只是占位 ——
          薄片必须跟随球的尺寸，而球尺寸是插件可配的，写死就会分成两处。
+
+      ⚠️ **这里刻意不写 `background` 与 `elevation`。** 它们由代码按当前形态决定：
+         有图 ⇒ 全不设（否则人物周围会套一个带阴影的白色圆角框，真机反馈为
+         「碰撞箱边缘有暗影」）；纯色薄片（`edgeImage:"none"`）⇒ 代码补上。
+         写在 XML 里的话，初始化那一帧会先把框画出来再被代码抹掉，看起来像闪一下。
     -->
     <FrameLayout
         android:id="@+id/bubbleEdge"
-        android:layout_width="6dp"
+        android:layout_width="28dp"
         android:layout_height="44dp"
-        android:background="@drawable/bubble_edge_bg"
-        android:elevation="8dp"
         android:visibility="gone">
+
+        <!--
+          贴边态的图片层（默认是「探头」形象，见 drawable-*/bubble_edge_default.png）。
+
+          ⚠️ 必须 `fitCenter` 而不是 `fitXY`：探头形象是竖长条，而可见框的
+             长宽比由用户/插件配的 edgeWidth × edgeHeight 决定，拉伸会把人物压扁。
+             留白处是透明的，看起来就是"从边里探出头"。
+
+          ⚠️ 用 `adjustViewBounds` + 不设固定尺寸不够：这里必须**严格填满**
+             父容器（`match_parent`），因为父容器尺寸就是"可点击区域"——
+             图片比框小的话，用户点到透明留白处仍应能唤出球。
+        -->
+        <ImageView
+            android:id="@+id/edgeImage"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter"
+            android:contentDescription="@null"
+            android:importantForAccessibility="no" />
 
         <View
             android:id="@+id/edgeDot"
@@ -164,7 +186,7 @@
                     android:layout_weight="1"
                     android:ellipsize="end"
                     android:maxLines="2"
-                    android:text="空闲"
+                    android:text="@string/notification_idle"
                     android:textColor="#1A1D21"
                     android:textSize="13sp"
                     android:textStyle="bold" />
@@ -175,7 +197,7 @@
                     android:layout_height="wrap_content"
                     android:background="?android:attr/selectableItemBackgroundBorderless"
                     android:padding="6dp"
-                    android:text="打开"
+                    android:text="@string/bubble_open"
                     android:textColor="#3B6FE0"
                     android:textSize="12sp" />
 
@@ -191,7 +213,7 @@
                     android:layout_marginStart="2dp"
                     android:background="?android:attr/selectableItemBackgroundBorderless"
                     android:padding="6dp"
-                    android:text="收起"
+                    android:text="@string/bubble_collapse"
                     android:textColor="#8A9099"
                     android:textSize="12sp" />
             </LinearLayout>
@@ -252,7 +274,7 @@
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:background="@drawable/bubble_input_bg"
-                    android:hint="发消息给 AI…"
+                    android:hint="@string/bubble_message_hint"
                     android:importantForAutofill="no"
                     android:inputType="textMultiLine|textCapSentences"
                     android:maxLines="4"
@@ -275,7 +297,7 @@
                     android:minWidth="56dp"
                     android:paddingStart="12dp"
                     android:paddingEnd="12dp"
-                    android:text="发送"
+                    android:text="@string/bubble_send"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp" />
 
@@ -294,7 +316,7 @@
                     android:minWidth="56dp"
                     android:paddingStart="12dp"
                     android:paddingEnd="12dp"
-                    android:text="停止"
+                    android:text="@string/bubble_stop"
                     android:textColor="#FFFFFF"
                     android:textSize="13sp"
                     android:visibility="gone" />

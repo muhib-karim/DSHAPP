@@ -182,10 +182,36 @@ if (allowEdgeCollapse && appearance.edgeSnap && overshoot >= dp(EDGE_OVERSHOOT_D
 拿夹取后的值判定，`overshoot` **恒为 0**，贴边永远不触发。这是本轮最容易写错的一处。
 
 - `EDGE_OVERSHOOT_DP = 28`：手指再多拖 28dp 才算「想把它扔出屏幕」，避免误触。
-- 贴边态是**独立薄片** `bubbleEdge`（`EDGE_WIDTH_DP = 6`），不是把球缩窄 ——
-  球的 56dp 是安装面积的语义，缩窄会让它变得点不到。
+- 贴边态是**独立视图** `bubbleEdge`，不是把球缩窄 —— 球的尺寸是安装面积的语义，
+  缩窄会让它变得点不到。
 - 薄片触摸只认点击（拖动它没意义，拖了就当作"想拿回来"直接 `exitEdge()`）。
 - `appearance.edgeSnap = false` 可以**关掉**这个行为（松手只会吸附到最近的左右边缘）。
+
+#### ⚠️ 贴边态曾经"点不到"，宽度从 6dp 提到 28dp
+
+原实现宽度写死 `EDGE_WIDTH_DP = 6`、纯色、无图片。真机反馈是「太小了，点不到」——
+6dp × 44dp 在 3x 屏上只有 18×132 像素，手指落点几乎必然偏出去。
+
+现在贴边态是**可自由编辑的一等公民**，走和球同一套下发通道（插件 `bubbleApply` /
+模型 `bubble` 工具），字段见 [bubble-bridge.md](bubble-bridge.md) 的 `edge*` 一节：
+
+| 字段 | 说明 |
+|---|---|
+| `edgeImage` | `default`（内置探头形象）/ `none`（纯色薄片，老行为）/ `custom` / data URI |
+| `edgeWidth` | 可见宽度 dp，6–120，**默认 28** |
+| `edgeHeight` | 可见高度 dp，`0` = 跟随球高 |
+| `edgeOpacity` | 图片不透明度 0–1 |
+| `edgeAnchor` | 0–1 固定竖直位置；`-1` = 沿用拖出去时的 y |
+
+⚠️ **`edgeImage == "none"` 时宽度退回老的 6dp**（见 `edgeWidthDp()`）—— 纯色薄缝的
+语义就是"一条缝"，与"能点到的探头"不是一回事，混用会得到一个 28dp 宽的色块。
+
+⚠️ 图片用 `fitCenter` 铺满可见框，竖长的探头形象不会被压扁；两侧留白透明，
+**但仍属于可点击区域**（父容器 `match_parent` 就是点击区域，点到留白也能唤出球）。
+
+⚠️ `edgeImage` 与 `avatar` **同一套陷阱**：下发时是 data URI，`save()` 落盘换成文件
+标记 `bubble-edge.bin`，回读必须认得这个标记 —— 否则自定义贴边图重启即丢，
+且插件做「读-改-写」时会把它洗回内置图。
 
 #### ③ 展开面板：完整转录 + 可拖动 + 可缩放
 

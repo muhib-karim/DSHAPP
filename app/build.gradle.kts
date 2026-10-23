@@ -34,7 +34,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 31
+        versionCode = 36
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -182,7 +182,9 @@ android {
         // 1.3.0 (versionCode 31), fork: two sign-ins (DeepSeek web account through a local bridge, or an API key),
         //      opaque UI without wallpapers, Settings > Plugins with a live "/" palette, in-app harness and app updates.
         //      Stamps bumped with it: MOBILE_UI_VERSION 1.0.0-105, compat 39, preset skills 1.0.0-2, gecko bridge 1.0.15.
-        versionName = "1.3.0"
+        // 1.3.1-en (versionCode 36), fork: 1.3.0 plus the English localization (upstream PR #6) merged with upstream main;
+        //   versionCode jumps past upstream's 35 so it updates both 1.3.0 installs and is never older than upstream.
+        versionName = "1.3.1-en"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {

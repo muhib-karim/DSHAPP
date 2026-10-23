@@ -55,7 +55,7 @@ import kotlin.math.roundToInt
  * | `shape` | string | `circle` / `square` / `rounded` / **`path`**（用 `shapePath`） |
  * | `shapePath` | string | SVG path 的 `d`，如 `M50 0 L61 35 L98 35 L68 57 L79 91 L50 70 L21 91 L32 57 L2 35 L39 35 Z` |
  * | `shapeViewBox` | string | `shapePath` 的坐标系，默认 `0 0 100 100` |
- * | `size` | int(dp) | 球的**边长**，24~160。方形画布时它是宽，也是高 |
+ * | `size` | int(dp) | 球的**边长**，24~320。方形画布时它是宽，也是高 |
  * | `boxWidth` | int(dp) | **画布宽**，0 = 跟随 `size`（正方形）。16~400 |
  * | `boxHeight` | int(dp) | **画布高**，0 = 跟随 `size`（正方形）。16~400 |
  * | `showDot` | bool | 是否显示右下角状态点。默认 **false**（不显示） |
@@ -184,6 +184,55 @@ data class BubbleAppearance(
      *   要贴边省屏幕的人（把球当按钮用）显式设 true 即可。
      */
     val edgeSnap: Boolean = false,
+
+    // ── 贴边态外观（拖出屏幕后那一条）─────────────────────────────────
+    //
+    // ## 为什么贴边态要能独立编辑
+    //
+    // 原实现是**写死的 6dp 纯色薄片**：宽度常量 `EDGE_WIDTH_DP`、背景由
+    // `edgeBackground()` 现画、没有任何图片。真机反馈是「太小了，点不到」——
+    // 6dp × 44dp 在 3x 屏上是 18×132 像素，手指落点几乎必然偏出去。
+    //
+    // 所以贴边态现在是一等公民：有自己的图片、自己的宽度、自己的可见高度，
+    // 且全部走和悬浮球同一套下发通道（插件 `bubbleApply` / 模型 `bubble` 工具），
+    // AI 可以直接改它。
+
+    /**
+     * 贴边态要显示的图片。
+     *
+     * | 取值 | 含义 |
+     * |---|---|
+     * | `"default"` | 内置的侧边探头形象（`bubble_edge_default`） |
+     * | `"none"` | 不显示图片，退回纯色薄片（老行为） |
+     * | `"custom"` | 用落盘的 `bubble-edge.bin`（见 [EDGE_IMAGE_FILE]） |
+     * | `data:image/…;base64,…` | 直接内联 |
+     *
+     * ⚠️ 与 [avatar] 同一套陷阱：下发时是 data URI，落盘后变成文件标记。
+     *   回读必须认文件标记，否则重启即丢、读-改-写会把图洗掉。
+     */
+    val edgeImage: String = EDGE_IMAGE_DEFAULT,
+
+    /** 贴边态图片的**可见宽度**（dp）。默认 28：比原来的 6dp 宽 4.7 倍，能点到了。 */
+    val edgeWidth: Int = DEFAULT_EDGE_WIDTH,
+
+    /**
+     * 贴边态图片的**可见高度**（dp）。0 = 自动（跟随球的画布高）。
+     *
+     * 图片按 `fitCenter` 铺在这个框里，所以长宽比不匹配时会有留白（透明）。
+     */
+    val edgeHeight: Int = 0,
+
+    /** 贴边态图片不透明度（0–1）。与 [opacity] 相乘。 */
+    val edgeOpacity: Float = 1f,
+
+    /**
+     * 贴边态在**竖直方向的位置比例**（0–1，相对可用高度）。
+     *
+     * `-1`（默认）= 沿用球被拖出去时的 y；`0` = 顶部，`1` = 底部。
+     * 给固定值可以让探头形象每次都出现在同一高度（更像"从边里探出头"）。
+     */
+    val edgeAnchor: Float = -1f,
+
     /**
      * 是否启用**抛掷物理**：快速甩动后松手，球会飞出去、撞边反弹、落地挤压、滚停。
      *
@@ -372,8 +421,13 @@ data class BubbleAppearance(
         //
         // ⚠️ 这几个是**运行状态**，与上面的 `state`（窗口形态）是两回事：
         //   一个是「球长什么样」，一个是「AI 在干什么」。
-        //   刻意只有 5 个：每多一个，插件就多一处要维护的映射，而映射错了
-        //   用户看到的是「宠物在做错的动作」，比少一个状态难查。
+        //
+        // ⚠️ 现在是 **7 个**：前 5 个是初版就有的，`result` / `success` 是后加的
+        //   （对齐 dsh-pet 的档位）。加状态确实有代价 —— 每多一个，插件就多一处
+        //   要维护的映射，映射错了用户看到的是「宠物在做错的动作」，比少一个难查。
+        //   所以新增时守两条：① 只在体感上真的能区分时才加（`working` 与 `result`
+        //   是"在跑"与"刚跑完"，宠物能表达这个差别）；② 必须**追加在末尾**，
+        //   因为 `workStatusTexts` / `statusImages` 是按下标取值的。
 
         /** 空闲：没在跑，等你输入。 */
         const val RUN_IDLE = "idle"
@@ -523,6 +577,48 @@ data class BubbleAppearance(
         /** 自定义头像的落盘文件名。内容变了会整体覆盖。 */
         const val AVATAR_FILE = "bubble-avatar.bin"
 
+        // ── 贴边态（拖出屏幕后那一条）───────────────────────────────────
+
+        /** 贴边态用内置的侧边探头形象（默认）。 */
+        const val EDGE_IMAGE_DEFAULT = "default"
+
+        /** 贴边态不显示图片，退回纯色薄片（老行为）。 */
+        const val EDGE_IMAGE_NONE = "none"
+
+        /** 自定义贴边图落盘文件名。内容变了会整体覆盖。 */
+        const val EDGE_IMAGE_FILE = "bubble-edge.bin"
+
+        /** 贴边图 base64 上限。探头形象通常比头像大一点，给到 1MB 原始数据。 */
+        const val MAX_EDGE_IMAGE_BASE64 = 1_400_000
+
+        /**
+         * 贴边态**可见宽度**默认值，dp。
+         *
+         * ⚠️ 原实现是写死的 6dp，真机反馈「太小了，点不到」——6dp × 44dp 在 3x 屏
+         *   上只有 18×132 像素。28dp 是「明显变大但仍只占一小条」的折中，
+         *   在 3x 屏上是 84px 宽，手指能稳稳点到。
+         */
+        const val DEFAULT_EDGE_WIDTH = 28
+
+        /**
+         * 球边长（`size`）的上限，dp。
+         *
+         * 曾是 160。桌宠素材（dsh-app-pet 的 640×360 webm）里人物只占画面宽度的
+         * ~33%，要让它看起来有正常大小就得把画布开得很大 —— 160 不够用。
+         * 320 在 3x 屏上是 960px，已经接近半屏宽，再大就会挡操作。
+         *
+         * ⚠️ 画布（`boxWidth`/`boxHeight`）的上限本来就是 400，比这里宽，
+         *   所以不需要同步改。
+         */
+        const val MAX_SIZE_DP = 320
+
+        /** 贴边态宽度下限 / 上限，dp。下限保证"能点到"，上限防止挡住半个屏幕。 */
+        const val MIN_EDGE_WIDTH = 6
+        const val MAX_EDGE_WIDTH = 120
+
+        /** 贴边态高度上限，dp。0 表示跟随球高，这里只约束显式给值的情况。 */
+        const val MAX_EDGE_HEIGHT = 400
+
         /**
          * SVG path 文本的长度上限。
          *
@@ -615,12 +711,49 @@ data class BubbleAppearance(
             val rawH = if (appearance.boxHeight > 0) appearance.boxHeight else 0
             // 两个都没配 → 完全走自动。
             if (rawW == 0 && rawH == 0) return auto
-            // 只配了一个 → 另一个沿用**自动**那一轴（而不是 size），于是
-            // 「只改宽」不用把高也写一遍，且高会跟着素材比例走。
-            val w = if (rawW > 0) rawW else (auto.first / dm.density).roundToInt()
-            val h = if (rawH > 0) rawH else (auto.second / dm.density).roundToInt()
-            return (w * dm.density).roundToInt().coerceAtLeast(1) to
-                (h * dm.density).roundToInt().coerceAtLeast(1)
+
+            // ⚠️ **`boxWidth`/`boxHeight` 是「相对 `size` 的比例基准」，不是绝对值。**
+            //
+            //   原实现直接用它们当最终 dp，于是只要两个都配了，`size` 就被彻底
+            //   架空 —— 真机反馈「调节直径没反应」。桌宠预设正是这种情形
+            //   （`size:160, boxWidth:160, boxHeight:142`）。
+            //
+            //   现在的语义：
+            //     `size` = 画布的**长边**，`boxWidth`/`boxHeight` 只表达**长宽比**。
+            //   于是拖直径滑块能整体缩放，而画布形状保持不变。
+            //
+            //   举例（长宽比 160:142）：
+            //     size=160 → 160 x 142
+            //     size=320 → 320 x 284
+            //   这正是用户对「直径」的直觉。
+            //
+            //   ⚠️ 素材本身是正方形（没配 boxWidth/boxHeight）时仍走 [autoBox]，
+            //     行为与以前完全一致，不影响存量配置。
+            val longDp = appearance.size
+            val boxLong = maxOf(rawW, rawH)
+            if (boxLong <= 0) return auto
+
+            // 按「配的那个当长边」求比例，缺的那一轴由比例推出。
+            val wDp: Int
+            val hDp: Int
+            if (rawW > 0 && rawH > 0) {
+                // 两个都给：等比缩放到长边 = size。
+                val k = longDp.toFloat() / boxLong
+                wDp = (rawW * k).roundToInt()
+                hDp = (rawH * k).roundToInt()
+            } else if (rawW > 0) {
+                // 只给宽：宽就是 size，高按素材比例。
+                val ratio = if (auto.first > 0) auto.second.toFloat() / auto.first else 1f
+                wDp = longDp
+                hDp = (wDp * ratio).roundToInt()
+            } else {
+                // 只给高：高就是 size，宽按素材比例。
+                val ratio = if (auto.second > 0) auto.first.toFloat() / auto.second else 1f
+                hDp = longDp
+                wDp = (hDp * ratio).roundToInt()
+            }
+            return (wDp * dm.density).roundToInt().coerceAtLeast(1) to
+                (hDp * dm.density).roundToInt().coerceAtLeast(1)
         }
 
         /** 整个配置对象的 key。 */
@@ -649,7 +782,7 @@ data class BubbleAppearance(
                 ),
                 shapePath = textOf(o, "shapePath", base.shapePath, MAX_SHAPE_PATH_CHARS),
                 shapeViewBox = textOf(o, "shapeViewBox", base.shapeViewBox, 64),
-                size = clampInt(o, "size", base.size, 24, 160),
+                size = clampInt(o, "size", base.size, 24, MAX_SIZE_DP),
                 // ⚠️ `0` 是**合法取值**（= 自动），所以这里不能再套 `clampInt(o,…,
                 //   24, 160)` —— 那会把 0 夹成 24，配置里写 `boxWidth:0` 反而变成长方形。
                 //   单独用一个 `autoOrInt` 把「0 或 16~400」放行。
@@ -689,6 +822,21 @@ data class BubbleAppearance(
                 panelAccent = colorOf(o, "panelAccent", base.panelAccent),
                 statusAutoHideMs = clampInt(o, "statusAutoHideMs", base.statusAutoHideMs, 0, 60_000),
                 edgeSnap = if (o.has("edgeSnap")) o.optBoolean("edgeSnap", base.edgeSnap) else base.edgeSnap,
+                // 贴边态外观：与 avatar 同一套「data URI 下发、文件标记回读」的陷阱，
+                // 见 [edgeImageOf] 的注释。
+                edgeImage = if (o.has("edgeImage")) edgeImageOf(o.opt("edgeImage"), base.edgeImage, context) else base.edgeImage,
+                edgeWidth = if (o.has("edgeWidth")) {
+                    o.optInt("edgeWidth", base.edgeWidth).coerceIn(MIN_EDGE_WIDTH, MAX_EDGE_WIDTH)
+                } else base.edgeWidth,
+                edgeHeight = if (o.has("edgeHeight")) {
+                    o.optInt("edgeHeight", base.edgeHeight).coerceIn(0, MAX_EDGE_HEIGHT)
+                } else base.edgeHeight,
+                edgeOpacity = if (o.has("edgeOpacity")) {
+                    o.optDouble("edgeOpacity", base.edgeOpacity.toDouble()).toFloat().coerceIn(0f, 1f)
+                } else base.edgeOpacity,
+                edgeAnchor = if (o.has("edgeAnchor")) {
+                    o.optDouble("edgeAnchor", base.edgeAnchor.toDouble()).toFloat().coerceIn(-1f, 1f)
+                } else base.edgeAnchor,
                 throwEnabled = if (o.has("throwEnabled")) o.optBoolean("throwEnabled", base.throwEnabled) else base.throwEnabled,
                 imeFlingEnabled = if (o.has("imeFlingEnabled")) o.optBoolean("imeFlingEnabled", base.imeFlingEnabled) else base.imeFlingEnabled,
                 shakeEnabled = if (o.has("shakeEnabled")) o.optBoolean("shakeEnabled", base.shakeEnabled) else base.shakeEnabled,
@@ -1411,6 +1559,90 @@ data class BubbleAppearance(
         }
 
         /**
+         * 解析贴边态图片字段。
+         *
+         * 与 [avatarOf] **完全同构**，包括那个最容易漏的坑：`save()` 会把 data URI
+         * 换成文件标记 [EDGE_IMAGE_FILE] 落盘，回读时必须认得这个标记 —— 否则
+         * 自定义贴边图重启即丢，且「读-改-写」会把它洗回内置图。
+         */
+        private fun edgeImageOf(raw: Any?, fallback: String, context: Context? = null): String {
+            val v = (raw as? String)?.trim() ?: return fallback
+            if (v.isEmpty()) return fallback
+            if (v == EDGE_IMAGE_NONE || v == EDGE_IMAGE_DEFAULT) return v
+            if (v == EDGE_IMAGE_FILE) {
+                val f = context?.let { File(it.filesDir, EDGE_IMAGE_FILE) }
+                return when {
+                    f == null -> EDGE_IMAGE_FILE
+                    f.isFile && f.length() > 0L -> EDGE_IMAGE_FILE
+                    else -> EDGE_IMAGE_DEFAULT
+                }
+            }
+            if (!v.startsWith("data:image/")) return EDGE_IMAGE_DEFAULT
+            if (v.length > MAX_EDGE_IMAGE_BASE64) {
+                Log.w(TAG, "悬浮球贴边图过大（${v.length} 字节 > $MAX_EDGE_IMAGE_BASE64），已忽略")
+                return fallback
+            }
+            return v
+        }
+
+        /**
+         * 解码 data URI 形式的贴边图并落盘。
+         *
+         * 与 [writeAvatar] 同构：先解码确认是有效位图再写，避免把垃圾字节写进去、
+         * 下次启动才在 BitmapFactory 那里失败。
+         */
+        fun writeEdgeImage(context: Context, image: String): File? {
+            if (!image.startsWith("data:image/")) return null
+            val comma = image.indexOf(',')
+            if (comma < 0) return null
+            val bytes = try {
+                Base64.decode(image.substring(comma + 1), Base64.DEFAULT)
+            } catch (t: Throwable) {
+                Log.w(TAG, "悬浮球贴边图 base64 解码失败: ${t.message}")
+                return null
+            }
+            if (BitmapFactory.decodeByteArray(bytes, 0, bytes.size) == null) {
+                Log.w(TAG, "悬浮球贴边图不是有效图片，已忽略")
+                return null
+            }
+            return try {
+                val f = File(context.filesDir, EDGE_IMAGE_FILE)
+                f.writeBytes(bytes)
+                Log.i(TAG, "已保存悬浮球贴边图（${bytes.size} 字节）")
+                f
+            } catch (t: Throwable) {
+                Log.w(TAG, "悬浮球贴边图落盘失败: ${t.message}")
+                null
+            }
+        }
+
+        /**
+         * 读回已落盘的自定义贴边图。
+         *
+         * 贴边态是**竖长条**（默认 28dp 宽），解码目标取宽度即可 —— 按长边采样会
+         * 因为高度大而过度降采样，探头形象反而糊掉。
+         */
+        fun readEdgeImage(context: Context, targetWidthPx: Int): Bitmap? {
+            val f = File(context.filesDir, EDGE_IMAGE_FILE)
+            if (!f.isFile || f.length() == 0L) return null
+            return try {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(f.absolutePath, bounds)
+                var sample = 1
+                // ⚠️ 只按**宽度**判断是否够采样：竖长条的 outHeight 天然很大，
+                //   两个维度都要大于阈值才采样的话，这里会几乎永远不降采样。
+                while (bounds.outWidth / (sample * 2) >= targetWidthPx * 2) sample *= 2
+                BitmapFactory.decodeFile(
+                    f.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sample },
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "读取悬浮球贴边图失败: ${t.message}")
+                null
+            }
+        }
+
+        /**
          * 解码 data URI 形式的头像并落盘。
          *
          * ⚠️ **落盘而不是只留内存**：插件换的头像要能在 App 重启后仍然生效，
@@ -1539,6 +1771,17 @@ data class BubbleAppearance(
                 put("panelAccent", appearance.panelAccent)
                 put("statusAutoHideMs", appearance.statusAutoHideMs)
                 put("edgeSnap", appearance.edgeSnap)
+                // ⚠️ 与 [avatar] 同理：data URI 不能直接落盘（几十万字符的 JSON），
+                //   落盘时换成文件标记，字节另存 bubble-edge.bin。
+                put(
+                    "edgeImage",
+                    if (appearance.edgeImage.startsWith("data:image/")) EDGE_IMAGE_FILE
+                    else appearance.edgeImage,
+                )
+                put("edgeWidth", appearance.edgeWidth)
+                put("edgeHeight", appearance.edgeHeight)
+                put("edgeOpacity", appearance.edgeOpacity.toDouble())
+                put("edgeAnchor", appearance.edgeAnchor.toDouble())
                 put("throwEnabled", appearance.throwEnabled)
                 put("imeFlingEnabled", appearance.imeFlingEnabled)
                 put("shakeEnabled", appearance.shakeEnabled)

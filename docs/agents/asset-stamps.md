@@ -26,6 +26,8 @@
 | `pet-bridge.zip` | 无需改（每次启动解包覆盖写，见 ⑫.4） |
 | `uiagent-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.5） |
 | `logs-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.6） |
+| `browser-tool.zip` | 无需改（每次启动解包覆盖写，见 ⑫.8） |
+| `browser-pane.zip` | 无需改（每次启动解包覆盖写，见 ⑫.8）。⚠️ 它是**客户端插件**，必须在引擎启动前落盘 |
 | `ui-probe.js` | 无需改（原生每次启动读一次进内存，见 ⑫.5）。⚠️ 但改了语义要同步升 `ui-probe.js` 内部的 `VERSION`（页面上的旧探针靠它判断要不要换） |
 | `webview-polyfill.js` | 无需改（每次启动覆盖写） |
 | `webview-compat.zip` | **必须重跑** `tools/build-webview-compat.ps1`（见 ⑯；文件名带内容 hash，换 `engine.bin` 后必然对不上） |
@@ -43,7 +45,7 @@
 
 `assets/*.zip` 全部被 `.gitignore` 忽略（L33），**没有任何打包脚本** ——
 `logs-tool.zip` / `bubble-tool.zip` / `statusbar-tool.zip` / `shell-tool.zip` /
-`uiagent-tool.zip` / `root-tool.zip` 都是**手工**打的。所以改完源码很容易
+`uiagent-tool.zip` / `root-tool.zip` / `browser-tool.zip` 都是**手工**打的。所以改完源码很容易
 「commit 了、构建也过了、APK 里却是旧代码」。
 
 **真踩过（`b0fbb4b`，10-14 02:44）**：那次给 6 个工具插件加了「注册失败不拖垮引擎」
@@ -59,13 +61,14 @@ b0fbb4b 之后其实**补打过 5 个**（`logs-tool` 02:41:56、`bubble-tool`/`
 所以判据只能是**逐 zip 与源目录做字节比对**，不能靠"我记得打过"。
 
 **判据（每次改完必须做）**：zip 内的 `lib/index.js` 必须与源目录**逐字节一致**。
-一条命令验完 6 个：
+一条命令验完 7 个：
 
 ```powershell
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $pairs=@{'logs-tool'='dsh-android-logs';'bubble-tool'='dsh-android-bubble';
  'statusbar-tool'='dsh-android-statusbar';'shell-tool'='dsh-android-shell';
- 'uiagent-tool'='dsh-android-uiagent';'root-tool'='dsh-android-root'}
+ 'uiagent-tool'='dsh-android-uiagent';'root-tool'='dsh-android-root';
+ 'browser-tool'='dsh-android-browser'}
 foreach($k in $pairs.Keys){
   $z=[IO.Compression.ZipFile]::OpenRead((Resolve-Path "app\src\main\assets\$k.zip").Path)
   foreach($e in $z.Entries){
@@ -77,7 +80,7 @@ foreach($k in $pairs.Keys){
 }
 ```
 
-**打包格式**（六个 zip 同构）：条目为 `package.json` + `lib/index.js`
+**打包格式**（七个 zip 同构）：条目为 `package.json` + `lib/index.js`
 （`uiagent-tool` 多一个 `lib/screens.js`），**相对路径、没有顶层目录** ——
 `EngineManager` 直接往 `$DSH_HOME/<xxx>-tool/dsh-android-xxx/` 解，多一层目录就找不到入口。
 

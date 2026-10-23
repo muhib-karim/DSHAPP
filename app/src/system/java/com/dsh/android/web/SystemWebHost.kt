@@ -597,6 +597,21 @@ private class SystemPageBridge(private val impl: PageBridge) {
     @android.webkit.JavascriptInterface
     fun bubbleRequestOverlay() = impl.bubbleRequestOverlay()
 
+    // ── AI 浏览器（官方右侧边栏的「AI 浏览器」面板）──────────────────────
+    // ⚠️ 与 gecko 版白名单必须逐条对齐 —— 少一条就是「点了没反应」，而原生
+    //   日志一切正常（页面侧 `window.DSHAndroid.openAiBrowser` 是 undefined）。
+    @android.webkit.JavascriptInterface
+    fun openAiBrowser() = impl.openAiBrowser()
+
+    @android.webkit.JavascriptInterface
+    fun aiBrowserLayout(json: String) = impl.aiBrowserLayout(json)
+
+    @android.webkit.JavascriptInterface
+    fun aiBrowserDetach() = impl.aiBrowserDetach()
+
+    @android.webkit.JavascriptInterface
+    fun aiBrowserState(): String = impl.aiBrowserState()
+
     // ── 甩动手感三开关（见「悬浮气泡」设置页）────────────────────────────
     // ⚠️ 与 gecko 版白名单必须逐条对齐，两边方法名少一个就是「点了没反应」。
     @android.webkit.JavascriptInterface

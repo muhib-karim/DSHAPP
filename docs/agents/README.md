@@ -9,6 +9,7 @@
 | [v130-signin-plugins-updates.md](v130-signin-plugins-updates.md) | 1.3.0 (fork) | Sign-in, web-account bridge, opaque UI, Settings > Plugins, live / palette, in-app updates |
 | [constraints.md](constraints.md) | 两条硬约束 | 包名 15 字符、targetSdk ≤ 28。改错不报错但真机必炸 |
 | [build-and-ship.md](build-and-ship.md) | 构建、发行与发布 | gradle 任务、签名、夸克网盘上传与版本整理 |
+| [server-build-env.md](server-build-env.md) | 服务器构建环境 | 八壹云部署、GRADLE_USER_HOME / DSH_HOME 两处必须存在的绝对路径、一键发布脚本 |
 | [platform-android.md](platform-android.md) | android 平台适配总览 | 为什么 Node 在 Android 上是 android 而不是 linux |
 | [link-compat.md](link-compat.md) | ③ SELinux 不给 link 权限 | LD_PRELOAD 转译层：为什么必须转译、转译语义、降级路径 |
 | [directory-picker.md](directory-picker.md) | ③.5 目录选择器只在**一棵**树里走 | HOME 下的入口链接接上手机存储 |
@@ -28,6 +29,7 @@
 | [bubble-tool.md](bubble-tool.md) | ⑫.3 bubble 工具 | 文件信箱，让模型自己改悬浮窗 |
 | [pet-bridge.md](pet-bridge.md) | ⑫.4 桌面宠物 | 状态→动作映射、两条状态通道 |
 | [ui-tool.md](ui-tool.md) | ⑫.5 ui 工具 | 让模型自己看和点界面：坐标系、遮挡、屏幕外、面板、持久化状态 |
+| [browser.md](browser.md) | ⑫.8 AI 浏览器 | 模型自己的 WebView：为什么不用 iframe、官方右侧边栏入口的两个接缝、文件信箱链路、控制权仲裁、页面 JS 三条硬规矩 |
 | [logging.md](logging.md) | ⑫.6 / ⑫.7 日志与诊断 | 三层存储、崩溃入口、脱敏、诊断包、归因写错的五处 |
 | [plugin-source.md](plugin-source.md) | ⑬ 添加插件少了「npm 官方源」 | 不是漏配，是被去重合并掉了 |
 | [web-port.md](web-port.md) | ⑭ Web 端口 3080 被占用 | 默认沿用，撞车才让内核分配 |

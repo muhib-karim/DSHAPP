@@ -360,13 +360,13 @@ class EngineManager private constructor(private val context: Context) {
 
             engineDir.deleteRecursively()
             if (!staging.renameTo(engineDir)) {
-                throw java.io.IOException("无法将解包目录重命名为 $engineDir")
+                throw java.io.IOException(context.getString(R.string.engine_unpack_rename_failed, engineDir))
             }
             _state.value = State.Extracting(100)
             Log.i(TAG, "引擎资产解包完成：${engineDir.absolutePath}")
         } catch (t: Throwable) {
             staging.deleteRecursively()
-            _state.value = State.Failed("引擎解包失败: ${t.message}")
+            _state.value = State.Failed(context.getString(R.string.engine_unpack_failed, t.message))
             throw t
         }
     }
@@ -1313,6 +1313,67 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 放宽「发图格式白名单」—— 原版只认 4 个精确的 MIME 字符串。
+     *
+     * **症状**：新会话里粘贴/选择图片，直接弹「仅支持 PNG、JPG、WebP、GIF 格式的图片」，
+     * 图根本没进输入框。而同一张图在已有会话里能发。
+     *
+     * **根因**：`dsh-client-ui-conversation` 的 `isImageMediaType()` 是**精确字符串比较**：
+     *
+     * ```js
+     * return value === "image/png" || value === "image/jpeg"
+     *     || value === "image/webp" || value === "image/gif";
+     * ```
+     *
+     * 于是下面这些**明明能显示的图片**全被判成非法：
+     *
+     * | 场景 | `file.type` | 结果 |
+     * |---|---|---|
+     * | 后缀是 `.jpg`（部分系统/相册） | `image/jpg` | ❌ 被拒（不是 `jpeg`） |
+     * | iPhone 拍照 | `image/heic` / `image/heif` | ❌ 被拒 |
+     * | 部分安卓相册 | `image/bmp` / `image/avif` | ❌ 被拒 |
+     * | 从剪贴板粘贴 | 可能是空串 | ❌ 被拒 |
+     *
+     * 触发点还叠了 `continuable`（新开会话）这个条件，所以表现成
+     * 「新会话一粘图就报错，老会话没事」。
+     *
+     * **做法**：把精确比较换成前缀 + 别名判断 —— 只要 `image/` 开头就放行，
+     * 再补上 `image/jpg` 这个常见别名。
+     *
+     * ⚠️ **只放宽「能不能选」，不放宽「能不能解码」**：真正的解码在下游
+     * （`dsh-attachment-local` 用 sharp），不支持的格式那里会给出明确错误，
+     * 比在入口处一刀切拦住友好得多 —— 用户至少能看到「这张图解码失败」，
+     * 而不是莫名其妙的格式白名单。
+     *
+     * 找不到锚点就跳过（引擎升级后结构变了也不让启动失败）。
+     */
+    private fun patchImageMediaType() {
+        val entry = File(
+            engineDir,
+            "node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        )
+        if (!entry.isFile) {
+            Log.w(TAG, "未找到会话 UI 入口，跳过发图格式补丁: ${entry.absolutePath}")
+            return
+        }
+
+        try {
+            val source = entry.readText()
+            if (source.contains(IMG_TYPE_ANCHOR)) {
+                return
+            }
+            if (!source.contains(IMG_TYPE_GUARD)) {
+                Log.w(TAG, "发图格式判断结构与预期不符，跳过补丁")
+                return
+            }
+            entry.writeText(source.replace(IMG_TYPE_GUARD, IMG_TYPE_ANCHOR))
+            Log.i(TAG, "已放宽发图格式白名单: dsh-client-ui-conversation")
+        } catch (t: Throwable) {
+            Log.w(TAG, "放宽发图格式白名单失败: ${t.message}")
+        }
+    }
+
+    /**
      * 从引擎打印的 URL 里取出端口号，取不到给空串。
      *
      * ⚠️ **不能写成 `url.substringAfter(":").substringBefore("/")`**（踩过，真机全中）：
@@ -2229,6 +2290,82 @@ class EngineManager private constructor(private val context: Context) {
     }
 
     /**
+     * 解出**右侧栏「AI 浏览器」入口**插件（`browser-pane.zip` →
+     * `$DSH_HOME/browser-pane/dsh-android-browser-pane/`）。
+     *
+     * 该插件是**客户端插件**（`dsh.client` 声明 + `lib/client.js`），在官方右侧
+     * 边栏里注册一项「AI 浏览器」：点开就调原生 `openAiBrowser()` 打开
+     * [com.dsh.android.browser.AiBrowserView]。
+     *
+     * ## 为什么单独成包，而不是并进 `dsh-android-mobile`
+     *
+     * 那个包的 `lib/client.js` 在 dev 与 main 两条分支上差 17 万字节，而
+     * `assets/mobile-ui.zip` 是**跨工作树共享的符号链接资产** —— 往它里面加东西
+     * 就必须重打整包，一次重打会把另一条分支的移动端修复整个回退掉。
+     * 独立成包互不干扰，代价只是多一个 8 KB 的 zip。
+     *
+     * ⚠️ 与 `bubble-tool` / `uiagent-tool` 那类**工具插件**不同，这个包是
+     *   **客户端插件**：它必须在**引擎启动之前**解包落盘，因为引擎启动时才会
+     *   扫描 `dsh.client` 声明并把客户端代码编进前端 bundle。解晚一步就是
+     *   「文件在、侧栏里没有这一项」，而且没有任何报错。
+     */
+    private fun ensureBrowserPane() {
+        val target = File(dshHome, "$BROWSER_PANE_DIR/$BROWSER_PANE_PACKAGE")
+        val clientJs = File(target, "lib/client.js")
+        try {
+            target.deleteRecursively()
+            java.util.zip.ZipInputStream(context.assets.open(BROWSER_PANE_ASSET).buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val out = File(target, entry.name)
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zis.copyTo(it) }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            Log.i(TAG, "已安装侧栏浏览器入口插件 $BROWSER_PANE_PACKAGE (${clientJs.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是侧栏里少一项（没有别的入口可退，但启动不该因此失败）
+            Log.w(TAG, "安装侧栏浏览器入口插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载侧栏浏览器入口的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeMobileUiPatch] 完全同构（`file://` 绝对路径 + `insert`）。
+     */
+    private fun writeBrowserPanePatch(): File? {
+        val patch = File(dshHome, BROWSER_PANE_PATCH)
+        val entry = File(dshHome, "$BROWSER_PANE_DIR/$BROWSER_PANE_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "侧栏浏览器入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载右侧栏「AI 浏览器」入口插件；插件包随 APK 分发，已解到 .dsh/${BROWSER_PANE_DIR}。
+                - insert:
+                    - id: $BROWSER_PANE_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入侧栏浏览器入口 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入侧栏浏览器入口 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
      * 解出 Agnes 多模态插件（`generate_image` / `generate_video` + 多模态配置页）。
      *
      * 与 [ensureMobileUi] 同一套做法、同一套理由：包解到 `$DSH_HOME/agnes-multimodal/`
@@ -2297,22 +2434,21 @@ class EngineManager private constructor(private val context: Context) {
     /**
      * 把内置号池接到 Agnes 多模态插件上（写 `$DSH_HOME/ag-multimodal.json`）。
      *
-     * ## 为什么这样接得上
-     *
      * 插件调 `readAccounts()` 拿账号池，每条形如 `{endpoint, key}`，然后直接
-     * `Authorization: Bearer <key>` 发出去。而内置号池的真密钥**不在 JS 层** ——
-     * 它们由 `libkeyinject.so` 在 `SSL_write` 里换掉，条件是「头部区域含
-     * [KEY_PLACEHOLDER]」。所以这里写的 `key` 就是那个**占位符**：
-     * 插件照常拼请求头，注入层在加密前把它换成随机抽中的真钥匙，与聊天那条链路
-     * 走的是同一个机制、同一个池子。
+     * `Authorization: Bearer <key>` 发出去。
      *
-     * ## ⚠️ endpoint 必须用国际站域名
+     * ## 号池改为服务端网关后的变化
      *
-     * 抽到国内站钥匙时，注入层靠**等长改写 Host 头**把请求路由到国内站，而基准
-     * 域名只能是较长的 `apihub`（`api.agnes-ai.cn` 加 3 个尾空格才够 18 字节 ——
-     * 18 − 15 = 3，别写成 4，见 `keyinject.c` 的 `KI_HOST_CN` 与那条 `_Static_assert`）。
-     * 这里若写 `api.agnes-ai.cn`，注入层找不到 `KI_HOST_INTL` 可改 —— 抽到国内站
-     * 钥匙就会拿国内站密钥去打国内站域名之外的路由，稳定 401。见 [KEY_BASE_URL]。
+     * 以前这里写的 `key` 是占位符 `sk-ANON…`，由 `libkeyinject.so` 在 `SSL_write`
+     * 里换成真钥匙；`endpoint` 必须用国际站域名，因为要靠等长改写 Host 头做
+     * 两站路由。**那条链路已整体下线**。
+     *
+     * 现在：
+     * - `endpoint` = 网关地址 [KEY_BASE_URL]
+     * - `key`      = 网关令牌 [KEY_PLACEHOLDER]
+     *
+     * 真密钥、两站路由、429 换号重试**全部由服务器负责**，客户端不需要知道
+     * 底下有几个站点、几把钥匙。
      *
      * ## ⚠️ 内置号是「不可删除、不可更改」的，所以每次启动都要修复
      *
@@ -2346,11 +2482,14 @@ class EngineManager private constructor(private val context: Context) {
             // 用户行原样保留、保持原有顺序（它们排在前面 ⇒ 优先级更高）。
             for (i in 0 until accounts.length()) {
                 val row = accounts.optJSONObject(i) ?: continue
-                // 内置行（认标记，也认占位符 —— 老配置里只有 endpoint/key 两个字段）
-                // 一律跳过，下面统一追加权威值。
-                if (row.optBoolean("builtin") || row.optString("key") == KEY_PLACEHOLDER) continue
-                if (row.optString("key").isBlank()) continue
-                next.put(JSONObject().put("endpoint", row.optString("endpoint")).put("key", row.optString("key")))
+                // 内置行一律跳过，下面统一追加权威值。认三种标记：
+                //   - `builtin` 布尔标记（当前写法）
+                //   - 老版本的 TLS 注入占位符 `sk-ANON…`（升级前写下的）
+                //   - 当前网关令牌（用户手改后被纠正）
+                val key = row.optString("key")
+                if (row.optBoolean("builtin") || key == LEGACY_KEY_PLACEHOLDER || key == KEY_PLACEHOLDER) continue
+                if (key.isBlank()) continue
+                next.put(JSONObject().put("endpoint", row.optString("endpoint")).put("key", key))
             }
             // 内置号恒在最后一位（池尾兜底），带 builtin 标记。
             next.put(
@@ -3033,21 +3172,20 @@ class EngineManager private constructor(private val context: Context) {
      * 此时引擎照常启动、只是没有内置号池，用户仍可自己配 provider。
      */
     private fun ensureKeyInject(): File? {
-        val dest = File(context.filesDir, KEYINJECT_FILE)
-        return try {
-            // 每次都覆盖写：库只有 11KB，且它随 APK 升级而变，比对哈希不值当
-            context.assets.open(KEYINJECT_ASSET).use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
-            }
-            dest.setReadable(true, false)
-            dest.setExecutable(true, false)
-            Log.i(TAG, "已解出号池注入库 $KEYINJECT_FILE (${dest.length()} 字节)")
-            dest
-        } catch (t: Throwable) {
-            // 没有资产 = 没跑生成脚本，属于正常状态，不是错误
-            Log.i(TAG, "未内置号池注入库（未运行 tools/build-keyinject.ps1），跳过")
-            null
+        // ⚠️ 号池改为服务端网关后，本方法**不再解出注入库**，恒返回 null。
+        //
+        // 保留这个函数（而不是删掉调用点）有两个原因：
+        //   1. 调用点有三处（start / rescue / LD_PRELOAD 拼接），删函数要连带
+        //      改多处控制流，风险大于收益；
+        //   2. 老安装的 `filesDir/libkeyinject.so` 需要顺手清掉 —— 留着它虽然
+        //      不会再被 LD_PRELOAD 加载，但会让人误以为注入层还在。
+        //
+        // 真正删掉的是：assets/keyinject.bin（不再打进 APK）、
+        // app/src/main/jni/keyinject.c、tools/build-keyinject.ps1 的产物链路。
+        File(context.filesDir, KEYINJECT_FILE).takeIf { it.isFile }?.let {
+            if (it.delete()) Log.i(TAG, "已删除旧的号池注入库: ${it.name}")
         }
+        return null
     }
 
     /**
@@ -3093,7 +3231,89 @@ class EngineManager private constructor(private val context: Context) {
      * 的一部分，用户删掉它就等于弄丢了号池，所以每次启动都要确保它在。但**只补缺**
      * （见 [mergeKeyPoolProvider]），已有 `agnes:` 时一个字节都不动。
      */
-    private fun ensureKeyPoolProvider(inject: File?, profile: String = PROFILE_NAME): Boolean {
+    /**
+     * 删掉 `$DSH_HOME/.credentials.yaml` 里那条**老用户手填的**内置号池密钥。
+     *
+     * ## 症状
+     *
+     * 升级后界面显示「API 密钥无效」，而 API 地址已经是网关地址。设置页里密钥
+     * 输入框提示「留空使用已保存凭据」，**看不到**「已检测到环境变量」。
+     *
+     * ## 根因
+     *
+     * `dsh-credentials-local` 的 `describe()` 优先级是：
+     *
+     * ```
+     * values（.credentials.yaml）→ inherited（父进程环境变量）→ dotenv 兜底
+     * ```
+     *
+     * 老版本要求用户在设置页里手填 Agnes 真密钥，那份值被写进 `.credentials.yaml`。
+     * 新版本改用环境变量 `AGNES_CREDENTIAL`（值是网关令牌），但**文件层优先**，
+     * 于是 `Authorization` 头带的仍是用户当年手填的**旧真密钥** ——
+     * 打到现在指向的网关地址上，网关不认识它，回 401 ⇒ 界面「API 密钥无效」。
+     *
+     * 这正是「留空使用已保存凭据」与「已检测到环境变量」互斥的原因：
+     * 前者说明 `source === "file"`，后者说明 `source === "env"`。老用户是前者。
+     *
+     * ## 为什么可以安全删除
+     *
+     * `AGNES_CREDENTIAL` 是**内置号池专用的引用名**（见 [KEY_ENV]），
+     * 用户自己的第三方 provider 用各自的引用名，不受影响。
+     * 而且网关令牌永远由 [start] 注入成环境变量 —— 文件里那条只会造成遮蔽。
+     *
+     * ⚠️ **只删这一条**。整份文档原样保留（注释、其它条目、格式都不动）：
+     * 用户可能同时配了别的 provider，粗暴重写等于毁他数据。
+     *
+     * ⚠️ 只认「值不是网关令牌」的条目。若用户手动填的就是网关令牌，留着无害。
+     */
+    private fun dropStaleBuiltinCredential() {
+        val file = File(dshHome, ".credentials.yaml")
+        if (!file.isFile) return
+        val text = try {
+            file.readText()
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取 .credentials.yaml 失败: ${t.message}")
+            return
+        }
+
+        // 找 `AGNES_CREDENTIAL:` 那一行（顶层键，允许引号/注释/空行）。
+        // 只处理顶层缩进为 0 的行，避免误伤嵌套结构。
+        val lines = text.lines().toMutableList()
+        val idx = lines.indexOfFirst { line ->
+            val t = line.trimStart()
+            line.indexOfFirst { it != ' ' } == 0 &&
+                t.startsWith("$KEY_ENV:") &&
+                !t.startsWith("#")
+        }
+        if (idx < 0) return
+
+        val raw = lines[idx].substringAfter("$KEY_ENV:").trim()
+        // 去掉行尾注释与引号，取出真正的值
+        val value = raw
+            .substringBefore(" #")
+            .trim()
+            .trim('\'', '"')
+        if (value.isEmpty()) return
+        if (value == KEY_PLACEHOLDER) return   // 已经是网关令牌，无需处理
+
+        // 还有别的条目就只删这一行，否则整个文件只剩这一条 ⇒ 删文件更干净
+        val remaining = lines.filterIndexed { i, line ->
+            i != idx && !(line.isBlank() || line.trimStart().startsWith("#"))
+        }
+        try {
+            if (remaining.isEmpty()) {
+                if (file.delete()) Log.i(TAG, "已删除只含旧号池密钥的 .credentials.yaml")
+            } else {
+                val body = lines.filterIndexed { i, _ -> i != idx }.joinToString("\n")
+                file.writeText(body.trimEnd('\n') + "\n")
+                Log.i(TAG, "已从 .credentials.yaml 移除旧的 $KEY_ENV 条目")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "清理 .credentials.yaml 失败: ${t.message}")
+        }
+    }
+
+    private fun ensureKeyPoolProvider(profile: String = PROFILE_NAME): Boolean {
         // 老版本把内置号池写成 --patch overlay（keyinject.patch.yml）。那个写法会
         // 在最顶层整块替换 `llm-pi-ai` 那行，把用户自己的 provider 一起盖掉 ——
         // 见 [KEY_POOL_NS]。这份残留**必须无条件删掉**（与号池资产在不在无关）：
@@ -3101,7 +3321,9 @@ class EngineManager private constructor(private val context: Context) {
         File(dshHome, KEYINJECT_PATCH).takeIf { it.isFile }?.let {
             if (it.delete()) Log.i(TAG, "已删除旧的内置号池 overlay: ${it.name}")
         }
-        if (inject == null) return false
+        // ⚠️ 号池改为服务端网关后，不再依赖本地注入库，所以这里**不再**有
+        // 「没有 libkeyinject.so 就跳过」的短路。旧逻辑的因果已经不存在了 ——
+        // 现在只要网关可用，号池就该在（原参数 `inject: File?` 已随之删除）。
 
         val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
         val existing = try {
@@ -3378,7 +3600,47 @@ class EngineManager private constructor(private val context: Context) {
             line.isNotBlank() && line.indexOfFirst { it != ' ' } == child + 6 &&
                 (trimmed == "retryPolicy:" || trimmed.startsWith("retryPolicy: "))
         }
-        if (hasRetryPolicy) return unchangedOrHealed()
+        // ── baseURL 迁移：老安装必须改到网关地址 ──────────────────────────
+        //
+        // ⚠️ 与上面 `retryPolicy` 完全同一类 bug，只是这次漏的是 baseURL。
+        //
+        //   号池从「客户端 TLS 注入 + 直连上游」改成「服务端网关」后，
+        //   `agnes:` 块里的 `baseURL` 必须从 `api.agnes-ai.cn` /
+        //   `apihub.agnes-ai.cn` 换成 [KEY_BASE_URL]。
+        //
+        //   但 `mergeKeyPoolProvider` 的既定语义是「已有 agnes: 就一个字节都不动」，
+        //   于是**所有老安装升级后仍然指向旧域名**：注入库已经删了，占位符不再被
+        //   替换成真密钥，请求带着 `sk-agnes-…` 令牌直连 Agnes 上游 ⇒ 上游回 401
+        //   ⇒ 客户端显示「API 密钥无效」。全新安装反而是对的，典型的
+        //   「新装测不出、老用户全炸」。
+        //
+        //   纠偏范围**严格限定在 baseURL 这一个键**，且**只认已知的旧值**：
+        //   - 命中旧直连域名 ⇒ 改成网关地址（这是本次迁移的唯一目的）
+        //   - 已是网关地址   ⇒ 不动
+        //   - 其它任意值     ⇒ 不动（用户自己填的第三方地址，绝不可覆盖）
+        var baseUrlFixed = false
+        val baseUrlIndent = child + 6
+        for (i in agnesIndex + 1 until agnesEnd) {
+            val line = lines[i]
+            if (line.isBlank()) continue
+            if (line.indexOfFirst { it != ' ' } != baseUrlIndent) continue
+            val trimmed = line.trim()
+            if (!trimmed.startsWith("baseURL:")) continue
+            val value = trimmed.removePrefix("baseURL:").trim().trim('\'', '"')
+            if (value in LEGACY_KEY_BASE_URLS) {
+                lines[i] = " ".repeat(baseUrlIndent) + "baseURL: '$KEY_BASE_URL'"
+                dirty = true
+                baseUrlFixed = true
+                Log.i(TAG, "内置号池 baseURL 迁移: $value -> $KEY_BASE_URL")
+            }
+            break
+        }
+        // ⚠️ 不能在这里 `return`：baseURL 改了之后，retryPolicy 可能**同样缺失**
+        //    （老安装两样都缺）。早退会让「换号重试」这个修复对老用户失效，
+        //    与上面 retryPolicy 注释里踩过的坑完全一样。继续往下走。
+        if (hasRetryPolicy) {
+            return if (baseUrlFixed) lines.joinToString("\n") else unchangedOrHealed()
+        }
 
         insert(agnesIndex + 1, keyPoolRetryPolicyYaml(child + 6))
         return lines.joinToString("\n")
@@ -3963,6 +4225,80 @@ class EngineManager private constructor(private val context: Context) {
             patch
         } catch (t: Throwable) {
             Log.w(TAG, "写入 UI 调试工具 overlay 失败: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 解出**浏览器工具**插件（`browser-tool.zip` → `$DSH_HOME/browser-tool/dsh-android-browser/`）。
+     *
+     * 该插件在 `apply()` 里注册一个名为 `browser` 的**独立工具**，让模型能：
+     * 打开网页、读页面结构（可见文本 + 带编号的可交互元素）、点按钮、填表单、
+     * 截图、管理标签页。真实执行者是 [com.dsh.android.browser.BrowserBridge]
+     * 与 [com.dsh.android.browser.AiBrowserView]。
+     *
+     * ⚠️ **必须解到 `$DSH_HOME/browser-tool/` 而不是 profile 的 `node_modules`**：
+     *   与 [ensureBubbleTool] 同一个坑 —— 那个目录归 pnpm 管，而本包不在 profile
+     *   的 `dependencies` 里，用户每装一次插件就会被挪进 `node_modules/.ignored/`。
+     *
+     * 与其它工具插件一样**不做版本戳**：包很小（两个文件），每次启动覆盖写。
+     */
+    private fun ensureBrowserTool() {
+        val target = File(dshHome, "$BROWSER_TOOL_DIR/$BROWSER_TOOL_PACKAGE")
+        val entry = File(target, "lib/index.js")
+        try {
+            context.assets.open(BROWSER_TOOL_ASSET).use { input ->
+                java.util.zip.ZipInputStream(input.buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val out = File(target, e.name)
+                            out.parentFile?.mkdirs()
+                            out.outputStream().use { zis.copyTo(it) }
+                        }
+                        zis.closeEntry()
+                        e = zis.nextEntry
+                    }
+                }
+            }
+            Log.i(TAG, "已安装浏览器工具插件 $BROWSER_TOOL_PACKAGE (${entry.length()} 字节)")
+        } catch (t: Throwable) {
+            // 装不上就只是没有 browser 工具，不该拖垮引擎启动
+            Log.w(TAG, "安装浏览器工具插件失败: ${t.message}")
+        }
+    }
+
+    /**
+     * 写出挂载浏览器工具的 overlay，返回其路径；入口不存在时返回 null。
+     *
+     * 与 [writeUiToolPatch] 同构。**没有「能力探测」这一步**：浏览器不需要
+     * 任何特权，只要插件入口在就挂载 —— 浏览器实例由
+     * [com.dsh.android.MainActivity.ensureAiBrowser] 在模型第一次调用时按需创建。
+     */
+    private fun writeBrowserToolPatch(): File? {
+        val patch = File(dshHome, BROWSER_TOOL_PATCH)
+        val entry = File(dshHome, "$BROWSER_TOOL_DIR/$BROWSER_TOOL_PACKAGE/lib/index.js")
+        if (!entry.isFile) {
+            if (patch.isFile) patch.delete()
+            Log.w(TAG, "浏览器工具入口不存在，跳过挂载: ${entry.absolutePath}")
+            return null
+        }
+        return try {
+            val url = "file://${entry.absolutePath}"
+            patch.writeText(
+                """
+                # 由 DSH Android 客户端生成，请勿手改（每次启动会整体覆盖）。
+                # 挂载浏览器工具插件：注册一个独立的 `browser` 工具，
+                # 让模型能用自己的 WebView 上网、登录、读页面、点按钮。
+                - insert:
+                    - id: $BROWSER_TOOL_PACKAGE
+                      name: '$url'
+                """.trimIndent() + "\n"
+            )
+            Log.i(TAG, "已写入浏览器工具 overlay: ${patch.name}")
+            patch
+        } catch (t: Throwable) {
+            Log.w(TAG, "写入浏览器工具 overlay 失败: ${t.message}")
             null
         }
     }
@@ -6701,7 +7037,7 @@ class EngineManager private constructor(private val context: Context) {
         if (!bootstrap.installNodeRuntime()) {
             if (rollBackPendingHarness("Node runtime preparation failed")) return@withContext
             _state.value = State.Failed(
-                "Termux 环境未就绪，无法启动引擎。\n" +
+                context.getString(R.string.engine_termux_not_ready) +
                     "prefix=${bootstrap.prefixDir.absolutePath}\n" +
                     "node=${bootstrap.nodeBinary.absolutePath}"
             )
@@ -6711,7 +7047,7 @@ class EngineManager private constructor(private val context: Context) {
         val nodeBin = bootstrap.nodeBinary
         if (!nodeBin.isFile) {
             if (rollBackPendingHarness("Node executable missing")) return@withContext
-            _state.value = State.Failed("找不到 Node 可执行文件: ${nodeBin.absolutePath}")
+            _state.value = State.Failed(context.getString(R.string.engine_node_missing, nodeBin.absolutePath))
             return@withContext
         }
 
@@ -6794,6 +7130,8 @@ class EngineManager private constructor(private val context: Context) {
         patchTerminalShell()
         // 附件模块的目录 fsync 会走到 /data/user/0（SELinux 拒绝 open）→ 附件发不出去
         patchAttachmentDurability()
+        // 发图格式白名单只认 4 个精确 MIME → image/jpg、heic、剪贴板粘贴全被误拒
+        patchImageMediaType()
         // ⚠️ 用户自己做的插件在运行期抛出未捕获异常时，installFailLoud 会 proc.exit(1)
         //   把整个引擎杀掉 → 反复重启 → App 再也打不开（三级降级阶梯对此无效，
         //   因为这条路径下 RescueBoot.recordFailure 一次都不会被调用）。见其 KDoc。
@@ -6814,6 +7152,11 @@ class EngineManager private constructor(private val context: Context) {
         ensurePickerRoots()
         // 移动端 UI 适配插件：必须在 profile 解析前落盘，否则 --patch 挂不上
         ensureMobileUi()
+        // 右侧栏「AI 浏览器」入口（客户端插件）。必须在引擎启动前解包：
+        // 引擎启动时才扫描 dsh.client 声明并编译前端 bundle，晚一步就是
+        // 「文件在、侧栏里没有这一项」，且没有任何报错。
+        ensureBrowserPane()
+        val browserPanePatch = writeBrowserPanePatch()
         // 降级 bundle：polyfill 只补 API，语法缺口得靠换 bundle 覆盖 dist 与各插件。
         // ⚠️ **必须在 ensureMobileUi() 之后**：那一支在版本戳不一致时会
         // `deleteRecursively()` 重解包 mobile-ui 目录，先降级会被它整个抹掉。
@@ -6873,16 +7216,20 @@ class EngineManager private constructor(private val context: Context) {
         val pluginManagerPatch = writePluginManagerPatch()
         // link 兼容层：SELinux 不给 app_data_file 的 link 权限，需在 libc 边界转译
         val linkCompat = ensureLinkCompat()
-        // 内置号池：密钥在 TLS 层注入，配置与磁盘上只有占位符。
-        // 资产缺失（没跑生成脚本）时返回 null，引擎照常启动、只是没有内置号池。
-        val keyInject = ensureKeyInject()
+        // 内置号池：已改为**服务端网关**，本地不再解出注入库。
+        // 这里调用是为了清掉老安装残留的 libkeyinject.so，恒返回 null（结果不使用）。
+        ensureKeyInject()
         // ⚠️ **不能**走 `--patch` overlay：overlay 在最顶层整块替换 `llm-pi-ai`
         // 那一行的 config，会把用户在 GUI 里新建的 provider 一起盖掉，于是
         // `dsh-config-editor` 的写入校验直接抛
         // `Configuration for "llm-pi-ai" is overridden by a home patch or
         // command-line overlay` —— 用户表现为「一添加第三方 API 就报错」。
         // 所以改为把内置号池**补进 profile 的用户配置层**（见 [ensureKeyPoolProvider]）。
-        ensureKeyPoolProvider(keyInject)
+        ensureKeyPoolProvider()
+        // 老用户在 GUI 里手填过真密钥 ⇒ `.credentials.yaml` 里有一条
+        // `AGNES_CREDENTIAL`，它的优先级**高于**环境变量，会把网关令牌顶掉。
+        // 号池改成服务端网关后这条残留必须清掉，详见 [dropStaleBuiltinCredential]。
+        dropStaleBuiltinCredential()
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
@@ -6903,7 +7250,7 @@ class EngineManager private constructor(private val context: Context) {
         //     引擎读不了（`profile "rescue" does not exist`），比不建更糟。
         if (rescueProfileDir != null) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
-            ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
+            ensureKeyPoolProvider(RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
             ensureAccountConfig(RESCUE_PROFILE_NAME, keyInject != null)
         }
@@ -6945,6 +7292,12 @@ class EngineManager private constructor(private val context: Context) {
         //   同样必须早于引擎启动：overlay 要在 profile 解析前落盘。
         ensureUiTool()
         val uiToolPatch = writeUiToolPatch()
+        // 浏览器工具：把「上网 / 登录 / 读页面 / 点按钮」接到模型的工具列表里。
+        // ⚠️ 与 ui 工具**完全并列且独立**：ui 操作的是本 App 自己的界面，
+        //   browser 操作的是一个独立的第二个 WebView（别的网站）。同样必须
+        //   早于引擎启动：overlay 要在 profile 解析前落盘。
+        ensureBrowserTool()
+        val browserToolPatch = writeBrowserToolPatch()
         // 日志工具：把「读日志 / 看崩溃现场 / 生成诊断包」接到模型的工具列表里。
         // ⚠️ 与上面三个工具**完全并列且独立**（不同信箱、不同能力），同样与特权无关：
         //   读日志不需要任何授权。必须早于引擎启动（overlay 要在 profile 解析前落盘）。
@@ -7007,7 +7360,7 @@ class EngineManager private constructor(private val context: Context) {
         val binJs = File(engineDir, "node_modules/@deepseek-ai/dsh/lib/bin.js")
         if (!binJs.isFile) {
             if (rollBackPendingHarness("entry missing")) return@withContext
-            _state.value = State.Failed("找不到引擎入口: ${binJs.absolutePath}")
+            _state.value = State.Failed(context.getString(R.string.engine_entry_missing, binJs.absolutePath))
             return@withContext
         }
 
@@ -7015,6 +7368,7 @@ class EngineManager private constructor(private val context: Context) {
         //   后应用的覆盖先应用的）。这里的顺序与改造前逐项一致，别顺手调。
         val overlays = listOfNotNull(
             mobileUiPatch,
+            browserPanePatch,
             agnesMmPatch,
             marketPatch,
             sandboxPatch,
@@ -7027,6 +7381,7 @@ class EngineManager private constructor(private val context: Context) {
             petPatch,
             uiToolPatch,
             logsToolPatch,
+            browserToolPatch,
             // ⚠️ **必须排在最后**：这一层只做 `disabled: true`，而它要禁用的条目
             //   正是前面那些 `- insert:` 插进来的。`--patch` 按顺序应用，排在
             //   插入之前会让 patch 匹配不到目标 id（官方行为：warn 后跳过，静默失效）。
@@ -7100,23 +7455,23 @@ class EngineManager private constructor(private val context: Context) {
             // link()/linkat() 语义转译：SELinux 不允许 untrusted_app 对 app_data_file
             // 做硬链接，而 DSH 上游用硬链接做独占原子发布。见 [ensureLinkCompat]。
             //
-            // 号池注入库同在这条链上，所以**必须用列表拼接而不是覆盖** ——
-            // 两个库都要生效。见 [ensureKeyInject]。
+            // ⚠️ 号池注入库已下线（改为服务端网关），现在这里只剩 linkcompat 一个。
+            //    仍用列表拼接而不是覆盖，是为了将来加库时不用改结构。
             //
             // ⚠️ 只加在本进程：LD_PRELOAD 会一并继承给 node spawn 的子进程（如 shell
-            // 工具）。对这两个库都无害（linkcompat 只 hook link/linkat 且先试原生；
-            // keyinject 只 hook SSL_*，没有 TLS 的子进程根本不会碰到），但若将来要
-            // 往 LD_PRELOAD 里追加别的库，务必确认不会破坏系统二进制。
-            val preloads = listOfNotNull(linkCompat, keyInject).map { it.absolutePath }
+            // 工具）。linkcompat 只 hook link/linkat 且先试原生，对系统二进制无害。
+            val preloads = listOfNotNull(linkCompat).map { it.absolutePath }
             if (preloads.isNotEmpty()) {
                 // 空格分隔，与 boo-sandbox-run.c 里追加 LD_PRELOAD 的写法一致
                 put("LD_PRELOAD", preloads.joinToString(" "))
             }
-            // 内置号池的凭据引用指向**占位符**，不是真密钥：真密钥在 TLS 层由
-            // libkeyinject.so 换上。所以这里泄露出去也无所谓 —— 这正是设计意图。
-            if (keyInject != null) {
-                put(KEY_ENV, KEY_PLACEHOLDER)
-            }
+            // 内置号池的凭据引用指向**网关令牌**。
+            //
+            // ⚠️ 与旧逻辑的关键差异：以前这里只在注入库解出成功时才设置，因为
+            // 占位符要靠注入库才会被替换 —— 没有库就宁可不设。现在令牌**不需要
+            // 任何本地组件**，所以必须无条件设置，否则引擎解析 `apiKeyEnv` 时
+            // 拿不到值，会报 `MISSING_CREDENTIAL`，号池直接不可用。
+            put(KEY_ENV, KEY_PLACEHOLDER)
             // 沙箱 runner 靠它定位 LD_PRELOAD 拦截器。runner 会把它追加到子进程
             // 的 LD_PRELOAD 里（保留这里已有的 link 兼容层，两个库都生效）。
             put("BOO_SANDBOX_LIB", File(context.filesDir, SANDBOX_LIB_FILE).absolutePath)
@@ -7216,7 +7571,7 @@ class EngineManager private constructor(private val context: Context) {
             pb.start()
         } catch (t: Throwable) {
             if (rollBackPendingHarness("process launch failed: ${t.message}")) return@withContext
-            _state.value = State.Failed("引擎进程启动失败: ${t.message}")
+            _state.value = State.Failed(context.getString(R.string.engine_process_start_failed, t.message))
             return@withContext
         }
         process = proc
@@ -7559,7 +7914,12 @@ class EngineManager private constructor(private val context: Context) {
                 exitCode = runCatching { proc.exitValue() }.getOrNull(),
                 tailLines = tailList,
             )
-            _state.value = State.Failed("引擎启动失败（$reason）。最后输出:\n$tail")
+            val displayReason = if (waited >= READY_TIMEOUT_MS) {
+                context.getString(R.string.engine_wait_timed_out, waited / 1000)
+            } else {
+                context.getString(R.string.engine_exited_before_url, waited)
+            }
+            _state.value = State.Failed(context.getString(R.string.engine_start_failed_detail, displayReason, tail))
             // ⚠️ **P0：把「真实启动失败」变成可读的状态**（见 RescueBoot 的类注释）。
             //
             // 这里传的是**真实启动**的 stdout 尾部 —— 这一点是整个修复的要害：
@@ -7887,7 +8247,10 @@ class EngineManager private constructor(private val context: Context) {
         //   `expected = false`：不是我们主动停的。
         CrashRecorder.recordEngineExit(code, expected = false, detail = detail)
         EventLog.record("engine.exit", mapOf("code" to (code?.toString() ?: "?"), "wasReady" to "true"))
-        _state.value = State.Dead(detail)
+        _state.value = State.Dead(
+            if (code != null) context.getString(R.string.engine_exit_code, code)
+            else context.getString(R.string.engine_exited)
+        )
     }
 
     fun isRunning(): Boolean = process?.isAlive == true
@@ -7907,7 +8270,7 @@ class EngineManager private constructor(private val context: Context) {
         if (!adbHome.isDirectory) {
             return WirelessDebugging.Result(
                 false,
-                "内置 adb 工具链未就绪（$ADB_WIRELESS_DIR 不存在），无线调试不可用。",
+                context.getString(R.string.adb_toolchain_missing, ADB_WIRELESS_DIR),
             )
         }
         val result = WirelessDebugging.pair(
@@ -7953,7 +8316,7 @@ class EngineManager private constructor(private val context: Context) {
                 //   这里用新端口补切成功，那句话此刻已经不成立。不改的话通知栏会告诉
                 //   用户「请去设置页点『切到固定端口』重试」—— 而实际上什么都不用做，
                 //   用户白跑一趟还会以为修复没生效。
-                return result.copy(message = "配对成功，并已切到固定端口 5555 —— 现在关掉无线调试、关掉 Wi-Fi 都不影响特权通道。")
+                return result.copy(message = context.getString(R.string.adb_paired_fixed_port))
             }
             Log.w(TAG, "配对成功但补切固定端口失败: ${switched.message}")
         }
@@ -7975,7 +8338,7 @@ class EngineManager private constructor(private val context: Context) {
         if (!adbHome.isDirectory) {
             return WirelessDebugging.Result(
                 false,
-                "内置 adb 工具链未就绪（$ADB_WIRELESS_DIR 不存在），无线调试不可用。",
+                context.getString(R.string.adb_toolchain_missing, ADB_WIRELESS_DIR),
             )
         }
         return WirelessDebugging.switchToTcp(
@@ -8207,6 +8570,30 @@ class EngineManager private constructor(private val context: Context) {
                 "\t}"
 
         /**
+         * 发图格式白名单的原版判断（精确比较 4 个 MIME）。
+         *
+         * ⚠️ 缩进是**三个制表符**，与官方发布件逐字一致；引擎升级后若不再匹配，
+         * 补丁会跳过并在日志里提示，不会让启动失败。见 [patchImageMediaType]。
+         */
+        private const val IMG_TYPE_GUARD =
+            "\t\t\treturn value === \"image/png\" || value === \"image/jpeg\" || " +
+                "value === \"image/webp\" || value === \"image/gif\";"
+
+        /**
+         * 放宽后的判断：任何 `image/` 前缀 + `image/jpg` 别名都放行。
+         *
+         * 解码能力交给下游 sharp 判断 —— 它会给明确错误，
+         * 比在入口处一刀切拦住友好（见 [patchImageMediaType] 的表格）。
+         */
+        private const val IMG_TYPE_ANCHOR =
+            "\t\t\tif (typeof value !== \"string\") return false;\n" +
+                "\t\t\t/* DSH Android: 放宽到任何 image/ 前缀。原版只认 4 个精确值，\n" +
+                "\t\t\t   而 image/jpg、image/heic、image/avif、image/bmp 以及剪贴板粘贴\n" +
+                "\t\t\t   的空 type 都会被误拒，用户看到的是「仅支持 PNG、JPG、WebP、GIF」。\n" +
+                "\t\t\t   真正的解码能力由下游 sharp 判断，那里报错更准确。 */\n" +
+                "\t\t\treturn value.startsWith(\"image/\");"
+
+        /**
          * 凭据文件名（`dsh-credentials-local` 的 `CREDENTIALS_FILENAME`，写死，
          * 因为它是引擎的公开约定而不是可配置项）。见 [ensureCredentialFileMode]。
          */
@@ -8380,7 +8767,7 @@ class EngineManager private constructor(private val context: Context) {
         private const val AGNES_MM_DIR = "agnes-multimodal"
 
         /** 插件内容版本戳：改了 `agnes-multimodal.zip` 里任何东西都必须改这里。 */
-        private const val AGNES_MM_VERSION = "1.0.0-3"
+        private const val AGNES_MM_VERSION = "1.0.0-4"
         private const val AGNES_MM_STAMP = ".agnes_mm_version"
 
         /** 插件自己的账号池状态文件（`lib/index.js` 的 `readAccounts()` 读的就是它）。 */
@@ -8646,8 +9033,17 @@ class EngineManager private constructor(private val context: Context) {
         private const val LINKCOMPAT_ASSET = "linkcompat.bin"
         private const val LINKCOMPAT_FILE = "liblinkcompat.so"
 
-        /** 内置号池的注入库（见 `ensureKeyInject()` 与 `app/src/main/jni/keyinject.c`）。 */
-        private const val KEYINJECT_ASSET = "keyinject.bin"
+        /**
+         * **旧版**号池注入库的文件名，仅用于**清理**老安装的残留。
+         *
+         * 号池已改为服务端网关，不再需要 `LD_PRELOAD` 注入。这个常量保留下来
+         * 只为一件事：`ensureKeyInject()` 要把用户设备上残留的
+         * `filesDir/libkeyinject.so` 删掉 —— 留着它虽然不会再被加载，但会让人
+         * 误以为注入层还在，排查问题时造成误导。
+         *
+         * ⚠️ 对应的资产 `assets/keyinject.bin` 与源码 `jni/keyinject.c` **已删除**，
+         * 不要再加回来。旧的 `KEYINJECT_ASSET` 常量也一并删掉了。
+         */
         private const val KEYINJECT_FILE = "libkeyinject.so"
 
         /**
@@ -8692,16 +9088,60 @@ class EngineManager private constructor(private val context: Context) {
         private val EMPTY_INLINE_VALUES = setOf("{}", "[]", "null", "~")
 
         /**
-         * 引擎配置里的匿名占位符。
+         * 网关令牌（替代旧的 TLS 层注入占位符）。
          *
-         * ⚠️ **必须与 `keyinject.c` 的 `KI_PLACEHOLDER` 逐字一致**，长度也必须等于
-         * 密钥长度（51）。等长替换是「不用重算 Content-Length」的前提，长度不等
-         * 会让请求错位失败。`tools/build-keyinject.ps1` 会读这个文件校验两者一致，
-         * 不一致时直接构建失败 —— 所以改这里必须同步改 C 侧。
+         * ## 为什么从「占位符 + LD_PRELOAD 注入」改成「网关令牌」
          *
-         * 占位符**不是秘密**：被粉丝读到也无所谓，它只是一把会被换掉的假钥匙。
+         * 旧方案把 132 把真密钥打进 APK，靠 `libkeyinject.so` 在 `SSL_write` 里
+         * 把占位符换成真钥匙。虽然做了混淆，但**密钥终究落在设备上** —— 一旦
+         * 泄漏就是 132 把一起丢，且换钥匙必须重新发版。
+         *
+         * 现在改为服务端中转：App 只持有这一个网关令牌，请求发到
+         * `agnes.jiulingssh.xyz`，由服务器按严格轮询挑选真密钥并注入。
+         * 好处：
+         *   - 真密钥永不落设备（`strings` / 环境变量 / 抓包都拿不到）
+         *   - 增删密钥只需改服务器上的 `agnes-keys.properties`，**不用发版**
+         *   - 429/5xx 由网关自动换号重试，客户端无感
+         *
+         * ⚠️ 这个令牌**不是秘密**（它随 APK 分发，粉丝能读到），所以网关侧必须
+         * 自己做限流与额度控制。令牌泄漏的后果是「额度被白嫖」，而不是「密钥泄漏」。
+         *
+         * ⚠️ 与旧 `KEY_PLACEHOLDER` 的兼容：老安装的 `ag-multimodal.json` 里可能
+         * 还留着占位符行，[seedAgnesAccounts] 认它并覆盖成新令牌。
          */
-        private const val KEY_PLACEHOLDER = "sk-ANON00000000000000000000000000000000000000000000"
+        private const val KEY_PLACEHOLDER = "sk-agnes-54a388522b26770c2b45aab2f5a22c0700b6be4c0f325a96"
+
+        /**
+         * **旧版**的 TLS 注入占位符，仅用于**识别并覆盖**老安装残留的配置行。
+         *
+         * 升级到网关方案前，`ag-multimodal.json` 与 provider 配置里写的是这个
+         * `sk-ANON…` 串。现在它已经没有意义（没有注入库会去替换它），但它会
+         * 留在用户设备上。`seedAgnesAccounts()` 认它并把整行替换成新令牌，
+         * 避免出现「用户有一条永远 401 的旧内置号」。
+         *
+         * ⚠️ **不要删除这个常量**，也不要把它当成有效配置使用。
+         */
+        private const val LEGACY_KEY_PLACEHOLDER = "sk-ANON00000000000000000000000000000000000000000000"
+
+        /**
+         * **旧版**直连上游的 baseURL，仅用于**识别并迁移**老安装的 `agnes:` 配置块。
+         *
+         * 号池改为服务端网关后，`baseURL` 必须是 [KEY_BASE_URL]。但
+         * [mergeKeyPoolProvider] 的语义是「已有 agnes: 就一个字节都不动」，
+         * 老安装升级后仍指向这两个域名 ⇒ 带着网关令牌直连上游 ⇒ 上游 401 ⇒
+         * 界面显示「API 密钥无效」。
+         *
+         * [mergeKeyPoolProvider] 命中这里列出的值时改写成网关地址；
+         * **其它任何值都不碰**（用户自填的第三方地址绝不可覆盖）。
+         *
+         * ⚠️ 不要把它们当成有效配置使用。
+         */
+        private val LEGACY_KEY_BASE_URLS = setOf(
+            "https://api.agnes-ai.cn/v1",
+            "https://apihub.agnes-ai.cn/v1",
+            "https://api.agnes-ai.cn",
+            "https://apihub.agnes-ai.cn",
+        )
 
         /**
          * 内置号池的 provider 路由名。
@@ -8719,13 +9159,18 @@ class EngineManager private constructor(private val context: Context) {
         private const val KEY_PROVIDER_NAME = "Agnes"
 
         /**
-         * baseURL **必须**用较长的国际站域名。
+         * 网关地址（替代旧的直连国际站域名）。
          *
-         * combo 靠等长改写 Host 头区分站点：`apihub.agnes-ai.cn`（18 字符）可以
-         * 缩成 `api.agnes-ai.cn` + 3 个尾部空格（同为 18），反过来则没有等长写法。
-         * 所以基准域名只能是国际站 —— 国内站的钥匙由 `keyinject.c` 把 Host 改短。
+         * 旧方案 baseURL 指向 `apihub.agnes-ai.cn`，靠 `keyinject.c` 等长改写
+         * Host 头在两个站点间路由 —— 那条链路已随注入层一起下线。
+         *
+         * 现在指向自建号池网关：两站钥匙的挑选与 Host 路由全部由**服务器**完成，
+         * 客户端只看到一普通 OpenAI 兼容端点，不需要知道底下有几个站点、几把钥匙。
+         *
+         * ⚠️ 保留 `/v1` 后缀：引擎的 `openai-completions` 会拼 `/chat/completions`，
+         * 与 OpenAI 官方 SDK 的习惯一致。
          */
-        private const val KEY_BASE_URL = "https://apihub.agnes-ai.cn/v1"
+        private const val KEY_BASE_URL = "https://agnes.jiulingssh.xyz/v1"
 
         /**
          * `apiKeyEnv` 引用的环境变量名。
@@ -8747,10 +9192,21 @@ class EngineManager private constructor(private val context: Context) {
          * **原样再列一遍**（值与 `dsh-llm/lib/types/retry-policy.js` 的
          * `DEFAULT_RETRYABLE_CODES` 逐字一致），漏掉哪个就等于把那类错误的重试关掉。
          *
-         * 五个默认值之外**多了一个 `AUTH`** —— 这就是本次改动的全部目的：
-         * 号池抽到死钥匙时上游回 401/403，`dsh-llm-pi-ai` 的 `classifyPiAiError`
-         * 把它归成 `AUTH`，而 `AUTH` 不在默认表里 ⇒ 不重试 ⇒ 报错中断用户。
-         * 加进来之后引擎会重发请求，`SSL_write` 重新随机抽钥匙，用户无感。
+         * 五个默认值之外**多了一个 `AUTH`**。
+         *
+         * ⚠️ 这条的**原始动机已随网关改造消失**，但**仍然保留**，理由如下：
+         *
+         * 旧方案里号池是「随机抽钥匙」，抽到死钥匙就回 401/403，所以要靠引擎
+         * 重发请求来换一把。现在网关自己会换号重试（`AGNES_MAX_ATTEMPTS`），
+         * 客户端正常情况下**收不到** 401 了。
+         *
+         * 但保留它仍有两个实际好处：
+         * 1. 网关令牌本身被吊销/更换时，客户端回 401 —— 重试虽无用，但能让
+         *    错误在界面上表现为「重试若干次后失败」，而不是瞬间中断；
+         * 2. 网关若因全池冷却返回 429（`RATE_LIMIT` 已在表里）或临时 5xx，
+         *    重试是有意义的。
+         *
+         * 换言之：`AUTH` 现在大概率是空转，但删掉它不会带来收益，留着无害。
          */
         private val KEY_RETRYABLE_CODES = listOf(
             "EMPTY_RESPONSE",
@@ -9536,6 +9992,46 @@ class EngineManager private constructor(private val context: Context) {
 
         /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
         private const val LOGS_TOOL_DIR = "logs-tool"
+
+        // ── 浏览器工具 ───────────────────────────────────────────────
+        //
+        // 与 bubble / statusbar / ui / logs **同一套做法**（独立工具 + 文件信箱 +
+        // 刻意在 pnpm 管辖之外），差别只在能力：那些操作**这个 App**，这个**上网**。
+        //
+        // 为什么需要它：引擎自带的侧栏浏览器是 iframe，而 GitHub
+        // （`X-Frame-Options: deny`）、Google（CSP）拒绝被嵌入 —— iframe 方案
+        // 连登录页都加载不出来。所以换成原生 `AiBrowserView`（真 WebView，
+        // 跑在用户手机上），本插件把「开网页/读页面/点按钮/填表单」注册成
+        // `browser` 工具，靠 [com.dsh.android.browser.BrowserBridge] 的文件信箱
+        // 把命令送回原生。详见 `mobile-ui-plugin/dsh-android-browser/lib/index.js`。
+        //
+        // ⚠️ **信箱必须是独立文件**：命令可能并发发起，回执按 `id` 配对，
+        //   而各插件各自从 1 自增 —— 共用文件会让工具调用收到对方的回执。
+        //
+        // ⚠️ **没有「能力探测」这一步**：浏览器不需要任何授权，只要入口在就挂载。
+        //   浏览器实例由 [com.dsh.android.MainActivity.ensureAiBrowser] 按需创建。
+
+        /** 注册 `browser` 工具的 host 插件；打包成 zip 随 APK 分发。 */
+        private const val BROWSER_TOOL_ASSET = "browser-tool.zip"
+        private const val BROWSER_TOOL_PACKAGE = "dsh-android-browser"
+        private const val BROWSER_TOOL_PATCH = "browser-tool.patch.yml"
+
+        /** 插件解包目录，相对 `$DSH_HOME`。⚠️ 同理，刻意在 pnpm 管辖之外。 */
+        private const val BROWSER_TOOL_DIR = "browser-tool"
+
+        // ── 右侧栏「AI 浏览器」入口（**客户端插件**）──────────────────────
+        //
+        // 与上面那些**工具插件**不同：这个包不含任何工具，它只在前端注册一个
+        // 右侧栏 tab，点开就调原生 `openAiBrowser()`。所以它必须在**引擎启动前**
+        // 落盘 —— 引擎启动时才扫描 `dsh.client` 声明并编译前端 bundle。
+        //
+        // ⚠️ 单独成包、不复用 `mobile-ui.zip`：那个 zip 是**跨工作树共享的符号
+        //   链接资产**，dev 分支的 `client.js` 比 main 多 17 万字节；重打它会把
+        //   另一条分支的移动端修复整个回退掉。
+        private const val BROWSER_PANE_ASSET = "browser-pane.zip"
+        private const val BROWSER_PANE_PACKAGE = "dsh-android-browser-pane"
+        private const val BROWSER_PANE_PATCH = "browser-pane.patch.yml"
+        private const val BROWSER_PANE_DIR = "browser-pane"
 
         // ── 定向隔离层（L1.5） ────────────────────────────────────────
         //

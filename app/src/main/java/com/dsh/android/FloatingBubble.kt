@@ -26,6 +26,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
+import java.io.File
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -482,6 +483,16 @@ class FloatingBubble(private val context: Context) {
                     next.copy(avatar = BubbleAppearance.load(ctx).avatar)
                 }
             }
+            // 贴边图与头像**完全同构**：base64 落盘，内存里换成文件标记。
+            // ⚠️ 不换标记的话，`usesEdgeImage()` 会认成"未知来源 ⇒ 用内置图"，
+            //   表现为「AI 换了贴边图但没反应」，要等重启 `load()` 才生效。
+            if (merged.edgeImage.startsWith("data:image/")) {
+                merged = if (BubbleAppearance.writeEdgeImage(ctx, merged.edgeImage) != null) {
+                    merged.copy(edgeImage = BubbleAppearance.EDGE_IMAGE_FILE)
+                } else {
+                    next.copy(edgeImage = BubbleAppearance.load(ctx).edgeImage)
+                }
+            }
             // 状态配图同理，只是它是一张二维表：逐档逐张过一遍 [BubbleStatusImages.ensure]。
             //
             // ⚠️ **`ensure` 而不是 `write`**：表里可能混着两种东西 —— 这次新传的
@@ -925,6 +936,18 @@ class FloatingBubble(private val context: Context) {
 
     /** 贴边态薄片与它上面的小点。 */
     private var edgeView: View? = null
+
+    /**
+     * 贴边态的图片层。
+     *
+     * ⚠️ 与 [edgeView] 分开持有：贴边态现在**可配图片**（默认是探头形象），
+     *   而 `edgeView` 的背景是纯色薄片（`edgeImage == "none"` 时才用它）。
+     *   两者叠在同一个 FrameLayout 里，靠 visibility 切换。
+     */
+    private var edgeImageView: ImageView? = null
+
+    /** [applyEdgeImage] 的去重指纹（来源 + 尺寸）。没变就不重设图片。 */
+    private var edgeImageKey: String = ""
     private var edgeDot: View? = null
 
     /**
@@ -1077,6 +1100,9 @@ class FloatingBubble(private val context: Context) {
     /** 正在跑的呼吸动画（X / Y 各一个，必须同步）。 */
     private var pulseAnimator: ObjectAnimator? = null
     private var pulseAnimatorY: ObjectAnimator? = null
+    /** 视频层的呼吸动画（X/Y 各一个，与图片层同频同相）。 */
+    private var pulseVideoX: ObjectAnimator? = null
+    private var pulseVideoY: ObjectAnimator? = null
 
     /** 当前呼吸动画的基准缩放，用来判断"配置真的变了没"。 */
     private var pulseBase = 0f
@@ -1309,6 +1335,7 @@ class FloatingBubble(private val context: Context) {
 
         // 功能开关关掉时只记状态、不做动作：地面也不该被键盘抬高（见 maxWindowY）。
         if (!keyboardAvoidEnabled) return
+        // 贴边态不参与键盘避让：它贴的是屏幕左右边缘，不是底部，键盘盖不到它。
         if (expanded || edgeCollapsed || dragging) return
         if (visible) {
             // ⚠️ 飞行中不再重复给初速：键盘弹出的那段动画里 `top` 会变几次，
@@ -1523,6 +1550,7 @@ class FloatingBubble(private val context: Context) {
         panelSend = view.findViewById(R.id.panelSend)
         edgeView = view.findViewById(R.id.bubbleEdge)
         edgeDot = view.findViewById(R.id.edgeDot)
+        edgeImageView = view.findViewById(R.id.edgeImage)
 
         paintDot(dotView, running = false)
         paintDot(panelDot, running = false, small = true)
@@ -1658,8 +1686,33 @@ class FloatingBubble(private val context: Context) {
      * ⚠️ 全程 try/catch：气泡是锦上添花，一份写错的配置不能让它消失。
      */
     fun applyAppearance(next: BubbleAppearance) {
+        val prev = appearance
         appearance = next
         try {
+            // ⚠️ **插件改了面板尺寸就清掉用户的手动拖动记录。**
+            //
+            //   原逻辑里 `panelWidth` / `panelHeight` 的取值是：
+            //     prefs 里有拖动记录 ⇒ 用记录值（插件配置被永久忽略）
+            //   于是用户只要拖过一次缩放手柄，之后再怎么调设置页的
+            //   「面板宽度 / 面板高度」都**完全没反应** —— 真机反馈为
+            //   「面板尺寸调节无效」，而且看起来像滑杆坏了。
+            //
+            //   修法：插件下发的配置里尺寸**变了**，就当成"这次以插件为准"，
+            //   清掉拖动记录。没变则不动（保留用户的微调）。
+            val sizeChanged = next.panelWidth != prev.panelWidth ||
+                next.panelHeight != prev.panelHeight
+            if (sizeChanged) {
+                prefs.edit()
+                    .remove(KEY_PANEL_W)
+                    .remove(KEY_TRANSCRIPT_H)
+                    .apply()
+                Log.i(
+                    TAG,
+                    "面板尺寸改为插件配置: width=${next.panelWidth} height=${next.panelHeight}" +
+                        "（已清除手动拖动记录）",
+                )
+            }
+
             applyAppearanceToViews()
             // ⚠️ **按新尺寸夹，不能读 `root.width`。** 这里刚改完 layoutParams，
             //   布局还没重测，`root.width` 仍是**旧**尺寸（可能是贴边态的 6dp，
@@ -1739,16 +1792,44 @@ class FloatingBubble(private val context: Context) {
         // ── 内容层：内置头像 / 自定义图片 / 动作帧集 / 精灵图 ───────────
         applyActionLayer(boxReq())
 
-        // ── 贴边薄片：高度跟随球，宽度固定 ─────────────────────────────
+        // ── 贴边薄片：尺寸与图片都由外观决定 ───────────────────────────
+        //
+        // ⚠️ 原实现宽度写死 `EDGE_WIDTH_DP = 6`，真机反馈「太小了，点不到」——
+        //   6dp × 44dp 在 3x 屏上只有 18×132 像素。现在宽度走 `edgeWidth`
+        //   （默认 28dp），并且可以显示图片。
         edgeView?.let { e ->
+            val edgeW = dp(edgeWidthDp())
+            val edgeH = if (appearance.edgeHeight > 0) dp(appearance.edgeHeight) else boxH
             (e.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.width = dp(EDGE_WIDTH_DP)
-                lp.height = boxH
+                lp.width = edgeW
+                lp.height = edgeH
                 e.layoutParams = lp
             }
-            e.background = edgeBackground()
-            e.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
+            // ⚠️ 显示图片时**不能有背景与投影**。
+            //
+            //   `bubble_edge_bg` 是「白色圆角矩形 + 1dp 灰描边」，原本是纯色薄片
+            //   的底；`elevation = 8dp` 又给整个 FrameLayout 加了一层投影。
+            //   图片叠在这两者之上时，人物周围会套一个带阴影的圆角框 ——
+            //   真机反馈为「碰撞箱边缘有暗影」，看起来像图片被裁进了一个框里。
+            //
+            //   所以：有图 ⇒ 背景置空、投影归零；无图（`edgeImage == "none"`）
+            //   ⇒ 恢复成原来的纯色薄片。
+            if (usesEdgeImage()) {
+                e.background = null
+                e.elevation = 0f
+            } else {
+                e.background = edgeBackground()
+                e.background?.alpha = (appearance.bgOpacity.coerceIn(0f, 1f) * 255).roundToInt()
+                e.elevation = dp(8).toFloat()
+            }
         }
+        // ⚠️ 贴边态的状态点**跟着 `showDot` 走**，与球上那个点同一套开关。
+        //
+        //   原实现让它无条件可见，而它 `layout_gravity="center"` 正好压在探头
+        //   人物的脸上 —— 真机反馈「那个圆圈挡到角色了」。
+        //   显示图片时尤其碍眼：图片本身已经表达了形象，再叠一个灰点没有信息量。
+        edgeDot?.visibility = if (appearance.showDot) View.VISIBLE else View.GONE
+        applyEdgeImage()
 
         // ── 整体不透明度（与两个分层透明度相乘）─────────────────────────
         root?.alpha = appearance.opacity.coerceIn(0.05f, 1f)
@@ -2068,6 +2149,13 @@ class FloatingBubble(private val context: Context) {
         // ⚠️ 用 [facingScaleX] 而不是直接读 `avatarScale`：转身（`flipOnTurn`）就是
         //   靠这里的水平镜像表达的，直接赋值会把朝向抹掉 —— 表现为"转身只生效一瞬"。
         iv.scaleY = appearance.avatarScale
+        // ⚠️ **视频层也必须一起缩放。**
+        //
+        //   原实现只给 `avatarView`（图片层）设了 `scaleY`，视频层 `videoHost`
+        //   完全没设。而桌宠最主流的用法就是视频素材 —— 于是调设置页的
+        //   「头像缩放」时，图片素材的球会变大变小，**视频素材的宠物纹丝不动**。
+        //   真机反馈为「宠物比例调整后不会自动变化」，看起来像滑杆坏了。
+        (videoHost as? View)?.scaleY = appearance.avatarScale
         // 水平镜像（转身）交给 [applyFacing] 统一刷。
         //
         // ⚠️ 不能只在"朝向变化的那一刻"刷一次：内容层会因换动作/换状态被反复重建，
@@ -2667,6 +2755,22 @@ class FloatingBubble(private val context: Context) {
     private fun applyMotion() {
         val iv = avatarView ?: return
 
+        // ⚠️ **视频层要跟着一起做动效。**
+        //
+        //   原实现只对 `avatarView`（图片层）设 spin/pulse，视频层 `videoHost`
+        //   完全不动。而桌宠的主流素材是视频 —— 于是「旋转」「呼吸」这两个
+        //   开关对视频宠物**完全无效**，且两个内容层互斥显示时观感不一致
+        //   （图片球会呼吸，切成视频后突然静止）。
+        //
+        //   这里只同步**静态部分**（基础缩放与旋转角）；呼吸是 `ObjectAnimator`，
+        //   动画器要各自建一个（见下面 pulse 分支里的 `pulseVideoX/Y`）。
+        (videoHost as? View)?.let { vh ->
+            vh.scaleY = appearance.avatarScale
+            vh.scaleX = if (appearance.flipOnTurn && facingRight) -appearance.avatarScale
+                        else appearance.avatarScale
+            vh.rotation = if (appearance.spin != 0) vh.rotation else 0f
+        }
+
         // ── 旋转 ──────────────────────────────────────────────────────
         if (appearance.spin != 0) {
             // 每 360° 的时长 = 360 / 每秒角度。负角度即逆时针。
@@ -2725,14 +2829,37 @@ class FloatingBubble(private val context: Context) {
                     interpolator = AccelerateDecelerateInterpolator()
                     start()
                 }
+                // 视频层用同一组参数再建一对，保证两个内容层呼吸节奏一致
+                (videoHost as? View)?.let { vh ->
+                    pulseVideoX?.cancel()
+                    pulseVideoY?.cancel()
+                    pulseVideoX = ObjectAnimator.ofFloat(vh, View.SCALE_X, sx, sx * 1.12f).apply {
+                        this.duration = 700
+                        repeatCount = ObjectAnimator.INFINITE
+                        repeatMode = ObjectAnimator.REVERSE
+                        interpolator = AccelerateDecelerateInterpolator()
+                        start()
+                    }
+                    pulseVideoY = ObjectAnimator.ofFloat(vh, View.SCALE_Y, base, base * 1.12f).apply {
+                        this.duration = 700
+                        repeatCount = ObjectAnimator.INFINITE
+                        repeatMode = ObjectAnimator.REVERSE
+                        interpolator = AccelerateDecelerateInterpolator()
+                        start()
+                    }
+                }
                 pulseBase = sx
                 pulsing = true
             }
         } else if (pulsing) {
             pulseAnimator?.cancel()
             pulseAnimatorY?.cancel()
+            pulseVideoX?.cancel()
+            pulseVideoY?.cancel()
             pulseAnimator = null
             pulseAnimatorY = null
+            pulseVideoX = null
+            pulseVideoY = null
             pulseBase = 0f
             pulsing = false
             // ⚠️ 用 [facingScaleX] 而不是 `avatarScale`：这里在"关掉呼吸"时把缩放
@@ -2740,6 +2867,10 @@ class FloatingBubble(private val context: Context) {
             //   宠物突然转回正面"。
             iv.scaleX = facingScaleX()
             iv.scaleY = appearance.avatarScale
+            (videoHost as? View)?.let { vh ->
+                vh.scaleX = facingScaleX()
+                vh.scaleY = appearance.avatarScale
+            }
         }
     }
 
@@ -2791,6 +2922,90 @@ class FloatingBubble(private val context: Context) {
     }
 
     /** 贴边薄片的底：窄圆角条，颜色跟随球的底色。 */
+    /**
+     * 贴边态当前应使用的宽度（dp）。
+     *
+     * 显示图片时用配置值；`edgeImage == "none"`（纯色薄片）时退回老的
+     * [EDGE_WIDTH_DP]，因为那是"一条缝"的语义，与"能点到的探头"不是一回事。
+     */
+    private fun edgeWidthDp(): Int = if (usesEdgeImage()) {
+        appearance.edgeWidth.coerceIn(
+            BubbleAppearance.MIN_EDGE_WIDTH,
+            BubbleAppearance.MAX_EDGE_WIDTH,
+        )
+    } else {
+        EDGE_WIDTH_DP
+    }
+
+    /** 贴边态当前是否要显示图片（而非纯色薄片）。 */
+    private fun usesEdgeImage(): Boolean = when (appearance.edgeImage) {
+        BubbleAppearance.EDGE_IMAGE_NONE -> false
+        BubbleAppearance.EDGE_IMAGE_FILE -> File(
+            context.filesDir,
+            BubbleAppearance.EDGE_IMAGE_FILE,
+        ).let { it.isFile && it.length() > 0L }
+        else -> true   // "default" 或 data URI
+    }
+
+    /**
+     * 把贴边图铺到 [edgeImageView] 上。
+     *
+     * 三种来源：内置 drawable（默认）、落盘的自定义图、内联 data URI。
+     * 纯色薄片模式下清空图片并让 `edgeView` 的背景露出来。
+     *
+     * ⚠️ 每帧都调用 `setImageBitmap` 会很浪费（`applyAppearanceToViews` 在状态
+     *   刷新时也会跑），所以**按来源指纹去重**：指纹没变就直接返回。
+     */
+    private fun applyEdgeImage() {
+        val iv = edgeImageView ?: return
+        val src = appearance.edgeImage
+        // ⚠️ **指纹里必须带 `edgeSide`。**
+        //
+        //   内置探头形象是「从右边探出头」画的（人物靠右、留白在左）。贴到
+        //   屏幕左边时必须水平镜像，否则人物背对屏幕边缘 —— 真机反馈为
+        //   「只能适配右边，贴左边很怪异」。
+        //
+        //   不把方向放进指纹的话，从右边换到左边时指纹没变，会直接 return，
+        //   镜像永远不会重算。
+        val fingerprint = "$src|${edgeWidthDp()}|${appearance.edgeHeight}|$edgeSide"
+        if (fingerprint == edgeImageKey && iv.drawable != null) {
+            iv.alpha = appearance.edgeOpacity.coerceIn(0f, 1f)
+            iv.scaleX = if (edgeSide < 0) -1f else 1f
+            return
+        }
+        edgeImageKey = fingerprint
+
+        if (!usesEdgeImage()) {
+            iv.setImageDrawable(null)
+            iv.visibility = View.GONE
+            return
+        }
+        iv.visibility = View.VISIBLE
+        iv.alpha = appearance.edgeOpacity.coerceIn(0f, 1f)
+
+        // ⚠️ 只认落盘文件与内置两种来源。内联 data URI **在 merge 阶段就已经被
+        //   [BubbleAppearance.writeEdgeImage] 换成文件标记了**（见那里的注释），
+        //   所以这里不需要再解码 —— 与 [appearance.avatar] 的处理完全一致。
+        //   万一真拿到 data URI（解析场景没落盘），退回内置图即可，不影响可用性。
+        if (src == BubbleAppearance.EDGE_IMAGE_FILE) {
+            val bmp = BubbleAppearance.readEdgeImage(context, dp(edgeWidthDp()))
+            if (bmp != null) {
+                iv.setImageBitmap(bmp)
+            } else {
+                // 文件没了（用户清数据）⇒ 退回内置，不留空白
+                iv.setImageResource(R.drawable.bubble_edge_default)
+            }
+        } else {
+            iv.setImageResource(R.drawable.bubble_edge_default)
+        }
+        // 镜像：贴左边时水平翻转，让「探头」朝向屏幕内侧。
+        //
+        // ⚠️ 用 `scaleX = -1` 而不是把 bitmap 翻转一份：后者每次切边都要重新
+        //   解码一张图（`edgeWidthDp()` 变了还要重采样），而 scaleX 是渲染层
+        //   的一次变换，零分配。`pivotX` 默认是 view 中心，镜像后位置不变。
+        iv.scaleX = if (edgeSide < 0) -1f else 1f
+    }
+
     private fun edgeBackground(): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
         cornerRadius = dp(3).toFloat()
@@ -3565,6 +3780,19 @@ class FloatingBubble(private val context: Context) {
         val tick = object : Runnable {
             override fun run() {
                 val st = throwState ?: return
+                // ⚠️ **贴边态绝不能继续跑物理。**
+                //
+                //   贴边时窗口尺寸从「球」变成了「一条探头」，而物理循环用的是
+                //   `v.width/v.height`（此刻已是贴边条的尺寸）。继续下落会有两个后果：
+                //   ① 一条探头贴片受重力往下滑，最后停在屏幕底部；
+                //   ② 地面判据按贴边条高度算，看起来就是"吸附的图片掉下来了"。
+                //
+                //   真机反馈原话：「宠物在吸附状态时会由于重力感应掉下来，
+                //   并且是以吸附的图片形式掉下来」。所以贴边时直接终止抛掷。
+                if (edgeCollapsed) {
+                    stopThrow()
+                    return
+                }
                 val now = System.nanoTime()
                 val dt = ((now - throwLastFrameNs) / 1_000_000_000f).coerceIn(0f, 0.05f)
                 throwLastFrameNs = now
@@ -3651,7 +3879,9 @@ class FloatingBubble(private val context: Context) {
         shakeDetector.onShake = { vx, vy ->
             // 只在**收起态**甩。展开态时面板是个大窗口，把它甩飞既没有视觉意义，
             // 也会让正在打字的人莫名其妙。
-            if (attached && !expanded) {
+            // ⚠️ 贴边态也不能甩：那时候窗口是一条探头，甩飞会变成
+            //   「一张贴边图飞出去」，与抛掷同样的毛病。
+            if (attached && !expanded && !edgeCollapsed) {
                 startThrow(vx, vy)
             }
         }
@@ -3895,13 +4125,18 @@ class FloatingBubble(private val context: Context) {
      * 后者是原有的吸附行为，球仍然完整可见。
      *
      * ⚠️ 位置必须**贴住屏幕边**（x = 0 或 screenW - edgeW），不能沿用球的坐标：
-     *   薄片只有 6dp 宽，沿用球的 x 会让它浮在半空中。
+     *   贴边态比球窄，沿用球的 x 会让它浮在半空中。
      */
     private fun enterEdge(side: Int) {
         val dm = context.resources.displayMetrics
         edgeSide = side
         expanded = false
         edgeCollapsed = true
+        // ⚠️ 进贴边态必须**立刻掐掉正在跑的抛掷**。
+        //   只靠物理 tick 里那个 `if (edgeCollapsed) return` 还不够：
+        //   tick 是 `postOnAnimation` 排的，可能还有一帧在队列里，那一帧会用
+        //   贴边条的尺寸算一次位置，把刚摆好的贴边位置冲掉。
+        stopThrow()
         hideStatusBubble()
         applyFocusFlags(focusable = false)
         panelInput?.let {
@@ -3912,19 +4147,35 @@ class FloatingBubble(private val context: Context) {
         circleView?.visibility = View.GONE
         edgeView?.visibility = View.VISIBLE
 
-        val edgeW = dp(EDGE_WIDTH_DP)
+        val edgeW = dp(edgeWidthDp())
+        val edgeH = if (appearance.edgeHeight > 0) dp(appearance.edgeHeight) else boxH()
         val x = if (side < 0) 0 else (dm.widthPixels - edgeW)
-        val (nx, ny) = clampInto(x, curY, edgeW, boxH())
+        // 竖直位置：`edgeAnchor` 给了固定值就用它（探头每次都在同一高度），
+        // 否则沿用球被拖出去时的 y —— 用户把球拖到哪，它就贴在哪。
+        val y = if (appearance.edgeAnchor >= 0f) {
+            val usable = (dm.heightPixels - edgeH).coerceAtLeast(0)
+            (usable * appearance.edgeAnchor.coerceIn(0f, 1f)).roundToInt()
+        } else {
+            curY
+        }
+        val (nx, ny) = clampInto(x, y, edgeW, edgeH)
         moveTo(nx, ny)
+        // ⚠️ **必须重新应用一次贴边图。**
+        //
+        //   [applyEdgeImage] 只在 `applyAppearanceToViews` 里被调用，而进贴边态
+        //   不走那条路。从右边换到左边时方向变了，不重算就会沿用上一次的镜像
+        //   （表现为「贴哪边都朝同一个方向」）。
+        //   指纹里带了 `edgeSide`，所以这里重复调用是廉价的：方向没变直接 return。
+        applyEdgeImage()
         prefs.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply()
-        Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny")
+        Log.i(TAG, "气泡已贴边折叠: side=$side x=$nx y=$ny w=${edgeWidthDp()}dp h=${edgeH}px")
     }
 
     /**
      * 退出贴边态，弹回完整球。
      *
-     * ⚠️ 位置按 [edgeSide] 算，不是按薄片当前坐标 —— 薄片只有 6dp，它贴左边时
-     *   中心在屏幕最左，直接用它的 x 会让球有一半在屏幕外。
+     * ⚠️ 位置按 [edgeSide] 算，不是按贴边态当前坐标 —— 贴边态贴左边时它的中心
+     *   就在屏幕最左，直接用它的 x 会让球有一半在屏幕外。
      */
     private fun exitEdge() {
         if (!edgeCollapsed) return
@@ -4314,7 +4565,7 @@ class FloatingBubble(private val context: Context) {
         if (text.isEmpty()) return
         val fn = sendText
         if (fn == null) {
-            toast("发送通道未就绪")
+            toast(context.getString(R.string.bubble_send_not_ready))
             return
         }
         val ok = try {
@@ -4325,9 +4576,9 @@ class FloatingBubble(private val context: Context) {
         }
         if (ok) {
             input.setText("")
-            toast("已发送")
+            toast(context.getString(R.string.bubble_sent))
         } else {
-            toast("发送失败，请打开 App")
+            toast(context.getString(R.string.bubble_send_failed))
         }
     }
 
@@ -4344,7 +4595,7 @@ class FloatingBubble(private val context: Context) {
     private fun doStop() {
         val fn = stopRun
         if (fn == null) {
-            toast("停止通道未就绪")
+            toast(context.getString(R.string.bubble_stop_not_ready))
             return
         }
         val ok = try {
@@ -4353,7 +4604,7 @@ class FloatingBubble(private val context: Context) {
             Log.w(TAG, "气泡停止失败: ${t.message}")
             false
         }
-        toast(if (ok) "已请求中断" else "中断失败，请打开 App")
+        toast(if (ok) context.getString(R.string.bubble_stop_requested) else context.getString(R.string.bubble_stop_failed))
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -4373,7 +4624,10 @@ class FloatingBubble(private val context: Context) {
         try {
             paintDot(dotView, status.running)
             paintDot(panelDot, status.running, small = true)
-            paintDot(edgeDot, status.running, small = true)
+            // ⚠️ 贴边态的状态点**默认不显示**（见 [applyEdgeImage] 里的可见性）。
+            //   它居中压在探头人物脸上，真机反馈「挡到角色了」。
+            //   只有在用户显式 `showDot: true` 时才画。
+            if (appearance.showDot) paintDot(edgeDot, status.running, small = true)
             refreshStatusBubble(status)
 
             // 「停止」只在 AI 真在跑时出现。常驻的话用户会去点它 ——
@@ -4382,8 +4636,8 @@ class FloatingBubble(private val context: Context) {
 
             val action = when {
                 status.text.isNotEmpty() -> status.text
-                status.running -> "思考中…"
-                else -> "空闲"
+                status.running -> context.getString(R.string.bubble_thinking)
+                else -> context.getString(R.string.notification_idle)
             }
             panelAction?.text = action
 
@@ -4431,7 +4685,7 @@ class FloatingBubble(private val context: Context) {
         }
         val text = when {
             status.text.isNotEmpty() -> status.text
-            status.running -> "思考中…"
+            status.running -> context.getString(R.string.bubble_thinking)
             // 空闲时若还有正文（上一轮的结论），也值得露一句 —— 但只取首行，
             // 且限长，否则标签会变成一大块。
             status.body.isNotEmpty() -> firstLine(status.body)
@@ -4662,16 +4916,16 @@ class FloatingBubble(private val context: Context) {
 
     /** 一条消息的角色标签。用户消息不显示（蓝色气泡本身就是标志）。 */
     private fun roleLabel(item: ChatTranscript.Item): String = when (item.role) {
-        ChatTranscript.Role.TOOL -> if (item.running) "工具调用 · 进行中" else "工具调用"
-        ChatTranscript.Role.ERROR -> "错误"
-        ChatTranscript.Role.REASONING -> if (item.running) "AI 思考 · 进行中" else "AI 思考"
-        ChatTranscript.Role.ASSISTANT -> if (item.running) "AI · 正在输出" else "AI"
+        ChatTranscript.Role.TOOL -> if (item.running) context.getString(R.string.bubble_tool_running) else context.getString(R.string.bubble_tool_call)
+        ChatTranscript.Role.ERROR -> context.getString(R.string.ui_error)
+        ChatTranscript.Role.REASONING -> if (item.running) context.getString(R.string.bubble_reasoning_running) else context.getString(R.string.bubble_reasoning)
+        ChatTranscript.Role.ASSISTANT -> if (item.running) context.getString(R.string.bubble_assistant_streaming) else "AI"
         else -> item.role
     }
 
     /** 转录为空时的提示。空面板会让人以为界面坏了。 */
     private fun makeEmptyHint(): TextView = TextView(context).apply {
-        text = "（这个会话还没有内容）"
+        text = context.getString(R.string.bubble_empty_conversation)
         textSize = 12f
         setTextColor(colorOr(appearance.panelText, DEFAULT_TEXT) and 0x00FFFFFF or 0x66000000)
         gravity = Gravity.CENTER
