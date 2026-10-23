@@ -9,12 +9,17 @@ on the final feature branch head. No merge, tag or release.
 - Version / branch: 1.3.0 / 31, feature/v1.3.0; pass 1 baseline 277daa8.
 - CI: baseline Release APK 39962242220 and Emulator smoke 39962242246 green.
 - Review: account lifecycle, incomplete streams, update activation/retry, opacity and plugin ownership gaps found.
-- Plan: docs/REVIEW_130_P2.md records requirement evidence and ordered implementation/tests.
-- Local watcher tests encounter ENOSPC on the shared host; handle failure without changing global system settings.
+- Plan committed: 2f77d8d; account, updater and UI fixes assigned by subsystem, regression tests first.
+- Baseline JVM build successful (97 existing tests); node watcher baseline has ENOSPC on shared host.
+- Mobile fixes verified: 34/34 Node tests, 5/5 Chromium tests; all 13 generated plugin zips byte-match source.
+- Actual upstream modal/header checked after animations: opaque colors, opacity 1, no backdrop filter.
+- Bridge RED run: 61 tests, 15 expected failures before fixes; native fixes remain in progress.
+- Server restart interrupted work; existing edits retained and subsystem workers resumed from their diffs.
 
 ## Next step
-1. Plan committed; execute the account/bridge, update and mobile plugin tasks with regression tests.
-2. Execute account/bridge, updater and mobile plugin regression fixes; run gates and final CI.
+1. Finish account/bridge and updater regression cycles, then inspect all subsystem diffs.
+2. Run isolated browser checks and both flavor builds before delivery gates.
+
 
 ## Decisions (why things are the way they are)
 - 2026-10-23: preserve fork package IDs, targetSdk 28 and versionCode 31; upstream package examples are historical.
@@ -26,4 +31,8 @@ on the final feature branch head. No merge, tag or release.
 - Gradle uses no daemon, at most two workers and a 2 GB heap; stop it after builds, wait below 3 GB available RAM.
 
 ## Session log (one line per session, append only)
-- 2026-10-23 13:54Z Codex/gpt-6-astra: reviewed pass 1 and wrote P2 plan; next: commit plan and implement regressions.
+- 2026-10-23 13:50Z Codex/gpt-6-astra: reviewed pass 1 and wrote P2 plan; next: commit plan and implement regressions.
+- 2026-10-23 13:51Z Codex/gpt-6-astra: plan committed before code; baseline JVM check next, then targeted fixes and gates.
+- 2026-10-23 13:52Z Codex/gpt-6-astra: baseline JVM build passed; smoke cancel/reopen/local-error checks added; next: regression fixes and browser verification.
+- 2026-10-23 13:54Z Codex/gpt-6-astra: recovered after server restart; retained plan, RED evidence and in-progress fixes; next: finish implementation and gates.
+- 2026-10-23 13:56Z Codex/gpt-6-astra: mobile regression suites green and plugin archives verified; next: native green runs, live palette check, commits and final gates.

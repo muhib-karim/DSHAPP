@@ -3,8 +3,8 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-export function loadClient(file) {
-  const source = fs.readFileSync(file, 'utf8');
+export function loadClient(file, { transform = (source) => source, requireModule = () => ({}), globals = {} } = {}) {
+  const source = transform(fs.readFileSync(file, 'utf8'));
   let exportsOut;
   const noop = () => {};
   const fakeElement = () => ({ style: { setProperty: noop, removeProperty: noop }, dataset: {}, setAttribute: noop,
@@ -14,11 +14,12 @@ export function loadClient(file) {
     createElement: fakeElement, querySelector: () => null, querySelectorAll: () => [], addEventListener: noop,
     removeEventListener: noop, getElementById: () => null };
   const window = {
-    __ModuleLoader__: { load: ({ factory }) => { exportsOut = factory(() => ({})); } },
+    __ModuleLoader__: { load: ({ factory }) => { exportsOut = factory(requireModule); } },
     addEventListener: noop, removeEventListener: noop, matchMedia: () => ({ matches: false, addEventListener: noop }),
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval: noop, innerWidth: 412, innerHeight: 915,
     getComputedStyle: () => ({ getPropertyValue: () => '' }), location: { href: 'http://127.0.0.1/' },
     navigator: { userAgent: 'node' }, localStorage: { getItem: () => null, setItem: noop, removeItem: noop },
+    ...globals,
   };
   window.window = window;
   window.document = document;

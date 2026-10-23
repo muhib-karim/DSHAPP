@@ -61,6 +61,26 @@ test('the profile base bundles (@deepseek-ai/*) count as DSH built-ins even when
   assert.deepEqual([web.kind, web.removable], ['builtin', false]);
 });
 
+test('official skills installed into the profile belong to the user and can be removed', () => {
+  const rows = plain(buildPluginRows([
+    { name: '@deepseek-ai/dsh-skill-office', official: true, installed: true, enabled: true,
+      optional: false, availability: 'profile', removable: true },
+    { name: '@deepseek-ai/dsh-custom-tools', official: false, installed: true, enabled: false,
+      availability: 'profile', removable: true },
+  ], []));
+  assert.ok(rows.every((r) => r.kind === 'user' && r.removable && r.toggleable));
+});
+
+test('upstream read-only bundles never offer an unusable switch or remove control', () => {
+  const rows = plain(buildPluginRows([
+    { name: '@deepseek-ai/dsh-web-app', installed: true, enabled: true, availability: 'installation',
+      removable: false, readOnlyReason: 'management-required' },
+    { name: 'custom-manager', installed: true, enabled: true, availability: 'profile',
+      removable: true, readOnlyReason: 'management-required' },
+  ], []));
+  assert.ok(rows.every((r) => !r.toggleable && !r.removable));
+});
+
 test('a bundle error is surfaced', () => {
   assert.equal(plain(buildPluginRows(bundles, APP_PLUGINS)).find((r) => r.name === '@acme/alpha-tools').error, 'patch failed');
 });

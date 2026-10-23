@@ -696,11 +696,9 @@ window.__ModuleLoader__.load({
       "blur(40px) saturate(1.5)"；祖先链上也没有 filter/opacity/transform
       破坏它。问题纯粹是**基础背景太透明**，模糊压不住高对比度的黑字。
 
-   修法：把背景不透明度提到 **0.97**（保留一点点毛玻璃质感，但不透字）。
-     · 亮色：rgba(248,249,250,0.58) → 0.97
-     · 暗色：rgba(67,69,74,0.45)   → 0.97
-     实测背后内容透出率从 42% 降到 **3%**，截图对比：修复前那行字清晰可读地
-     压在卡片上，修复后卡片区域干净、只剩清单本身。
+   修法：使用完全不透明的背景（v1.3.0：不再保留毛玻璃质感）。
+     · 亮色：rgb(248,249,250)
+     · 暗色：rgb(67,69,74)
 
    ⚠️ 必须分别写亮/暗两套值：两边的底色不同（248,249,250 vs 67,69,74），
       不能用同一个颜色，也不能只写一套。
@@ -711,11 +709,11 @@ window.__ModuleLoader__.load({
       才不重叠）。要根治得改官方布局结构，风险远大于收益；而"透字"是纯粹的
       可读性缺陷，提不透明度即可解决，不影响任何行为。 */
 [data-mobile] .lXshSW_root {
-  background: rgba(248, 249, 250, 0.97) !important;
+  background: rgb(248, 249, 250) !important;
 }
 [data-mobile] body[data-ds-dark-theme] .lXshSW_root,
 [data-mobile] [data-ds-dark-theme] .lXshSW_root {
-  background: rgba(67, 69, 74, 0.97) !important;
+  background: rgb(67, 69, 74) !important;
 }
 
 /* ══ 修复 64：模型名在窄屏下被截断（"deepseek-v4.1..." 看不全）═════════
@@ -1298,7 +1296,7 @@ html[data-mobile] body {
 	--dsw-menu-backdrop-filter: none !important;
 	--dsw-mask-blur: none !important;
 }
-html[data-mobile], html[data-mobile] body {
+html[data-mobile], html[data-mobile] body, html[data-mobile] #root {
 	background-image: none !important;
 	background-color: var(--mp-solid-base, var(--dsw-alias-bg-base)) !important;
 }
@@ -1426,12 +1424,30 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 		}
 
 		let mpOpaqueLogged = "";
+		const mpOpaqueOverrides = new Map();
+
+		// Retract only values still owned by this guard. A newer theme write wins, even if it arrives
+		// before a scheduled guard run or disposal. Remember inline priorities as well as colours.
+		function mpRestoreOpaqueTokens() {
+			for (const [token, entry] of mpOpaqueOverrides) {
+				if (entry.style.getPropertyValue(token) !== entry.written || entry.style.getPropertyPriority(token) !== entry.priority) continue;
+				if (entry.original) entry.style.setProperty(token, entry.original, entry.originalPriority);
+				else entry.style.removeProperty(token);
+			}
+			mpOpaqueOverrides.clear();
+		}
+
+		function mpWriteOpaqueToken(style, token, value, priority = "important") {
+			const original = style.getPropertyValue(token);
+			const originalPriority = style.getPropertyPriority(token);
+			style.setProperty(token, value, priority);
+			mpOpaqueOverrides.set(token, { style, original, originalPriority, written: style.getPropertyValue(token), priority });
+		}
 
 		function mpApplyOpaqueTokens() {
+			mpRestoreOpaqueTokens();
 			const body = document.body;
 			if (!body || !mpIsMobile()) return;
-			for (const token of SURFACE_TOKENS) body.style.removeProperty(token);
-			body.style.removeProperty("--mp-solid-base");
 			const probe = document.createElement("div");
 			probe.dataset.mpProbe = "";   // setupCleanSurfaces ignores its own probe (otherwise it re-runs forever)
 			probe.style.cssText = "position:absolute;width:0;height:0;visibility:hidden;pointer-events:none";
@@ -1440,12 +1456,12 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 				const dark = body.hasAttribute("data-ds-dark-theme");
 				const rawBase = mpResolveToken(probe, "--dsw-alias-bg-base");
 				const base = flattenColor(rawBase, dark ? "#000000" : "#ffffff") || rawBase;
-				body.style.setProperty("--mp-solid-base", base);
+				mpWriteOpaqueToken(body.style, "--mp-solid-base", base);
 				let changed = 0;
 				for (const token of SURFACE_TOKENS) {
 					const solid = token === "--dsw-alias-bg-base" ? (base !== rawBase ? base : null)
 						: flattenColor(mpResolveToken(probe, token), base);
-					if (solid) { body.style.setProperty(token, solid, "important"); changed++; }
+					if (solid) { mpWriteOpaqueToken(body.style, token, solid); changed++; }
 				}
 				const summary = changed + ":" + base;
 				if (changed && summary !== mpOpaqueLogged) console.info("[dsh-android-mobile] opaque guard: flattened " + changed + " translucent surface token(s)");
@@ -1492,20 +1508,26 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 		/** Installs the three clean layers; re-runs when themes, the colour scheme or top-level nodes change. */
 		function setupCleanSurfaces() {
 			let timer = 0;
+			let appliedBodyStyle = "";
 			const run = () => {
 				timer = 0;
 				window.__mpCleanRuns = (window.__mpCleanRuns || 0) + 1;
 				injectCleanStyles();
 				mpApplyOpaqueTokens();
 				mpHideWallpaperLayers();
+				appliedBodyStyle = document.body.style.cssText;
 			};
 			const schedule = () => { if (!timer) timer = window.setTimeout(run, 150); };
 			run();
 			const headObserver = new MutationObserver(schedule);
-			headObserver.observe(document.head, { childList: true });
-			const bodyObserver = new MutationObserver((records) => { if (!mpOnlyProbeMutations(records)) schedule(); });
+			headObserver.observe(document.head, { childList: true, subtree: true, characterData: true });
+			const bodyObserver = new MutationObserver((records) => {
+				const external = records.filter((r) => !(r.type === "attributes" && r.attributeName === "style"
+					&& document.body.style.cssText === appliedBodyStyle));
+				if (external.length && !mpOnlyProbeMutations(external)) schedule();
+			});
 			bodyObserver.observe(document.body, { childList: true, attributes: true,
-				attributeFilter: ["data-ds-dark-theme", "data-dsh-theme", "class"] });
+				attributeFilter: ["data-ds-dark-theme", "data-dsh-theme", "class", "style"] });
 			const rootObserver = new MutationObserver(schedule);
 			const root = document.getElementById("root");
 			if (root) rootObserver.observe(root, { childList: true });
@@ -1519,6 +1541,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 				htmlObserver.disconnect();
 				window.removeEventListener("resize", schedule);
 				if (timer) window.clearTimeout(timer);
+				mpRestoreOpaqueTokens();
 			};
 		}
 
@@ -9440,8 +9463,10 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			for (const b of bundles || []) {
 				if (!b || !b.name) continue;
 				const app = APP_BUNDLES.has(b.name);
-				// The profile's own base bundles (@deepseek-ai/dsh-base, dsh-web-app, …) are not flagged official.
-				const kind = app ? "app" : (b.official || String(b.name).startsWith("@deepseek-ai/") ? "builtin" : "user");
+				// Official describes the publisher/catalog, not who installed the package. The manager knows
+				// which bundles the installation ships and which belong to the user's profile.
+				const builtin = b.availability === "installation" || (!b.installed && (b.official || b.optional));
+				const kind = app ? "app" : (builtin ? "builtin" : "user");
 				if (kind === "builtin" && !b.installed && !b.optional) continue;
 				rows.push({
 					name: b.name,
@@ -9450,8 +9475,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 					version: b.version || "",
 					kind,
 					enabled: !!b.enabled,
-					toggleable: !!(b.installed || b.optional),
-					removable: kind === "user" && b.removable !== false,
+					toggleable: !b.readOnlyReason && !!(b.installed || b.optional),
+					removable: !b.readOnlyReason && kind === "user" && b.removable === true,
 					error: b.error ? String(b.error.message || b.error.code || b.error) : "",
 				});
 			}
@@ -9658,6 +9683,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			lastCheck: "Last checked",
 			never: "never",
 			update: "Update",
+			install: "Install",
 			upToDate: "Up to date",
 			available: "Update available",
 			installing: "Installing",
@@ -9682,6 +9708,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			lastCheck: "上次检查",
 			never: "从未",
 			update: "更新",
+			install: "安装",
 			upToDate: "已是最新",
 			available: "有可用更新",
 			installing: "安装中",
@@ -9718,8 +9745,8 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 					h("div", { style: S.row }, h("span", { style: S.rowLabel }, t("current")), h("span", { style: S.rowValue }, u.current || "—")),
 					h("div", { style: S.row }, h("span", { style: S.rowLabel }, t("latest")), h("span", { style: S.rowValue }, u.latest || "—")),
 					u.message ? h("p", { style: { ...S.note, margin: 0 } }, u.message) : null,
-					u.status === "available" ? h("div", { style: S.actions },
-						h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } }, t("update") + " → " + u.latest)) : null,
+					u.canUpdate || u.canInstall ? h("div", { style: S.actions },
+						h("button", { style: S.btnPrimary, onClick: () => { mpAppAction(action); refresh(); } }, t(u.canInstall ? "install" : "update") + " → " + u.latest)) : null,
 				);
 			};
 			const last = update.lastCheck ? new Date(update.lastCheck).toLocaleString() : t("never");

@@ -13,10 +13,43 @@
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 /** `reason` of the events this module emits; its own events never schedule a follow-up (no loop). */
 export const OWN_REASON = 'dsh-android: skills changed';
 export const EVENT = 'plugin-manager/changed';
+
+const identity = (stat) => stat && `${stat.dev}:${stat.ino}`;
+const metadata = (name, stat) => `${name}\0${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino}\n`;
+
+function watchRoot(file, options, listener) {
+	// Some Node versions swallow allocation errors while constructing a recursive watcher on Linux.
+	// Probe the native root watch first so ENOSPC reaches our fallback instead of returning an inert handle.
+	const probe = options.recursive ? fs.watch(file, { persistent: false }, () => {}) : null;
+	try { return fs.watch(file, options, listener); }
+	finally { probe?.close(); }
+}
+
+// A resumable metadata walk for roots whose native watcher failed. No file contents are read, symlinks are
+// never followed, and opendir releases its handles when the iterator completes or the refresher is disposed.
+async function* snapshotEntries(root) {
+	async function* visit(file, relative) {
+		try {
+			const stat = await fs.promises.lstat(file);
+			yield metadata(relative, stat);
+			if (!stat.isDirectory() || (relative && !root.recursive)) return;
+			const dir = await fs.promises.opendir(file);
+			for await (const entry of dir) {
+				if (entry.name === '.git' || entry.name === 'node_modules') continue;
+				yield* visit(path.join(file, entry.name), `${relative}/${entry.name}`);
+			}
+		} catch (error) {
+			yield `${relative}\0${error.code || 'unreadable'}\n`;
+		}
+	}
+	yield* visit(root.path, '');
+}
 
 /**
  * @param {object} o
@@ -26,13 +59,18 @@ export const EVENT = 'plugin-manager/changed';
  * @param {number} [o.debounceMs]   quiet time after the last file change
  * @param {number} [o.followUpMs]   delay of the follow-up after another plugin change
  * @param {Function} [o.watch]      fs.watch (injectable for tests)
+ * @param {number} [o.pollMs]      fallback/root-health interval; native watchers never scan the tree
+ * @param {number} [o.retryMs]     minimum interval between native watcher allocation retries
+ * @param {number} [o.scanBatchEntries] maximum metadata entries visited per root per fallback tick
  * @param {(msg: string) => void} [o.log]
  */
-export function createSkillRefresher({ emit, on, roots, debounceMs = 800, followUpMs = 2000, watch = fs.watch, log = () => {} }) {
+export function createSkillRefresher({ emit, on, roots, debounceMs = 800, followUpMs = 2000, watch = watchRoot,
+	pollMs = 5000, retryMs = 30000, scanBatchEntries = 256, log = () => {} }) {
 	let fileTimer = null;
 	let followTimer = null;
 	let disposed = false;
-	const watchers = [];
+	let pollTimer = null;
+	const states = roots.map((root) => ({ root, watcher: null, identity: null, retryAt: 0, scan: null, signature: null }));
 
 	const fire = (why) => {
 		if (disposed) return;
@@ -44,20 +82,86 @@ export function createSkillRefresher({ emit, on, roots, debounceMs = 800, follow
 		}
 	};
 	const onFiles = () => {
+		if (disposed) return;
 		if (fileTimer) clearTimeout(fileTimer);
 		fileTimer = setTimeout(() => { fileTimer = null; fire('skill files changed'); }, debounceMs);
 	};
 
-	for (const root of roots) {
+	const closeWatcher = (state) => {
+		try { state.watcher?.close(); } catch { /* already closed */ }
+		state.watcher = null;
+	};
+	const closeScan = (state) => {
+		const scan = state.scan;
+		state.scan = null;
+		if (scan) scan.entries.return().catch(() => {});
+	};
+	const tryWatch = (state) => {
+		state.retryAt = Date.now() + retryMs;
 		try {
-			if (!fs.existsSync(root.path)) continue;
-			const watcher = watch(root.path, { recursive: !!root.recursive, persistent: false }, onFiles);
-			watcher.on?.('error', () => {});
-			watchers.push(watcher);
+			const stat = fs.lstatSync(state.root.path);
+			state.identity = identity(stat);
+			if (!stat.isDirectory()) return;
+			const watcher = watch(state.root.path, { recursive: !!state.root.recursive, persistent: false }, onFiles);
+			state.watcher = watcher;
+			watcher.on?.('error', (error) => {
+				if (disposed || state.watcher !== watcher) return;
+				closeWatcher(state);
+				state.signature = null;
+				state.retryAt = Date.now() + retryMs;
+				log(`skill watcher stopped; using bounded polling: ${error?.message ?? error}`);
+			});
+			closeScan(state);
 		} catch (error) {
-			log(`cannot watch ${root.path}: ${error?.message ?? error}`);
+			if (error.code !== 'ENOENT') log(`cannot watch ${state.root.path}; using bounded polling: ${error?.message ?? error}`);
+		}
+	};
+	for (const state of states) tryWatch(state);
+
+	async function maintain() {
+		try {
+			for (const state of states) {
+				if (disposed) break;
+				const stat = await fs.promises.lstat(state.root.path).catch(() => null);
+				if (disposed) break;
+				if (identity(stat) !== state.identity) {
+					closeWatcher(state);
+					closeScan(state);
+					state.identity = identity(stat);
+					state.signature = null;
+					state.retryAt = 0;
+					onFiles(); // deleted/recreated root: fs.watch otherwise stays attached to the old inode
+				}
+				if (!state.watcher && Date.now() >= state.retryAt) tryWatch(state);
+				if (state.watcher) continue;
+				if (!state.scan) state.scan = { entries: snapshotEntries(state.root), hash: createHash('sha256') };
+				const scan = state.scan;
+				for (let count = 0; count < Math.max(1, scanBatchEntries) && !disposed; count++) {
+					const next = await scan.entries.next();
+					if (disposed) break;
+					if (next.done) {
+						const signature = scan.hash.digest('hex');
+						// One initial invalidation closes the gap while fallback monitoring was starting.
+						if (signature !== state.signature) onFiles();
+						state.signature = signature;
+						state.scan = null;
+						break;
+					}
+					scan.hash.update(next.value);
+				}
+			}
+		} catch (error) {
+			log(`skill watcher health check failed: ${error?.message ?? error}`);
+		} finally {
+			if (!disposed) schedulePoll();
 		}
 	}
+	function schedulePoll() {
+		if (!states.length) return;
+		pollTimer = setTimeout(maintain, Math.max(1, pollMs));
+		pollTimer.unref?.();
+	}
+	schedulePoll();
 
 	const off = on ? on(EVENT, (payload) => {
 		if (payload?.reason === OWN_REASON) return;
@@ -66,12 +170,14 @@ export function createSkillRefresher({ emit, on, roots, debounceMs = 800, follow
 	}) : null;
 
 	return {
-		watching: watchers.length,
+		get watching() { return states.filter((state) => state.watcher).length; },
 		dispose() {
+			if (disposed) return;
 			disposed = true;
 			if (fileTimer) clearTimeout(fileTimer);
 			if (followTimer) clearTimeout(followTimer);
-			for (const w of watchers) { try { w.close(); } catch { /* already closed */ } }
+			if (pollTimer) clearTimeout(pollTimer);
+			for (const state of states) { closeWatcher(state); closeScan(state); }
 			if (typeof off === 'function') off();
 		},
 	};
