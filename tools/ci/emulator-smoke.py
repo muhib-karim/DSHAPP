@@ -8,6 +8,10 @@ settings web UI therefore needs a real arm64 device (FORK_NOTES.md). When the en
 test goes on to the chat and settings screens as before; otherwise it checks the native boot-status screen (safe mode,
 view log) and the native log viewer.
 
+v1.3.0: before any of that the app shows its first screen ("Continue with Google" / "Use API key"). The test requires
+both buttons, opens the API-key screen, submits an invalid key and requires the error text (DeepSeek's 401, or the
+offline message when the emulator has no network), then taps "Set up later" and goes on as before.
+
 usage: emulator-smoke.py <apk> <package> <out dir>
 Runs inside reactivecircus/android-emulator-runner (an x86_64 image that translates arm64 apps).
 """
@@ -25,6 +29,11 @@ SETTINGS = re.compile(r"^(设置|Settings)$", re.I)
 SETTINGS_OPEN = re.compile(r"(通用|General|模型|Models|插件|Plugins|外观|Appearance)", re.I)
 VIEW_LOG = re.compile(r"^(查看日志|View log|View logs)$", re.I)
 ENGINE_FAIL = re.compile(r"(启动失败|failed to start|CANNOT LINK|救援模式|Rescue)", re.I)
+GOOGLE = re.compile(r"^Continue with Google$", re.I)
+API_KEY = re.compile(r"^Use API key$", re.I)
+LATER = re.compile(r"^Set up later$", re.I)
+BACK = re.compile(r"^Back$", re.I)
+KEY_ERROR = re.compile(r"(rejected this key|Could not reach api\.deepseek\.com|DeepSeek answered HTTP|no balance|rate limiting)", re.I)
 
 
 def adb(*args, check=False, timeout=120):
@@ -102,8 +111,7 @@ def main():
     adb("logcat", "-c")
     adb("shell", "monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1", check=True)
     time.sleep(25)
-    screen("first")
-    shot("01-first-screen")
+    first_ok, key_ok = sign_in_screens()
 
     chat = False
     boot_status = False
@@ -122,7 +130,7 @@ def main():
     time.sleep(5)
     root = screen("status")
     if chat:
-        shot("02-chat")
+        shot("04-chat")
         target = find(root, SETTINGS)
         if target is None:
             corner = [n for n in nodes(root) if n.get("clickable") == "true" and re.match(r"\[(\d+),(\d+)\]", n.get("bounds", ""))]
@@ -134,19 +142,21 @@ def main():
         ok = target is not None and tap(target)
         time.sleep(4)
         ok = ok and SETTINGS_OPEN.search(" | ".join(label(n) for n in nodes(screen("settings")))) is not None
-        shot("03-settings")
+        shot("05-settings")
         result = f"engine up: chat screen and settings screen opened: {ok}"
     else:
-        shot("02-boot-status")
+        shot("04-boot-status")
         button = find(root, VIEW_LOG)
         ok = boot_status and button is not None and tap(button)
         time.sleep(4)
         screen("log")
         resumed = adb("shell", "dumpsys", "activity", "activities")
         ok = ok and "LogViewerActivity" in next((l for l in resumed.splitlines() if "mResumedActivity" in l or "topResumedActivity" in l), "")
-        shot("03-log-viewer")
+        shot("05-log-viewer")
         result = ("engine not up on this x86_64 emulator (arm64-only Termux bootstrap); native boot-status screen shown and "
                   f"log viewer opened: {ok}")
+    result = f"first screen (Google + API key): {first_ok}; API-key screen with error on an invalid key: {key_ok}; " + result
+    ok = ok and first_ok and key_ok
     with open(os.path.join(OUT, "logcat.txt"), "w", encoding="utf-8") as fh:
         fh.write(adb("logcat", "-d", "-v", "time", timeout=120))
     with open(os.path.join(OUT, "RESULT.txt"), "w", encoding="utf-8") as fh:
@@ -154,6 +164,52 @@ def main():
     print(result, flush=True)
     if not ok:
         sys.exit(1)
+
+
+def sign_in_screens():
+    """First screen, API-key screen, an invalid key's error; then "Set up later" back to the app."""
+    root = None
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        root = screen("first")
+        if find(root, GOOGLE) is not None and find(root, API_KEY) is not None:
+            break
+        time.sleep(5)
+    shot("01-first-screen")
+    first_ok = find(root, GOOGLE) is not None and find(root, API_KEY) is not None
+    print("first screen:", first_ok, flush=True)
+    if not first_ok:
+        return False, False
+    tap(find(root, API_KEY))
+    time.sleep(3)
+    root = screen("api-key")
+    shot("02-api-key-screen")
+    field = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
+    key_ok = False
+    if field is not None:
+        tap(field)
+        time.sleep(1)
+        adb("shell", "input", "text", "sk-smoke-invalid-key-0000000000")
+        adb("shell", "input", "keyevent", "66")   # IME "Done" submits
+        deadline = time.time() + 45
+        while time.time() < deadline and not key_ok:
+            time.sleep(3)
+            root = screen("api-key-error")
+            key_ok = find(root, KEY_ERROR) is not None
+        adb("shell", "input", "keyevent", "111")   # hide the keyboard (ESC) for a clean screenshot
+        time.sleep(1)
+        shot("03-api-key-error")
+    print("API-key screen error shown:", key_ok, flush=True)
+    root = screen("api-key-done")
+    if find(root, BACK) is not None:
+        tap(find(root, BACK))
+        time.sleep(2)
+        root = screen("first-again")
+    later = find(root, LATER)
+    if later is not None:
+        tap(later)
+        time.sleep(3)
+    return first_ok, key_ok
 
 
 def find(root, pattern):
