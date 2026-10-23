@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- v1.3.0 first screen and sign-in: opaque, follows the system light/dark mode. -->
+    <color name="signin_bg">#FFFFFF</color>
+    <color name="signin_surface">#F3F4F6</color>
+    <color name="signin_text">#111827</color>
+    <color name="signin_muted">#4B5563</color>
+    <color name="signin_accent">#4D6BFE</color>
+    <color name="signin_on_accent">#FFFFFF</color>
+    <color name="signin_error">#B42318</color>
+</resources>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="signin_bg">#0F1115</color>
+    <color name="signin_surface">#1C1F26</color>
+    <color name="signin_text">#F3F4F6</color>
+    <color name="signin_muted">#B4BAC5</color>
+    <color name="signin_accent">#6B84FF</color>
+    <color name="signin_on_accent">#FFFFFF</color>
+    <color name="signin_error">#FF8A80</color>
+</resources>

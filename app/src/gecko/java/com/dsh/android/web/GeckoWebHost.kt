@@ -649,6 +649,9 @@ class GeckoWebHost(
                     // ⚠️ 必须重推：用户从日志界面（另一个 Activity）清空/上传后
                     //   回到设置页，缓存里还是旧数字，不重推就永远不刷新。
                     "logsRefresh" -> pushSnapshot()
+                    // Settings > Account: actions, then a fresh snapshot so the page's synchronous appState() sees it.
+                    "appAction" -> { b.appAction(args.optString(0), args.optString(1)); pushSnapshot() }
+                    "appStateRefresh" -> pushSnapshot()
                     // 会话转录：与 onStatus 同一条路，只是体量大得多（见 ChatTranscript）。
                     "onTranscript" -> b.onTranscript(args.optString(0))
                     // 插件下发悬浮球外观。**改完必须重推快照** —— 页面侧读的是
@@ -724,6 +727,8 @@ class GeckoWebHost(
             // 日志摘要（JSON 文本）。页面侧 `logSummary()` 是**同步**读取，所以
             // 只能经快照缓存 —— 与 root/bubble 完全同一套语义。
             .put("logSummary", callbacks.bridge.logSummary())
+            // Settings > Account snapshot, read synchronously by the page.
+            .put("appState", callbacks.bridge.appState())
             // Shizuku 状态（JSON 文本）。同样是页面侧**同步**读取
             // （`bridge.shizukuState()`），只能经快照缓存。
             // ⚠️ 它必须进快照还有一个更硬的理由：Shizuku 的授权是**异步**回来的

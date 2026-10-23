@@ -163,7 +163,7 @@ param(
     #      所以**必须 bump**：只重打 `mobile-ui.zip` 而不动这里，设备上那棵树会命中
     #      原有的戳字符串 `chrome74-v21`（**相等 ⇒ 跳过**），继续跑旧群的二维码。
     #      同 v21：判据是字符串相等，不是「这次跑过脚本」。
-    [string]$CompatVersion = "22",
+    [string]$CompatVersion = "44",
 
     [string]$EngineBin,
     [string]$OutZip

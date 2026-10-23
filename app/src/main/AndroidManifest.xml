@@ -202,5 +202,28 @@
             </intent-filter>
         </receiver>
 
+        <!-- 1.3.2-en (from v1.3.0): first screen (Continue with Google / Use API key). Not exported. -->
+        <activity
+            android:name=".account.SignInActivity"
+            android:exported="false"
+            android:theme="@style/Theme.DSH.SignIn"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 1.3.2-en (from v1.3.0): DeepSeek web sign-in. Exported only for the mkdsh://session link that the browser
+             bookmark sends as an explicit intent to this package; a link that did not follow a sign-in started in the
+             app is used only after the user confirms it. -->
+        <activity
+            android:name=".webbridge.DeepSeekLoginActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.DSH.SignIn"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mkdsh" android:host="session" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

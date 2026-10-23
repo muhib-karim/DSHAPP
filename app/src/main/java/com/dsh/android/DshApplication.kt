@@ -108,6 +108,8 @@ class DshApplication : Application() {
         //   通知权限框，错过就再也不问。原实现渠道要等用户点「配对」才建，
         //   于是首次打开 App 永远拿不到那个弹框，必须退出重进（见方法注释）。
         AdbPairingNotifier.ensureChannel(this)
+        // v1.3.0: the engine asks for the web-account bridge port before each launch (see EngineManager.ensureAccountConfig).
+        EngineManager.get(this).webBridgePort = { com.dsh.android.webbridge.WebAccount.ensureStarted(this) }
         bootstrapTermux()
         // 崩溃后留下的待传诊断包，在这里补传（不阻塞启动，见该方法注释）。
         uploadPendingBundles()

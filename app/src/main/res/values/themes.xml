@@ -5,4 +5,15 @@
         <item name="android:navigationBarColor">#0F1115</item>
         <item name="android:windowBackground">#0F1115</item>
     </style>
+    <!-- v1.3.0 sign-in screens: opaque, light or dark with the system. -->
+    <style name="Theme.DSH.SignIn" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/signin_bg</item>
+        <item name="android:statusBarColor">@color/signin_bg</item>
+        <item name="android:navigationBarColor">@color/signin_bg</item>
+        <item name="colorPrimary">@color/signin_accent</item>
+        <item name="colorOnPrimary">@color/signin_on_accent</item>
+        <item name="colorError">@color/signin_error</item>
+        <item name="android:textColorPrimary">@color/signin_text</item>
+        <item name="android:textColorSecondary">@color/signin_muted</item>
+    </style>
 </resources>

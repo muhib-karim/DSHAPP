@@ -206,4 +206,14 @@ interface PageBridge {
      * 基本类型与 String，返回对象会静默变成 `undefined`。
      */
     fun logSummary(): String
+
+    /**
+     * Settings > Account (ported from v1.3.0): one JSON snapshot of the native side, read synchronously
+     * (`{"account":{mode,label,keyHint,webExpired}}`, see `AppState`). One getter and one action method, so the two
+     * hand-maintained flavor whitelists grow by two entries.
+     */
+    fun appState(): String
+
+    /** Settings > Account actions: `accountSwitch`, `accountReplaceKey`, `accountSignOut`. */
+    fun appAction(name: String, arg: String)
 }

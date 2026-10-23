@@ -76,6 +76,8 @@ const snapshot = {
   // 日志摘要。⚠️ 与 root/bubble 同一套缓存语义：native messaging 只能异步，
   //   而设置页的 `logSummary()` 是**同步**读取（见 system 版的同名字段）。
   logSummary: '{}',
+  // Settings > Account snapshot (ported from v1.3.0); the page reads it synchronously.
+  appState: '{}',
   // Shizuku 状态（uid 2000 的第二条来源）。同样是页面侧**同步**读取
   //   （`bridge.shizukuState()`），只能经快照缓存。
   //   ⚠️ 它必须进快照还有一个更硬的理由：Shizuku 的授权是**异步**回来的
@@ -176,6 +178,7 @@ function onNativeMessage(msg) {
     if (typeof msg.appearance === 'string') snapshot.appearance = msg.appearance;
     if (typeof msg.pairingEnabled === 'boolean') snapshot.pairingEnabled = msg.pairingEnabled;
     if (typeof msg.logSummary === 'string') snapshot.logSummary = msg.logSummary;
+    if (typeof msg.appState === 'string') snapshot.appState = msg.appState;
     if (typeof msg.shizuku === 'string') snapshot.shizuku = msg.shizuku;
     return;
   }
@@ -366,7 +369,7 @@ const PAGE_SHIM_SOURCE = `(function (post) {
  * 而它要调用的那几个原生侧函数以参数形式传进去（它们是 exportFunction 的
  * 返回值，跨边界是合法的）。
  */
-const BRIDGE_INSTALLER_SOURCE = `(function (post, getRoot, getBubble, getPairingEnabled, getAppearance, getLogSummary, getShizuku) {
+const BRIDGE_INSTALLER_SOURCE = `(function (post, getRoot, getBubble, getPairingEnabled, getAppearance, getLogSummary, getShizuku, getAppState) {
   // ⚠️ **无条件覆盖**，不能写成「已有就跳过」。content script 重跑时传进来的
   //   post 是**新的**函数对象（闭包着新的原生端口），而旧 DSHAndroid 里的方法
   //   还指着**旧的** post → 旧端口（可能已断）。保留旧对象的结果是页面调了方法
@@ -407,6 +410,13 @@ const BRIDGE_INSTALLER_SOURCE = `(function (post, getRoot, getBubble, getPairing
       return getLogSummary();
     },
     openLogs: function () { post('openLogs', []); },
+    // Settings > Account: 「appState()」 reads the snapshot (and asks for a fresh one, read again a beat later);
+    //   「appAction(name, arg)」 is fire and forget, the native side pushes a new snapshot afterwards.
+    appState: function () {
+      post('appStateRefresh', []);
+      return getAppState();
+    },
+    appAction: function (name, arg) { post('appAction', [String(name), String(arg == null ? '' : arg)]); },
     // Shizuku（uid 2000 的第二条来源，见 ShizukuChannel）。
     //   ⚠️ 本段是**模板字符串**的内容，注释里一律用「」包住标识符 ——
     //     写反引号会提前终止模板，症状是整个 content script 不执行
@@ -496,12 +506,13 @@ function installBridge() {
   const getLogSummary = exportFunction(function () { return String(snapshot.logSummary); }, pageWindow);
   // Shizuku 状态同构：原生推快照、页面同步读缓存。
   const getShizuku = exportFunction(function () { return String(snapshot.shizuku); }, pageWindow);
+  const getAppState = exportFunction(function () { return String(snapshot.appState); }, pageWindow);
 
   try {
     // 在页面世界现造安装器，再把导出函数喂进去 —— 对象因此在页面世界出生，
     // 不需要（也不能）克隆。见 BRIDGE_INSTALLER_SOURCE 的说明。
     pageWindow.eval(BRIDGE_INSTALLER_SOURCE)(
-      post, getRoot, getBubble, getPairingEnabled, getAppearance, getLogSummary, getShizuku);
+      post, getRoot, getBubble, getPairingEnabled, getAppearance, getLogSummary, getShizuku, getAppState);
     log('[dsh-bridge] 桥已装入页面世界: ' + typeof pageWindow.DSHAndroid);
   } catch (e) {
     // 桥装不上 ⇒ 设置页的气泡开关 / root 状态 / 无线调试配对三块静默失效。

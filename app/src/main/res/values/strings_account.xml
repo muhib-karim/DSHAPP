@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="signin_title">DeepSeek</string>
+    <string name="signin_subtitle">Sign in to start chatting</string>
+    <string name="signin_switch_subtitle">Choose how DSH talks to DeepSeek</string>
+    <string name="signin_google">Continue with Google</string>
+    <string name="signin_api_key">Use API key</string>
+    <string name="signin_later">Set up later</string>
+    <string name="signin_footer">Your account and keys stay on this phone.</string>
+    <string name="signin_key_title">Use API key</string>
+    <string name="signin_replace_title">Replace API key</string>
+    <string name="signin_replace_subtitle">Keep your account, change the key</string>
+    <string name="signin_replace_body">Paste the new key from platform.deepseek.com. Your account stays signed in and only the key changes; Back keeps the old one.</string>
+    <string name="signin_key_body">Paste a key from platform.deepseek.com. It is checked once, then saved only in DSH\'s own credentials file on this phone.</string>
+    <string name="signin_key_hint">DeepSeek API key</string>
+    <string name="signin_key_continue">Continue</string>
+    <string name="signin_key_get">Get a key</string>
+    <string name="signin_back">Back</string>
+    <string name="signin_checking">Checking the key…</string>
+    <string name="signin_key_paste">Paste</string>
+    <string name="signin_key_paste_description">Paste a key from the clipboard</string>
+    <string name="signin_key_error_title">Couldn\'t sign in with this key</string>
+    <string name="signin_key_error_title_replace">Couldn\'t replace the key</string>
+    <string name="signin_key_save_failed">Could not save the key. Try again.</string>
+    <string name="signin_key_superseded">The account changed while the key was being checked. Try again.</string>
+    <string name="login_title">Sign in to DeepSeek</string>
+    <string name="login_close">Close</string>
+    <string name="login_google_hint">Google won\'t open here?</string>
+    <string name="login_use_browser">Use your browser</string>
+    <string name="login_browser_steps">1. Sign in at chat.deepseek.com in your browser (Google works there).\n2. Copy the bookmark below, save it as a bookmark, and open it on chat.deepseek.com.\n3. Tap "Open in DSH", or copy the session and paste it here.</string>
+    <string name="login_open_browser">Open chat.deepseek.com</string>
+    <string name="login_copy_bookmark">Copy bookmark</string>
+    <string name="login_paste_hint">Paste session</string>
+    <string name="login_bookmark_copied">Bookmark copied. Save it in your browser\'s bookmarks.</string>
+    <string name="login_switch_account">Choose another account on the page, or use your browser. Closing keeps your current DSH account.</string>
+    <string name="login_save_failed">Could not save the account. Try again.</string>
+    <string name="login_checking">Signing in…</string>
+    <string name="login_birthday">Finish your DeepSeek profile on the page first.</string>
+    <string name="login_failed">That session was not accepted. Sign in again.</string>
+    <string name="login_offline">Could not reach chat.deepseek.com. Check your connection.</string>
+    <string name="login_confirm_account">Sign in to DSH as %1$s?</string>
+    <string name="login_bad_paste">That is not a DeepSeek session.</string>
+    <string name="shortcut_account">DeepSeek account</string>
+</resources>

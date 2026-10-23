@@ -7,6 +7,9 @@ import com.dsh.android.log.LogStore
 import com.dsh.android.log.CrashRecorder
 import com.dsh.android.log.BootState
 import com.dsh.android.log.RescueBoot
+import com.dsh.android.account.AccountConfig
+import com.dsh.android.account.AccountStore
+import com.dsh.android.account.DshCredentials
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +47,9 @@ import java.util.concurrent.TimeUnit
  * 而 `$PREFIX/bin/node` 正落在私有目录里。详见 app/build.gradle.kts 的注释。
  */
 class EngineManager private constructor(private val context: Context) {
+
+    /** v1.3.0: starts the web-account bridge if needed and returns its port (null: not running). Set by WebAccount. */
+    @Volatile var webBridgePort: (() -> Int?)? = null
 
     sealed interface State {
         data object Idle : State
@@ -3342,6 +3348,32 @@ class EngineManager private constructor(private val context: Context) {
 
         insert(agnesIndex + 1, keyPoolRetryPolicyYaml(child + 6))
         return lines.joinToString("\n")
+    }
+
+    /**
+     * v1.3.0: writes what the first screen's sign-in means into the profile patch (see [AccountConfig]); for the web
+     * account also the bridge secret into `.credentials.yaml`. Runs before every launch: the bridge port is per process.
+     */
+    private fun ensureAccountConfig(profile: String, hasKeyPool: Boolean) {
+        val store = AccountStore(context)
+        val mode = store.mode
+        val port = if (mode == AccountConfig.Mode.WEB) webBridgePort?.invoke() else null
+        try {
+            if (port != null) DshCredentials.write(dshHome, mapOf(DshCredentials.WEB_BRIDGE_KEY to store.bridgeSecret()))
+            else if (DshCredentials.read(dshHome, DshCredentials.WEB_BRIDGE_KEY) != null) {
+                DshCredentials.write(dshHome, mapOf(DshCredentials.WEB_BRIDGE_KEY to null))
+            }
+            val patch = File(dshHome, "profiles/$profile/$PROFILE_PATCH_FILENAME")
+            val existing = if (patch.isFile) patch.readText() else ""
+            val updated = AccountConfig.render(existing, mode, port, hasKeyPool)
+            if (updated != existing) {
+                patch.parentFile?.mkdirs()
+                patch.writeText(updated)
+                Log.i(TAG, "account config ($profile): mode=$mode bridge=${port != null}")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "account config ($profile) failed: ${t.message}")
+        }
     }
 
     /**
@@ -6782,6 +6814,7 @@ class EngineManager private constructor(private val context: Context) {
         // 默认模型 = 内置 Agnes。引擎的出厂默认是官方模型（deepseek-official），
         // 而本 App 的用户大多没配过第三方 API ⇒ 那个路由必然失败。详见 [ensureDefaultModel]。
         ensureDefaultModel()
+        ensureAccountConfig(PROFILE_NAME, keyInject != null)
 
         // ⚠️ **救援 profile 也必须拿到同一套用户层配置**，否则救援界面是残废的：
         //   没有默认模型 ⇒ AI 一开口就路由失败；没有号池 ⇒ 用户得自己配 key；
@@ -6799,6 +6832,7 @@ class EngineManager private constructor(private val context: Context) {
             seedDefaultSettings(RESCUE_PROFILE_NAME)
             ensureKeyPoolProvider(keyInject, RESCUE_PROFILE_NAME)
             ensureDefaultModel(RESCUE_PROFILE_NAME)
+            ensureAccountConfig(RESCUE_PROFILE_NAME, keyInject != null)
         }
         // uid 2000 通道：截图/点击/卸载/settings 等 app 域做不到的操作要靠它。
         // 未导入密钥时脚本自己回落为本地执行，不影响任何现有功能。
@@ -7301,10 +7335,12 @@ class EngineManager private constructor(private val context: Context) {
                 )
                 _state.value = State.Ready(url)
                 Log.i(TAG, "引擎就绪: $url")
+                onEngineReady()
                 return@withContext
             }
             _state.value = State.Ready(url)
             Log.i(TAG, "引擎就绪: $url")
+            onEngineReady()
             // ⚠️ 引擎**真的起来了** ⇒ 清掉上次的失败记录。
             //
             //   见 RescueBoot 的类注释：这份记录是「上次为什么起不来」的唯一线索，
@@ -7551,6 +7587,29 @@ class EngineManager private constructor(private val context: Context) {
         // 守护线程同理：引擎都停了，再去切 adbd 没有意义，还白耗电
         WirelessDebugging.stopFixedPortGuard()
         _state.value = State.Idle
+    }
+
+    /** v1.3.0: a restart asked for while a boot was in progress; done once that boot reaches Ready. */
+    @Volatile private var restartWhenReady: String? = null
+
+    /**
+     * v1.3.0: restart so dsh re-reads its account config (sign-in, sign-out). Ready → now; a boot in progress → once it
+     * reaches Ready (restarting mid-boot would start a second pipeline next to the running one); stopped or failed → the
+     * next start reads the new config anyway. Never blocks the caller (stop() waits for the process to exit).
+     */
+    fun restartForConfigChange(reason: String) {
+        when (_state.value) {
+            is State.Ready -> Thread({ requestRestart(reason) }, "engine-restart").start()
+            is State.Starting, is State.Extracting -> restartWhenReady = reason
+            else -> Unit
+        }
+    }
+
+    private fun onEngineReady() {
+        restartWhenReady?.let { reason ->
+            restartWhenReady = null
+            Thread({ requestRestart("$reason (after boot)") }, "engine-restart").start()
+        }
     }
 
     /**
@@ -8792,7 +8851,7 @@ class EngineManager private constructor(private val context: Context) {
          *      设备上会命中「两戳都一致 → 整棵树跳过」，继续跑旧群的二维码 ——
          *      而日志不会打任何东西（版本没变），看起来像"什么都没发生"（同 v65 的坑）。
          */
-        private const val MOBILE_UI_VERSION = "1.0.0-66"
+        private const val MOBILE_UI_VERSION = "1.0.0-110"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

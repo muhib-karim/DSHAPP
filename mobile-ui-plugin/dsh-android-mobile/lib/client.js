@@ -7134,12 +7134,159 @@ window.__ModuleLoader__.load({
 		/** 最近一次组字结束的时间戳（0 = 从未）。见 setupEnterAsNewline。 */
 		let mpLastCompositionEnd = 0;
 
+		/* 1.3.2-en: Settings > Account, ported unchanged from v1.3.0 (self-contained settings entry). */
+		/** Registers a settings section through the same "settings.section" slot as the sections above. */
+		function mpRegisterV13Section(ctx, spec) {
+			if (mpPrivReact === null) {
+				try { mpPrivReact = require("react"); } catch (e) { mpPrivReact = null; }
+			}
+			if (!mpPrivReact) return;
+			try {
+				ctx.inject(["slots", "locale"].concat(spec.inject || []), (scope) => {
+					const t = scope.locale.bind(spec.ns);
+					scope.effect(() => scope.locale.register(spec.ns, { zh: spec.zh, en: spec.en }), "dsh-android-mobile: " + spec.id);
+					scope.slots.inject("settings.section", () => scope.slots.register({
+						name: "settings.section",
+						id: spec.id,
+						order: spec.order,
+						label: () => t("nav"),
+						locale: spec.ns,
+					}, (slotProps) => spec.component(slotProps, scope)));
+				});
+			} catch (e) {
+				console.warn("[dsh-android-mobile] settings section " + spec.id + " failed:", e && (e.stack || e.message || e));
+			}
+		}
+
+		/** Native snapshot for Settings > Account (DSHAndroid.appState()); null without the app bridge. */
+		function mpReadAppState() {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.appState !== "function") return null;
+			try {
+				const raw = bridge.appState();
+				return typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || {});
+			} catch (e) {
+				return null;
+			}
+		}
+
+		function mpAppAction(name, arg) {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.appAction !== "function") return false;
+			try { bridge.appAction(String(name), arg == null ? "" : String(arg)); return true; } catch (e) { return false; }
+		}
+
+		/**
+		 * React hook: the native snapshot, re-read a beat after each read (the gecko flavor reads a cached snapshot and
+		 * asks for a fresh one), on return from another screen, and every [pollMs] while the section is open.
+		 */
+		function mpUseAppState(React, pollMs) {
+			const [state, setState] = React.useState(() => mpReadAppState());
+			const refresh = React.useCallback(() => {
+				setState(mpReadAppState());
+				setTimeout(() => setState(mpReadAppState()), 300);
+			}, []);
+			React.useEffect(() => {
+				const onVisible = () => { if (!document.hidden) refresh(); };
+				document.addEventListener("visibilitychange", onVisible);
+				window.addEventListener("focus", onVisible);
+				const timer = pollMs ? setInterval(refresh, pollMs) : 0;
+				refresh();
+				return () => {
+					document.removeEventListener("visibilitychange", onVisible);
+					window.removeEventListener("focus", onVisible);
+					if (timer) clearInterval(timer);
+				};
+			}, [refresh]);
+			return [state, refresh];
+		}
+
+		const MP_ACCOUNT_NS = "dsh-android-mobile.account";
+		const MP_ACCOUNT_EN = {
+			nav: "Account",
+			title: "Account",
+			intro: "How DSH talks to DeepSeek on this phone. Switching or signing out restarts the engine.",
+			modeWeb: "DeepSeek web account",
+			modeKey: "DeepSeek API key",
+			modeNone: "Not signed in",
+			keyInUse: "Key in use",
+			replaceKey: "Replace API key",
+			signedInAs: "Signed in as",
+			switch: "Switch account",
+			signOut: "Sign out",
+			signIn: "Sign in",
+			reauth: "Sign in again",
+			webExpired: "This web session has expired. Sign in again to keep using your DeepSeek web account.",
+			confirmSignOut: "Sign out of DeepSeek on this phone? The API key or web session is removed.",
+			webNote: "Web account replies come from chat.deepseek.com through a local bridge on this phone. Tools work through a text protocol; images are not sent.",
+			keyNote: "The key is stored only in DSH's own credentials file (owner-only) and used by the official DeepSeek provider.",
+			noBridge: "Account settings are available in the Android app.",
+		};
+		const MP_ACCOUNT_ZH = {
+			nav: "账号",
+			title: "账号",
+			intro: "DSH 在这台手机上用什么身份连接 DeepSeek。切换或退出会重启引擎。",
+			modeWeb: "DeepSeek 网页账号",
+			modeKey: "DeepSeek API 密钥",
+			modeNone: "未登录",
+			keyInUse: "当前密钥",
+			replaceKey: "更换 API 密钥",
+			signedInAs: "当前账号",
+			switch: "切换账号",
+			signOut: "退出登录",
+			signIn: "登录",
+			reauth: "重新登录",
+			webExpired: "网页会话已过期。重新登录后即可继续使用 DeepSeek 网页账号。",
+			confirmSignOut: "确定在这台手机上退出 DeepSeek？API 密钥或网页会话会被删除。",
+			webNote: "网页账号的回复经本机的本地桥来自 chat.deepseek.com。工具通过文本协议调用；不发送图片。",
+			keyNote: "密钥只保存在 DSH 自己的凭据文件里（仅本人可读），由官方 DeepSeek 供应商使用。",
+			noBridge: "账号设置仅在 Android App 中可用。",
+		};
+
+		function mpAccountSection(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_ACCOUNT_EN[key] ?? key;
+			const [state] = mpUseAppState(React, 4000);
+			const h = React.createElement;
+			if (!state) {
+				return h("div", { style: S.section }, h("h2", { style: S.heading }, t("title")), h("p", { style: S.intro }, t("noBridge")));
+			}
+			const account = state.account || {};
+			const mode = account.mode || "none";
+			const label = mode === "web" ? t("modeWeb") : (mode === "api_key" ? t("modeKey") : t("modeNone"));
+			const webExpired = mode === "web" && account.webExpired === true;
+			const tone = mode === "none" || webExpired ? MP_PRIV_TONE.warn : MP_PRIV_TONE.on;
+			const signOut = () => { if (window.confirm(t("confirmSignOut"))) mpAppAction("accountSignOut"); };
+			return h("div", { style: S.section },
+				h("h2", { style: S.heading }, t("title")),
+				h("p", { style: S.intro }, t("intro")),
+				h("div", { style: S.card, "data-mp-account": mode },
+					h("div", { style: S.cardHead },
+						h("h3", { style: S.cardTitle }, t("signedInAs")),
+						h("span", { style: { ...S.badge, color: tone.color, background: tone.bg } }, label),
+					),
+					mode === "web" && account.label ? h("p", { style: S.summary }, account.label) : null,
+					// Only the masked suffix the app exposes; the full key never reaches the page.
+					mode === "api_key" && account.keyHint ? h("p", { style: S.summary, "data-mp-account-key-hint": "1" }, t("keyInUse") + " " + account.keyHint) : null,
+					webExpired ? h("p", { style: { ...S.note, color: MP_PRIV_TONE.warn.color, background: MP_PRIV_TONE.warn.bg, borderRadius: "8px", padding: "8px 10px" }, "data-mp-account-expired": "1" }, t("webExpired")) : null,
+					h("div", { style: S.actions },
+						h("button", { style: S.btnPrimary, onClick: () => mpAppAction("accountSwitch") }, webExpired ? t("reauth") : (mode === "none" ? t("signIn") : t("switch"))),
+						mode === "api_key" ? h("button", { style: S.btn, onClick: () => mpAppAction("accountReplaceKey"), "data-mp-account-replace": "1" }, t("replaceKey")) : null,
+						mode !== "none" ? h("button", { style: S.btn, onClick: signOut }, t("signOut")) : null,
+					),
+					mode === "web" ? h("p", { style: S.note }, t("webNote")) : null,
+					mode === "api_key" ? h("p", { style: S.note }, t("keyNote")) : null,
+				),
+			);
+		}
 		function apply(ctx) {
 			mpCtx = ctx;
 			mpSessionsCache = ctx.get("sessions") ?? null;
 			mpRegisterPrivilegedSection(ctx);
 			mpRegisterBubbleSection(ctx);
 			mpRegisterLogsSection(ctx);
+			mpRegisterV13Section(ctx, { id: "dsh-android-account", order: 3, ns: MP_ACCOUNT_NS, zh: MP_ACCOUNT_ZH, en: MP_ACCOUNT_EN, component: mpAccountSection });
 			mpRegisterContactSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */
