@@ -124,3 +124,5 @@ video-promo/
 # 一律忽略，防的是「下次又写到仓库里」。
 /tunnel*.json
 /cloudflared*.json
+
+__pycache__/

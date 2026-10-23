@@ -24,7 +24,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.dsh.android"
+        applicationId = "com.mkdsh.droid" // fork id, 15 characters (upstream: com.dsh.android)
         minSdk = 26
         // 🔴 必须是 28，不能升到 29+。Android 10（API 29）起，targetSdk ≥ 29 的
         // 应用不允许 execve() 自身私有目录里的文件（W^X 限制，SELinux
@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 26
+        versionCode = 37
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -124,7 +124,8 @@ android {
         //         整轮失败（`unknown prompt variable "{{cwd}}" ... registered
         //         variables: provider, model`）。上一轮只删了锚点没删正文。
         //      ③ 内置预设源码换成 npm 上已发布的 dsh-preset-razor@1.0.3。
-        versionName = "0.3.0"
+        // 1.3.2-en (versionCode 37), fork: upstream 0.3.0 with an English UI and the DeepSeek web login from 1.3.0.
+        versionName = "1.3.2-en"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
@@ -160,7 +161,7 @@ android {
         }
         create("gecko") {
             dimension = "webengine"
-            applicationId = "com.dsh.webview"
+            applicationId = "com.mkdsh.gecko" // fork id, 15 characters (upstream: com.dsh.webview)
             // 两个包会同时存在于设备上（applicationId 不同 ⇒ 可共存），
             // 版本号带后缀才能在系统「应用信息」里分辨出装的是哪一个。
             versionNameSuffix = "-gecko"
@@ -242,6 +243,12 @@ android {
         jvmTarget = "17"
     }
 
+    testOptions {
+        // JVM unit tests (app/src/test) touch only plain Kotlin classes; android.jar stubs return defaults
+        // instead of throwing if one is reached by accident.
+        unitTests.isReturnDefaultValues = true
+    }
+
     buildFeatures {
         viewBinding = true
         // TermuxBootstrap.ELF_ROOT_REPLACEMENT 从 BuildConfig.APPLICATION_ID 派生 ——
@@ -298,4 +305,8 @@ dependencies {
     //   140 依赖 core 1.16.0（minAGP 8.6.0 / minCompileSdk 35，均满足），是能在
     //   当前工具链下直接构建的最高版本。要再往上就得先升 AGP，那是另一件事。
     "geckoImplementation"("org.mozilla.geckoview:geckoview-arm64-v8a:140.0.20250707120347")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("org.yaml:snakeyaml:2.2")
 }
