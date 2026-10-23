@@ -9247,6 +9247,141 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			}
 		}
 
+		// ── v1.3.0 settings: Account (and the shared helpers the Plugins and About sections use) ──────────
+
+		/** Registers a settings section through the same "settings.section" slot as the sections above. */
+		function mpRegisterV13Section(ctx, spec) {
+			if (mpPrivReact === null) {
+				try { mpPrivReact = require("react"); } catch (e) { mpPrivReact = null; }
+			}
+			if (!mpPrivReact) return;
+			try {
+				ctx.inject(["slots", "locale"], (scope) => {
+					const t = scope.locale.bind(spec.ns);
+					scope.effect(() => scope.locale.register(spec.ns, { zh: spec.zh, en: spec.en }), "dsh-android-mobile: " + spec.id);
+					scope.slots.inject("settings.section", () => scope.slots.register({
+						name: "settings.section",
+						id: spec.id,
+						order: spec.order,
+						label: () => t("nav"),
+						locale: spec.ns,
+					}, spec.component));
+				});
+			} catch (e) {
+				console.warn("[dsh-android-mobile] settings section " + spec.id + " failed:", e && (e.stack || e.message || e));
+			}
+		}
+
+		/** Native snapshot for the v1.3.0 sections (DSHAndroid.appState()); null without the app bridge. */
+		function mpReadAppState() {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.appState !== "function") return null;
+			try {
+				const raw = bridge.appState();
+				return typeof raw === "string" ? JSON.parse(raw || "{}") : (raw || {});
+			} catch (e) {
+				return null;
+			}
+		}
+
+		function mpAppAction(name, arg) {
+			const bridge = window.DSHAndroid;
+			if (!bridge || typeof bridge.appAction !== "function") return false;
+			try { bridge.appAction(String(name), arg == null ? "" : String(arg)); return true; } catch (e) { return false; }
+		}
+
+		/**
+		 * React hook: the native snapshot, re-read a beat after each read (the gecko flavor reads a cached snapshot and
+		 * asks for a fresh one), on return from another screen, and every [pollMs] while the section is open.
+		 */
+		function mpUseAppState(React, pollMs) {
+			const [state, setState] = React.useState(() => mpReadAppState());
+			const refresh = React.useCallback(() => {
+				setState(mpReadAppState());
+				setTimeout(() => setState(mpReadAppState()), 300);
+			}, []);
+			React.useEffect(() => {
+				const onVisible = () => { if (!document.hidden) refresh(); };
+				document.addEventListener("visibilitychange", onVisible);
+				window.addEventListener("focus", onVisible);
+				const timer = pollMs ? setInterval(refresh, pollMs) : 0;
+				refresh();
+				return () => {
+					document.removeEventListener("visibilitychange", onVisible);
+					window.removeEventListener("focus", onVisible);
+					if (timer) clearInterval(timer);
+				};
+			}, [refresh]);
+			return [state, refresh];
+		}
+
+		const MP_ACCOUNT_NS = "dsh-android-mobile.account";
+		const MP_ACCOUNT_EN = {
+			nav: "Account",
+			title: "Account",
+			intro: "How DSH talks to DeepSeek on this phone. Switching or signing out restarts the engine.",
+			modeWeb: "DeepSeek web account",
+			modeKey: "DeepSeek API key",
+			modeNone: "Not signed in",
+			signedInAs: "Signed in as",
+			switch: "Switch account",
+			signOut: "Sign out",
+			signIn: "Sign in",
+			confirmSignOut: "Sign out of DeepSeek on this phone? The API key or web session is removed.",
+			webNote: "Web account replies come from chat.deepseek.com through a local bridge on this phone. Tools work through a text protocol; images are not sent.",
+			keyNote: "The key is stored only in DSH's own credentials file (owner-only) and used by the official DeepSeek provider.",
+			noBridge: "Account settings are available in the Android app.",
+		};
+		const MP_ACCOUNT_ZH = {
+			nav: "账号",
+			title: "账号",
+			intro: "DSH 在这台手机上用什么身份连接 DeepSeek。切换或退出会重启引擎。",
+			modeWeb: "DeepSeek 网页账号",
+			modeKey: "DeepSeek API 密钥",
+			modeNone: "未登录",
+			signedInAs: "当前账号",
+			switch: "切换账号",
+			signOut: "退出登录",
+			signIn: "登录",
+			confirmSignOut: "确定在这台手机上退出 DeepSeek？API 密钥或网页会话会被删除。",
+			webNote: "网页账号的回复经本机的本地桥来自 chat.deepseek.com。工具通过文本协议调用；不发送图片。",
+			keyNote: "密钥只保存在 DSH 自己的凭据文件里（仅本人可读），由官方 DeepSeek 供应商使用。",
+			noBridge: "账号设置仅在 Android App 中可用。",
+		};
+
+		function mpAccountSection(props) {
+			const React = mpPrivReact;
+			const S = MP_PRIV_S;
+			const t = typeof props.t === "function" ? props.t : (key) => MP_ACCOUNT_EN[key] ?? key;
+			const [state] = mpUseAppState(React, 4000);
+			const h = React.createElement;
+			if (!state) {
+				return h("div", { style: S.section }, h("h2", { style: S.heading }, t("title")), h("p", { style: S.intro }, t("noBridge")));
+			}
+			const account = state.account || {};
+			const mode = account.mode || "none";
+			const label = mode === "web" ? t("modeWeb") : (mode === "api_key" ? t("modeKey") : t("modeNone"));
+			const tone = mode === "none" ? MP_PRIV_TONE.warn : MP_PRIV_TONE.on;
+			const signOut = () => { if (window.confirm(t("confirmSignOut"))) mpAppAction("accountSignOut"); };
+			return h("div", { style: S.section },
+				h("h2", { style: S.heading }, t("title")),
+				h("p", { style: S.intro }, t("intro")),
+				h("div", { style: S.card, "data-mp-account": mode },
+					h("div", { style: S.cardHead },
+						h("h3", { style: S.cardTitle }, t("signedInAs")),
+						h("span", { style: { ...S.badge, color: tone.color, background: tone.bg } }, label),
+					),
+					mode === "web" && account.label ? h("p", { style: S.summary }, account.label) : null,
+					h("div", { style: S.actions },
+						h("button", { style: S.btnPrimary, onClick: () => mpAppAction("accountSwitch") }, mode === "none" ? t("signIn") : t("switch")),
+						mode !== "none" ? h("button", { style: S.btn, onClick: signOut }, t("signOut")) : null,
+					),
+					mode === "web" ? h("p", { style: S.note }, t("webNote")) : null,
+					mode === "api_key" ? h("p", { style: S.note }, t("keyNote")) : null,
+				),
+			);
+		}
+
 		/** 最近一次组字结束的时间戳（0 = 从未）。见 setupEnterAsNewline。 */
 		let mpLastCompositionEnd = 0;
 
@@ -9717,6 +9852,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			mpRegisterPrivilegedSection(ctx);
 			mpRegisterBubbleSection(ctx);
 			mpRegisterLogsSection(ctx);
+			mpRegisterV13Section(ctx, { id: "dsh-android-account", order: 3, ns: MP_ACCOUNT_NS, zh: MP_ACCOUNT_ZH, en: MP_ACCOUNT_EN, component: mpAccountSection });
 			mpRegisterContactSection(ctx);
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */

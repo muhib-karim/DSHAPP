@@ -29,6 +29,8 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.dsh.android.account.AccountStore
+import com.dsh.android.account.SignInActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
@@ -840,6 +842,11 @@ class MainActivity : AppCompatActivity() {
         ensureStorageAccess()
         setupShizukuPermissionListener()
         bootEngine()
+        // v1.3.0: first screen (Continue with Google / Use API key) over the boot screen; the engine keeps booting
+        // behind it and is restarted with the new account config when the user signs in.
+        if (savedInstanceState == null && AccountStore(this).needsFirstScreen()) {
+            startActivity(Intent(this, SignInActivity::class.java))
+        }
     }
 
     /**
@@ -2087,6 +2094,15 @@ class MainActivity : AppCompatActivity() {
          */
         override fun openLogs() {
             runOnUiThread { openLogViewer("settings") }
+        }
+
+        override fun appState(): String = runCatching { AppState.json(this@MainActivity) }.getOrElse {
+            Log.w(DshApplication.TAG, "appState failed", it)
+            "{}"
+        }
+
+        override fun appAction(name: String, arg: String) {
+            runOnUiThread { AppState.action(this@MainActivity, name, arg) }
         }
 
         /**

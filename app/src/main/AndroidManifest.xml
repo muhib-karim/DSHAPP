@@ -211,6 +211,29 @@
             ⚠️ `excludeFromRecents` 不设：用户从崩溃浮层跳进来看日志时，
             这个界面出现在最近任务里是合理的（他可能想切出去发截图再切回来）。
         -->
+        <!-- v1.3.0: first screen (Continue with Google / Use API key). Not exported. -->
+        <activity
+            android:name=".account.SignInActivity"
+            android:exported="false"
+            android:theme="@style/Theme.DSH.SignIn"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- v1.3.0: DeepSeek web sign-in. Exported only for the mkdsh://session link that the browser bookmark sends
+             as an explicit intent to this package; the token is taken only within 30 minutes of a browser sign-in. -->
+        <activity
+            android:name=".webbridge.DeepSeekLoginActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.DSH.SignIn"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mkdsh" android:host="session" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".LogViewerActivity"
             android:exported="false"

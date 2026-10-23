@@ -705,4 +705,12 @@ private class SystemPageBridge(private val impl: PageBridge) {
      */
     @android.webkit.JavascriptInterface
     fun logSummary(): String = impl.logSummary()
+
+    /** v1.3.0 settings snapshot (JSON). Must stay in this whitelist, see [PageBridge.appState]. */
+    @android.webkit.JavascriptInterface
+    fun appState(): String = impl.appState()
+
+    /** v1.3.0 settings actions, see [PageBridge.appAction]. */
+    @android.webkit.JavascriptInterface
+    fun appAction(name: String, arg: String) = impl.appAction(name, arg)
 }

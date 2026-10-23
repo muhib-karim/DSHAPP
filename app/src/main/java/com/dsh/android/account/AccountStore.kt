@@ -38,6 +38,14 @@ class AccountStore(context: Context) {
 
     fun saveWebToken(token: String) { prefs.edit().putString(KEY_WEB_TOKEN, encrypt(token)).apply() }
 
+    /** Drops the web session only (switching to an API key). */
+    fun signOutWeb() { prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).apply() }
+
+    /** When the browser route was started (the `mkdsh://session` link is accepted for 30 minutes after it). */
+    var browserSignInStartedAt: Long?
+        get() = prefs.getLong(KEY_BROWSER_STARTED, 0L).takeIf { it > 0 }
+        set(value) { prefs.edit().putLong(KEY_BROWSER_STARTED, value ?: 0L).apply() }
+
     /** Forget the account: back to the first screen on the next launch. */
     fun signOut() {
         prefs.edit().remove(KEY_WEB_TOKEN).remove(KEY_WEB_LABEL).remove(KEY_LATER)
@@ -91,6 +99,7 @@ class AccountStore(context: Context) {
         const val KEY_WEB_TOKEN = "web_token"
         const val KEY_WEB_LABEL = "web_label"
         const val KEY_BRIDGE_SECRET = "bridge_secret"
+        const val KEY_BROWSER_STARTED = "browser_started"
         const val KEY_ALIAS = "dsh_account_v1"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
     }
