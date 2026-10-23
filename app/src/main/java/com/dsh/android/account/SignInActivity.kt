@@ -104,13 +104,16 @@ class SignInActivity : AppCompatActivity() {
     /** Remembers the mode; the engine is restarted so dsh reads the new provider and default model. */
     private fun done(mode: AccountConfig.Mode) {
         val previous = store.mode
-        if (previous == AccountConfig.Mode.API_KEY && mode == AccountConfig.Mode.WEB) {
-            runCatching { DshCredentials.write(EngineManager.get(this).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to null)) }
-        }
         if (mode == AccountConfig.Mode.API_KEY) store.signOutWeb()
         store.mode = mode
         DshLog.i("DSH", "signed in: mode=$mode (was $previous)")
-        restartEngine(this)
+        val app = applicationContext
+        thread(name = "sign-in-apply") {
+            if (previous == AccountConfig.Mode.API_KEY && mode == AccountConfig.Mode.WEB) {
+                runCatching { DshCredentials.write(EngineManager.get(app).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to null)) }
+            }
+            restartEngine(app)
+        }
         setResult(RESULT_OK)
         finish()
     }
@@ -119,14 +122,9 @@ class SignInActivity : AppCompatActivity() {
         const val EXTRA_SWITCH = "switch"
         private const val STATE_KEY_PANEL = "keyPanel"
 
-        /** Restarts a running or starting engine so it picks up the account config; a failed engine is left alone. */
+        /** Has the engine pick up the new account config (now if Ready, after the boot in progress otherwise). */
         fun restartEngine(context: android.content.Context) {
-            val engine = EngineManager.get(context)
-            when (engine.state.value) {
-                is EngineManager.State.Ready, EngineManager.State.Starting, is EngineManager.State.Extracting ->
-                    engine.requestRestart("account changed")
-                else -> Unit
-            }
+            EngineManager.get(context).restartForConfigChange("account changed")
         }
     }
 }

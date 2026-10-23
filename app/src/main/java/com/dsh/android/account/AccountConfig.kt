@@ -9,8 +9,8 @@ package com.dsh.android.account
  * - None / later: no bridge route. Without upstream's key pool the app-seeded `agnes` default has no key, so it is
  *   replaced by `deepseek-official` and dsh asks for a key in Settings > Models instead of failing every turn.
  *
- * The default model is changed only while it still names a provider the app set ([APP_PROVIDERS]); a model the user
- * picked in Settings is never overwritten.
+ * The default model's provider is switched only while it names a provider the app set ([APP_PROVIDERS]) other than
+ * the mode's own; a model the user picked (another provider, or another model of the same provider) is never overwritten.
  */
 object AccountConfig {
     enum class Mode { NONE, API_KEY, WEB }
@@ -32,11 +32,8 @@ object AccountConfig {
         } else {
             out = ProfilePatch.removePiAiRoute(out, WEB_ROUTE)
             val current = ProfilePatch.defaultModelProvider(out)
-            val pointsAtApp = current == null || current in APP_PROVIDERS
             val keepKeyPool = effective == Mode.NONE && hasKeyPool && current == KEY_POOL_PROVIDER
-            if (pointsAtApp && !keepKeyPool && (effective == Mode.API_KEY || current != OFFICIAL_PROVIDER)) {
-                out = ProfilePatch.setDefaultModel(out, OFFICIAL_PROVIDER, OFFICIAL_MODEL, APP_PROVIDERS)
-            }
+            if (!keepKeyPool) out = ProfilePatch.setDefaultModel(out, OFFICIAL_PROVIDER, OFFICIAL_MODEL, APP_PROVIDERS)
         }
         return out
     }

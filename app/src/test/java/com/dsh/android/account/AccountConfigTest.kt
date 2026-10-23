@@ -70,6 +70,20 @@ class AccountConfigTest {
         }
     }
 
+    @Test fun anotherModelOfTheSameProviderIsKept() {
+        val api = AccountConfig.render(seeded, AccountConfig.Mode.API_KEY, null, false).replace("model: deepseek-flash", "model: deepseek-v4-pro")
+        assertEquals("deepseek-v4-pro", defaultModel(AccountConfig.render(api, AccountConfig.Mode.API_KEY, null, false))["model"])
+        assertEquals("deepseek-v4-pro", defaultModel(AccountConfig.render(api, AccountConfig.Mode.NONE, null, false))["model"])
+        val web = AccountConfig.render(seeded, AccountConfig.Mode.WEB, 41234, false).replace("model: deepseek-web-chat", "model: deepseek-web-reasoner")
+        assertEquals("deepseek-web-reasoner", defaultModel(AccountConfig.render(web, AccountConfig.Mode.WEB, 50000, false))["model"])
+    }
+
+    @Test fun switchingProviderKeepsTheRowsOtherKeys() {
+        val withExtra = seeded.replace("    model: agnes-3.0-flash\n", "    model: agnes-3.0-flash\n    reasoningEffort: high\n")
+        val out = AccountConfig.render(withExtra, AccountConfig.Mode.API_KEY, null, false)
+        assertEquals(mapOf("provider" to "deepseek-official", "model" to "deepseek-flash", "reasoningEffort" to "high"), defaultModel(out))
+    }
+
     @Test fun idempotent() {
         val once = AccountConfig.render(seeded, AccountConfig.Mode.WEB, 41234, false)
         assertEquals(once, AccountConfig.render(once, AccountConfig.Mode.WEB, 41234, false))

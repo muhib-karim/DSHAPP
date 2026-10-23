@@ -20,23 +20,28 @@ object ProfilePatch {
     }
 
     /**
-     * Points the default model at [provider]/[model]. When [replaceOnly] is given, an existing row is replaced only if
-     * its provider is in that set (the app's own seed), so a model the user picked in Settings stays.
+     * Points the default model at [provider]/[model]. An existing row is left alone when it already names [provider]
+     * (whatever model the user picked there) or, with [replaceOnly], when its provider is not one of those (a provider
+     * the user set up). Otherwise only its `provider` and `model` values change; other keys in the row stay.
      */
     fun setDefaultModel(body: String, provider: String, model: String, replaceOnly: Set<String>?): String {
         val lines = body.lines().toMutableList()
-        val block = entryBlock(lines, DEFAULT_MODEL_ID)
-        if (block != null) {
-            val current = defaultModelProvider(body)
-            if (replaceOnly != null && current !in replaceOnly) return body
-            val indent = indentOf(lines[block.first])
-            val replacement = defaultModelEntry(indent, provider, model)
-            if (lines.subList(block.first, block.last + 1) == replacement) return body
-            repeat(block.last - block.first + 1) { lines.removeAt(block.first) }
-            lines.addAll(block.first, replacement)
+        val block = entryBlock(lines, DEFAULT_MODEL_ID) ?: return append(lines, defaultModelEntry(0, provider, model))
+        val current = defaultModelProvider(body)
+        if (current == provider) return body
+        if (replaceOnly != null && current !in replaceOnly) return body
+        val providerLine = (block.first..block.last).firstOrNull { lines[it].trim().startsWith("provider:") }
+        val modelLine = (block.first..block.last).firstOrNull { lines[it].trim().startsWith("model:") }
+        if (providerLine != null && modelLine != null && indentOf(lines[providerLine]) == indentOf(lines[modelLine])) {
+            val pad = pad(indentOf(lines[providerLine]))
+            lines[providerLine] = "${pad}provider: $provider"
+            lines[modelLine] = "${pad}model: $model"
             return finish(lines)
         }
-        return append(lines, defaultModelEntry(0, provider, model))
+        val replacement = defaultModelEntry(indentOf(lines[block.first]), provider, model)
+        repeat(block.last - block.first + 1) { lines.removeAt(block.first) }
+        lines.addAll(block.first, replacement)
+        return finish(lines)
     }
 
     /** Adds or replaces `llm-pi-ai` → `config.providers.<route>` with [routeYaml] (a mapping written at indent 0). */
