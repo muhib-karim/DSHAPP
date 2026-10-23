@@ -182,6 +182,29 @@ interface PageBridge {
     fun openAiBrowser()
 
     /**
+     * 把 AI 浏览器摆到官方右侧边栏面板的内容区上。
+     *
+     * `json` 是前端量出来的矩形：
+     * `{"x":0,"y":120,"w":411,"h":700,"vw":411,"vh":880}`
+     * —— `x/y/w/h` 是 `getBoundingClientRect()` 的 **CSS 视口坐标/尺寸**，
+     * `vw/vh` 是 `window.innerWidth/innerHeight`（用来算 CSS→物理的缩放比）。
+     *
+     * ⚠️ 换算必须在原生侧做：页面里拿不到自己在屏幕上的位置（`window.screenX`
+     *   在 WebView 里恒为 0），只有原生能 `getLocationOnScreen()`。
+     *
+     * ⚠️ 这个方法会被高频调用（ResizeObserver），原生侧必须做「矩形没变就
+     *   直接返回」的短路，否则每次都会触发一轮 layout。
+     */
+    fun aiBrowserLayout(json: String)
+
+    /**
+     * 面板卸载 / tab 关掉时调用：把 AI 浏览器收起来。
+     *
+     * 只隐藏，**不销毁** —— 页面状态与登录态留在内存里，下次开 tab 还是原样。
+     */
+    fun aiBrowserDetach()
+
+    /**
      * 读「键盘避让」状态。返回 JSON：`{"enabled":bool,"a11y":bool}`。
      *
      * 两个字段是**两件独立的事实**，不要合并：

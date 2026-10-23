@@ -771,6 +771,57 @@ class AiBrowserView(context: Context) : FrameLayout(context) {
         }
     }
 
+    // ── 嵌入定位 ────────────────────────────────────────────────────────
+    //
+    // 官方右侧边栏的「AI 浏览器」是一个**网页面板**，而原生 WebView 不能
+    // 放进 DOM 里（iframe 会被 X-Frame-Options / CSP 拒绝，那正是本方案存在的
+    // 原因）。所以做法是：前端把面板内容区的矩形（CSS 视口坐标）上报给原生，
+    // 原生把本 View 摆到屏幕上那块区域 —— 视觉上就嵌在 tab 下面。
+    //
+    // 代价：矩形变了要**持续上报**（侧栏宽度、键盘、旋转都会变），由前端的
+    // ResizeObserver 负责。
+
+    /**
+     * 摆到指定矩形（相对**宿主根布局**的像素）。
+     *
+     * @param left 左边缘（px，相对根布局）
+     * @param top 上边缘（px，相对根布局）
+     * @param width 宽度（px）
+     * @param height 高度（px）
+     */
+    fun applyEmbedRect(left: Int, top: Int, width: Int, height: Int) {
+        val lp = layoutParams as? FrameLayout.LayoutParams
+            ?: FrameLayout.LayoutParams(width, height)
+        val w = width.coerceAtLeast(1)
+        val h = height.coerceAtLeast(1)
+        if (lp.width == w && lp.height == h &&
+            lp.leftMargin == left && lp.topMargin == top
+        ) {
+            return   // 没变就别重建布局（ResizeObserver 会高频打过来）
+        }
+        lp.width = w
+        lp.height = h
+        lp.leftMargin = left
+        lp.topMargin = top
+        lp.gravity = Gravity.TOP or Gravity.START
+        layoutParams = lp
+        requestLayout()
+    }
+
+    /** 退回全屏铺满（面板关掉、或宿主想全屏展示时）。 */
+    fun clearEmbedRect() {
+        val lp = layoutParams as? FrameLayout.LayoutParams ?: return
+        if (lp.width == LayoutParams.MATCH_PARENT && lp.leftMargin == 0 && lp.topMargin == 0) {
+            return
+        }
+        lp.width = LayoutParams.MATCH_PARENT
+        lp.height = LayoutParams.MATCH_PARENT
+        lp.leftMargin = 0
+        lp.topMargin = 0
+        layoutParams = lp
+        requestLayout()
+    }
+
     /** 释放：必须在宿主销毁时调用，否则 WebView 泄漏。 */
     fun destroy() {
         for (tab in tabs.toList()) releaseTab(tab)

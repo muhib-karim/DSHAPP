@@ -677,6 +677,9 @@ class GeckoWebHost(
                     // AI 浏览器（官方右侧边栏的「AI 浏览器」面板）。
                     // ⚠️ 与 system 版逐条对齐：漏了就「点了没反应」。
                     "openAiBrowser" -> b.openAiBrowser()
+                    // AI 浏览器嵌入定位：前端量出面板矩形后高频上报（ResizeObserver）。
+                    "aiBrowserLayout" -> b.aiBrowserLayout(args.optString(0, ""))
+                    "aiBrowserDetach" -> b.aiBrowserDetach()
                     // 甩动手感三开关（见「悬浮气泡」设置页）。
                     "bubbleSetThrow" -> b.bubbleSetThrow(args.optBoolean(0))
                     "bubbleSetShake" -> b.bubbleSetShake(args.optBoolean(0))

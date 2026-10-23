@@ -1269,11 +1269,14 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 挂在**根布局**上，不是 `webContainer`：启动层（overlay）是
         //    webContainer 的兄弟节点且盖在它上面，挂进 webContainer 的视图
         //    会被启动层挡住。根布局的最上层子视图永远在最前。
+        // ⚠️ 显式用 FrameLayout.LayoutParams：后面 `applyEmbedRect` 要改
+        //   leftMargin/topMargin 把它摆到侧栏面板上，父容器是 FrameLayout，
+        //   margin 才会被尊重。
         binding.root.addView(
             v,
-            ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
             ),
         )
         // ✕ 只是隐藏，页面状态与登录态都留在内存里。
@@ -1962,6 +1965,76 @@ class MainActivity : AppCompatActivity() {
             // ⚠️ 必须显式写 this@MainActivity：本类是 inner class，直接调
             //   `openAiBrowser()` 会解析成自己 ⇒ 无限递归（StackOverflow）。
             runOnUiThread { this@MainActivity.openAiBrowser() }
+        }
+
+        /**
+         * 面板矩形上报 —— 把 AI 浏览器摆到右侧栏面板的内容区上。
+         *
+         * ## 为什么要换算
+         *
+         * 前端给的是 `getBoundingClientRect()`：**CSS 视口坐标**。要落到屏幕上
+         * 还得两样页面拿不到的东西：WebView 在屏幕上的位置、以及 CSS→物理的
+         * 缩放比（`window.screenX` 在 WebView 里恒为 0）。
+         *
+         * ```
+         * scale   = webView宽度(物理px) / 视口宽度(CSS px)
+         * 屏幕X    = webView屏幕X + cssX * scale
+         * 根布局X  = 屏幕X - 根布局屏幕X
+         * ```
+         *
+         * ⚠️ 每帧都可能来一次（ResizeObserver）。所以：解析失败静默返回、
+         *   矩形没变由 `applyEmbedRect` 短路 —— 不能在这里打日志刷屏。
+         */
+        override fun aiBrowserLayout(json: String) {
+            val rect = runCatching { org.json.JSONObject(json) }.getOrNull() ?: return
+            val x = rect.optDouble("x", Double.NaN)
+            val y = rect.optDouble("y", Double.NaN)
+            val w = rect.optDouble("w", 0.0)
+            val h = rect.optDouble("h", 0.0)
+            val vw = rect.optDouble("vw", 0.0)
+            // 布局还没稳定（面板高度 0 / 视口宽度未知）时不上报：这时候摆过去
+            // 只会得到一条 1px 的缝，等下一次 ResizeObserver 更靠谱。
+            if (x.isNaN() || y.isNaN() || w < 8 || h < 8 || vw < 8) return
+            if (!::web.isInitialized) return
+            val webView = web.view
+            if (webView.width <= 0 || webView.height <= 0) return
+
+            val scale = webView.width / vw
+            val webLoc = IntArray(2)
+            webView.getLocationOnScreen(webLoc)
+            val rootLoc = IntArray(2)
+            binding.root.getLocationOnScreen(rootLoc)
+
+            val left = (webLoc[0] + x * scale).toInt() - rootLoc[0]
+            val top = (webLoc[1] + y * scale).toInt() - rootLoc[1]
+            val widthPx = (w * scale).toInt()
+            val heightPx = (h * scale).toInt()
+
+            runOnUiThread {
+                val view = ensureAiBrowser() ?: return@runOnUiThread
+                view.applyEmbedRect(left, top, widthPx, heightPx)
+                if (view.visibility != View.VISIBLE) {
+                    view.visibility = View.VISIBLE
+                    view.bringToFront()
+                    Log.i(
+                        DshApplication.TAG,
+                        "AI 浏览器嵌入右侧栏面板: ${widthPx}x${heightPx} @ ($left,$top) scale=$scale",
+                    )
+                }
+            }
+        }
+
+        override fun aiBrowserDetach() {
+            // 只隐藏，不销毁：页面状态与登录态保留，下次开 tab 还是原样。
+            runOnUiThread {
+                aiBrowser?.let {
+                    it.visibility = View.GONE
+                    // ⚠️ 必须清掉嵌入矩形：否则面板关掉后 AI 再调工具打开时，
+                    //   浏览器会出现在上一次那块（已经不存在的）面板位置。
+                    it.clearEmbedRect()
+                }
+                Log.i(DshApplication.TAG, "AI 浏览器已随面板收起")
+            }
         }
 
         override fun bubbleRequestOverlay() {

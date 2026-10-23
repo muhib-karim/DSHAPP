@@ -61,70 +61,139 @@ window.__ModuleLoader__.load({
 		/**
 		 * 右侧栏「AI 浏览器」面板的正文。
 		 *
-		 * ## 为什么挂载就自动打开
+		 * ## 它其实是个「占位 + 覆盖」
 		 *
-		 * 用户从侧栏点「AI 浏览器」，期望的是**浏览器出来**，而不是先看到一块面板、
-		 * 还得再点一次按钮。原生浏览器是全屏覆盖层，一打开就把右侧栏盖住，
-		 * 所以这块面板实际只在「关掉浏览器又切回侧栏」时才被看见 —— 那时它是
-		 * 一张说明卡 + 一个复开入口，正是有用的东西。
+		 * 原生 WebView **不能**放进网页 DOM 里（iframe 会被 `X-Frame-Options`
+		 * / CSP 拒绝 —— 那正是这套方案存在的原因）。所以这里渲染一块铺满面板的
+		 * 空 div，把它 `getBoundingClientRect()` 量出来上报给原生，原生再把
+		 * WebView 摆到屏幕上同一块矩形上。
 		 *
-		 * ⚠️ `autoOpened` 这个 ref 守卫不能省：React 的 StrictMode 会把 effect
-		 *    跑两遍，没有它就是连开两次（第一次的 WebView 还没建完又建一个）。
+		 * 视觉结果就是：浏览器的内容正好嵌在「AI 浏览器」这个 tab 下面，
+		 * 上面是官方的 tab 头，下面是浏览器自己的工具栏和页面。
+		 *
+		 * ## 为什么要 ResizeObserver 而不是量一次
+		 *
+		 * 面板宽度会变（侧栏拖宽、旋转屏幕）、高度会变（键盘弹出、窗口调整）、
+		 * 位置也会变（抽屉动画）。只量一次就会错位。
+		 * 上报按 `requestAnimationFrame` 节流 —— ResizeObserver 在动画期间可能
+		 * 一帧来好几次，直接转发会把原生的 layout 打爆。
 		 *
 		 * @returns {object} React 元素。
 		 */
 		function BrowserPane() {
 			const React = require("react");
 			const e = React.createElement;
-			// 三态而不是布尔：初始那一帧是 "idle"，**不能**先画成失败 ——
-			// 打开成功时用户会看到橙色警告闪一下再消失，像出了错。
+			const slotRef = React.useRef(null);
+			// idle = 还没量到有效矩形；live = 已上报并显示；noBridge = 旧版 APK
 			const [phase, setPhase] = React.useState("idle");
-			const autoOpened = React.useRef(false);
 
 			React.useEffect(() => {
-				if (autoOpened.current) return;
-				autoOpened.current = true;
-				setPhase(openNativeAiBrowser() ? "opened" : "failed");
+				const bridge = window.DSHAndroid;
+				if (!bridge || typeof bridge.aiBrowserLayout !== "function") {
+					setPhase("noBridge");
+					return undefined;
+				}
+
+				let raf = 0;
+				let lastPayload = "";
+				let reported = false;
+
+				const measure = () => {
+					raf = 0;
+					const node = slotRef.current;
+					if (!node) return;
+					let rect = node.getBoundingClientRect();
+					// 占位 div 在某些面板里高度会塌成 0（父级是 auto 高度）。
+					// 那就退一步量父元素 —— 面板本身的矩形才是我们真正要的区域。
+					if (rect.height < 8 && node.parentElement) {
+						rect = node.parentElement.getBoundingClientRect();
+					}
+					if (rect.width < 8 || rect.height < 8) return;
+					const payload = JSON.stringify({
+						x: Math.round(rect.left),
+						y: Math.round(rect.top),
+						w: Math.round(rect.width),
+						h: Math.round(rect.height),
+						vw: Math.round(window.innerWidth),
+						vh: Math.round(window.innerHeight),
+					});
+					if (payload === lastPayload) return;
+					lastPayload = payload;
+					try {
+						bridge.aiBrowserLayout(payload);
+						if (!reported) {
+							reported = true;
+							setPhase("live");
+						}
+					} catch (error) {
+						console.warn("[dsh-android-browser-pane] 上报面板矩形失败:", error && error.message);
+					}
+				};
+
+				const schedule = () => {
+					if (raf) return;
+					raf = window.requestAnimationFrame(measure);
+				};
+
+				let observer = null;
+				try {
+					observer = new ResizeObserver(schedule);
+					if (slotRef.current) observer.observe(slotRef.current);
+				} catch (error) {
+					// 老内核没有 ResizeObserver：退回轮询（下面那三个定时器）也够用
+					console.warn("[dsh-android-browser-pane] 无 ResizeObserver，退回定时测量");
+				}
+				window.addEventListener("resize", schedule);
+				window.addEventListener("orientationchange", schedule);
+
+				// 面板打开的动画 / 抽屉滑动不触发 resize，补几拍。
+				schedule();
+				const timers = [80, 200, 420, 900].map((ms) => window.setTimeout(schedule, ms));
+
+				return () => {
+					for (const t of timers) window.clearTimeout(t);
+					if (raf) window.cancelAnimationFrame(raf);
+					if (observer) observer.disconnect();
+					window.removeEventListener("resize", schedule);
+					window.removeEventListener("orientationchange", schedule);
+					// tab 切走 / 面板卸载：把浏览器收起来（只隐藏，状态保留）。
+					try {
+						if (typeof bridge.aiBrowserDetach === "function") bridge.aiBrowserDetach();
+					} catch (error) {
+						/* 面板已经在拆，什么都做不了；不刷日志 */
+					}
+				};
 			}, []);
 
+			const note = { fontSize: "12px", lineHeight: 1.65, opacity: 0.72 };
 			const card = {
 				padding: "14px",
 				borderRadius: "12px",
 				background: "rgba(127,127,147,.10)",
 				border: "1px solid rgba(127,127,147,.22)",
-				display: "flex",
-				flexDirection: "column",
-				gap: "10px",
-			};
-			const head = { fontSize: "13.5px", fontWeight: 600, lineHeight: 1.4 };
-			const note = { fontSize: "12px", lineHeight: 1.65, opacity: 0.72 };
-			const button = {
-				alignSelf: "flex-start",
-				padding: "8px 16px",
-				borderRadius: "999px",
-				border: "1px solid rgba(127,127,147,.34)",
-				background: "rgba(127,127,147,.16)",
-				color: "inherit",
-				font: "inherit",
-				fontSize: "12.5px",
-				fontWeight: 600,
-				cursor: "pointer",
 			};
 
-			return e("div", { style: { padding: "10px" } },
-				e("div", { style: card },
-					e("div", { style: head }, "AI 浏览器"),
-					e("div", { style: note },
-						"这台浏览器跑在你自己的手机上，登录状态会保留。AI 可以直接用它上网、登录、填表单；你也可以随时从顶部状态按钮接管。"),
-					e("button", {
-						type: "button",
-						style: button,
-						onClick: () => setPhase(openNativeAiBrowser() ? "opened" : "failed"),
-					}, phase === "opened" ? "再打开一次" : "打开浏览器"),
-					phase === "failed"
+			return e("div", {
+				style: {
+					position: "relative",
+					width: "100%",
+					height: "100%",
+					// 面板高度是 auto 时给个下限，保证第一次量得到一块可用区域
+					minHeight: "320px",
+					boxSizing: "border-box",
+				},
+			},
+				// 这块就是浏览器要盖住的区域。背景留空 —— 原生 WebView 会盖上来。
+				e("div", {
+					ref: slotRef,
+					style: { position: "absolute", left: 0, top: 0, right: 0, bottom: 0 },
+				}),
+				phase === "live" ? null : e("div", { style: Object.assign({}, card, { position: "absolute", left: 0, top: 0, right: 0 }) },
+					e("div", { style: { fontSize: "13.5px", fontWeight: 600, marginBottom: "6px" } }, "AI 浏览器"),
+					phase === "noBridge"
 						? e("div", { style: Object.assign({}, note, { color: "#E0A33A" }) },
-							"没能打开：这个版本的原生桥还没接上 openAiBrowser。")
-						: null,
+							"这个 APK 的原生桥还没有 aiBrowserLayout —— 面板没法把浏览器嵌进来。")
+						: e("div", { style: note }, "正在把浏览器放到这里…"),
 				),
 			);
 		}
