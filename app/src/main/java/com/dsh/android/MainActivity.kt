@@ -1294,74 +1294,9 @@ class MainActivity : AppCompatActivity() {
         val view = ensureAiBrowser() ?: return
         view.visibility = View.VISIBLE
         view.bringToFront()
-        hideBrowserHandle()
         if (url != null) view.loadUrl(url)
         else if (view.currentUrl().isEmpty()) view.loadUrl(com.dsh.android.browser.AiBrowserView.HOME_URL)
         Log.i(DshApplication.TAG, "AI 浏览器已打开: ${view.currentUrl()}")
-    }
-
-    // ── 常驻入口：右侧贴边把手 ──────────────────────────────────────
-    //
-    // 浏览器是整个 App 最上面的一层，一旦打开就盖住官方界面；但**打开它的
-    // 入口**不能只在启动层上 —— 启动层收起后就再也点不到了。
-    //
-    // 所以贴一个把手在右边缘（垂直居中）：它属于原生层，不碰官方前端的任何
-    // DOM，坏了最多是「入口看不见」，绝不会把界面搞白。
-
-    /** 右侧贴边把手。懒创建，启动层收起后才显示。 */
-    private var browserHandle: View? = null
-
-    /**
-     * 创建（或取出）右手边的浏览器把手。
-     *
-     * ⚠️ 必须 addView 到**根布局**且排在浏览器之前 —— 浏览器 `bringToFront()`
-     *   之后要盖住它。
-     */
-    private fun ensureBrowserHandle(): View {
-        browserHandle?.let { return it }
-        val d = resources.displayMetrics.density
-        fun px(v: Int) = (v * d).toInt()
-
-        val handle = TextView(this).apply {
-            text = "浏览"
-            setTextColor(0xFFDCE6F5.toInt())
-            textSize = 10f
-            gravity = android.view.Gravity.CENTER
-            setPadding(0, px(8), 0, px(8))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(0xCC2B3444.toInt())
-                // 只圆左边两个角，右边贴着屏幕边缘
-                cornerRadii = floatArrayOf(
-                    px(9).toFloat(), px(9).toFloat(),
-                    0f, 0f,
-                    0f, 0f,
-                    px(9).toFloat(), px(9).toFloat(),
-                )
-            }
-            isClickable = true
-            isFocusable = true
-            visibility = View.GONE
-            contentDescription = "打开 AI 浏览器"
-            setOnClickListener { openAiBrowser() }
-        }
-        binding.root.addView(
-            handle,
-            android.widget.FrameLayout.LayoutParams(px(24), px(56)).apply {
-                gravity = android.view.Gravity.END or android.view.Gravity.CENTER_VERTICAL
-            },
-        )
-        browserHandle = handle
-        return handle
-    }
-
-    /** 显示把手（启动层收起后调用）。 */
-    private fun showBrowserHandle() {
-        ensureBrowserHandle().visibility = View.VISIBLE
-    }
-
-    /** 隐藏把手（浏览器打开时）。 */
-    private fun hideBrowserHandle() {
-        browserHandle?.visibility = View.GONE
     }
 
     /** 当前 workspace 目录（截图等落盘用）。 */
@@ -1371,8 +1306,6 @@ class MainActivity : AppCompatActivity() {
     /** 关闭 AI 浏览器（只隐藏，保留页面状态与登录态，下次打开还是原样）。 */
     fun closeAiBrowser() {
         aiBrowser?.visibility = View.GONE
-        // 收起浏览器时把入口还回来 —— 否则用户关掉之后再没有路进去。
-        if (overlayDismissed) showBrowserHandle()
         Log.i(DshApplication.TAG, "AI 浏览器已隐藏")
     }
 
@@ -3613,10 +3546,6 @@ class MainActivity : AppCompatActivity() {
             .withEndAction {
                 binding.overlay.visibility = View.GONE
                 binding.overlay.alpha = 1f
-                // 启动层彻底收起后才露出手把 —— 它 addView 在根布局的最上层，
-                // 提前显示会盖在启动页上（启动页正中间是头像，右上角才是按钮）。
-                // 浏览器此刻若已打开（AI 先动手了），把手不该出现。
-                if (!isAiBrowserVisible()) showBrowserHandle()
             }
             .start()
     }
@@ -3912,7 +3841,6 @@ class MainActivity : AppCompatActivity() {
             it.destroy()
         }
         aiBrowser = null
-        browserHandle = null
         // ⚠️ **正常退出标记**：这是区分「崩溃」与「被系统杀掉」的唯一依据。
         //
         // 本 App 的 `targetSdk = 28`，用不了 API 30 的 `ApplicationExitInfo`

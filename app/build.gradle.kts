@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 32
+        versionCode = 33
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -248,7 +248,12 @@ android {
         //        移动端修复整个回退掉。独立成包互不干扰。
         //     ④ 右边缘把手**暂时保留**：侧栏入口尚无真机验证，留一条退路；
         //        确认侧栏可用后可以删（见 `ensureBrowserHandle` 的注释）。
-        versionName = "0.4.1"
+        // ⚠️ 33 —— **调试版，不是发行版**。versionName 显式带 `-debug`，
+        //   避免再被当成正式发布：0.4.0/0.4.1 那两个包曾被误传到夸克「当前最新版」，
+        //   已全部撤回（见 git 记录）。今后调试包不改前两位版本号、不进夸克。
+        //   本次改动：删掉 0.4.0 的右边缘「浏览」把手（它挡住了右侧栏内容），
+        //   入口只剩官方右侧边栏那一项。
+        versionName = "0.4.1-debug"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
