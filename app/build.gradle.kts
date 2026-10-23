@@ -32,7 +32,7 @@ android {
         // 全部包（node / bash / dpkg / python）都装在 filesDir 下的 $PREFIX 里，
         // 一升到 29 就会全线 Permission denied。Termux 官方 App 同样停在 28。
         targetSdk = 28
-        versionCode = 29
+        versionCode = 30
         // 后缀语义：`credperm` = 凭据文件权限修复（0.2.9 首发）；
         // `tooliso` = 工具插件注册失败的隔离（可选工具注册失败不再拖垮引擎启动）；
         // `rescue` = 坏插件不再让 App 打不开（四级降级阶梯 + AI 自助修复通道）。
@@ -176,7 +176,29 @@ android {
         //         `build-webview-compat.ps1 -CompatVersion` 33 → 34。
         //         两个都是**字符串相等**判据，不 bump 会命中「戳一致 ⇒ 整棵树跳过」，
         //         设备上静默跑回旧 UI（本项目已踩过 20 次以上）。
-        versionName = "0.3.3"
+        //
+        // ⚠️ 30（本次）**换 versionName：0.3.3 → 0.3.4**。
+        //   0.3.4 的主题是**用户数据可自救**：引擎挂掉时也能把会话/配置/工作区
+        //   导出来，然后卸载重装再导回去 —— 在此之前唯一的出路是卸载，而卸载
+        //   会清空整个私有目录，用户因此宁可忍着也不用重装。
+        //     ① 启动层加「导出数据」「导入数据」两个按钮，**任何状态都显示**
+        //        （与「查看日志」同一套兜底理由，但更要紧：设置页在 Web GUI 里，
+        //        而 Web GUI 恰恰可能就是打不开的那一环）。
+        //        纯 Kotlin 实现，不依赖引擎 —— 引擎完全起不来时也能用。
+        //     ② 导出范围只含**用户独有、重建不出来**的部分（sessions / profiles /
+        //        storages / skills / deskpet / workspace / .credentials.yaml），
+        //        不含 engine/ 与 usr/（300+ MB，能从 APK 重新解包），
+        //        于是包体积从 300+ MB 降到几 MB。
+        //     ③ 导入先 `inspect()` 解析包内实际内容再让用户勾选，不假定七项都在；
+        //        落地前把现有数据改名备份（`backup-before-import-<时间戳>/`），
+        //        与安全模式同一套「改名不删」语义。
+        //     ④ **跨 flavor 互通**：两个包名不同（com.dsh.android / com.dsh.webview），
+        //        备份包内部用相对路径所以天然通用，但用户层配置里的
+        //        `file:///data/user/0/<包名>/...` 绝对路径要在导入时改写，
+        //        否则插件指向另一个 App 的私有目录、必然加载失败。
+        //     ⑤ 修初版一个真机 bug：导入的文件选择用了 `AlertDialog.setItems()`，
+        //        深色主题下白底白字、整行看不见，用户以为点不动。改成自绘卡片。
+        versionName = "0.3.4"
 
         // 只支持 arm64-v8a：内置的引擎资产与 Termux bootstrap 都是 arm64 架构
         ndk {
