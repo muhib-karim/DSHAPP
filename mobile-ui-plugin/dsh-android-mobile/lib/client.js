@@ -1276,6 +1276,240 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 
+		// ── v1.3.0: clean, opaque surfaces (owner: "no glass anywhere", "remove the animated wallpaper") ──
+		//
+		// The glass in the field came from two places: upstream's own menu material (backdrop blur over a
+		// translucent fill, `data-menu-material="translucent"`), and user theme plugins that recolour the
+		// --dsw-* tokens with alpha and put a wallpaper (fixed canvas/video/background-image) behind the UI.
+		// Three layers, all mobile-only like the rest of this plugin:
+		//   1. CLEAN_CSS: backdrop-filter off everywhere, no background images on html/body/#root or their
+		//      pseudo-elements, flat trigger menus ("+" and "/"), opaque header. Selectors start with
+		//      html[data-mobile] and use !important, so they outrank a theme's `html, body {... !important}`.
+		//   2. mpOpaqueGuard: reads every surface token as the browser resolves it and, if it has alpha,
+		//      writes the colour flattened over the page base inline on <body> (any theme, light or dark).
+		//   3. mpWallpaperGuard: hides fixed full-screen decorative layers that a theme appends.
+		// Keep this CSS free of backticks (template string) and of any blur.
+		const CLEAN_CSS = `
+html[data-mobile] *, html[data-mobile] *::before, html[data-mobile] *::after {
+	backdrop-filter: none !important;
+	-webkit-backdrop-filter: none !important;
+}
+html[data-mobile] body {
+	--dsw-menu-backdrop-filter: none !important;
+	--dsw-mask-blur: none !important;
+}
+html[data-mobile], html[data-mobile] body {
+	background-image: none !important;
+	background-color: var(--mp-solid-base, var(--dsw-alias-bg-base)) !important;
+}
+html[data-mobile] body::before, html[data-mobile] body::after,
+html[data-mobile] #root::before, html[data-mobile] #root::after {
+	background-image: none !important;
+	animation: none !important;
+}
+html[data-mobile] .wSkVaW_header {
+	background-color: var(--mp-solid-base, var(--dsw-alias-bg-base)) !important;
+	background-image: none !important;
+}
+html[data-mobile] [data-menu-material] > [aria-hidden="true"] {
+	background: var(--dsw-specific-menu) !important;
+	opacity: 1 !important;
+}
+html[data-mobile] [data-trigger-menu] {
+	background: var(--dsw-specific-menu) !important;
+	background-image: none !important;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, .16) !important;
+}
+html[data-mobile] [data-trigger-menu] [role="option"],
+html[data-mobile] [data-trigger-menu] [role="presentation"] {
+	background: transparent !important;
+	background-image: none !important;
+	box-shadow: none !important;
+	text-shadow: none !important;
+	border-color: transparent !important;
+}
+html[data-mobile] [data-trigger-menu] [role="option"][aria-selected="true"] {
+	background: var(--dsw-alias-interactive-bg-hover-solid, var(--dsw-alias-bg-layer-3)) !important;
+}
+html[data-mobile] [data-mp-wallpaper-hidden] {
+	display: none !important;
+}
+`;
+
+		/** Surface tokens that must never be translucent (backgrounds of panels, menus, sheets, inputs). */
+		const SURFACE_TOKENS = [
+			"--dsw-alias-bg-base", "--dsw-alias-bg-layer-1", "--dsw-alias-bg-layer-2", "--dsw-alias-bg-layer-3",
+			"--dsw-alias-bg-overlay", "--dsw-alias-bg-module-platform", "--dsw-alias-bg-document-preview",
+			"--dsw-alias-bg-multi-select", "--dsw-alias-bg-mask-drop", "--dsw-specific-menu", "--dsw-menu-surface-fill",
+			"--dsw-alias-menu-group-header-fill", "--dsw-specific-sidebar-fill", "--dsw-specific-input-major",
+			"--dsw-specific-selector", "--dsw-specific-tip", "--dsw-specific-bubble", "--dsw-specific-login-input",
+			"--dsw-alias-toast-bg", "--dsw-alias-tooltip-bg", "--dsw-alias-button-elevated-fill",
+			"--dsw-alias-button-floating-fill", "--dsw-alias-button-contrast-fill", "--dsw-alias-settings-card-fill",
+			"--dsw-alias-onboarding-card-fill", "--dsw-alias-markdown-code-block",
+		];
+
+		/** CSS colour → [r, g, b, a] (0..255, alpha 0..1); null for formats this does not read. */
+		function parseColor(value) {
+			const v = String(value || "").trim().toLowerCase();
+			let m = /^#([0-9a-f]{3,8})$/.exec(v);
+			if (m) {
+				let h = m[1];
+				if (h.length === 3 || h.length === 4) h = h.split("").map((c) => c + c).join("");
+				if (h.length !== 6 && h.length !== 8) return null;
+				const n = (i) => parseInt(h.slice(i, i + 2), 16);
+				return [n(0), n(2), n(4), h.length === 8 ? n(6) / 255 : 1];
+			}
+			m = /^rgba?\(([^)]+)\)$/.exec(v);
+			if (m) {
+				const p = m[1].split(/[\s,/]+/).filter(Boolean).map(parseFloat);
+				if (p.length < 3 || p.some((x) => Number.isNaN(x))) return null;
+				return [p[0], p[1], p[2], p.length > 3 ? p[3] : 1];
+			}
+			m = /^color\(srgb\s+([^)]+)\)$/.exec(v);
+			if (m) {
+				const p = m[1].split(/[\s/]+/).filter(Boolean).map(parseFloat);
+				if (p.length < 3 || p.some((x) => Number.isNaN(x))) return null;
+				return [Math.round(p[0] * 255), Math.round(p[1] * 255), Math.round(p[2] * 255), p.length > 3 ? p[3] : 1];
+			}
+			return null;
+		}
+
+		/**
+		 * A translucent colour composited over `base` as an opaque rgb(); null when it is already opaque or
+		 * unreadable. A translucent base is first composited over black.
+		 */
+		function flattenColor(value, base) {
+			const c = parseColor(value);
+			if (!c || c[3] >= 1) return null;
+			let b = parseColor(base) || [255, 255, 255, 1];
+			if (b[3] < 1) b = [b[0] * b[3], b[1] * b[3], b[2] * b[3], 1];
+			const mix = (i) => Math.round(c[i] * c[3] + b[i] * (1 - c[3]));
+			return "rgb(" + mix(0) + ", " + mix(1) + ", " + mix(2) + ")";
+		}
+
+		/**
+		 * Is this element a decorative full-screen layer (a wallpaper)? `info` is a plain description so the
+		 * rule can be unit tested: {tag, position, rect, pointerEvents, backgroundImage, textLength,
+		 * interactive, uiRoot}.
+		 */
+		function isWallpaperLayer(info, viewport) {
+			if (!info || info.uiRoot) return false;
+			if (info.position !== "fixed" && info.position !== "absolute") return false;
+			const area = viewport.width * viewport.height;
+			if (!(area > 0) || (info.rect.width * info.rect.height) / area < 0.9) return false;
+			if (info.textLength > 0 || info.interactive > 0) return false;
+			const media = info.tag === "canvas" || info.tag === "video" || info.tag === "img";
+			return media || info.pointerEvents === "none" || (info.backgroundImage && info.backgroundImage !== "none");
+		}
+
+		function injectCleanStyles() {
+			// Re-appended when another stylesheet lands after it, so it stays last in <head>.
+			let tag = document.querySelector("style[data-plugin-css='dsh-android-mobile/clean.css']");
+			if (tag && tag === document.head.lastElementChild) return;
+			if (!tag) {
+				tag = document.createElement("style");
+				tag.dataset.plugin = "dsh-android-mobile";
+				tag.dataset.pluginCss = "dsh-android-mobile/clean.css";
+				tag.textContent = CLEAN_CSS;
+			}
+			document.head.appendChild(tag);
+		}
+
+		/** Resolve a custom property to the colour the browser computes for it (handles var() and color-mix()). */
+		function mpResolveToken(probe, token) {
+			probe.style.backgroundColor = "var(" + token + ")";
+			return getComputedStyle(probe).backgroundColor;
+		}
+
+		function mpApplyOpaqueTokens() {
+			const body = document.body;
+			if (!body || !mpIsMobile()) return;
+			for (const token of SURFACE_TOKENS) body.style.removeProperty(token);
+			body.style.removeProperty("--mp-solid-base");
+			const probe = document.createElement("div");
+			probe.style.cssText = "position:absolute;width:0;height:0;visibility:hidden;pointer-events:none";
+			body.appendChild(probe);
+			try {
+				const dark = body.hasAttribute("data-ds-dark-theme");
+				const rawBase = mpResolveToken(probe, "--dsw-alias-bg-base");
+				const base = flattenColor(rawBase, dark ? "#000000" : "#ffffff") || rawBase;
+				body.style.setProperty("--mp-solid-base", base);
+				let changed = 0;
+				for (const token of SURFACE_TOKENS) {
+					const solid = token === "--dsw-alias-bg-base" ? (base !== rawBase ? base : null)
+						: flattenColor(mpResolveToken(probe, token), base);
+					if (solid) { body.style.setProperty(token, solid, "important"); changed++; }
+				}
+				if (changed) console.info("[dsh-android-mobile] opaque guard: flattened " + changed + " translucent surface token(s)");
+			} finally {
+				probe.remove();
+			}
+		}
+
+		function mpHideWallpaperLayers() {
+			if (!document.body || !mpIsMobile()) return;
+			const viewport = { width: window.innerWidth, height: window.innerHeight };
+			const candidates = [...document.body.children];
+			const root = document.getElementById("root");
+			if (root) candidates.push(...root.children);
+			for (const el of candidates) {
+				if (el.hasAttribute("data-mp-wallpaper-hidden")) continue;
+				const tag = el.tagName.toLowerCase();
+				if (tag === "script" || tag === "style" || tag === "link") continue;
+				const cs = getComputedStyle(el);
+				const info = {
+					tag,
+					position: cs.position,
+					rect: el.getBoundingClientRect(),
+					pointerEvents: cs.pointerEvents,
+					backgroundImage: cs.backgroundImage,
+					textLength: (el.textContent || "").trim().length,
+					interactive: el.querySelectorAll("button,input,textarea,select,a[href],[role],[contenteditable]").length,
+					uiRoot: el.id === "root" || el.id.startsWith("mp-") || el.className.toString().includes("mp-")
+						|| el.hasAttribute("role") || el.hasAttribute("aria-modal") || el.hasAttribute("data-trigger-menu"),
+				};
+				if (isWallpaperLayer(info, viewport)) {
+					el.setAttribute("data-mp-wallpaper-hidden", "");
+					if (tag === "video") try { el.pause(); } catch (e) { /* ignore */ }
+					console.info("[dsh-android-mobile] wallpaper guard: hid a full-screen " + tag + " layer");
+				}
+			}
+		}
+
+		/** Installs the three clean layers; re-runs when themes, the colour scheme or top-level nodes change. */
+		function setupCleanSurfaces() {
+			let timer = 0;
+			const run = () => {
+				timer = 0;
+				injectCleanStyles();
+				mpApplyOpaqueTokens();
+				mpHideWallpaperLayers();
+			};
+			const schedule = () => { if (!timer) timer = window.setTimeout(run, 150); };
+			run();
+			const headObserver = new MutationObserver(schedule);
+			headObserver.observe(document.head, { childList: true });
+			const bodyObserver = new MutationObserver(schedule);
+			bodyObserver.observe(document.body, { childList: true, attributes: true,
+				attributeFilter: ["data-ds-dark-theme", "data-dsh-theme", "class"] });
+			const rootObserver = new MutationObserver(schedule);
+			const root = document.getElementById("root");
+			if (root) rootObserver.observe(root, { childList: true });
+			const htmlObserver = new MutationObserver(schedule);
+			htmlObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-mobile"] });
+			window.addEventListener("resize", schedule);
+			return () => {
+				headObserver.disconnect();
+				bodyObserver.disconnect();
+				rootObserver.disconnect();
+				htmlObserver.disconnect();
+				window.removeEventListener("resize", schedule);
+				if (timer) window.clearTimeout(timer);
+			};
+		}
+
+		exports.__test = { parseColor, flattenColor, isWallpaperLayer, CLEAN_CSS, SURFACE_TOKENS };
+
 		// ── 3. 消息 meta 精简：保留 "22:41 · 用时 3秒"，删 " · 首 token … / … tok/s" ──
 		function trimMeta(el) {
 			if (!mpIsMobile()) return; // 修复 40：仅移动端；桌面端完全走官方
@@ -9487,6 +9721,7 @@ window.__ModuleLoader__.load({
 			mpInstallPendingTrust();   /* 修复 51：越早越好 */
 			mpWatchSessions(ctx);       /* 修复 51：等服务就绪 */
 			injectStyles();
+			const disposeCleanSurfaces = setupCleanSurfaces();   /* v1.3.0：不透明、无壁纸 */
 			const disposeKeyboardGuard = setupComposerKeyboardGuard();
 			const disposeTriggerMenuDismiss = setupTriggerMenuAutoDismiss();
 			const disposeKeepFocusGuard = setupKeepFocusGuard();
@@ -9542,6 +9777,7 @@ window.__ModuleLoader__.load({
 
 			return () => {
 				mo.disconnect();
+				disposeCleanSurfaces();
 				document.removeEventListener("click", onNewSessionClick, true);
 				document.removeEventListener("click", onSessionRowClick, true);
 				disposePressFeedback();

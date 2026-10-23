@@ -125,18 +125,17 @@ call with a sequence is the only thing that works.
 - \`action:"stopflash"\` stops the flashing and **keeps the pinned colours**. Use
   \`action:"reset"\` instead if the user wants to go back to following the page entirely.
 
-## Fullscreen / 全面屏 — the base layer that makes any background cover the whole screen
+## Fullscreen / 全面屏 — edge-to-edge solid background
 
-By default the app window starts BELOW the status bar: the page cannot paint into that top strip
-at all, so a background image / gradient / colour stops short of the top and the user sees a
-visible band. **\`fullscreen: true\` removes that limitation** — the content is laid out across the
-entire screen (from y=0 to the very bottom) and both bars become transparent overlays floating on
-top of the page.
+By default the app window starts BELOW the status bar. **\`fullscreen: true\`** lays the content out
+across the entire screen and makes both bars transparent overlays, so the page's solid background
+colour runs under the clock and the navigation bar with no band along the top.
 
-This is the **base layer**, deliberately not a "background image" special case: turn it on and
-*whatever* the page draws — solid colour, gradient, image, video — covers the full screen with no
-further work. Turn it on when the user asks for a background image, an immersive / edge-to-edge
-look, "make the background fill the screen", or complains about a band along the top.
+The app stays clean and opaque (owner's rule since v1.3.0): **no background images, wallpapers,
+videos, animated backgrounds or blur.** The mobile UI hides full-screen decorative layers and flattens
+translucent surfaces, so do not offer a wallpaper; offer a solid colour or a theme recolour instead.
+Turn fullscreen on when the user asks for an immersive / edge-to-edge look or complains about a band
+along the top.
 
 - \`fullscreen: true\` → both bars transparent, content extended to the whole screen, and the app
   tells the page how tall the status bar is so it can keep its own UI clear of the clock.
@@ -181,7 +180,7 @@ is correct.
 - "flash the top bar in seven rainbow colours" → \`{statusBarFlash: ["#FF0000","#FF7F00","#FFFF00","#00FF00","#00FFFF","#0000FF","#8B00FF"]}\`
 - "party mode, both bars, quite fast" → \`{statusBarFlash: ["#FF0000","#00FF00","#0000FF"], navBarFlash: ["#FF0000","#00FF00","#0000FF"], flashIntervalMs: 150, flashLoops: -1}\`
 - "blink the top bar between red and green three times, then stop" → \`{statusBarFlash: ["#FF0000","#00FF00"], flashIntervalMs: 300, flashLoops: 3}\`
-- "set a background image and make it fill the whole screen" → \`{fullscreen: true}\` (plus \`statusBarIcons\` if the image is light or dark)
+- "make the background fill the whole screen" → \`{fullscreen: true}\` (plus \`statusBarIcons\` if the page colour is light or dark)
 - "make it immersive / edge-to-edge / no black band at the top" → \`{fullscreen: true}\`
 - "put it back the way it was" → \`{fullscreen: false}\`
 - "stop the flashing please" → \`{action: "stopflash"}\`
@@ -383,7 +382,7 @@ function statusBarTool(home) {
 				},
 				fullscreen: {
 					type: 'boolean',
-					description: '全面屏 / immersive edge-to-edge: lay the content out across the WHOLE screen and make both bars transparent, so any page background (image / gradient / colour) covers the full screen. This is the base layer for background images — no special handling needed. Set false to go back to the normal layout. Mutually exclusive with the flash fields (fullscreen wins).',
+					description: '全面屏 / immersive edge-to-edge: lay the content out across the WHOLE screen and make both bars transparent, so the page solid background covers the full screen (no wallpapers or background images: the app keeps an opaque UI). Set false to go back to the normal layout. Mutually exclusive with the flash fields (fullscreen wins).',
 				},
 				statusBarIcons: {
 					type: 'string',
