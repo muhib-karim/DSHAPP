@@ -29,6 +29,7 @@ object AppState {
             account.put("label", store.webLabel ?: "DeepSeek account")
             account.put("webExpired", store.webExpired)
         }
+        if (store.mode == AccountConfig.Mode.API_KEY) account.put("keyHint", apiKeyHint(activity) ?: JSONObject.NULL)
         val version = JSONObject()
             .put("app", BuildConfig.VERSION_NAME)
             .put("code", BuildConfig.VERSION_CODE)
@@ -41,6 +42,7 @@ object AppState {
         DshLog.i(DshApplication.TAG, "settings action: $name")
         when (name) {
             "accountSwitch" -> activity.startActivity(Intent(activity, SignInActivity::class.java).putExtra(SignInActivity.EXTRA_SWITCH, true))
+            "accountReplaceKey" -> replaceApiKey(activity)
             "accountSignOut" -> signOut(activity) {
                 if (!activity.isFinishing && !activity.isDestroyed) activity.startActivity(Intent(activity, SignInActivity::class.java))
             }
@@ -72,6 +74,18 @@ object AppState {
                 .getOrDefault(false)
             DshLog.i(DshApplication.TAG, if (restored) "harness restored to $expected" else "harness restore $expected not applied")
         }, "harness-restore").start()
+    }
+
+    /**
+     * Settings > Account: change only the API key. The account mode is not touched, and nothing is signed out, so the
+     * user keeps their DSH setup while the key rotates. Refused unless an API key is the current sign-in.
+     */
+    private fun replaceApiKey(activity: Activity) {
+        if (AccountStore(activity).mode != AccountConfig.Mode.API_KEY) {
+            DshLog.w(DshApplication.TAG, "replace key: not signed in with an API key")
+            return
+        }
+        activity.startActivity(Intent(activity, SignInActivity::class.java).putExtra(SignInActivity.EXTRA_REPLACE_KEY, true))
     }
 
     /**
@@ -131,5 +145,10 @@ object AppState {
     fun harnessVersion(activity: Activity): String? = runCatching {
         val pkg = File(activity.filesDir, "engine/node_modules/@deepseek-ai/dsh/package.json")
         JSONObject(pkg.readText()).optString("version").ifEmpty { null }
+    }.getOrNull()
+
+    /** Only the masked suffix of the saved key ever leaves the credentials file (see [DshCredentials.keyHint]). */
+    private fun apiKeyHint(activity: Activity): String? = runCatching {
+        DshCredentials.keyHint(DshCredentials.read(EngineManager.get(activity).dshHomeDir, DshCredentials.DEEPSEEK_API_KEY))
     }.getOrNull()
 }

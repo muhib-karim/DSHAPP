@@ -34,7 +34,9 @@ updatable in the app.
     hand-off when Google refuses the embedded WebView. The session token is encrypted with an Android Keystore key.
     dsh reaches it through a local OpenAI-compatible bridge (127.0.0.1, random port, per-install bearer secret) that
     solves DeepSeek's proof of work and maps tool calls through a text protocol.
-  - Settings > Account: switch account, sign out (token, cookies, page storage and keys removed). When
+  - Settings > Account: switch account, sign out (token, cookies, page storage and keys removed). An API-key account
+    shows only the last four characters of the saved key and can **Replace API key** without signing out first; Back from
+    that screen keeps the old key and the account. When
     chat.deepseek.com rejects the saved session, the card says the web session has expired and offers **Sign in again**,
     so a stale session fails visibly instead of only in the chat.
 - **Settings > Plugins**: user plugins next to the app's and DSH's built-ins; install an npm name or open the

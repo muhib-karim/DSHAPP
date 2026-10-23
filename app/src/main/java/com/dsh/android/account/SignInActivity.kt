@@ -25,6 +25,9 @@ class SignInActivity : AppCompatActivity() {
     private var attempt: AccountChanges.Attempt? = null
     @Volatile private var checking = false
 
+    /** Settings > Account "Replace API key": only the key changes; the account stays signed in on Back or failure. */
+    private var replaceMode = false
+
     private val webLogin = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) { setResult(RESULT_OK); finish() }
     }
@@ -34,7 +37,15 @@ class SignInActivity : AppCompatActivity() {
         binding = ActivitySignInBinding.inflate(layoutInflater)
         setContentView(binding.root)
         store = AccountStore(this)
-        if (intent.getBooleanExtra(EXTRA_SWITCH, false)) binding.subtitle.setText(com.dsh.android.R.string.signin_switch_subtitle)
+        replaceMode = intent.getBooleanExtra(EXTRA_REPLACE_KEY, false) && store.mode == AccountConfig.Mode.API_KEY
+        if (replaceMode) {
+            binding.subtitle.setText(com.dsh.android.R.string.signin_replace_subtitle)
+            binding.keyTitle.setText(com.dsh.android.R.string.signin_replace_title)
+            binding.keyBody.setText(com.dsh.android.R.string.signin_replace_body)
+            binding.btnLater.visibility = View.GONE
+        } else if (intent.getBooleanExtra(EXTRA_SWITCH, false)) {
+            binding.subtitle.setText(com.dsh.android.R.string.signin_switch_subtitle)
+        }
 
         binding.btnGoogle.setOnClickListener {
             cancelCheck()
@@ -45,7 +56,7 @@ class SignInActivity : AppCompatActivity() {
             store.setUpLater()
             finish()
         }
-        binding.btnKeyBack.setOnClickListener { showKeyPanel(false) }
+        binding.btnKeyBack.setOnClickListener { goBack() }
         binding.btnGetKey.setOnClickListener {
             runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://platform.deepseek.com/api_keys"))) }
         }
@@ -54,16 +65,22 @@ class SignInActivity : AppCompatActivity() {
             if (action == EditorInfo.IME_ACTION_DONE) { submitKey(); true } else false
         }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (binding.keyPanel.visibility == View.VISIBLE) showKeyPanel(false) else finish()
-            }
+            override fun handleOnBackPressed() { goBack() }
         })
-        if (savedInstanceState?.getBoolean(STATE_KEY_PANEL) == true) showKeyPanel(true)
+        if (replaceMode) showKeyPanel(true) else if (savedInstanceState?.getBoolean(STATE_KEY_PANEL) == true) showKeyPanel(true)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_KEY_PANEL, binding.keyPanel.visibility == View.VISIBLE)
+    }
+
+    /**
+     * Back never commits anything: in replace mode it simply closes the screen, so a canceled replacement leaves the
+     * existing key and account mode untouched. Outside replace mode it returns to the two-choice first screen.
+     */
+    private fun goBack() {
+        if (replaceMode || binding.keyPanel.visibility != View.VISIBLE) finish() else showKeyPanel(false)
     }
 
     private fun showKeyPanel(show: Boolean) {
@@ -96,14 +113,16 @@ class SignInActivity : AppCompatActivity() {
                 val saved = runCatching {
                     pending.commit {
                         DshCredentials.write(EngineManager.get(app).dshHomeDir, mapOf(DshCredentials.DEEPSEEK_API_KEY to key))
-                        store.signOutWeb()
-                        store.mode = AccountConfig.Mode.API_KEY
+                        if (!replaceMode) {
+                            store.signOutWeb()
+                            store.mode = AccountConfig.Mode.API_KEY
+                        }
                     }
                 }
                 when {
                     saved.isFailure -> showError("Could not save the key: ${saved.exceptionOrNull()?.message}")
                     saved.getOrDefault(false) -> {
-                        DshLog.i("DSH", "signed in: mode=API_KEY")
+                        DshLog.i("DSH", if (replaceMode) "replaced API key: mode=API_KEY" else "signed in: mode=API_KEY")
                         thread(name = "sign-in-apply") { restartEngine(app) }
                         setResult(RESULT_OK)
                         finish()
@@ -138,6 +157,9 @@ class SignInActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_SWITCH = "switch"
+
+        /** Open straight on the API-key panel to rotate the key; the saved account is kept on Back. */
+        const val EXTRA_REPLACE_KEY = "replaceKey"
         private const val STATE_KEY_PANEL = "keyPanel"
 
         /** Has the engine pick up the new account config (now if Ready, after the boot in progress otherwise). */

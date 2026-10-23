@@ -154,6 +154,12 @@ use. Never expose or log the full key.
 - Manual: replace a key, confirm the hint changes, chat works without a full sign-out, and Back from the replace
   screen leaves the existing account signed in.
 
+**Deviation:** `AppState` performs the one `DshCredentials.read` and passes the value straight to
+`DshCredentials.keyHint`, so the full key exists only inside that call; no other UI path reads it. `keyHint` also
+returns null for values shorter than five characters. `SignInActivity` honours `EXTRA_REPLACE_KEY` only when the saved
+mode is already `api_key` (a stale intent cannot silently keep a web account), replace mode hides **Set up later** and
+skips `signOutWeb()`. `PRESET_SKILLS_VERSION` is unchanged because only `mobile-ui.zip` changed.
+
 ## 5. First-screen key entry: paste, restore after rotation, clearer errors
 
 Polish the API-key panel without adding permissions or reading the clipboard silently.

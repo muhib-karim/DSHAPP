@@ -8,6 +8,9 @@
     <string name="signin_later">Set up later</string>
     <string name="signin_footer">Your account and keys stay on this phone.</string>
     <string name="signin_key_title">Use API key</string>
+    <string name="signin_replace_title">Replace API key</string>
+    <string name="signin_replace_subtitle">Keep your account, change the key</string>
+    <string name="signin_replace_body">Paste the new key from platform.deepseek.com. Your account stays signed in and only the key changes; Back keeps the old one.</string>
     <string name="signin_key_body">Paste a key from platform.deepseek.com. It is checked once, then saved only in DSH\'s own credentials file on this phone.</string>
     <string name="signin_key_hint">DeepSeek API key</string>
     <string name="signin_key_continue">Continue</string>

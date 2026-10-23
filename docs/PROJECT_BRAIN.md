@@ -19,12 +19,18 @@ green and no merge, tag or release.
   (existing `accountSwitch`). New token, web sign-out, API-key switch and full sign-out clear it. New
   `AccountStoreTest` and `BridgeServerTest` cases plus `account-expiry.test.mjs`; stamps `1.0.0-104` / compat `38`.
   Both-flavor gate: 174 JVM tests each, 42 Node tests, both APKs built with the new zip; Gradle stopped.
+- P3 item 4 done: `DshCredentials.keyHint` exposes only `••••` + the last four characters (null for unusable keys);
+  `AppState` adds `account.keyHint` in API-key mode and `accountReplaceKey`, which opens `SignInActivity` with
+  `EXTRA_REPLACE_KEY` on the key panel ("Replace API key"); Back keeps the old key and the account mode, success writes
+  the key and restarts the engine without signing out. Account card shows the hint and a secondary replace button.
+  New `DshCredentialsTest` hint cases and `account-key.test.mjs`; stamps `1.0.0-105` / compat `39`.
+  Both-flavor gate: 176 JVM tests each, 45 Node tests, both APKs built with the new zip; Gradle stopped.
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. Implement P3 item 4 (API-key replacement/masked hint) with its tests.
+1. Implement P3 item 5 (first-screen polish) with its tests.
 2. After all items refresh screenshots and run the full matrix.
 
 
@@ -53,3 +59,4 @@ green and no merge, tag or release.
 - 2026-10-23 14:43Z dsh/DeepSeek V4.1 Flash: P3 item 2 (manual harness restore) implemented; targeted JVM and Node tests green; next: both-flavor gate, commit, item 3.
 - 2026-10-23 14:52Z dsh/DeepSeek V4.1 Flash: P3 item 3 (web-session expiry) implemented; targeted JVM + new Node test green, zip/stamps refreshed; next: both-flavor gate and commit.
 - 2026-10-23 14:56Z dsh/DeepSeek V4.1 Flash: P3 item 3 gate green (174 JVM per flavor, 42 Node, both APK assets match); next: commit, item 4.
+- 2026-10-23 14:58Z dsh/DeepSeek V4.1 Flash: P3 item 4 (API-key replace + masked hint) implemented; new Node test green, zip/stamps bumped; next: both-flavor gate and commit.

@@ -83,6 +83,25 @@ class DshCredentialsTest {
         assertEquals("sk-test-0123456789", DshCredentials.read(home, "DEEPSEEK_API_KEY"))
     }
 
+    @Test fun hintShowsOnlyTheLastFourCharacters() {
+        val key = "sk-0123456789abcdef" // gitleaks:allow (fake test fixture)
+        val hint = DshCredentials.keyHint(key)
+        assertEquals("••••cdef", hint)
+        assertFalse("the hint must not contain the whole key", hint!!.contains(key))
+        assertFalse("the hint must not expose an early part of the key", hint.contains(key.take(6)))
+        assertEquals("••••6789", DshCredentials.keyHint("  sk-test-0123456789 \n"))
+    }
+
+    @Test fun hintIsNullWhenThereIsNoUsableKey() {
+        assertNull(DshCredentials.keyHint(null))
+        assertNull(DshCredentials.keyHint(""))
+        assertNull(DshCredentials.keyHint("   "))
+        assertNull(DshCredentials.keyHint("short"))
+        assertNull(DshCredentials.keyHint("sk-0123"))
+        assertNull(DshCredentials.keyHint("sk-test has a space"))
+        assertNull(DshCredentials.keyHint("sk-ключ-0123456789"))
+    }
+
     @Test fun keyShapeProblems() {
         assertNotNull(DshCredentials.problem(""))
         assertNotNull(DshCredentials.problem("sk abc defgh"))

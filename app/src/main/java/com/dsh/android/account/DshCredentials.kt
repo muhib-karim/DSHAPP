@@ -40,6 +40,16 @@ object DshCredentials {
         return null
     }
 
+    /**
+     * What the UI may show for [value]: only its last four characters (`••••1234`), or null when there is no usable
+     * key. It never returns the full value, so no UI path needs to redact anything itself.
+     */
+    fun keyHint(value: String?): String? {
+        val k = value?.trim().orEmpty()
+        if (k.isEmpty() || problem(k) != null || k.length <= 4) return null
+        return "••••" + k.takeLast(4)
+    }
+
     /** Sets refs (a null value removes the ref); other refs and all records are kept. */
     @Synchronized
     fun write(dshHome: File, refs: Map<String, String?>) {
