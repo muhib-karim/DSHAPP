@@ -328,3 +328,15 @@ Finish the pass with evidence, not just code.
 - Each user-facing change is documented in the 1.3.0 sections and has a test or a reproducible manual check.
 - The tree is left clean, on `feature/v1.3.0`, with the pass trailer on every commit and the final round summary
   reporting the actual head SHA and build result.
+
+**Done 2026-10-23 UTC.** The 1.3.0 changelog covers every user-visible item; `README.md` / `README.en.md` extend the
+"What's new" notes and disclose the screenshot provenance; `PROJECT_BRAIN.md` carries the status, gate results, limits
+and UTC log; the agent doc maps the five new settings actions to code and tests and records the stamp rules and
+commands. Verification: 200 JVM tests per flavor, 66 Node tests, 5 Chromium tests, both debug APKs, mobile-ui
+zip/source byte comparison and stamp audit. No push, merge, tag or release.
+
+**Deviation:** screenshot 02 could not be recaptured in this environment (no emulator binary, system image or KVM), so
+it remains the CI capture from before the Paste button and now carries an explicit caption in both READMEs. Screenshots
+08 and 09 were refreshed from the real DSH web UI plus this app's plugin rendered at phone size, with demo account and
+version values as the README already discloses; they are not mockups, but they are host renders rather than emulator
+captures. No other item deviates from the plan.

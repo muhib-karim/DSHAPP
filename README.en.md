@@ -74,13 +74,20 @@ labels come only from build information — no account, serial, file path or URL
 |---|---|---|
 | <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |
 
-The first two screenshots are from the CI emulator. The others are DSH's real web UI with the app's mobile plugin
-rendered at phone size on a desktop, with a demo model reply and demo account and update values.
+The first two screenshots are from the CI emulator (02 predates the **Paste** button; the current key panel has
+one). The others are DSH's real web UI with the app's mobile plugin rendered at phone size on a desktop; 08 and 09 were
+re-rendered from the current plugin, with a demo model reply and demo account and update values.
 
 The second review pass makes account switching and canceled sign-ins safe, rejects interrupted web replies,
 and keeps Update/Install available after permission prompts or failed downloads. Harness rollback preserves user
 configuration and recovers interrupted activation. Custom theme colors stay intact while surfaces remain opaque;
 user-installed official plugins remain removable, and skill refresh tolerates unavailable file watchers.
+
+The third pass adds package and signature checks before installing an APK, manual restore of the previous harness,
+a clear expired-web-session notice, a masked key hint with in-place replacement, the Paste button and rotation-safe
+input, plain-text release notes with a trusted release link, plugin search with group counts and scope badges,
+diagnostics with logs and engine restart, and cancellable APK downloads that clean stale cache files.
+Both flavors pass 200 JVM tests each; 66 Node and 5 Chromium checks pass, and both debug APKs build.
 
 **Run a full AI coding agent on your Android phone.**
 

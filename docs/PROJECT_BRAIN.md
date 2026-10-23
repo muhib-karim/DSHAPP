@@ -64,13 +64,21 @@ green and no merge, tag or release.
   eligibility and cache-cleanup tests, a concurrency guard test, and Node tests for the Cancel button and badge.
   Stamps `1.0.0-109` / compat `43` / preset `1.0.0-4`; mobile UI zip re-packed and byte-compared.
   Gate: 200 JVM tests per flavor, 66 Node tests, both APKs built; Gradle stopped.
+- P3 item 10 done: `README.md` / `README.en.md` extend the 1.3.0 notes with the third-pass features and record the
+  refreshed account/About screenshots plus the one stale native capture; `docs/agents/v130-signin-plugins-updates.md`
+  maps `harnessRollback`, `accountReplaceKey`, `openLogs`, `cancelAppUpdate` and `openReleasePage` to code and tests,
+  records stamps `1.0.0-109` / compat `43` / preset `1.0.0-4`, and the exact gate commands. `docs/PLAN_130_P3.md`
+  records the close-out and its deviation. Screenshots 08/09 were re-rendered from the real DSH web UI and plugin at
+  phone size with demo values; 02 remains its pre-Paste CI capture because no emulator/system image/KVM exists here,
+  and the README caption says so. Gate: 200 JVM tests per flavor, 66 Node, 5 Chromium, both APKs, zip/stamps re-checked,
+  no push. (The user-visible bullets were already added with items 1–9; item 10 changes no app behavior.)
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. P3 item 9 is done; the code plan's items are implemented.
-2. Refresh screenshots, run the full matrix and prepare the pass 3 review/summary.
+1. P3 items 1–10 are complete and documented; the tree is left clean on `feature/v1.3.0`.
+2. Report the pass result to the owner; do not push, merge, tag or release.
 
 
 ## Decisions (why things are the way they are)
@@ -107,3 +115,4 @@ green and no merge, tag or release.
 - 2026-10-23 15:37Z dsh/DeepSeek V4.1 Flash: P3 item 7 (plugin search, counts, scope badges) implemented; full gate green (186 JVM per flavor, 57 Node, both APKs); next: commit, item 8.
 - 2026-10-23 15:44Z dsh/deepseek-v4.1-flash: P3 item 8 diagnostics/logs/restart implemented; both APKs and tests green; next: full matrix and pass summary.
 - 2026-10-23 15:52Z dsh/DeepSeek V4.1 Flash: P3 item 9 (cancelable APK download + stale-cache cleanup) implemented; full gate green (200 JVM per flavor, 66 Node, both APKs); next: commit, item 10 docs/screenshots.
+- 2026-10-23 16:20Z dsh/DeepSeek V4.1 Flash: P3 item 10 close-out docs/screenshots done; both-flavor gate green (200 JVM per flavor), 66 Node, 5 Chromium, both APKs, stamps/zip checked; next: secret scan, commit, report.

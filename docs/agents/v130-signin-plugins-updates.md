@@ -15,6 +15,30 @@
 | Live "/" palette | `mobile-ui-plugin/dsh-android-mobile/lib/skill-refresh.js` (re-emits `plugin-manager/changed`) | `tools/tests/skill-refresh.test.mjs` |
 | Updates | `update/Versions.kt`, `EngineSlots.kt`, `HarnessUpdater.kt`, `AppUpdater.kt`, `UpdateCenter.kt`; `EngineManager` hooks `rollBackPendingHarness` / `pendingHarnessReady` / `activateHarnessUpdate` / `activatePreviousHarness` / `runWithEngineEnv` | `VersionsTest`, `EngineSlotsTest`, `HarnessUpdaterTest`, `AppUpdaterTest`, `HarnessActivationTest`, `EngineLifecycleTest`, `UpdateActionsTest`, `DownloadGuardTest` |
 
+## Settings actions added in 1.3.0
+
+All go through the existing `PageBridge` pair; no new bridge method. The client sends `appAction(name, arg)` and the
+host re-validates everything it needs.
+
+| Action | Argument | Native path | Client control | Tests |
+|---|---|---|---|---|
+| `harnessRollback` | previous harness version, e.g. `0.2.1-rc.1` | `AppState.restorePreviousHarness` checks the version shape, then `EngineManager.activatePreviousHarness` re-checks the slot and `UpdateActions.rollback` refuses unless a previous harness exists and the updater is idle | About card, **Restore previous version** (`data-mp-update-action="harnessRollback"`) | `UpdateActionsTest`, `EngineSlotsTest`, `update-controls.test.mjs` |
+| `accountReplaceKey` | none | `AppState.replaceApiKey` refuses unless the mode is `api_key`, then starts `SignInActivity` with `EXTRA_REPLACE_KEY` | Account card, **Replace API key** (`data-mp-account-replace`) | `DshCredentialsTest`, `account-key.test.mjs` |
+| `openLogs` | none | the `openLogs` branch in `AppState.action` starts the host's `LogViewerActivity`; the page never renders or copies logs | About card, **Open logs** (`data-mp-diagnostics-action="openLogs"`) | `DiagnosticsTest`, `update-controls.test.mjs` |
+| `cancelAppUpdate` | none | `AppState.cancelAppUpdate` → `UpdateCenter.cancelAppUpdate` → `DownloadGuard.cancel`, which invalidates the generation before disconnecting | About card, **Cancel download** while `canCancel` (`data-mp-update-action="cancelAppUpdate"`) | `UpdateActionsTest`, `DownloadGuardTest`, `update-controls.test.mjs` |
+| `openReleasePage` | none (the page comes from stored state, never from the page) | `AppState.openReleasePage` re-checks `AppUpdater.isTrustedReleasePage` before `ACTION_VIEW` | About card, **Release page** (`data-mp-update-action="openReleasePage"`) | `AppUpdaterTest`, `update-controls.test.mjs` |
+
+## Version stamps after pass 3
+
+| Source set | Stamp(s) | Current |
+|---|---|---|
+| Mobile UI plugin (`mobile-ui-plugin/dsh-android-mobile/lib/client.js`, `skill-refresh.js`) | `EngineManager.MOBILE_UI_VERSION`, `tools/build-webview-compat.ps1 -CompatVersion`, packaged `app/src/main/assets/mobile-ui.zip` | `1.0.0-109`, `43`, repacked |
+| Bundled preset skills | `PRESET_SKILLS_VERSION` | `1.0.0-4` |
+
+Any edit under `mobile-ui-plugin/dsh-android-mobile/` bumps **both** the mobile-UI and compat stamps, regenerates the
+zip and byte-compares the unpacked tree with the source directory (`diff -r`). Native-only changes do not touch these
+stamps; docs and tests do not bump them either. See [asset-stamps.md](asset-stamps.md).
+
 ## Rules that are easy to break
 
 1. **Never overwrite a model the user picked.** `AccountConfig` changes `agent-default-model` only while it names a
@@ -57,7 +81,10 @@
 
 ```bash
 node --test tools/tests/*.test.mjs
-./gradlew --no-daemon testSystemDebugUnitTest testGeckoDebugUnitTest
+./gradlew --no-daemon --max-workers=2 :app:testSystemDebugUnitTest :app:testGeckoDebugUnitTest :app:assembleDebug
+./gradlew --stop
+# Chromium-only, with Playwright resolvable from the test (5 checks):
+node --test tools/tests/mobile-clean.browser.mjs
 ```
 
 Manual cancel check (arm64 device, an APK release is offered): start the download, tap **Cancel download**, and confirm
@@ -71,3 +98,11 @@ See [the requirement review and verification record](../REVIEW_130_P2.md). Regre
 account operations, incomplete web streams, pending-harness rollback and interrupted slot activation, retryable
 updates, theme-owned inline colors, plugin ownership and unavailable file watchers. The emulator remains a native
 screen smoke test; account service access and Android engine boot still require a real account and arm64 device.
+
+## Pass 3 verification
+
+On 2026-10-23 UTC the both-flavor gate passed: 200 JVM tests per flavor (400 total), 66 Node tests, 5 Chromium checks,
+and both debug APKs assembled. The unpacked `mobile-ui.zip` is byte-identical to its source and the stamps above are the
+ones in the tree. The emulator smoke script could not run here (no emulator binary, system image or KVM), so the native
+API-key screenshot 02 remains its pre-Paste CI capture and the README says so; screenshots 08 and 09 were re-rendered
+from the real DSH web UI and plugin at phone size with demo values. Nothing was pushed, merged, tagged or released.

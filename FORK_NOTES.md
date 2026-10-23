@@ -31,6 +31,10 @@ Status of the fork and answers to the owner's questions; notes for review.
 - The harness update path: the updater's `package.json`/`.npmrc` and pnpm 11 arguments installing 0.2.1-rc.3 into a
   hoisted tree that boots (`dsh web:`). On a phone it additionally runs the app's Android patch steps.
 - The first screen and the API-key screen (with DeepSeek's real 401 for an invalid key) on the CI emulator.
+- The third-pass native and Node regressions: 200 JVM tests per flavor, 66 Node tests and 5 Chromium checks. They cover
+  APK package/signature verification, manual harness restore and interrupted slot transitions, web-session expiry,
+  key hints and replacement, Paste/rotation, release-note sanitising and trusted links, plugin search, diagnostics/logs/
+  restart, and cancelable downloads. Both debug APKs assemble and the mobile-ui archive matches its source.
 
 ## Emulator smoke test: what it does and does not cover
 - CI's emulator is an x86_64 Android 14 image that runs arm64 apps through translation. The app ships an arm64 Termux
@@ -49,6 +53,13 @@ regressions for canceled/superseded account changes, incomplete web streams and 
 interrupted harness activation and rollback before configuration repair, reachable update retries, theme color
 preservation, plugin ownership and watcher fallback. The smoke test also checks API-panel cancel/reopen and empty
 key validation. These tests do not turn the x86_64 emulator into an arm64 engine acceptance test.
+
+## Third pass
+
+The close-out evidence is in [docs/PLAN_130_P3.md](docs/PLAN_130_P3.md) and `docs/PROJECT_BRAIN.md`. The local
+environment has no emulator, system image or KVM, so `tools/ci/emulator-smoke.py` was not run and screenshot 02 remains
+the earlier CI capture (it predates the Paste button; the README says so). Screenshots 08/09 were re-rendered from the
+real web UI and plugin with demo values. Chat and Settings still need a real arm64 device; nothing was pushed.
 
 ## Gaps (not built or not verifiable here)
 - The web account depends on chat.deepseek.com's web API (not a public API; it can change). Replies have no images
