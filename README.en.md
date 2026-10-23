@@ -57,6 +57,11 @@ verified).
 The first two screenshots are from the CI emulator. The others are DSH's real web UI with the app's mobile plugin
 rendered at phone size on a desktop, with a demo model reply and demo account and update values.
 
+The second review pass makes account switching and canceled sign-ins safe, rejects interrupted web replies,
+and keeps Update/Install available after permission prompts or failed downloads. Harness rollback preserves user
+configuration and recovers interrupted activation. Custom theme colors stay intact while surfaces remain opaque;
+user-installed official plugins remain removable, and skill refresh tolerates unavailable file watchers.
+
 **Run a full AI coding agent on your Android phone.**
 
 [中文](README.md) · [Docs](docs/agents/README.md) · [Contributing](CONTRIBUTING.md)
@@ -108,8 +113,8 @@ Download an APK from [Releases](../../releases) and sideload it.
 
 | Package | applicationId | For |
 |---|---|---|
-| `DSH<version>.apk` | `com.dsh.android` | Most devices, smaller |
-| `DSH<version>-gecko.apk` | `com.dsh.webview` | Old devices / system WebView unavailable |
+| `DSH<version>-mk.apk` | `com.mkdsh.droid` | Most devices, smaller |
+| `DSH<version>-mk-gecko.apk` | `com.mkdsh.gecko` | Old devices / system WebView unavailable |
 
 The two packages have **different applicationIds and can coexist**, each with its own
 independent data directory.
@@ -261,7 +266,7 @@ docs/agents/                           developer docs (35 articles, look up as n
   roughly 10–60 seconds depending on the device.
 - **Web account (Continue with Google)** — it uses chat.deepseek.com's web API, which is not a public API and can
   change; DSH's tools run through a text protocol, images are not sent. Google sign-in inside the app may be refused
-  by Google; the browser route always works. Use an API key for the most reliable agent runs.
+  by Google; the browser route is available as a fallback. Use an API key for the most reliable agent runs.
 - **Harness updates** need about 0.5 GB of free space while installing (the previous harness is kept for rollback);
   on the system-WebView build the updated harness needs Android System WebView 94 or newer.
 

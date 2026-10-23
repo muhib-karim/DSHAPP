@@ -42,6 +42,14 @@ Status of the fork and answers to the owner's questions; notes for review.
   the native log viewer. **The DSH chat and settings web UI need a real arm64 device**; the test goes on
   to them automatically if the engine comes up (for example on an arm64 runner).
 
+## Second review pass
+
+The P2 requirement audit and execution evidence are in [docs/REVIEW_130_P2.md](docs/REVIEW_130_P2.md). This pass adds
+regressions for canceled/superseded account changes, incomplete web streams and active-request cancellation,
+interrupted harness activation and rollback before configuration repair, reachable update retries, theme color
+preservation, plugin ownership and watcher fallback. The smoke test also checks API-panel cancel/reopen and empty
+key validation. These tests do not turn the x86_64 emulator into an arm64 engine acceptance test.
+
 ## Gaps (not built or not verifiable here)
 - The web account depends on chat.deepseek.com's web API (not a public API; it can change). Replies have no images
   and tools go through a text protocol, so agent runs are less reliable than with an API key.

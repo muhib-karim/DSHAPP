@@ -36,7 +36,10 @@
 **漏改的后果是静默的**：老标记仍在 → 解包被跳过 → 新资产永不生效。
 这三个都是踩过的坑。
 
-### ⚠️ 改 `mobile-ui-plugin/**` 的源码**必须手工重打对应的 `.zip`**
+### 改 `mobile-ui-plugin/**` 后必须重打并比对对应的 `.zip`
+
+本 fork 的 CI 由 `tools/ci/assemble-assets.py` 从源码重建全部 13 个插件 zip；本地构建仍需准备资产，
+并逐个比较 zip 内完整文件集合及字节内容。以下为上游手工打包时期的背景与格式约束。
 
 `assets/*.zip` 全部被 `.gitignore` 忽略（L33），**没有任何打包脚本** ——
 `logs-tool.zip` / `bubble-tool.zip` / `statusbar-tool.zip` / `shell-tool.zip` /

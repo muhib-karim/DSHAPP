@@ -33,6 +33,7 @@ GOOGLE = re.compile(r"^Continue with Google$", re.I)
 API_KEY = re.compile(r"^Use API key$", re.I)
 LATER = re.compile(r"^Set up later$", re.I)
 KEY = "sk-smoke-invalid-key-0000000000"
+LOCAL_KEY_ERROR = re.compile(r"^Enter your DeepSeek API key\.$", re.I)
 KEY_ERROR = re.compile(r"(rejected this key|Could not reach api\.deepseek\.com|DeepSeek answered HTTP|no balance|rate limiting)", re.I)
 
 
@@ -200,13 +201,50 @@ def sign_in_screens():
     print("first screen:", first_ok, flush=True)
     if not first_ok:
         return False, False
+    # Cancel an untouched API-key panel and reopen it. Back must not dismiss first-run setup or commit an account.
     tap(find(root, API_KEY))
+    time.sleep(3)
+    root = screen("api-key-cancel")
+    for _ in range(4):
+        if find(root, GOOGLE) is not None and find(root, API_KEY) is not None:
+            break
+        adb("shell", "input", "keyevent", "4")
+        time.sleep(2)
+        root = screen("api-key-canceled")
+    choice = find(root, API_KEY)
+    if choice is None or find(root, GOOGLE) is None:
+        print("API-key cancel did not return to account choices", flush=True)
+        return first_ok, False
+    tap(choice)
     time.sleep(3)
     root = screen("api-key")
     shot("02-api-key-screen")
     field = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
     key_ok = False
     if field is not None:
+        # Empty input is a deterministic local error; it must not depend on the network or accept an account.
+        ensure_app_focus()
+        tap(field)
+        wait_for_ime()
+        adb("shell", "input", "keyevent", "66")
+        deadline = time.time() + 20
+        local_ok = False
+        while time.time() < deadline:
+            root = screen("api-key-empty")
+            if find(root, LOCAL_KEY_ERROR) is not None:
+                local_ok = True
+                break
+            button = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnKeyContinue")), None)
+            if button is not None:
+                tap(button)
+            time.sleep(2)
+        shot("02a-api-key-local-error")
+        if not local_ok:
+            print("empty API key did not show local validation", flush=True)
+            return first_ok, False
+        field = key_field(root)
+        if field is None:
+            return first_ok, False
         # Run 39953357675 typed before the keyboard was up (nothing arrived); run 39955835370 re-tapped the field's old
         # bounds after the keyboard had moved the layout and hit "Get a key", which opened Chrome. So: tap once, wait for
         # the keyboard, type, and re-tap only with bounds from a fresh dump while the app is in front.

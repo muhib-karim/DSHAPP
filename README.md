@@ -48,6 +48,10 @@
 前两张截图来自 CI 模拟器；其余为 DSH 真实的 Web 界面加本 App 的移动端插件，在电脑上按手机尺寸渲染，
 其中的模型回复、账号与版本信息为演示数据。
 
+第二轮审查补齐了账号切换与取消登录的保护，网页回复中断时明确报错；授予安装权限、下载失败或取消安装后仍可重试。
+引擎更新失败会保留用户配置并恢复旧版，更新切换中断也可恢复。主题原有配色得到保留，所有表面仍为实色；
+用户自行安装的官方插件可移除，文件监听不可用时技能列表仍会刷新。
+
 **在 Android 手机上跑一个完整的 AI 编码 Agent。**
 
 [English](README.en.md) · [文档](docs/agents/README.md) · [参与贡献](CONTRIBUTING.md)
@@ -93,8 +97,8 @@ APK
 
 | 包 | applicationId | 适用 |
 |---|---|---|
-| `DSH<版本>.apk` | `com.dsh.android` | 绝大多数设备，体积小 |
-| `DSH<版本>-gecko.apk` | `com.dsh.webview` | 老设备 / 系统 WebView 不可用时 |
+| `DSH<版本>-mk.apk` | `com.mkdsh.droid` | 绝大多数设备，体积小 |
+| `DSH<版本>-mk-gecko.apk` | `com.mkdsh.gecko` | 老设备 / 系统 WebView 不可用时 |
 
 两个包 **applicationId 不同，可以同时安装**，数据目录互相独立。
 
@@ -233,7 +237,7 @@ docs/agents/                           开发文档（35 篇，按需检索）
 - **首次启动较慢** —— 要解包 Termux 环境与引擎，视设备约 10–60 秒。
 
 - **网页账号（Continue with Google）**：走 chat.deepseek.com 的网页接口，它不是公开 API，可能变化；DSH 的工具通过文本协议
-  调用，不发送图片。App 内的 Google 登录可能被 Google 拒绝，浏览器登录始终可用。要最稳定地跑 Agent，请用 API Key。
+  调用，不发送图片。App 内的 Google 登录可能被 Google 拒绝，也可尝试浏览器登录作为备选。要最稳定地跑 Agent，请用 API Key。
 - **引擎更新** 安装期间约需 0.5 GB 空闲空间（旧版本会保留用于回滚）；system 版更新后的引擎需要 Android System WebView 94 或更高。
 
 完整清单见 [boundaries.md](docs/agents/boundaries.md)。

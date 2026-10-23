@@ -6,24 +6,18 @@ Complete the 1.3.0 second review pass against the frozen requirements, with loca
 on the final feature branch head. No merge, tag or release.
 
 ## Status
-- Version / branch: 1.3.0 / 31, feature/v1.3.0; pass 1 baseline 277daa8.
-- CI: baseline Release APK 39962242220 and Emulator smoke 39962242246 green.
-- Review: account lifecycle, incomplete streams, update activation/retry, opacity and plugin ownership gaps found.
-- Plan committed: 2f77d8d; account, updater and UI fixes assigned by subsystem, regression tests first.
-- Baseline JVM build successful (97 existing tests); node watcher baseline has ENOSPC on shared host.
-- Mobile fixes verified: 34/34 Node tests, 5/5 Chromium tests; all 13 generated plugin zips byte-match source.
-- Actual upstream modal/header checked after animations: opaque colors, opacity 1, no backdrop filter.
-- Account/bridge regressions green: 103 tests, zero failures; RED covered stream, cancellation and account-generation failures.
-- Mobile code/stamps committed as 499587a; account/bridge committed as 1a8826e.
-- Updater targeted green: 44 tests. Sign-out write-failure and lifecycle-race regressions reproduced and fixed.
-- Independent final review found no unresolved important issues; final targeted gate passed updater 46/46 and account changes 8/8.
-- Full both-flavor gates are running under the shared Gradle resource guard; system JVM 152/152 and system debug assembly passed.
-- Final Node/Chromium gates repeated green: 34 + 5 tests; smoke syntax and all 13 archive/source comparisons pass.
-- Server restart interrupted work; existing edits retained and subsystem workers resumed from their diffs.
+- Version / branch: 1.3.0 / 31, feature/v1.3.0; P2 plan committed before code as 2f77d8d.
+- Account/bridge, opaque theme/plugin controls, watcher fallback and recoverable update activation are implemented.
+- Independent final review found no unresolved important issues; sign-out persistence and update/start races fixed.
+- Final local gates: 152 JVM tests per flavor, both debug APKs, 34 Node tests and 5 Chromium tests passed.
+- Smoke script syntax and all 13 plugin archive/source byte comparisons pass; Gradle is stopped.
+- Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
+- Live upstream frontend: skill add/remove refreshes without reload; real light/dark Settings surfaces are opaque.
+- Delivery gate: security checks, push and exact-head Release APK + Emulator smoke; final line records both run IDs.
 
 ## Next step
-1. Complete sign-out failure and update lifecycle regressions, then run both flavor test/build gates.
-2. Finish live browser checks, update delivery evidence, commit and push; monitor both CI workflows.
+1. Run security gates and push the completed P2 commits; watch both exact-head CI workflows until green.
+2. Hand off P3; verify CI IDs from the final delivery line and retain live account/arm64 acceptance limitations.
 
 
 ## Decisions (why things are the way they are)
@@ -45,3 +39,4 @@ on the final feature branch head. No merge, tag or release.
 - 2026-10-23 13:58Z Codex/gpt-6-astra: final review identified sign-out and update/start races; regression fixes underway before final gates.
 - 2026-10-23 13:59Z Codex/gpt-6-astra: final review fixes complete; Node/browser/archive gates pass; next: both-flavor JVM/build verification and delivery.
 - 2026-10-23 14:00Z Codex/gpt-6-astra: sign-out and lifecycle targeted regressions green; starting both-flavor full tests/builds, then commit and push.
+- 2026-10-23 14:02Z Codex/gpt-6-astra: local full gates and live frontend checks passed; committing delivery record before security checks, push and exact-head CI watch.

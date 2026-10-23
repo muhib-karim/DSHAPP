@@ -54,6 +54,21 @@ updatable in the app.
 - Without the upstream key pool, the default model is no longer the unusable `agnes` route.
 - Settings back bar: opaque, readable chevron, follows the UI language.
 
+### Fixed (second review pass)
+
+- Canceled or superseded sign-in checks cannot overwrite the account; switching web accounts no longer immediately
+  accepts the old session. Signing out invalidates pending sign-ins and stops active bridge requests; failed credential removal preserves
+  the account and displays a retry message.
+- Interrupted or rejected web streams report failure instead of successful completion or partial tool calls;
+  prompt limits cover single messages, system instructions and tool definitions.
+- Harness activation recovers interrupted slot changes and rolls back failed validation, gateway startup or boot
+  timeout before normal rescue can alter user configuration; the failed process stops before restoring files.
+- Update and Install actions remain available after permission prompts, transient errors or a canceled installer.
+- Preserve custom theme colors and refresh them on same-scheme changes; remove root wallpapers and task-plan glass.
+- Respect upstream plugin ownership and read-only policy, including removable user-installed official packages;
+  live skill refresh survives unavailable watchers and folders created later.
+- Emulator smoke checks cancellation/reopening of API entry and deterministic empty-key validation.
+
 ---
 
 ## [0.3.0] — 2026-10-17
