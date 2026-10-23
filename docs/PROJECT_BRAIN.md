@@ -25,12 +25,18 @@ green and no merge, tag or release.
   the key and restarts the engine without signing out. Account card shows the hint and a secondary replace button.
   New `DshCredentialsTest` hint cases and `account-key.test.mjs`; stamps `1.0.0-105` / compat `39`.
   Both-flavor gate: 176 JVM tests each, 45 Node tests, both APKs built with the new zip; Gradle stopped.
+- P3 item 5 done: the API-key panel has an explicit **Paste** button (clipboard read only on tap; a trailing newline is
+  trimmed, blank/non-text clips leave the field alone) and keeps the typed key, inline error and focus across rotation;
+  rotating during a check cancels that check, so the destroyed screen cannot write the key. Errors have a heading plus a
+  reason (save failures no longer echo the exception), and a consumed/superseded attempt is reported instead of a silent
+  no-op. New `KeyEntry` + 6 JVM tests and a smoke assertion for the Paste button.
+  Both-flavor gate: 182 JVM tests each, 45 Node tests, both APKs built; Gradle stopped.
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. Implement P3 item 5 (first-screen polish) with its tests.
+1. Commit P3 item 5 after the both-flavor gate, then implement P3 item 6 (release notes).
 2. After all items refresh screenshots and run the full matrix.
 
 
@@ -60,3 +66,5 @@ green and no merge, tag or release.
 - 2026-10-23 14:52Z dsh/DeepSeek V4.1 Flash: P3 item 3 (web-session expiry) implemented; targeted JVM + new Node test green, zip/stamps refreshed; next: both-flavor gate and commit.
 - 2026-10-23 14:56Z dsh/DeepSeek V4.1 Flash: P3 item 3 gate green (174 JVM per flavor, 42 Node, both APK assets match); next: commit, item 4.
 - 2026-10-23 14:58Z dsh/DeepSeek V4.1 Flash: P3 item 4 (API-key replace + masked hint) implemented; new Node test green, zip/stamps bumped; next: both-flavor gate and commit.
+- 2026-10-23 15:08Z dsh/DeepSeek V4.1 Flash: P3 item 5 (paste, rotation restore, clearer key errors) implemented; KeyEntry tests added and smoke checks the Paste button; next: both-flavor gate and commit.
+- 2026-10-23 15:19Z dsh/DeepSeek V4.1 Flash: P3 item 5 gate green (182 JVM per flavor, 45 Node, both APKs); next: commit, item 6.

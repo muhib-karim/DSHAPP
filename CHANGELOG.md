@@ -30,6 +30,10 @@ updatable in the app.
 - **First screen with two sign-ins**: "Continue with Google" (DeepSeek web account) and "Use API key".
   - API key: checked with one `GET https://api.deepseek.com/models`, then written to dsh's own
     `$DSH_HOME/.credentials.yaml` (mode 600, other refs and records kept); default model `deepseek-official/deepseek-flash`.
+  - The API-key panel has an explicit **Paste** button. The clipboard is read only when it is tapped; a trailing newline
+    from a copied key is dropped and a blank or non-text clip leaves the field untouched. The typed key, inline error and
+    focus survive rotation, while a check interrupted by rotation is canceled so the old screen cannot write the key.
+    Check, write and account-switch failures now show a heading and a reason instead of leaving the panel unchanged.
   - Web account: chat.deepseek.com sign-in in an in-app WebView, or in the phone's browser with a bookmark/paste
     hand-off when Google refuses the embedded WebView. The session token is encrypted with an Android Keystore key.
     dsh reaches it through a local OpenAI-compatible bridge (127.0.0.1, random port, per-install bearer secret) that

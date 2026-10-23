@@ -17,6 +17,12 @@
     <string name="signin_key_get">Get a key</string>
     <string name="signin_back">Back</string>
     <string name="signin_checking">Checking the key…</string>
+    <string name="signin_key_paste">Paste</string>
+    <string name="signin_key_paste_description">Paste a key from the clipboard</string>
+    <string name="signin_key_error_title">Couldn\'t sign in with this key</string>
+    <string name="signin_key_error_title_replace">Couldn\'t replace the key</string>
+    <string name="signin_key_save_failed">Could not save the key. Try again.</string>
+    <string name="signin_key_superseded">The account changed while the key was being checked. Try again.</string>
     <string name="login_title">Sign in to DeepSeek</string>
     <string name="login_close">Close</string>
     <string name="login_google_hint">Google won\'t open here?</string>

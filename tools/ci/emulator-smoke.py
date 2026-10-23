@@ -220,6 +220,12 @@ def sign_in_screens():
     root = screen("api-key")
     shot("02-api-key-screen")
     field = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/keyInput")), None)
+    # The key panel must offer an explicit Paste action (the clipboard is never read without a tap).
+    paste = next((n for n in nodes(root) if (n.get("resource-id") or "").endswith(":id/btnPasteKey")), None)
+    paste_ok = paste is not None and bool((paste.get("content-desc") or "").strip())
+    print("API-key paste button:", paste_ok, flush=True)
+    if not paste_ok:
+        return first_ok, False
     key_ok = False
     if field is not None:
         # Empty input is a deterministic local error; it must not depend on the network or accept an account.

@@ -35,6 +35,10 @@ key** (a key from platform.deepseek.com, checked once and saved only in DSH's ow
   the last four characters of the saved key and offers **Replace API key**, so the key can rotate without signing out
   first; Back from that screen keeps the old key and the account. If chat.deepseek.com rejects the saved web session,
   the card says so and offers **Sign in again**, instead of only failing when a message is sent.
+- **Key entry**: the API-key panel has an explicit **Paste** button — the clipboard is read only when it is tapped, a
+  trailing newline from a copied key is dropped, and a blank clipboard leaves what you typed alone. Rotating the phone
+  keeps the text, the inline error and the focus; a check interrupted by rotation is canceled instead of being allowed
+  to write a key from the old screen. A failed check, write or account switch now says why.
 
 **A cleaner, opaque interface.** No wallpaper or animated background, no glass: sheets, the "+" and "/" menus,
 dialogs, the header and previews are all solid, in light and dark. This holds for any theme, including themes the AI
