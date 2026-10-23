@@ -32,6 +32,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
+import com.dsh.android.backup.BackupDialog
 import com.dsh.android.databinding.ActivityMainBinding
 import com.dsh.android.log.BootState
 import com.dsh.android.log.VersionInfo
@@ -810,6 +811,25 @@ class MainActivity : AppCompatActivity() {
         // ⚠️ 同样要拦冒泡：不拦的话点它会先触发 overlay 自己的「点一下收起浮层」，
         //   于是启动层被收掉、白屏露出来，而日志界面还没打开。
         binding.overlayLogs.setOnClickListener { openLogViewer("overlay") }
+
+        // 导出 / 导入数据 —— 与「查看日志」同一套兜底理由，但更要紧：
+        // 引擎挂了、Web GUI 打不开时，设置页进不去，而卸载重装会清掉整个
+        // 私有目录。这两个是**唯一**不丢数据的自救路径。
+        //
+        // ⚠️ 同样不拦冒泡：Dialog 自己会消费触摸，不会落到 overlay 上。
+        //   但两者都刻意**不依赖引擎**（纯 Kotlin 文件操作，见 UserDataExporter），
+        //   所以引擎起没起来都能用。
+        binding.overlayExport.setOnClickListener {
+            BackupDialog.showExport(this) { file ->
+                // ⚠️ LENGTH_LONG：路径很长，SHORT 会让用户来不及看
+                Toast.makeText(this, BackupDialog.exportResultText(this, file), Toast.LENGTH_LONG).show()
+            }
+        }
+        binding.overlayImport.setOnClickListener {
+            BackupDialog.showImport(this) { result ->
+                Toast.makeText(this, BackupDialog.importResultText(this, result), Toast.LENGTH_LONG).show()
+            }
+        }
 
         // 降级态常驻横幅（不变量 I4）。**入口必须在 onCreate 就装好**，不能等到
         // 引擎就绪 —— 救援态恰恰可能在引擎起来之前用户就想退出（比如他确信

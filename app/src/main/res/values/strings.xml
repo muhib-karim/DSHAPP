@@ -72,6 +72,34 @@
     <string name="rescue_banner_detail">上次为什么失败</string>
 
     <!--
+      启动层上的「导出数据」「导入数据」按钮。
+
+      ## 为什么必须在启动层、且任何状态都显示
+
+      用户最需要它们的时刻恰恰是「引擎已经挂了、界面打不开」——那时候
+      设置页（在 Web GUI 里）根本进不去。而卸载重装会清掉整个私有目录，
+      所以「先导出再卸载」是唯一不丢数据的自救路径。
+
+      与「查看日志」同一套理由（见 overlayLogs 的注释），但更重要：
+      日志只是诊断，数据是用户真正在乎的东西。
+    -->
+    <string name="overlay_export_entry">导出数据</string>
+    <string name="overlay_import_entry">导入数据</string>
+
+    <!-- 导出/导入对话框 -->
+    <string name="backup_export_title">导出数据</string>
+    <string name="backup_export_hint">勾选要导出的内容。不含引擎本身（重装时会自动解包）。</string>
+    <string name="backup_import_title">导入数据</string>
+    <string name="backup_import_hint">选择一份备份，勾选要恢复的内容。恢复前会自动备份现有数据。</string>
+    <string name="backup_import_pick">选择备份文件…</string>
+    <string name="backup_import_empty">没有找到备份。请先把 dsh-backup-*.zip 放到手机的「下载」目录。</string>
+    <string name="backup_do_export">导出到手机</string>
+    <string name="backup_do_import">开始恢复</string>
+    <string name="backup_cancel">取消</string>
+    <string name="backup_working">处理中…</string>
+    <string name="backup_risky_hint">含明文密钥，导出后任何 App 都能读取</string>
+
+    <!--
       Shizuku 相关文案（设置页「特权权限」分节）。
 
       Shizuku 是 uid 2000 的第二条来源，也是**唯一不依赖 adbd** 的那条：它不需要
