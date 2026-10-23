@@ -150,3 +150,9 @@ adb logcat -d -s DSH:I     # 引擎就绪 / 界面加载完成 / 各 ensureXxx �
    不能靠"我记得打过了"。踩过一次六个里漏一个，从"改了哪几个文件"看不出来。
 3. **不要为了"修"报错去升 `targetSdk` / 改包名** —— 那是硬约束①②，升了就全线崩，
    而且报错信息不会指向真正的原因。
+
+## Session handoff
+
+Read `docs/PROJECT_BRAIN.md` at session start. Update its Status and Next step after meaningful work and append a
+short UTC Session log entry before a long build or stopping. Commit the handoff with the work; no secrets or machine
+paths in it. Current pass plan: `docs/REVIEW_130_P2.md`.
