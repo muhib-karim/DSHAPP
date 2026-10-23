@@ -7,7 +7,7 @@ name: Emulator smoke
 # on a real arm64 device; tools/ci/emulator-smoke.py goes on to them when the engine does come up.
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**']
   pull_request:
     branches: [main]
   workflow_dispatch:

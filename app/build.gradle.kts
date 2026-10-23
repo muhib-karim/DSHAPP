@@ -297,6 +297,12 @@ android {
         jvmTarget = "17"
     }
 
+    testOptions {
+        // JVM unit tests (app/src/test) touch only plain Kotlin classes; android.jar stubs return defaults
+        // instead of throwing if one is reached by accident.
+        unitTests.isReturnDefaultValues = true
+    }
+
     buildFeatures {
         viewBinding = true
         // TermuxBootstrap.ELF_ROOT_REPLACEMENT 从 BuildConfig.APPLICATION_ID 派生 ——
@@ -353,4 +359,10 @@ dependencies {
     //   140 依赖 core 1.16.0（minAGP 8.6.0 / minCompileSdk 35，均满足），是能在
     //   当前工具链下直接构建的最高版本。要再往上就得先升 AGP，那是另一件事。
     "geckoImplementation"("org.mozilla.geckoview:geckoview-arm64-v8a:140.0.20250707120347")
+
+    // JVM unit tests. org.json: android.jar only has stubs of it. SnakeYAML: checks that the YAML the app writes
+    // into dsh's config parses (test only, not shipped).
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("org.yaml:snakeyaml:2.2")
 }

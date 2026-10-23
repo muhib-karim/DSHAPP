@@ -75,7 +75,7 @@ the emulator smoke test.
 **Files:** modify `app/build.gradle.kts` (testImplementation `junit:junit:4.13.2`, `org.json:json:20240303`,
 `org.yaml:snakeyaml:2.2`; `testOptions.unitTests.isReturnDefaultValues = true`), `.github/workflows/release-apk.yml`
 and `emulator-smoke.yml` (push trigger adds `feature/**`; the build job runs
-`bash ./gradlew testSystemDebugUnitTest` and `node --test tools/tests/` before assembling). Create `tools/tests/`.
+`bash ./gradlew testSystemDebugUnitTest` and `node --test tools/tests/*.test.mjs` before assembling). Create `tools/tests/`.
 
 - [ ] Add a trivial passing test, run `testSystemDebugUnitTest`, commit `test: add JVM and node unit test scaffolding`.
 
@@ -117,7 +117,7 @@ and `emulator-smoke.yml` (push trigger adds `feature/**`; the build job runs
   - `isWallpaperLayer` is true for a fixed canvas covering 100% with `pointer-events: none`, and false for the
     composer or a 300×200 image.
   - `CLEAN_CSS` contains no `backdrop-filter` value other than `none`, and `client.js` contains no `blur(`.
-- [ ] Implement; `node --test tools/tests/` passes.
+- [ ] Implement; `node --test tools/tests/*.test.mjs` passes.
 - [ ] Verify against the real web UI: run dsh 0.2.1-rc.2 locally with the plugin patched in, and take Playwright
   screenshots at 412×915 (chat, "+" menu, "/" palette, settings, preview) in light and dark. Any computed
   `backdrop-filter` other than `none` fails, as does a surface with alpha < 1.
