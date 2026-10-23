@@ -3,6 +3,7 @@ package com.dsh.android
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.webkit.CookieManager
 import android.webkit.WebStorage
 import androidx.appcompat.app.AlertDialog
@@ -13,17 +14,22 @@ import com.dsh.android.account.DshCredentials
 import com.dsh.android.account.SignInActivity
 import com.dsh.android.log.DshLog
 import com.dsh.android.update.AppUpdater
+import com.dsh.android.update.Diagnostics
 import com.dsh.android.update.UpdateCenter
 import com.dsh.android.webbridge.DeepSeekWebClient
 import com.dsh.android.webbridge.WebAccount
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * v1.3.0 settings sections (Account, About & updates) through the page bridge: [json] is the snapshot behind
  * `DSHAndroid.appState()`, [action] runs `DSHAndroid.appAction(name, arg)` on the main thread.
  */
 object AppState {
+    /** One manual restart request at a time; a second tap before the first one leaves the main thread is ignored. */
+    private val restartInFlight = AtomicBoolean(false)
+
     fun json(activity: Activity): String {
         val store = AccountStore(activity)
         val account = JSONObject().put("mode", store.mode.name.lowercase())
@@ -37,6 +43,10 @@ object AppState {
             .put("code", BuildConfig.VERSION_CODE)
             .put("flavor", if (BuildConfig.BUILT_IN_WEB_ENGINE) "gecko" else "system")
             .put("harness", harnessVersion(activity) ?: JSONObject.NULL)
+            // Settings > About diagnostics: non-sensitive labels only (see [Diagnostics]).
+            .put("android", Diagnostics.android(Build.VERSION.RELEASE, Build.VERSION.SDK_INT) ?: JSONObject.NULL)
+            .put("device", Diagnostics.device(Build.MANUFACTURER, Build.MODEL) ?: JSONObject.NULL)
+            .put("abi", Diagnostics.abi(Build.SUPPORTED_ABIS) ?: JSONObject.NULL)
         return JSONObject().put("account", account).put("version", version).put("update", UpdateCenter.json(activity)).toString()
     }
 
@@ -53,10 +63,39 @@ object AppState {
             "updateApp" -> UpdateCenter.updateApp(activity)
             "openReleasePage" -> openReleasePage(activity)
             "harnessRollback" -> restorePreviousHarness(activity, arg)
-            // Settings > Plugins: a plugin change that dsh can only apply on restart.
-            "engineRestart" -> Thread({ EngineManager.get(activity).requestRestart("plugins changed") }, "engine-restart").start()
+            // Settings > About: the host's own log viewer (crashes, engine log, export), not a copy of it in the page.
+            "openLogs" -> activity.startActivity(LogViewerActivity.intent(activity))
+            // Settings > Plugins / About: a change dsh can only apply on restart.
+            "engineRestart" -> restartEngine(activity)
             else -> DshLog.w(DshApplication.TAG, "unknown settings action: $name")
         }
+    }
+
+    /**
+     * Settings > About: restart the engine so dsh re-reads its config. Refused while a boot or a restart is already
+     * running — two overlapping pipelines would race for the same port and process slot. A manual restart is the
+     * right action after a plugin change and after the engine has died, so it is not limited to [EngineManager.State.Ready].
+     */
+    private fun restartEngine(activity: Activity) {
+        if (!restartInFlight.compareAndSet(false, true)) {
+            DshLog.i(DshApplication.TAG, "engine restart: already requested")
+            return
+        }
+        val app = activity.applicationContext
+        Thread({
+            try {
+                val engine = EngineManager.get(app)
+                when (engine.state.value) {
+                    is EngineManager.State.Starting, is EngineManager.State.Extracting, is EngineManager.State.Dead ->
+                        DshLog.i(DshApplication.TAG, "engine restart: a start or restart is already in progress")
+                    else -> engine.requestRestart("settings changed")
+                }
+            } catch (t: Throwable) {
+                DshLog.w(DshApplication.TAG, "engine restart failed: ${t.message}")
+            } finally {
+                restartInFlight.set(false)
+            }
+        }, "engine-restart").start()
     }
 
     /**

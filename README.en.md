@@ -62,6 +62,11 @@ against the installed app before the installer opens, so a wrong download is ref
 The release notes expand as plain text in the card (long notes are truncated), and **Release page** opens this
 repository's GitHub release — the page cannot supply a different URL.
 
+The same card lists the app version and build, Android release, device, ABI and WebView version for bug reports.
+**Open logs** opens the app's own log viewer; **Restart engine** restarts after one confirmation, and a request made
+while the engine is already starting or restarting is ignored, so two engines never race for the same port. These
+labels come only from build information — no account, serial, file path or URL.
+
 | Plugins | Account | About & updates |
 |---|---|---|
 | <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |

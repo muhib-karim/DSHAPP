@@ -49,6 +49,10 @@
 回到更新前的版本，不必等它启动失败。App 本身从本仓库的 GitHub Releases 更新（校验 SHA-256，并在安装前核对包名与签名，错的包会直接拒绝并可重试）。
 更新说明可在卡片里展开为纯文本阅读（过长会截断），**发布页**按钮只会打开本仓库的 GitHub Release，页面无法传入任意链接。
 
+同一张卡片还列出 App 版本与 build、Android 版本、设备、ABI 和 WebView 版本，方便反馈问题时附上。
+**打开日志** 进入 App 自己的日志页；**重启引擎** 确认后重启，正在启动或重启时会被忽略，
+不会让两个引擎同时抢一个端口。这些标签只来自系统构建信息，不含账号、序列号、文件路径或链接。
+
 | 插件 | 账号 | 关于与更新 |
 |---|---|---|
 | <img src="docs/screenshots/v1.3.0/07-settings-plugins.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/08-settings-account.jpg" width="240"> | <img src="docs/screenshots/v1.3.0/09-settings-about.jpg" width="240"> |

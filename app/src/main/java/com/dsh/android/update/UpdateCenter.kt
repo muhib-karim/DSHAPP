@@ -90,6 +90,8 @@ object UpdateCenter {
             .put("canUpdate", appActions.canUpdate).put("canInstall", appActions.canInstall)
         return JSONObject().put("harness", harness).put("app", app)
             .put("checking", checking).put("lastCheck", p.getLong("lastCheck", 0L))
+            // Settings > About diagnostics: 0 while the page has not reported its WebView, which the card shows as "—".
+            .put("webView", webViewMajor)
     }
 
     /** The checked app release's page, but only when it is this fork's HTTPS GitHub release URL. */

@@ -9787,6 +9787,15 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			releasePage: "Release page",
 			restore: "Restore previous version ({version})",
 			confirmRestore: "Go back to @deepseek-ai/dsh {version}? The engine will restart.",
+			diagnostics: "Diagnostics",
+			android: "Android",
+			device: "Device",
+			abi: "ABI",
+			webView: "WebView",
+			openLogs: "Open logs",
+			restartEngine: "Restart engine",
+			confirmRestart: "Restart the engine? The page reconnects when it is ready.",
+			diagnosticsNote: "These labels help when reporting a problem; they contain no account data.",
 		};
 		const MP_ABOUT_ZH = {
 			nav: "关于与更新",
@@ -9815,6 +9824,15 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			releasePage: "发布页",
 			restore: "恢复上一个版本（{version}）",
 			confirmRestore: "回到 @deepseek-ai/dsh {version}？引擎会重新启动。",
+			diagnostics: "诊断信息",
+			android: "Android 版本",
+			device: "设备",
+			abi: "架构",
+			webView: "WebView 版本",
+			openLogs: "打开日志",
+			restartEngine: "重启引擎",
+			confirmRestart: "重启引擎？界面会在引擎就绪后自动重连。",
+			diagnosticsNote: "反馈问题时附上这些信息；它们不包含账号数据。",
 		};
 
 		function mpAboutSection(props) {
@@ -9825,7 +9843,16 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 			const [state, refresh] = mpUseAppState(React, 1500);
 			if (!state) return h("div", { style: S.section }, h("h2", { style: S.heading }, t("title")), h("p", { style: S.intro }, t("noBridge")));
 			const update = state.update || {};
+			const version = state.version || {};
 			const busyCheck = !!update.checking;
+			const diagValue = (value) => value === undefined || value === null || value === "" ? "—" : String(value);
+			const diagRows = [
+				["app", t("app"), version.app ? diagValue(version.app) + (version.code ? " (" + version.code + ")" : "") : "—"],
+				["android", t("android"), diagValue(version.android)],
+				["device", t("device"), diagValue(version.device)],
+				["abi", t("abi"), diagValue(version.abi)],
+				["webView", t("webView"), Number(update.webView) > 0 ? String(update.webView) : "—"],
+			];
 			const statusText = (u) => ({ current: t("upToDate"), available: t("available"), installing: t("installing"),
 				downloading: t("downloading") + (u.progress >= 0 ? " " + u.progress + "%" : ""), ready: t("ready"), blocked: t("blocked"),
 				error: t("failed") })[u.status] || t("unknown");
@@ -9862,6 +9889,21 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 				);
 			};
 			const last = update.lastCheck ? new Date(update.lastCheck).toLocaleString() : t("never");
+			const diagnostics = h("div", { style: S.card, "data-mp-diagnostics": "" },
+				h("div", { style: S.cardHead }, h("h3", { style: S.cardTitle }, t("diagnostics"))),
+				diagRows.map(([key, label, value]) => h("div", { style: S.row, key, "data-mp-diagnostic": key },
+					h("span", { style: S.rowLabel }, label), h("span", { style: S.rowValue }, value))),
+				h("div", { style: S.actions },
+					h("button", { style: S.btn, "data-mp-diagnostics-action": "openLogs",
+						onClick: () => mpAppAction("openLogs") }, t("openLogs")),
+					h("button", { style: S.btn, "data-mp-diagnostics-action": "engineRestart", onClick: () => {
+						if (!window.confirm(t("confirmRestart"))) return;
+						mpAppAction("engineRestart");
+						refresh();
+					} }, t("restartEngine")),
+				),
+				h("p", { style: S.note }, t("diagnosticsNote")),
+			);
 			return h("div", { style: S.section },
 				h("h2", { style: S.heading }, t("title")),
 				h("p", { style: S.intro }, t("intro")),
@@ -9871,6 +9913,7 @@ html[data-mobile] [data-mp-wallpaper-hidden] {
 					h("button", { style: S.btn, disabled: busyCheck, onClick: () => { mpAppAction("updateCheck"); refresh(); } }, busyCheck ? t("checking") : t("check")),
 					h("span", { style: S.note }, t("lastCheck") + ": " + last),
 				),
+				diagnostics,
 			);
 		}
 

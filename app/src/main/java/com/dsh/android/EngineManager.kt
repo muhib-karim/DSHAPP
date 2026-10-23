@@ -9241,8 +9241,12 @@ class EngineManager private constructor(private val context: Context) {
           *      那是基于旧的 66/22 算的。合并时**必须取本地已推进的值再 +1**
           *      （99 → 100 / 33 → 34），否则会回退，设备上静默跑回没有这张卡的旧 UI。
           *      ⚠️ 两个戳都 bump（本常量 99 → 100，-CompatVersion 33 → 34）。
+          * 1.0.0-108：设置 > 关于新增「诊断信息」卡片：App/Android/设备/ABI/WebView 只读标签，
+          *      外加「打开日志」与「重启引擎」两个动作（重启需确认；原生侧在启动或重启中会忽略）。
+          *      只改 `mobileui/lib/client.js`，降级产物随之变化。
+          *      ⚠️ 两个戳都 bump（本常量 107 → 108，-CompatVersion 41 → 42）。
           */
-        private const val MOBILE_UI_VERSION = "1.0.0-107"
+        private const val MOBILE_UI_VERSION = "1.0.0-108"
         private const val MOBILE_UI_STAMP = ".mobile_ui_version"
 
         // ── 出厂默认设置 ─────────────────────────────────────────────

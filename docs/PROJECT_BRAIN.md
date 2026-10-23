@@ -48,13 +48,20 @@ green and no merge, tag or release.
   unchanged. Pure `mpFilterPluginRows` / `mpPluginGroupCounts` plus a stateful-hook render test in
   `plugin-search.test.mjs`. Stamps `1.0.0-107` / compat `41` / preset `1.0.0-4`; zip re-packed and byte-compared.
   Gate: 186 JVM tests per flavor, 57 Node tests, both APKs built; Gradle stopped.
+- P3 item 8 done: Settings > About & updates shows non-sensitive diagnostics (app version and build, Android release,
+  device, ABI, WebView major; 0/unknown renders as a dash) and offers **Open logs** (the existing `LogViewerActivity`
+  viewer) and **Restart engine** (confirm first; a start/restart already in flight is ignored, and a second pipeline
+  cannot be started). `AppState` guards restarts with an `AtomicBoolean` plus the engine state, `UpdateCenter` exposes
+  `webView`, and a pure `Diagnostics` helper formats the labels; no serials, accounts, paths or URLs. Stamps
+  `1.0.0-108` / compat `42` / preset `1.0.0-4`; mobile UI zip re-packed and byte-compared.
+  Gate: 190 JVM tests per flavor, 62 Node tests, both APKs built; Gradle stopped.
 - P2 evidence remains: 152 JVM tests per flavor, 34 Node tests, 5 Chromium tests, plugin archive/source byte checks.
 - Bundled harness matches npm latest 0.2.1-rc.2; local APKs omit upstream runtime assets supplied by CI.
 - Live chat/Settings acceptance still needs an arm64 device; the x86_64 emulator covers native screens only.
 
 ## Next step
-1. P3 item 7 is done; implement P3 item 8 (About: logs, restart, diagnostics).
-2. After all items refresh screenshots and run the full matrix.
+1. P3 item 8 is done; all pass 3 items are implemented.
+2. Refresh screenshots, run the full matrix and prepare the pass 3 review/summary.
 
 
 ## Decisions (why things are the way they are)
@@ -89,3 +96,4 @@ green and no merge, tag or release.
 - 2026-10-23 15:31Z dsh/DeepSeek V4.1 Flash: P3 item 6 (release notes + trusted release link) implemented; targeted JVM/Node green; next: full both-flavor gate and commit.
 - 2026-10-23 15:35Z dsh/DeepSeek V4.1 Flash: P3 item 6 gate green (186 JVM per flavor, 49 Node, both APKs); next: commit, item 7.
 - 2026-10-23 15:37Z dsh/DeepSeek V4.1 Flash: P3 item 7 (plugin search, counts, scope badges) implemented; full gate green (186 JVM per flavor, 57 Node, both APKs); next: commit, item 8.
+- 2026-10-23 15:44Z dsh/deepseek-v4.1-flash: P3 item 8 diagnostics/logs/restart implemented; both APKs and tests green; next: full matrix and pass summary.

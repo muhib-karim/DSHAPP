@@ -60,6 +60,10 @@ updatable in the app.
   (line breaks and lists readable, control characters and excess blank lines removed, long notes capped at 4,000
   characters with a visible ellipsis). A **Release page** button opens the release on github.com; the page cannot pass
   a URL, and native code accepts only `https://github.com/muhib-karim/DSHAPP/releases/…`.
+- **Diagnostics in About & updates**: the card lists the app version and build, Android release, device, ABI and
+  WebView version. **Open logs** opens the app's own log viewer, and **Restart engine** asks once and then restarts the
+  engine; a restart while a start or restart is already running is ignored, so two engine pipelines never race for the
+  same port. The labels come only from build information — no account, serial, path or URL.
 - JVM and node unit tests (credentials writer, profile patch, key check, PoW solver, SSE parser, bridge mapping and
   server, version compare, update slots, plugin list, skill refresh, opaque surfaces); CI runs them before the build.
   The emulator smoke test now covers the first screen and the API-key screen.

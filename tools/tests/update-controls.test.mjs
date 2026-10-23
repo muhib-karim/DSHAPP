@@ -7,7 +7,7 @@ const CLIENT = fileURLToPath(new URL('../../mobile-ui-plugin/dsh-android-mobile/
 
 // Render the real About section into an element tree. React's hooks and the Android bridge are the external
 // boundaries; card selection, labels and click handlers all run unchanged from the shipped client bundle.
-function render(updates, { confirm = true } = {}) {
+function render(updates, { confirm = true, version = null } = {}) {
   const actions = [];
   const confirms = [];
   const React = {
@@ -21,7 +21,7 @@ function render(updates, { confirm = true } = {}) {
       .replace('exports.__test = {', 'exports.__test = { mpAboutSection,'),
     requireModule: (name) => name === 'react' ? React : {},
     globals: { confirm: (message) => { confirms.push(message); return confirm; },
-      DSHAndroid: { appState: () => JSON.stringify({ update: updates }),
+      DSHAndroid: { appState: () => JSON.stringify({ update: updates, version: version || {} }),
         appAction: (name, argument) => actions.push([name, argument]) } },
   });
   return { tree: client.__test.mpAboutSection({}), actions, confirms };
@@ -131,4 +131,60 @@ test('release notes belong to the app card, not the harness card', () => {
   const card = find(tree, (node) => node.props['data-mp-update'] === 'harness');
   assert.equal(find(card, (node) => node.tag === 'details'), undefined);
   assert.equal(find(card, (node) => node.props['data-mp-update-action'] === 'openReleasePage'), undefined);
+});
+
+const DIAGNOSTICS = {
+  app: '1.3.0', code: 31, flavor: 'gecko', harness: '0.2.1-rc.2',
+  android: '14 (SDK 34)', device: 'Google Pixel 8', abi: 'arm64-v8a',
+};
+
+function diagnosticsValue(tree, key) {
+  const card = find(tree, (node) => node.props['data-mp-diagnostics'] !== undefined);
+  assert.ok(card, 'the diagnostics card is present');
+  const row = find(card, (node) => node.props['data-mp-diagnostic'] === key);
+  assert.ok(row, `the ${key} row is present`);
+  return row.children[1].children.join('');
+}
+
+test('diagnostics show the build, Android, device, ABI and WebView labels', () => {
+  const { tree } = render({ webView: 120 }, { version: DIAGNOSTICS });
+  assert.equal(diagnosticsValue(tree, 'app'), '1.3.0 (31)');
+  assert.equal(diagnosticsValue(tree, 'android'), '14 (SDK 34)');
+  assert.equal(diagnosticsValue(tree, 'device'), 'Google Pixel 8');
+  assert.equal(diagnosticsValue(tree, 'abi'), 'arm64-v8a');
+  assert.equal(diagnosticsValue(tree, 'webView'), '120');
+});
+
+test('diagnostics fall back to a dash when the host reports nothing', () => {
+  const { tree } = render({ webView: 0 });
+  for (const key of ['app', 'android', 'device', 'abi', 'webView']) {
+    assert.equal(diagnosticsValue(tree, key), '—', `${key} stays readable without a value`);
+  }
+});
+
+test('open logs asks the host to open its own viewer', () => {
+  const { tree, actions } = render({});
+  const button = find(tree, (node) => node.props['data-mp-diagnostics-action'] === 'openLogs');
+  assert.ok(button, 'the log action is visible');
+  assert.equal(button.children.join(''), 'Open logs');
+  button.props.onClick();
+  assert.deepEqual(actions, [['openLogs', '']]);
+});
+
+test('restarting the engine asks first and then sends one action', () => {
+  const { tree, actions, confirms } = render({});
+  const button = find(tree, (node) => node.props['data-mp-diagnostics-action'] === 'engineRestart');
+  assert.ok(button, 'the restart action is visible');
+  assert.equal(button.children.join(''), 'Restart engine');
+  assert.equal(confirms.length, 0, 'nothing is asked before the tap');
+  button.props.onClick();
+  assert.deepEqual(confirms, ['Restart the engine? The page reconnects when it is ready.']);
+  assert.deepEqual(actions, [['engineRestart', '']]);
+});
+
+test('cancelling the engine restart sends nothing', () => {
+  const { tree, actions, confirms } = render({}, { confirm: false });
+  find(tree, (node) => node.props['data-mp-diagnostics-action'] === 'engineRestart').props.onClick();
+  assert.equal(confirms.length, 1);
+  assert.deepEqual(actions, []);
 });
